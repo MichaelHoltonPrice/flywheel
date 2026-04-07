@@ -7,6 +7,7 @@ and volume mounts.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -97,8 +98,13 @@ def run_container(config: ContainerConfig, args: list[str] | None = None) -> Con
     """
     cmd = build_docker_command(config, args)
 
+    # Prevent MSYS/Git Bash from translating Unix-style paths
+    # (e.g., /output -> C:/Program Files/Git/output) in Docker commands.
+    env = os.environ.copy()
+    env["MSYS_NO_PATHCONV"] = "1"
+
     start = time.monotonic()
-    process = subprocess.Popen(cmd)
+    process = subprocess.Popen(cmd, env=env)
     try:
         process.wait()
     except KeyboardInterrupt:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -144,7 +144,7 @@ class TestRunContainer:
         run_container(config)
 
         mock_popen.assert_called_once_with(
-            ["docker", "run", "--rm", "-t", "test:latest"]
+            ["docker", "run", "--rm", "-t", "test:latest"], env=ANY
         )
         mock_process.wait.assert_called_once()
 
@@ -182,7 +182,7 @@ class TestRunContainer:
         run_container(config, args=["--epochs", "5"])
 
         expected = ["docker", "run", "--rm", "-t", "test:latest", "--epochs", "5"]
-        mock_popen.assert_called_once_with(expected)
+        mock_popen.assert_called_once_with(expected, env=ANY)
 
     @patch("flywheel.container.subprocess.Popen")
     def test_gpu_flag_in_command(self, mock_popen):
