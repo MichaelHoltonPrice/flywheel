@@ -70,16 +70,22 @@ class TestFromYaml:
         train_block = template.blocks[0]
         assert train_block.name == "train"
         assert train_block.image == "cyberloop-train:latest"
-        assert train_block.inputs == ["checkpoint"]
-        assert train_block.outputs == ["checkpoint"]
+        assert len(train_block.inputs) == 1
+        assert train_block.inputs[0].name == "checkpoint"
+        assert train_block.inputs[0].container_path == "/input/checkpoint"
+        assert len(train_block.outputs) == 1
+        assert train_block.outputs[0].name == "checkpoint"
+        assert train_block.outputs[0].container_path == "/output/checkpoint"
 
     def test_eval_block_fields(self, valid_template_path: Path):
         template = Template.from_yaml(valid_template_path)
         eval_block = template.blocks[1]
         assert eval_block.name == "eval"
         assert eval_block.image == "cyberloop-eval:latest"
-        assert eval_block.inputs == ["checkpoint"]
-        assert eval_block.outputs == ["score"]
+        assert len(eval_block.inputs) == 1
+        assert eval_block.inputs[0].name == "checkpoint"
+        assert len(eval_block.outputs) == 1
+        assert eval_block.outputs[0].name == "score"
 
 
 class TestGitArtifactValidation:
@@ -283,7 +289,47 @@ blocks:
         path = tmp_path / "ok.yaml"
         path.write_text(yaml_content)
         template = Template.from_yaml(path)
-        assert template.blocks[0].inputs == ["engine"]
+        assert template.blocks[0].inputs[0].name == "engine"
+
+
+class TestDuplicateBlockNames:
+    def test_duplicate_block_name_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: process
+    image: img:latest
+    inputs: []
+    outputs: [data]
+  - name: process
+    image: img2:latest
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "dup_block.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="Duplicate block name"):
+            Template.from_yaml(path)
+
+
+class TestDuplicateOutputSlots:
+    def test_duplicate_output_in_block_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: process
+    image: img:latest
+    inputs: []
+    outputs: [data, data]
+"""
+        path = tmp_path / "dup_output.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="duplicate output"):
+            Template.from_yaml(path)
 
 
 class TestNameValidation:
@@ -327,6 +373,96 @@ blocks:
         with pytest.raises(ValueError, match="invalid"):
             Template.from_yaml(path)
 
+class TestExpandedBlockFormat:
+    def test_expanded_inputs_with_container_path(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+blocks:
+  - name: train
+    image: train:latest
+    inputs:
+      - name: checkpoint
+        container_path: /data/input
+        optional: true
+    outputs: [checkpoint]
+"""
+        path = tmp_path / "expanded.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        inp = template.blocks[0].inputs[0]
+        assert inp.name == "checkpoint"
+        assert inp.container_path == "/data/input"
+        assert inp.optional is True
+
+    def test_expanded_outputs_with_container_path(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+blocks:
+  - name: train
+    image: train:latest
+    inputs: []
+    outputs:
+      - name: checkpoint
+        container_path: /output
+"""
+        path = tmp_path / "expanded.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        out = template.blocks[0].outputs[0]
+        assert out.name == "checkpoint"
+        assert out.container_path == "/output"
+
+    def test_resource_config(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+blocks:
+  - name: train
+    image: train:latest
+    gpus: true
+    shm_size: "8g"
+    env:
+      OMP_NUM_THREADS: "1"
+    inputs: []
+    outputs: [checkpoint]
+"""
+        path = tmp_path / "resources.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        block = template.blocks[0]
+        assert block.gpus is True
+        assert block.shm_size == "8g"
+        assert block.env == {"OMP_NUM_THREADS": "1"}
+
+    def test_defaults_for_optional_fields(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: process
+    image: proc:latest
+    inputs: [data]
+    outputs: [data]
+"""
+        path = tmp_path / "defaults.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        block = template.blocks[0]
+        assert block.gpus is False
+        assert block.shm_size is None
+        assert block.env == {}
+        assert block.inputs[0].optional is False
+        assert block.inputs[0].container_path == "/input/data"
+        assert block.outputs[0].container_path == "/output/data"
+
+
+class TestNameValidationAccepted:
     def test_valid_names_with_hyphens_and_underscores(self, tmp_path: Path):
         yaml_content = """\
 artifacts:

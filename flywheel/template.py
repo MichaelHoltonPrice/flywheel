@@ -8,7 +8,7 @@ are parsed from YAML files and validated at load time.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -38,13 +38,33 @@ class ArtifactDeclaration:
 
 
 @dataclass(frozen=True)
+class InputSlot:
+    """A declared input to a block — artifact name, container mount path, and optionality."""
+
+    name: str
+    container_path: str
+    optional: bool = False
+
+
+@dataclass(frozen=True)
+class OutputSlot:
+    """A declared output of a block — artifact name and container mount path."""
+
+    name: str
+    container_path: str
+
+
+@dataclass(frozen=True)
 class BlockDefinition:
-    """A declared block in a template — name, container image, and artifact references."""
+    """A declared block in a template — image, resources, and I/O slots."""
 
     name: str
     image: str
-    inputs: list[str]  # artifact names
-    outputs: list[str]  # artifact names
+    inputs: list[InputSlot]
+    outputs: list[OutputSlot]
+    gpus: bool = False
+    shm_size: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,19 +125,62 @@ class Template:
             artifact_names.add(name)
             artifact_kinds[name] = kind
 
+        block_names: set[str] = set()
         blocks: list[BlockDefinition] = []
         for entry in data.get("blocks", []):
             _validate_name(entry["name"], "Block")
-            inputs = entry.get("inputs", [])
-            outputs = entry.get("outputs", [])
+            if entry["name"] in block_names:
+                raise ValueError(f"Duplicate block name {entry['name']!r}")
+            block_names.add(entry["name"])
+            raw_inputs = entry.get("inputs", [])
+            raw_outputs = entry.get("outputs", [])
 
-            for ref in inputs:
+            input_slots: list[InputSlot] = []
+            for inp in raw_inputs:
+                if isinstance(inp, str):
+                    ref = inp
+                    input_slots.append(InputSlot(
+                        name=ref,
+                        container_path=f"/input/{ref}",
+                    ))
+                else:
+                    ref = inp["name"]
+                    input_slots.append(InputSlot(
+                        name=ref,
+                        container_path=inp.get(
+                            "container_path", f"/input/{ref}"
+                        ),
+                        optional=inp.get("optional", False),
+                    ))
                 if ref not in artifact_names:
                     raise ValueError(
                         f"Block {entry['name']!r} input {ref!r} "
                         f"not declared in artifacts"
                     )
-            for ref in outputs:
+
+            output_names: set[str] = set()
+            output_slots: list[OutputSlot] = []
+            for out in raw_outputs:
+                if isinstance(out, str):
+                    ref = out
+                    output_slots.append(OutputSlot(
+                        name=ref,
+                        container_path=f"/output/{ref}",
+                    ))
+                else:
+                    ref = out["name"]
+                    output_slots.append(OutputSlot(
+                        name=ref,
+                        container_path=out.get(
+                            "container_path", f"/output/{ref}"
+                        ),
+                    ))
+                if ref in output_names:
+                    raise ValueError(
+                        f"Block {entry['name']!r} has duplicate "
+                        f"output {ref!r}"
+                    )
+                output_names.add(ref)
                 if ref not in artifact_names:
                     raise ValueError(
                         f"Block {entry['name']!r} output {ref!r} "
@@ -132,8 +195,11 @@ class Template:
             blocks.append(BlockDefinition(
                 name=entry["name"],
                 image=entry["image"],
-                inputs=inputs,
-                outputs=outputs,
+                inputs=input_slots,
+                outputs=output_slots,
+                gpus=entry.get("gpus", False),
+                shm_size=entry.get("shm_size"),
+                env=entry.get("env", {}),
             ))
 
         return cls(name=path.stem, artifacts=artifacts, blocks=blocks)

@@ -75,16 +75,83 @@ project_root/
 
 A template defines the capabilities of a workspace: what
 artifacts exist, what blocks can run, and how containers are
-built. Templates live in `workforce/templates/`.
+configured. Templates live in `workforce/templates/`.
 
 A template declares:
 - **Artifact declarations** — names and storage kinds (copy or
   git), with repo and path for git artifacts
-- **Block definitions** — names, container images, and which
-  declared artifacts they consume and produce
+- **Block definitions** — names, container images, resource
+  requirements, and input/output artifact mappings with
+  container paths
 
 Block inputs and outputs must reference declared artifact names.
 This is validated at template parse time.
+
+## Block execution
+
+### Dependency injection: build-time vs runtime
+
+Blocks receive inputs via dependency injection. There are two
+forms:
+
+- **Runtime injection** — artifacts mounted into a running
+  container as files or directories. Flywheel handles this
+  directly via Docker volume mounts.
+- **Build-time injection** — source code or data compiled into
+  the Docker image itself (e.g., a game engine compiled into
+  PyO3 bindings). Flywheel tracks the dependency via git
+  artifacts for provenance, even though the injection happens
+  at image build time, not container run time.
+
+Both are real dependencies. The distinction is practical:
+runtime inputs can change between runs without rebuilding the
+image; build-time inputs require a rebuild. This is an
+implementation detail, not a fundamental design choice — a
+future block could accept source code at runtime and compile
+on startup.
+
+### Input and output slots
+
+Each block declares its inputs and outputs as named slots,
+each mapped to a container path:
+
+```yaml
+blocks:
+  - name: train
+    image: cyberloop-train:latest
+    gpus: true
+    shm_size: "8g"
+    inputs:
+      - name: checkpoint
+        container_path: /input/checkpoint
+        optional: true
+    outputs:
+      - name: checkpoint
+        container_path: /output
+```
+
+Flywheel mounts artifact directories at the declared container
+paths. What files exist inside is the container's concern, not
+flywheel's.
+
+### Convention-based output recording
+
+Flywheel creates a directory per declared output artifact and
+mounts it at the block's declared container path. The container
+writes files there. After the container exits, flywheel records
+whatever appeared in each output directory as a CopyArtifact.
+
+This avoids requiring containers to write a manifest or be
+flywheel-aware. The template already declares the contract
+(what a block produces), so a manifest would be redundant.
+If we later need richer signaling (metadata, partial results,
+error details), manifests can be layered on top.
+
+### Resource configuration
+
+Block definitions include container resource requirements
+(GPU access, shared memory, environment variables). These are
+defaults that could be overridden at run time.
 
 ### Workspace creation
 

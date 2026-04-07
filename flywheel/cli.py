@@ -1,6 +1,8 @@
 """CLI entry point for flywheel.
 
-Supports: flywheel create workspace --name NAME --template TEMPLATE
+Supports:
+    flywheel create workspace --name NAME --template TEMPLATE
+    flywheel run block --workspace PATH --block BLOCK --template TEMPLATE [-- extra args...]
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from pathlib import Path
 
 import yaml
 
+from flywheel.execution import run_block
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -24,6 +27,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="flywheel")
     subparsers = parser.add_subparsers(dest="command")
 
+    # flywheel create workspace
     create_parser = subparsers.add_parser("create")
     create_sub = create_parser.add_subparsers(dest="resource")
 
@@ -31,10 +35,34 @@ def main(argv: list[str] | None = None) -> None:
     ws_parser.add_argument("--name", required=True)
     ws_parser.add_argument("--template", required=True)
 
-    args = parser.parse_args(argv)
+    # flywheel run block
+    run_parser = subparsers.add_parser("run")
+    run_sub = run_parser.add_subparsers(dest="target")
+
+    block_parser = run_sub.add_parser("block")
+    block_parser.add_argument("--workspace", required=True)
+    block_parser.add_argument("--block", required=True)
+    block_parser.add_argument("--template", required=True)
+
+    # Split on '--' to separate flywheel args from container args
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--" in argv:
+        split_idx = argv.index("--")
+        flywheel_argv = argv[:split_idx]
+        extra_container_args = argv[split_idx + 1:]
+    else:
+        flywheel_argv = argv
+        extra_container_args = []
+
+    args = parser.parse_args(flywheel_argv)
 
     if args.command == "create" and getattr(args, "resource", None) == "workspace":
         create_workspace(args.name, args.template)
+    elif args.command == "run" and getattr(args, "target", None) == "block":
+        run_block_command(
+            args.workspace, args.block, args.template, extra_container_args,
+        )
     else:
         parser.print_help()
         sys.exit(1)
@@ -65,3 +93,46 @@ def create_workspace(name: str, template_name: str) -> None:
 
     ws = Workspace.create(name, template, workforce_dir)
     print(f"Created workspace {ws.name!r} at {ws.path}")
+
+
+def run_block_command(
+    workspace_path: str,
+    block_name: str,
+    template_name: str,
+    extra_args: list[str],
+) -> None:
+    """Run a block within an existing workspace.
+
+    Reads flywheel.yaml to find the workforce dir and project root.
+    Loads the workspace and template, then executes the block.
+
+    Args:
+        workspace_path: Path to the workspace directory.
+        block_name: Name of the block to execute.
+        template_name: Name of the template file (without .yaml extension).
+        extra_args: Extra arguments passed to the container entrypoint.
+
+    Raises:
+        FileNotFoundError: If flywheel.yaml or the template file is missing.
+        KeyError: If the block is not found in the template.
+        ValueError: If inputs are missing or outputs already recorded.
+        RuntimeError: If the container exits with non-zero code.
+    """
+    project_root = Path.cwd()
+    config_path = project_root / "flywheel.yaml"
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    workforce_dir = project_root / config["harness_dir"]
+    template_path = workforce_dir / "templates" / f"{template_name}.yaml"
+    template = Template.from_yaml(template_path)
+
+    ws = Workspace.load(Path(workspace_path))
+    result = run_block(
+        ws, block_name, template, project_root, args=extra_args or None,
+    )
+    print(
+        f"Block {block_name!r} completed: "
+        f"exit_code={result.exit_code}, elapsed={result.elapsed_s:.1f}s"
+    )
