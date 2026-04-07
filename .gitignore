@@ -5,3 +5,5 @@ dist/
 build/
 .pytest_cache/
 runs/
+.claude/worktrees/
+.claude/settings.local.json
