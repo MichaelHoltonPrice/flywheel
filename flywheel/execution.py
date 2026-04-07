@@ -172,18 +172,14 @@ def run_block(
                 slot.name, decl, project_root
             )
             host_path = str(
-                Path(git_artifact.ref.repo) / git_artifact.ref.path
+                (Path(git_artifact.ref.repo) / git_artifact.ref.path).resolve()
             )
             mounts.append((host_path, slot.container_path, "ro"))
         elif artifact is not None and isinstance(artifact, CopyArtifact):
-            host_path = str(
-                workspace.path / "artifacts" / artifact.name
-            )
+            artifact_dir = workspace.path / "artifacts" / artifact.name
             if artifact.path != Path("."):
-                host_path = str(
-                    workspace.path / "artifacts" / artifact.name
-                    / artifact.path
-                )
+                artifact_dir = artifact_dir / artifact.path
+            host_path = str(artifact_dir.resolve())
             mounts.append((host_path, slot.container_path, "ro"))
         elif slot.optional:
             continue
@@ -199,7 +195,7 @@ def run_block(
         if output_dir.exists():
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True)
-        mounts.append((str(output_dir), slot.container_path, "rw"))
+        mounts.append((str(output_dir.resolve()), slot.container_path, "rw"))
 
     # 6. Build ContainerConfig with resource settings and run
     config = ContainerConfig(
