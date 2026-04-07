@@ -3,7 +3,9 @@ name = "flywheel"
 version = "0.1.0"
 description = "Orchestration framework for measurable AI improvement loops"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0",
+]
 
 [project.optional-dependencies]
 dev = [
