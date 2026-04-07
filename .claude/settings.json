@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "if": "Bash(git commit *)",
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "Review the staged changes and test files in tests/ for quality issues. Check for: (1) Coverage gaps — are there important code paths without corresponding tests? (2) Missing edge cases — are error conditions, boundary values, and empty inputs tested? (3) Race conditions — are there shared mutable state or concurrent operations without proper synchronization? (4) Phantom tests — tests that don't actually verify behavior, such as asserting True, asserting on constants, or testing only the test setup. (5) Documentation — do new or significantly changed Python modules have docstrings explaining their purpose? Do public classes and functions have docstrings? Report specific file names and test names for any issues found. Return {\"ok\": true} if quality is solid, or {\"ok\": false, \"reason\": \"specific issues\"} to block the commit.",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
