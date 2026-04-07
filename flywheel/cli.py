@@ -11,8 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
-
+from flywheel.config import load_project_config
 from flywheel.execution import run_block
 from flywheel.template import Template
 from flywheel.workspace import Workspace
@@ -80,18 +79,14 @@ def create_workspace(name: str, template_name: str) -> None:
 
     Raises:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
+        ValueError: If flywheel.yaml is malformed.
     """
-    project_root = Path.cwd()
-    config_path = project_root / "flywheel.yaml"
+    config = load_project_config(Path.cwd())
 
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-
-    workforce_dir = project_root / config["harness_dir"]
-    template_path = workforce_dir / "templates" / f"{template_name}.yaml"
+    template_path = config.templates_dir / f"{template_name}.yaml"
     template = Template.from_yaml(template_path)
 
-    ws = Workspace.create(name, template, workforce_dir)
+    ws = Workspace.create(name, template, config.harness_dir)
     print(f"Created workspace {ws.name!r} at {ws.path}")
 
 
@@ -114,18 +109,15 @@ def run_block_command(
 
     Raises:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
+        ValueError: If flywheel.yaml is malformed, inputs are missing,
+            or outputs already recorded.
         KeyError: If the block is not found in the template.
-        ValueError: If inputs are missing or outputs already recorded.
         RuntimeError: If the container exits with non-zero code.
     """
     project_root = Path.cwd()
-    config_path = project_root / "flywheel.yaml"
+    config = load_project_config(project_root)
 
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-
-    workforce_dir = project_root / config["harness_dir"]
-    template_path = workforce_dir / "templates" / f"{template_name}.yaml"
+    template_path = config.templates_dir / f"{template_name}.yaml"
     template = Template.from_yaml(template_path)
 
     ws = Workspace.load(Path(workspace_path))
