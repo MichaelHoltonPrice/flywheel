@@ -19,9 +19,10 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 
 ```bash
 pip install -e ".[dev]"
-pytest
-ruff check .          # line-length 100
+bash scripts/verify.sh
 ```
+
+Run `scripts/verify.sh` before considering any work complete. It runs ruff and pytest.
 
 ## Project layout
 
