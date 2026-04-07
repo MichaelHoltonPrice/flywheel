@@ -28,8 +28,7 @@ artifacts:
 blocks:
   - name: train
     image: train:latest
-    gpus: true
-    shm_size: "8g"
+    docker_args: ["--gpus", "all", "--shm-size", "8g"]
     inputs:
       - name: engine
         container_path: /input/engine
@@ -284,8 +283,8 @@ class TestResourceConfig:
             run_block(ws, "train", template, project_root)
 
         config = captured_config["config"]
-        assert config.gpus is True
-        assert config.shm_size == "8g"
+        assert "--gpus" in config.docker_args
+        assert "--shm-size" in config.docker_args
 
 
 class TestErrorCases:

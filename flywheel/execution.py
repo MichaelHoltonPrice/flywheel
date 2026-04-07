@@ -200,8 +200,7 @@ def run_block(
     # 6. Build ContainerConfig with resource settings and run
     config = ContainerConfig(
         image=block_def.image,
-        gpus=block_def.gpus,
-        shm_size=block_def.shm_size,
+        docker_args=block_def.docker_args,
         env=block_def.env,
         mounts=mounts,
     )

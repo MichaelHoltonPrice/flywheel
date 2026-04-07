@@ -119,8 +119,7 @@ each mapped to a container path:
 blocks:
   - name: train
     image: cyberloop-train:latest
-    gpus: true
-    shm_size: "8g"
+    docker_args: ["--gpus", "all", "--shm-size", "8g"]
     inputs:
       - name: checkpoint
         container_path: /input/checkpoint
@@ -147,11 +146,12 @@ flywheel-aware. The template already declares the contract
 If we later need richer signaling (metadata, partial results,
 error details), manifests can be layered on top.
 
-### Resource configuration
+### Docker configuration
 
-Block definitions include container resource requirements
-(GPU access, shared memory, environment variables). These are
-defaults that could be overridden at run time.
+Block definitions include a `docker_args` list for pass-through
+Docker flags (e.g. `["--gpus", "all", "--shm-size", "8g"]`).
+Flywheel does not interpret these — they are project-specific
+and passed directly to `docker run` before the image name.
 
 ### Workspace creation
 

@@ -13,28 +13,21 @@ class TestBuildDockerCommand:
         cmd = build_docker_command(config)
         assert cmd == ["docker", "run", "--rm", "-t", "myimage:latest"]
 
-    def test_with_gpus(self):
-        config = ContainerConfig(image="train:latest", gpus=True)
+    def test_docker_args_passed_through(self):
+        config = ContainerConfig(
+            image="train:latest",
+            docker_args=["--gpus", "all", "--shm-size", "8g"],
+        )
         cmd = build_docker_command(config)
         assert "--gpus" in cmd
-        idx = cmd.index("--gpus")
-        assert cmd[idx + 1] == "all"
+        assert cmd[cmd.index("--gpus") + 1] == "all"
+        assert "--shm-size" in cmd
+        assert cmd[cmd.index("--shm-size") + 1] == "8g"
 
-    def test_without_gpus(self):
-        config = ContainerConfig(image="eval:latest", gpus=False)
+    def test_no_docker_args(self):
+        config = ContainerConfig(image="eval:latest")
         cmd = build_docker_command(config)
         assert "--gpus" not in cmd
-
-    def test_with_shm_size(self):
-        config = ContainerConfig(image="train:latest", shm_size="8g")
-        cmd = build_docker_command(config)
-        assert "--shm-size" in cmd
-        idx = cmd.index("--shm-size")
-        assert cmd[idx + 1] == "8g"
-
-    def test_without_shm_size(self):
-        config = ContainerConfig(image="train:latest")
-        cmd = build_docker_command(config)
         assert "--shm-size" not in cmd
 
     def test_with_env_vars(self):
@@ -95,8 +88,7 @@ class TestBuildDockerCommand:
     def test_full_config(self):
         config = ContainerConfig(
             image="train:latest",
-            gpus=True,
-            shm_size="16g",
+            docker_args=["--gpus", "all", "--shm-size", "16g"],
             env={"LR": "0.001"},
             mounts=[("/data", "/input", "ro")],
         )
@@ -111,7 +103,7 @@ class TestBuildDockerCommand:
     def test_image_always_before_args(self):
         config = ContainerConfig(
             image="myimg:v2",
-            gpus=True,
+            docker_args=["--gpus", "all"],
             env={"A": "B"},
             mounts=[("/x", "/y", "ro")],
         )
@@ -190,7 +182,10 @@ class TestRunContainer:
         mock_process.returncode = 0
         mock_popen.return_value = mock_process
 
-        config = ContainerConfig(image="test:latest", gpus=True)
+        config = ContainerConfig(
+            image="test:latest",
+            docker_args=["--gpus", "all"],
+        )
         run_container(config)
 
         called_cmd = mock_popen.call_args[0][0]
@@ -205,7 +200,6 @@ class TestContainerConfig:
 
     def test_defaults(self):
         config = ContainerConfig(image="img:latest")
-        assert config.gpus is False
-        assert config.shm_size is None
+        assert config.docker_args == []
         assert config.env == {}
         assert config.mounts == []

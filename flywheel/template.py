@@ -56,14 +56,13 @@ class OutputSlot:
 
 @dataclass(frozen=True)
 class BlockDefinition:
-    """A declared block in a template — image, resources, and I/O slots."""
+    """A declared block in a template — image, Docker flags, and I/O slots."""
 
     name: str
     image: str
     inputs: list[InputSlot]
     outputs: list[OutputSlot]
-    gpus: bool = False
-    shm_size: str | None = None
+    docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
 
 
@@ -197,8 +196,7 @@ class Template:
                 image=entry["image"],
                 inputs=input_slots,
                 outputs=output_slots,
-                gpus=entry.get("gpus", False),
-                shm_size=entry.get("shm_size"),
+                docker_args=entry.get("docker_args", []),
                 env=entry.get("env", {}),
             ))
 

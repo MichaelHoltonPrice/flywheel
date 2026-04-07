@@ -1,8 +1,8 @@
 """Docker container launching for flywheel blocks.
 
 Builds and runs Docker containers via subprocess, streaming output to
-the terminal. Handles GPU access, shared memory, environment variables,
-and volume mounts.
+the terminal. Handles environment variables, volume mounts, and
+pass-through Docker flags.
 """
 
 from __future__ import annotations
@@ -19,15 +19,15 @@ class ContainerConfig:
 
     Attributes:
         image: Docker image name (with optional tag).
-        gpus: Whether to pass --gpus all.
-        shm_size: Shared memory size (e.g. "8g"), or None to use Docker default.
+        docker_args: Extra flags passed to ``docker run`` before the image
+            name (e.g. ``["--gpus", "all", "--shm-size", "8g"]``).
+            Project-specific; flywheel does not interpret these.
         env: Environment variables to set inside the container.
         mounts: List of (host_path, container_path, mode) tuples for -v mounts.
     """
 
     image: str
-    gpus: bool = False
-    shm_size: str | None = None
+    docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     mounts: list[tuple[str, str, str]] = field(default_factory=list)
 
@@ -57,11 +57,7 @@ def build_docker_command(config: ContainerConfig, args: list[str] | None = None)
     """
     cmd = ["docker", "run", "--rm", "-t"]
 
-    if config.gpus:
-        cmd.extend(["--gpus", "all"])
-
-    if config.shm_size is not None:
-        cmd.extend(["--shm-size", config.shm_size])
+    cmd.extend(config.docker_args)
 
     for key, value in config.env.items():
         cmd.extend(["-e", f"{key}={value}"])

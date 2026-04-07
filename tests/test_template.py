@@ -424,8 +424,7 @@ artifacts:
 blocks:
   - name: train
     image: train:latest
-    gpus: true
-    shm_size: "8g"
+    docker_args: ["--gpus", "all", "--shm-size", "8g"]
     env:
       OMP_NUM_THREADS: "1"
     inputs: []
@@ -435,8 +434,7 @@ blocks:
         path.write_text(yaml_content)
         template = Template.from_yaml(path)
         block = template.blocks[0]
-        assert block.gpus is True
-        assert block.shm_size == "8g"
+        assert block.docker_args == ["--gpus", "all", "--shm-size", "8g"]
         assert block.env == {"OMP_NUM_THREADS": "1"}
 
     def test_defaults_for_optional_fields(self, tmp_path: Path):
@@ -454,8 +452,7 @@ blocks:
         path.write_text(yaml_content)
         template = Template.from_yaml(path)
         block = template.blocks[0]
-        assert block.gpus is False
-        assert block.shm_size is None
+        assert block.docker_args == []
         assert block.env == {}
         assert block.inputs[0].optional is False
         assert block.inputs[0].container_path == "/input/data"
