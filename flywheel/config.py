@@ -74,7 +74,21 @@ def load_project_config(project_root: Path) -> ProjectConfig:
             f"{config_path} is missing required field 'harness_dir'"
         )
 
-    harness_dir = project_root / data["harness_dir"]
+    raw_harness = data["harness_dir"]
+    if not isinstance(raw_harness, str):
+        raise ValueError(
+            f"'harness_dir' in {config_path} must be a string, "
+            f"got {type(raw_harness).__name__}"
+        )
+
+    harness_path = Path(raw_harness)
+    if harness_path.is_absolute() or raw_harness.startswith("/"):
+        raise ValueError(
+            f"'harness_dir' in {config_path} must be a relative path, "
+            f"got {raw_harness!r}"
+        )
+
+    harness_dir = project_root / raw_harness
 
     return ProjectConfig(
         project_root=project_root,

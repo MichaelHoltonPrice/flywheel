@@ -81,7 +81,8 @@ def create_workspace(name: str, template_name: str) -> None:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
         ValueError: If flywheel.yaml is malformed.
     """
-    config = load_project_config(Path.cwd())
+    project_root = Path.cwd()
+    config = load_project_config(project_root)
 
     template_path = config.templates_dir / f"{template_name}.yaml"
     template = Template.from_yaml(template_path)
@@ -114,15 +115,15 @@ def run_block_command(
         KeyError: If the block is not found in the template.
         RuntimeError: If the container exits with non-zero code.
     """
-    project_root = Path.cwd()
-    config = load_project_config(project_root)
+    config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{template_name}.yaml"
     template = Template.from_yaml(template_path)
 
     ws = Workspace.load(Path(workspace_path))
     result = run_block(
-        ws, block_name, template, project_root, args=extra_args or None,
+        ws, block_name, template, config.project_root,
+        args=extra_args or None,
     )
     print(
         f"Block {block_name!r} completed: "
