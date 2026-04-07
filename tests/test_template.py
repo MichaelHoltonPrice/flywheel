@@ -284,3 +284,62 @@ blocks:
         path.write_text(yaml_content)
         template = Template.from_yaml(path)
         assert template.blocks[0].inputs == ["engine"]
+
+
+class TestNameValidation:
+    def test_empty_artifact_name_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: ""
+    kind: copy
+blocks: []
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="must not be empty"):
+            Template.from_yaml(path)
+
+    def test_artifact_name_with_slash_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: "my/artifact"
+    kind: copy
+blocks: []
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="invalid"):
+            Template.from_yaml(path)
+
+    def test_block_name_with_space_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: "my block"
+    image: img:latest
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="invalid"):
+            Template.from_yaml(path)
+
+    def test_valid_names_with_hyphens_and_underscores(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: my-data_01
+    kind: copy
+blocks:
+  - name: my-block_v2
+    image: img:latest
+    inputs: []
+    outputs: [my-data_01]
+"""
+        path = tmp_path / "ok.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        assert template.artifacts[0].name == "my-data_01"
+        assert template.blocks[0].name == "my-block_v2"

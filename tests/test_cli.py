@@ -190,3 +190,17 @@ class TestCreateWorkspaceFunction:
 
         ws_path = project_root / "workforce" / "workspaces" / "my_ws"
         assert ws_path.is_dir()
+
+
+class TestMainErrorPaths:
+    def test_no_args_exits(self):
+        with pytest.raises(SystemExit):
+            main([])
+
+    def test_invalid_command_exits(self):
+        with pytest.raises(SystemExit):
+            main(["list"])
+
+    def test_create_without_subcommand_exits(self):
+        with pytest.raises(SystemExit):
+            main(["create"])

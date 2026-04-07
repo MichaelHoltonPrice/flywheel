@@ -438,3 +438,35 @@ blocks: []
 
         # Should also clean up
         assert not (workforce_dir / "workspaces" / "test_ws").exists()
+
+
+class TestWorkspaceNameValidation:
+    def test_empty_name_raises(self, project_copy_only: Path):
+        workforce_dir = project_copy_only / "workforce"
+        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        with pytest.raises(ValueError, match="must not be empty"):
+            Workspace.create("", template, workforce_dir)
+
+    def test_slash_in_name_raises(self, project_copy_only: Path):
+        workforce_dir = project_copy_only / "workforce"
+        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        with pytest.raises(ValueError, match="invalid"):
+            Workspace.create("my/ws", template, workforce_dir)
+
+    def test_dotdot_in_name_raises(self, project_copy_only: Path):
+        workforce_dir = project_copy_only / "workforce"
+        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        with pytest.raises(ValueError, match="invalid"):
+            Workspace.create("..", template, workforce_dir)
+
+    def test_space_in_name_raises(self, project_copy_only: Path):
+        workforce_dir = project_copy_only / "workforce"
+        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        with pytest.raises(ValueError, match="invalid"):
+            Workspace.create("my ws", template, workforce_dir)
+
+    def test_valid_names_accepted(self, project_copy_only: Path):
+        workforce_dir = project_copy_only / "workforce"
+        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        ws = Workspace.create("my-workspace_01", template, workforce_dir)
+        assert ws.name == "my-workspace_01"

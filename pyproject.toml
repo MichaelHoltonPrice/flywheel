@@ -32,10 +32,20 @@ select = [
     "UP",     # pyupgrade (Python version idioms)
     "B",      # flake8-bugbear (common pitfalls)
     "SIM",    # flake8-simplify
+    "D",      # pydocstyle (docstring conventions)
+    "PLC0415",  # no imports inside functions
 ]
 ignore = [
     "SIM108", # ternary operator suggestions (often less readable)
+    "D104",   # missing docstring in __init__.py
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]       # no docstring requirements for tests
+"tests/test_import.py" = ["PLC0415"]  # import inside function is intentional
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["flywheel"]

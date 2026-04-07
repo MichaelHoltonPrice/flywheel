@@ -1,5 +1,13 @@
+"""Workspace creation, persistence, and artifact recording.
+
+A workspace is a directory inside a project's workforce folder,
+created from a template. It holds all artifacts for a unit of work
+and enforces immutability once artifacts are recorded.
+"""
+
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -11,9 +19,28 @@ import yaml
 from flywheel.artifact import Artifact, CopyArtifact, GitArtifact, GitRef
 from flywheel.template import Template
 
+_VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+def _validate_name(name: str, label: str) -> None:
+    """Validate that a name is safe for use as a directory or identifier."""
+    if not name:
+        raise ValueError(f"{label} name must not be empty")
+    if not _VALID_NAME.match(name):
+        raise ValueError(
+            f"{label} name {name!r} is invalid. "
+            f"Use only letters, digits, hyphens, and underscores."
+        )
+
 
 @dataclass
 class Workspace:
+    """A workspace instance created from a template.
+
+    Artifacts start as None (not yet produced/resolved) and are
+    filled via record_artifact(), which enforces immutability.
+    """
+
     name: str
     path: Path
     template_name: str
@@ -25,12 +52,24 @@ class Workspace:
     def create(cls, name: str, template: Template, workforce_dir: Path) -> Workspace:
         """Create a new workspace directory from a template.
 
-        - Creates workforce_dir/workspaces/{name}/
-        - Creates an artifacts/ subdirectory
-        - Resolves git artifacts (capture repo, commit SHA, path -- refuse if dirty)
-        - Sets copy artifacts to None (not yet produced)
-        - Saves workspace.yaml metadata
+        Creates the workspace directory, resolves git artifact baselines,
+        and writes workspace.yaml metadata.
+
+        Args:
+            name: Workspace name (letters, digits, hyphens, underscores).
+            template: The template defining artifacts and blocks.
+            workforce_dir: Path to the workforce directory.
+
+        Returns:
+            The created Workspace instance.
+
+        Raises:
+            FileExistsError: If the workspace already exists.
+            ValueError: If the name is invalid or git artifact declarations are incomplete.
+            RuntimeError: If a git repo has uncommitted changes.
+            FileNotFoundError: If a git artifact path does not exist in the repo.
         """
+        _validate_name(name, "Workspace")
         ws_path = workforce_dir / "workspaces" / name
         if ws_path.exists():
             raise FileExistsError(f"Workspace already exists: {ws_path}")
@@ -115,7 +154,14 @@ class Workspace:
 
     @classmethod
     def load(cls, path: Path) -> Workspace:
-        """Load an existing workspace from its workspace.yaml."""
+        """Load an existing workspace from its workspace.yaml.
+
+        Args:
+            path: Path to the workspace directory.
+
+        Returns:
+            The loaded Workspace instance.
+        """
         yaml_path = path / "workspace.yaml"
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
@@ -157,7 +203,18 @@ class Workspace:
         )
 
     def record_artifact(self, name: str, artifact: Artifact) -> None:
-        """Record a produced artifact. Refuses to overwrite a previously recorded artifact."""
+        """Record a produced artifact.
+
+        Args:
+            name: The declared artifact slot name.
+            artifact: The artifact to record.
+
+        Raises:
+            KeyError: If the name is not declared in this workspace.
+            ValueError: If the slot is already recorded, or the artifact name
+                does not match the slot.
+            TypeError: If the artifact kind does not match the declared kind.
+        """
         if name not in self.artifacts:
             raise KeyError(f"Artifact {name!r} not declared in this workspace")
         if self.artifacts[name] is not None:

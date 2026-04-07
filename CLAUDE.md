@@ -24,6 +24,10 @@ bash scripts/verify.sh
 
 Run `scripts/verify.sh` before considering any work complete. It runs ruff and pytest.
 
+Before committing, also run a review agent to check for:
+- Test quality (coverage gaps, edge cases, phantom tests)
+- Docstring completeness (Args/Returns/Raises sections for public functions with parameters — ruff does not enforce this)
+
 ## Project layout
 
 Flywheel expects a `flywheel.yaml` in the target project root defining `project_dir`, `harness_dir`, and `runs_dir`. Workflow configs live in `harness_dir`.

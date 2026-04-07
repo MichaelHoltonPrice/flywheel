@@ -1,3 +1,8 @@
+"""CLI entry point for flywheel.
+
+Supports: flywheel create workspace --name NAME --template TEMPLATE
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +16,11 @@ from flywheel.workspace import Workspace
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and dispatch to the appropriate command.
+
+    Args:
+        argv: Command-line arguments. Defaults to sys.argv when None.
+    """
     parser = argparse.ArgumentParser(prog="flywheel")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -35,7 +45,13 @@ def create_workspace(name: str, template_name: str) -> None:
 
     Reads flywheel.yaml to find the workforce dir (harness_dir).
     Looks for template at workforce_dir/templates/{template_name}.yaml.
-    Creates workspace via Workspace.create().
+
+    Args:
+        name: Workspace name.
+        template_name: Name of the template file (without .yaml extension).
+
+    Raises:
+        FileNotFoundError: If flywheel.yaml or the template file is missing.
     """
     project_root = Path.cwd()
     config_path = project_root / "flywheel.yaml"
