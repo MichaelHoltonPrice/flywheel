@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.cli import create_workspace, main
+from flywheel.cli import _parse_bindings, create_workspace, main
 from tests.conftest import _init_git_repo
 
 
@@ -204,3 +204,58 @@ class TestMainErrorPaths:
     def test_create_without_subcommand_exits(self):
         with pytest.raises(SystemExit):
             main(["create"])
+
+    def test_run_without_subcommand_exits(self):
+        with pytest.raises(SystemExit):
+            main(["run"])
+
+
+class TestParseBindings:
+    def test_single_binding(self):
+        result = _parse_bindings(["checkpoint=checkpoint@abc123"])
+        assert result == {"checkpoint": "checkpoint@abc123"}
+
+    def test_multiple_bindings(self):
+        result = _parse_bindings([
+            "checkpoint=checkpoint@abc",
+            "engine=engine@baseline",
+        ])
+        assert result == {
+            "checkpoint": "checkpoint@abc",
+            "engine": "engine@baseline",
+        }
+
+    def test_empty_list(self):
+        result = _parse_bindings([])
+        assert result == {}
+
+    def test_malformed_raises(self):
+        with pytest.raises(ValueError, match="Invalid --bind format"):
+            _parse_bindings(["no_equals_sign"])
+
+    def test_value_with_at_sign(self):
+        result = _parse_bindings(["checkpoint=checkpoint@abc123"])
+        assert result["checkpoint"] == "checkpoint@abc123"
+
+
+class TestMainRunBlock:
+    def test_argument_parsing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Verify that main() parses run block args and calls the right path."""
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+
+        # Create a workspace first
+        main(["create", "workspace", "--name", "test_ws",
+              "--template", "my_template"])
+
+        # run block should fail at container launch (Docker not available
+        # in tests), but it should get past argument parsing
+        with pytest.raises((RuntimeError, FileNotFoundError, OSError, ValueError)):
+            main([
+                "run", "block",
+                "--workspace",
+                str(project_root / "foundry" / "workspaces" / "test_ws"),
+                "--block", "train",
+                "--template", "my_template",
+                "--", "--subclass", "dueling",
+            ])

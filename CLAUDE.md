@@ -4,11 +4,11 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 
 ## Key concepts
 
-- **Blocks with I/O contracts** are the fundamental unit. See `docs/vision.md` (aspirational) and `docs/architecture.md` (implemented or agreed-upon decisions; future work is noted separately at the end).
+- **Block execution** is the atomic operation. One block, one Docker container, one set of inputs producing outputs. See `docs/vision.md` (aspirational) and `docs/architecture.md` (implemented or agreed-upon decisions; future work is noted separately at the end).
 - **All project logic runs in Docker containers.** Flywheel on the host is pure orchestration.
-- **Workspaces** compartmentalize work within a run.
-- **Artifacts** are either dumb (file/directory copies stored in a workspace) or git-based (references to version-controlled code).
-- **Patterns**: container, sequential_pipeline, sweep.
+- **Artifacts** have two levels: declarations (template-level types like "checkpoint" or "score") and instances (concrete, immutable records produced by block executions). Two storage kinds exist: copy artifacts (files in the workspace) and git artifacts (references to version-controlled code).
+- **Workspaces** are created from templates and accumulate artifact instances and execution records over their lifetime. The workspace is a history, not a snapshot.
+- **The foundry** is the flywheel-managed directory within a project, holding templates and workspaces. It is a peer to the project source code.
 
 ## Batteries (solve-once capabilities)
 

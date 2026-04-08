@@ -2,7 +2,8 @@
 
 Supports:
     flywheel create workspace --name NAME --template TEMPLATE
-    flywheel run block --workspace PATH --block BLOCK --template TEMPLATE [-- extra args...]
+    flywheel run block --workspace PATH --block BLOCK --template TEMPLATE
+        [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
 """
 
 from __future__ import annotations
@@ -42,6 +43,11 @@ def main(argv: list[str] | None = None) -> None:
     block_parser.add_argument("--workspace", required=True)
     block_parser.add_argument("--block", required=True)
     block_parser.add_argument("--template", required=True)
+    block_parser.add_argument(
+        "--bind", action="append", default=[],
+        help="Bind an input slot to a specific artifact ID, "
+        "as SLOT=ARTIFACT_ID (repeatable).",
+    )
 
     # Split on '--' to separate flywheel args from container args
     if argv is None:
@@ -59,12 +65,38 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "create" and getattr(args, "resource", None) == "workspace":
         create_workspace(args.name, args.template)
     elif args.command == "run" and getattr(args, "target", None) == "block":
+        bindings = _parse_bindings(args.bind)
         run_block_command(
-            args.workspace, args.block, args.template, extra_container_args,
+            args.workspace, args.block, args.template,
+            bindings, extra_container_args,
         )
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _parse_bindings(raw: list[str]) -> dict[str, str]:
+    """Parse --bind SLOT=ARTIFACT_ID arguments into a dict.
+
+    Args:
+        raw: List of "SLOT=ARTIFACT_ID" strings from argparse.
+
+    Returns:
+        A dict mapping slot names to artifact instance IDs.
+
+    Raises:
+        ValueError: If any entry is not in SLOT=ARTIFACT_ID format.
+    """
+    bindings: dict[str, str] = {}
+    for entry in raw:
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid --bind format {entry!r}, "
+                f"expected SLOT=ARTIFACT_ID"
+            )
+        slot, artifact_id = entry.split("=", 1)
+        bindings[slot] = artifact_id
+    return bindings
 
 
 def create_workspace(name: str, template_name: str) -> None:
@@ -95,6 +127,7 @@ def run_block_command(
     workspace_path: str,
     block_name: str,
     template_name: str,
+    bindings: dict[str, str],
     extra_args: list[str],
 ) -> None:
     """Run a block within an existing workspace.
@@ -106,12 +139,12 @@ def run_block_command(
         workspace_path: Path to the workspace directory.
         block_name: Name of the block to execute.
         template_name: Name of the template file (without .yaml extension).
+        bindings: Explicit input bindings mapping slot names to artifact IDs.
         extra_args: Extra arguments passed to the container entrypoint.
 
     Raises:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
-        ValueError: If flywheel.yaml is malformed, inputs are missing,
-            or outputs already recorded.
+        ValueError: If flywheel.yaml is malformed or inputs are missing.
         KeyError: If the block is not found in the template.
         RuntimeError: If the container exits with non-zero code.
     """
@@ -123,6 +156,7 @@ def run_block_command(
     ws = Workspace.load(Path(workspace_path))
     result = run_block(
         ws, block_name, template, config.project_root,
+        input_bindings=bindings or None,
         args=extra_args or None,
     )
     print(

@@ -109,7 +109,7 @@ What connects approaches is evaluation. Both produce artifacts
 that can be scored by the same evaluator, and those scores are
 comparable. Flywheel's artifact tracking makes this comparison
 natural — different approaches produce different artifact
-lineages, but their evaluation artifacts land in the same
+provenance chains, but their evaluation artifacts land in the same
 workspace and can be inspected side by side.
 
 ## Contracts and dependency injection
@@ -220,7 +220,7 @@ Not every block follows this progression. Some start as code. Some
 never need an LLM. The framework supports any trajectory, but the
 common pattern is expensive → cheap with escalation.
 
-## Artifact lineage
+## Artifact provenance
 
 Artifacts come in two forms: **declarations** and **instances**.
 
@@ -232,10 +232,16 @@ each block execution consumes specific input instances and
 produces new output instances.
 
 This means a block can execute repeatedly within a workspace.
-Each execution produces distinct outputs, and the full lineage
-is explicit: which execution consumed which artifacts and
-produced which artifacts. The workspace is not a snapshot — it
-is a history.
+Each execution produces distinct outputs, and the full
+provenance is explicit: which execution consumed which artifacts
+and produced which artifacts. The workspace is not a snapshot —
+it is a history.
+
+Provenance is not a separate feature layered on top of the
+system. It is the natural consequence of recording block
+executions and artifact instances correctly. The core primitives
+are BlockExecution and ArtifactInstance; provenance is the
+directed acyclic graph formed by their links.
 
 ## Execution records
 

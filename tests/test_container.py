@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -190,6 +191,51 @@ class TestRunContainer:
 
         called_cmd = mock_popen.call_args[0][0]
         assert "--gpus" in called_cmd
+
+
+class TestKeyboardInterrupt:
+    @patch("flywheel.container.subprocess.Popen")
+    def test_terminate_called_on_interrupt(self, mock_popen):
+        mock_process = MagicMock()
+        mock_process.wait.side_effect = KeyboardInterrupt()
+        mock_popen.return_value = mock_process
+
+        config = ContainerConfig(image="test:latest")
+        with pytest.raises(KeyboardInterrupt):
+            run_container(config)
+
+        mock_process.terminate.assert_called_once()
+
+    @patch("flywheel.container.subprocess.Popen")
+    def test_kill_called_on_terminate_timeout(self, mock_popen):
+        mock_process = MagicMock()
+        mock_process.wait.side_effect = [
+            KeyboardInterrupt(),
+            subprocess.TimeoutExpired(cmd="docker", timeout=10),
+            None,
+        ]
+        mock_popen.return_value = mock_process
+
+        config = ContainerConfig(image="test:latest")
+        with pytest.raises(KeyboardInterrupt):
+            run_container(config)
+
+        mock_process.terminate.assert_called_once()
+        mock_process.kill.assert_called_once()
+
+
+class TestMsysPathConv:
+    @patch("flywheel.container.subprocess.Popen")
+    def test_msys_no_pathconv_set(self, mock_popen):
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_popen.return_value = mock_process
+
+        config = ContainerConfig(image="test:latest")
+        run_container(config)
+
+        env = mock_popen.call_args[1]["env"]
+        assert env.get("MSYS_NO_PATHCONV") == "1"
 
 
 class TestContainerConfig:

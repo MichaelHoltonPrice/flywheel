@@ -7,25 +7,13 @@ are parsed from YAML files and validated at load time.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import yaml
 
-_VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
-
-
-def _validate_name(name: str, label: str) -> None:
-    """Validate that a name is safe for use as an identifier."""
-    if not name:
-        raise ValueError(f"{label} name must not be empty")
-    if not _VALID_NAME.match(name):
-        raise ValueError(
-            f"{label} name {name!r} is invalid. "
-            f"Use only letters, digits, hyphens, and underscores."
-        )
+from flywheel.validation import validate_name as _validate_name
 
 
 @dataclass(frozen=True)

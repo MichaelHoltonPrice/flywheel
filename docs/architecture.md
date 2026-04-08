@@ -14,11 +14,12 @@ the end.
 ### Declarations and instances
 
 An **artifact declaration** is a template-level concept: a named
-slot with a storage kind. "The train block produces checkpoints."
+artifact type with a storage kind. "The train block produces
+checkpoints."
 
 An **artifact instance** is a concrete, immutable record: a
 specific checkpoint produced by a specific block execution, with
-a unique ID, a timestamp, and full lineage. Multiple instances
+a unique ID, a timestamp, and full provenance. Multiple instances
 can exist for the same declaration within a workspace.
 
 This distinction is fundamental. The template declares what
@@ -42,10 +43,12 @@ is something injectable with a name.
 
 ### Artifact IDs
 
-Each artifact instance has a readable ID in the form
-`slot_name@revision` — for example, `checkpoint@1`,
-`checkpoint@2`, `engine@baseline`, `score@3`. These are
-human-readable, self-documenting, and scoped to the workspace.
+Each artifact instance has a unique ID in the form
+`name@identifier` — for example, `checkpoint@a3f7b2`,
+`engine@baseline`, `score@e9c104`. The prefix is the
+artifact declaration name; the suffix is a short UUID
+(or ``baseline`` for workspace-creation git artifacts).
+IDs are scoped to the workspace.
 
 ### Git artifacts require a clean working tree
 
@@ -63,9 +66,16 @@ the code looked like when the workspace was set up.
 
 At **block execution**, flywheel re-resolves the current committed
 state and records a **new** git artifact instance (e.g.,
-`engine@exec3`). The baseline instance is never mutated. Both
+`engine@a3f7b2`). The baseline instance is never mutated. Both
 coexist in the workspace and the execution record shows exactly
 which instance was used.
+
+**Current limitation:** when a git artifact is mounted into a
+container, flywheel mounts the live working tree path, not the
+specific recorded commit. The commit SHA is recorded for
+provenance but not enforced at mount time. If the working tree
+has moved to a newer commit since the artifact was recorded,
+the container sees the newer code.
 
 ### Immutability
 
@@ -88,12 +98,12 @@ Each block execution record includes:
   each input slot.
 - Output bindings, showing which artifact instance was produced
   for each output slot.
-- A status indicator (succeeded or failed).
+- A status indicator (succeeded, failed, or interrupted).
 - Runtime metadata such as the image, docker args, exit code,
   and elapsed time.
 
 Block executions are append-only. The workspace accumulates a
-history of executions that forms the complete lineage graph.
+history of executions that forms the complete provenance graph.
 
 A **run** is a higher-level concept — an orchestration pattern
 composed of multiple block executions, potentially in parallel.
@@ -168,9 +178,11 @@ and passed directly to `docker run` before the image name.
 1. Resolve the block definition from the template.
 2. Create a new block execution ID.
 3. Resolve each input slot to a concrete artifact instance.
-   The caller specifies which instance to use for each input.
-   For git inputs, re-resolve the current committed state and
-   record as a new git artifact instance.
+   The caller may specify explicit bindings for any input slot.
+   For unbound copy inputs, the most recent instance for that
+   slot is used (a provisional "latest wins" default). For git
+   inputs, re-resolve the current committed state and record
+   as a new git artifact instance.
 4. Allocate fresh output directories with new artifact IDs.
 5. Mount input instances and output directories into the
    container.
@@ -199,9 +211,9 @@ project_root/
         └── my_workspace/
             ├── workspace.yaml   ← metadata, artifacts, executions
             └── artifacts/       ← copy artifact instance directories
-                ├── checkpoint@1/
-                ├── checkpoint@2/
-                └── score@1/
+                ├── checkpoint@a3f7b2/
+                ├── checkpoint@d1e8c4/
+                └── score@b7a209/
 ```
 
 ### Templates
@@ -234,25 +246,22 @@ workspace directory with a `workspace.yaml` metadata file.
 The workspace.yaml file contains workspace metadata (name,
 template, creation time), all artifact instances keyed by ID,
 and all block execution records keyed by ID. Together these
-form the complete lineage record for the workspace.
+form the complete provenance record for the workspace.
 
 ## Future work
 
-### Current bindings
+### Default binding policy
 
-The workspace could maintain a convenience map from each
-declared artifact slot to a default artifact instance. This
-would allow downstream block executions to consume "the latest
-checkpoint" without the caller specifying an explicit artifact
-ID each time. Advancing bindings on success and holding them on
-failure would give natural "latest good" semantics.
+When no explicit binding is provided for a copy input slot,
+the current implementation uses the most recent instance for
+that slot ("latest wins"). This is a provisional default that
+works for simple sequential workflows.
 
-This is deferred because the right default policy is not yet
-clear. For example, a project might need per-subclass defaults
-(the best checkpoint for dueling vs defense), or the "best"
-artifact might depend on an evaluation metric rather than
-recency. The current design requires explicit artifact IDs,
-which is more verbose but avoids encoding policy prematurely.
+A more sophisticated policy might need per-subclass defaults
+(the best checkpoint for dueling vs defense), or selection
+based on an evaluation metric rather than recency. A formal
+`current_bindings` map on the workspace could support these
+patterns, but the right design is not yet clear.
 
 ### Schema versioning
 
@@ -262,8 +271,15 @@ older workspaces and migrating them forward.
 
 ### Interrupted execution handling
 
-Block executions can be interrupted (e.g., by Ctrl+C or a
-container timeout). The execution record should capture this
-state distinctly from failure, since an interrupted execution
-may have produced partial but usable output. The design for
-how partial outputs are handled is not yet decided.
+Block executions can be interrupted (e.g., by Ctrl+C). The
+execution is recorded with "interrupted" status, and orphaned
+output directories are cleaned up. Partial outputs from
+interrupted executions are not preserved as artifact instances.
+
+### Commit-pinned git mounts
+
+Git artifact instances record a commit SHA, but the current
+mount implementation uses the live working tree. A future
+improvement could use ``git archive`` or ``git worktree`` to
+extract the exact committed state, making explicit bindings
+to historical git artifacts truly reproducible.
