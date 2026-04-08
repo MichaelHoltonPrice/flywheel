@@ -8,7 +8,10 @@ visibility into hybrid human+agent workflows, and reusable
 capabilities (computer use agents, LLM agent wrappers) so projects
 can focus on their domain logic.
 
-See [docs/vision.md](docs/vision.md) for the design rationale.
+See [docs/vision.md](docs/vision.md) for the design rationale
+(includes aspirational elements) and
+[docs/architecture.md](docs/architecture.md) for implementation
+decisions (future work is noted separately at the end).
 
 ## Setup
 
