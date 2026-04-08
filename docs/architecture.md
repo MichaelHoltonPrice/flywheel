@@ -52,7 +52,7 @@ never silently change.
 
 ## Workspaces
 
-A workspace is a directory inside a project's workforce folder.
+A workspace is a directory inside a project's foundry folder.
 It is created from a template and contains all artifacts for a
 unit of work.
 
@@ -60,9 +60,9 @@ unit of work.
 
 ```
 project_root/
-├── flywheel.yaml             ← project config (harness_dir, etc.)
+├── flywheel.yaml             ← project config (foundry_dir, etc.)
 ├── crates/                   ← project source code
-└── workforce/                ← flywheel's folder
+└── foundry/                  ← flywheel's folder
     ├── templates/            ← workspace templates
     │   └── improve_bot.yaml
     └── workspaces/
@@ -75,7 +75,7 @@ project_root/
 
 A template defines the capabilities of a workspace: what
 artifacts exist, what blocks can run, and how containers are
-configured. Templates live in `workforce/templates/`.
+configured. Templates live in `foundry/templates/`.
 
 A template declares:
 - **Artifact declarations** — names and storage kinds (copy or
@@ -157,6 +157,6 @@ and passed directly to `docker run` before the image name.
 
 `flywheel create workspace --name NAME --template TEMPLATE` runs
 from the project root. It reads `flywheel.yaml` to find the
-workforce directory, loads the template, resolves git artifacts
+foundry directory, loads the template, resolves git artifacts
 (refusing if dirty), and creates the workspace directory with
 a `workspace.yaml` metadata file.

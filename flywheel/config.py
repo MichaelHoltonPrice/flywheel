@@ -21,16 +21,16 @@ class ProjectConfig:
 
     Attributes:
         project_root: The project root directory containing flywheel.yaml.
-        harness_dir: Path to the workforce/harness directory.
+        foundry_dir: Path to the foundry directory.
     """
 
     project_root: Path
-    harness_dir: Path
+    foundry_dir: Path
 
     @property
     def templates_dir(self) -> Path:
         """Path to the templates directory."""
-        return self.harness_dir / "templates"
+        return self.foundry_dir / "templates"
 
 
 def load_project_config(project_root: Path) -> ProjectConfig:
@@ -69,28 +69,28 @@ def load_project_config(project_root: Path) -> ProjectConfig:
             f"got {type(data).__name__}"
         )
 
-    if "harness_dir" not in data:
+    if "foundry_dir" not in data:
         raise ValueError(
-            f"{config_path} is missing required field 'harness_dir'"
+            f"{config_path} is missing required field 'foundry_dir'"
         )
 
-    raw_harness = data["harness_dir"]
-    if not isinstance(raw_harness, str):
+    raw_foundry = data["foundry_dir"]
+    if not isinstance(raw_foundry, str):
         raise ValueError(
-            f"'harness_dir' in {config_path} must be a string, "
-            f"got {type(raw_harness).__name__}"
+            f"'foundry_dir' in {config_path} must be a string, "
+            f"got {type(raw_foundry).__name__}"
         )
 
-    harness_path = Path(raw_harness)
-    if harness_path.is_absolute() or raw_harness.startswith("/"):
+    foundry_path = Path(raw_foundry)
+    if foundry_path.is_absolute() or raw_foundry.startswith("/"):
         raise ValueError(
-            f"'harness_dir' in {config_path} must be a relative path, "
-            f"got {raw_harness!r}"
+            f"'foundry_dir' in {config_path} must be a relative path, "
+            f"got {raw_foundry!r}"
         )
 
-    harness_dir = project_root / raw_harness
+    foundry_dir = project_root / raw_foundry
 
     return ProjectConfig(
         project_root=project_root,
-        harness_dir=harness_dir,
+        foundry_dir=foundry_dir,
     )

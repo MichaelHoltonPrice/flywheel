@@ -1,6 +1,6 @@
 """Workspace creation, persistence, and artifact recording.
 
-A workspace is a directory inside a project's workforce folder,
+A workspace is a directory inside a project's foundry folder,
 created from a template. It holds all artifacts for a unit of work
 and enforces immutability once artifacts are recorded.
 """
@@ -49,7 +49,7 @@ class Workspace:
     _artifact_kinds: dict[str, str]  # declared kind per artifact name
 
     @classmethod
-    def create(cls, name: str, template: Template, workforce_dir: Path) -> Workspace:
+    def create(cls, name: str, template: Template, foundry_dir: Path) -> Workspace:
         """Create a new workspace directory from a template.
 
         Creates the workspace directory, resolves git artifact baselines,
@@ -58,7 +58,7 @@ class Workspace:
         Args:
             name: Workspace name (letters, digits, hyphens, underscores).
             template: The template defining artifacts and blocks.
-            workforce_dir: Path to the workforce directory.
+            foundry_dir: Path to the foundry directory.
 
         Returns:
             The created Workspace instance.
@@ -70,7 +70,7 @@ class Workspace:
             FileNotFoundError: If a git artifact path does not exist in the repo.
         """
         _validate_name(name, "Workspace")
-        ws_path = workforce_dir / "workspaces" / name
+        ws_path = foundry_dir / "workspaces" / name
         if ws_path.exists():
             raise FileExistsError(f"Workspace already exists: {ws_path}")
 
@@ -78,7 +78,7 @@ class Workspace:
         (ws_path / "artifacts").mkdir()
 
         try:
-            project_root = workforce_dir.parent
+            project_root = foundry_dir.parent
             artifacts: dict[str, Artifact | None] = {}
             artifact_kinds: dict[str, str] = {}
 

@@ -36,10 +36,10 @@ def make_project(tmp_path: Path) -> Path:
 
     # Create flywheel.yaml
     flywheel_yaml = project_root / "flywheel.yaml"
-    flywheel_yaml.write_text("harness_dir: workforce\n")
+    flywheel_yaml.write_text("foundry_dir: foundry\n")
 
     # Create template directory and file
-    templates_dir = project_root / "workforce" / "templates"
+    templates_dir = project_root / "foundry" / "templates"
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "my_template.yaml"
@@ -86,9 +86,9 @@ def make_copy_only_project(tmp_path: Path) -> Path:
     project_root.mkdir()
 
     flywheel_yaml = project_root / "flywheel.yaml"
-    flywheel_yaml.write_text("harness_dir: workforce\n")
+    flywheel_yaml.write_text("foundry_dir: foundry\n")
 
-    templates_dir = project_root / "workforce" / "templates"
+    templates_dir = project_root / "foundry" / "templates"
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "simple.yaml"
@@ -110,7 +110,7 @@ class TestMainCreateWorkspace:
 
         main(["create", "workspace", "--name", "test_ws", "--template", "my_template"])
 
-        ws_path = project_root / "workforce" / "workspaces" / "test_ws"
+        ws_path = project_root / "foundry" / "workspaces" / "test_ws"
         assert ws_path.is_dir()
 
     def test_creates_artifacts_dir(
@@ -121,7 +121,7 @@ class TestMainCreateWorkspace:
 
         main(["create", "workspace", "--name", "test_ws", "--template", "my_template"])
 
-        ws_path = project_root / "workforce" / "workspaces" / "test_ws"
+        ws_path = project_root / "foundry" / "workspaces" / "test_ws"
         assert (ws_path / "artifacts").is_dir()
 
     def test_creates_workspace_yaml(
@@ -132,7 +132,7 @@ class TestMainCreateWorkspace:
 
         main(["create", "workspace", "--name", "test_ws", "--template", "my_template"])
 
-        ws_path = project_root / "workforce" / "workspaces" / "test_ws"
+        ws_path = project_root / "foundry" / "workspaces" / "test_ws"
         assert (ws_path / "workspace.yaml").is_file()
 
 
@@ -158,8 +158,8 @@ class TestMissingTemplate:
 
         # Create flywheel.yaml but no template
         flywheel_yaml = project_root / "flywheel.yaml"
-        flywheel_yaml.write_text("harness_dir: workforce\n")
-        (project_root / "workforce" / "templates").mkdir(parents=True)
+        flywheel_yaml.write_text("foundry_dir: foundry\n")
+        (project_root / "foundry" / "templates").mkdir(parents=True)
 
         monkeypatch.chdir(project_root)
 
@@ -176,7 +176,7 @@ class TestCreateWorkspaceFunction:
 
         create_workspace("my_ws", "my_template")
 
-        ws_path = project_root / "workforce" / "workspaces" / "my_ws"
+        ws_path = project_root / "foundry" / "workspaces" / "my_ws"
         assert ws_path.is_dir()
         assert (ws_path / "workspace.yaml").is_file()
 
@@ -188,7 +188,7 @@ class TestCreateWorkspaceFunction:
 
         create_workspace("my_ws", "simple")
 
-        ws_path = project_root / "workforce" / "workspaces" / "my_ws"
+        ws_path = project_root / "foundry" / "workspaces" / "my_ws"
         assert ws_path.is_dir()
 
 

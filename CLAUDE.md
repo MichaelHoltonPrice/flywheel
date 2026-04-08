@@ -30,4 +30,4 @@ Before committing, also run a review agent to check for:
 
 ## Project layout
 
-Flywheel expects a `flywheel.yaml` in the target project root defining `harness_dir` (the workforce directory). Templates and workspaces live under `harness_dir`.
+Flywheel expects a `flywheel.yaml` in the target project root defining `foundry_dir` (the foundry directory). Templates and workspaces live under `foundry_dir`.

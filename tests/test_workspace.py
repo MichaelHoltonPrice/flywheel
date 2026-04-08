@@ -80,10 +80,10 @@ def project_with_git(tmp_path: Path) -> Path:
         capture_output=True,
     )
 
-    # Create workforce structure
-    workforce_dir = project_root / "workforce"
-    workforce_dir.mkdir()
-    templates_dir = workforce_dir / "templates"
+    # Create foundry structure
+    foundry_dir = project_root / "foundry"
+    foundry_dir.mkdir()
+    templates_dir = foundry_dir / "templates"
     templates_dir.mkdir()
     write_template_yaml(templates_dir / "my_template.yaml")
 
@@ -94,7 +94,7 @@ def project_with_git(tmp_path: Path) -> Path:
         capture_output=True,
     )
     subprocess.run(
-        ["git", "-C", str(project_root), "commit", "-m", "add workforce"],
+        ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
         check=True,
         capture_output=True,
     )
@@ -108,9 +108,9 @@ def project_copy_only(tmp_path: Path) -> Path:
     project_root = tmp_path / "project"
     project_root.mkdir()
 
-    workforce_dir = project_root / "workforce"
-    workforce_dir.mkdir()
-    templates_dir = workforce_dir / "templates"
+    foundry_dir = project_root / "foundry"
+    foundry_dir.mkdir()
+    templates_dir = foundry_dir / "templates"
     templates_dir.mkdir()
     write_copy_only_template(templates_dir / "simple.yaml")
 
@@ -119,78 +119,78 @@ def project_copy_only(tmp_path: Path) -> Path:
 
 class TestWorkspaceCreate:
     def test_creates_workspace_directory(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.path.exists()
-        assert ws.path == workforce_dir / "workspaces" / "test_ws"
+        assert ws.path == foundry_dir / "workspaces" / "test_ws"
 
     def test_creates_artifacts_subdir(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert (ws.path / "artifacts").is_dir()
 
     def test_writes_workspace_yaml(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert (ws.path / "workspace.yaml").is_file()
 
     def test_raises_if_already_exists(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        Workspace.create("test_ws", template, foundry_dir)
         with pytest.raises(FileExistsError, match="already exists"):
-            Workspace.create("test_ws", template, workforce_dir)
+            Workspace.create("test_ws", template, foundry_dir)
 
     def test_workspace_name(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.name == "test_ws"
 
     def test_template_name(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.template_name == "my_template"
 
     def test_has_created_at(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.created_at is not None
 
 
 class TestCopyArtifactsStartNone:
     def test_copy_artifacts_are_none(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.artifacts["checkpoint"] is None
         assert ws.artifacts["score"] is None
 
     def test_copy_only_all_none(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.artifacts["data"] is None
         assert ws.artifacts["output"] is None
 
 
 class TestGitArtifactResolution:
     def test_git_artifact_resolved(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         engine = ws.artifacts["engine"]
         assert isinstance(engine, GitArtifact)
 
     def test_git_artifact_has_commit_sha(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         engine = ws.artifacts["engine"]
         assert isinstance(engine, GitArtifact)
         # SHA is a 40-char hex string
@@ -198,17 +198,17 @@ class TestGitArtifactResolution:
         assert all(c in "0123456789abcdef" for c in engine.ref.commit)
 
     def test_git_artifact_has_repo_path(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         engine = ws.artifacts["engine"]
         assert isinstance(engine, GitArtifact)
         assert engine.ref.repo == str(project_with_git.resolve())
 
     def test_git_artifact_has_path(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
         engine = ws.artifacts["engine"]
         assert isinstance(engine, GitArtifact)
         assert engine.ref.path == "src"
@@ -216,8 +216,8 @@ class TestGitArtifactResolution:
 
 class TestGitDirtyTreeRefused:
     def test_dirty_tree_raises(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
 
         # Make the repo dirty by adding an untracked file
         (project_with_git / "dirty.txt").write_text("uncommitted")
@@ -228,21 +228,21 @@ class TestGitDirtyTreeRefused:
         )
 
         with pytest.raises(RuntimeError, match="uncommitted changes"):
-            Workspace.create("test_ws", template, workforce_dir)
+            Workspace.create("test_ws", template, foundry_dir)
 
     def test_untracked_file_makes_dirty(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
 
         # An untracked file also shows in --porcelain
         (project_with_git / "untracked.txt").write_text("untracked")
 
         with pytest.raises(RuntimeError, match="uncommitted changes"):
-            Workspace.create("test_ws", template, workforce_dir)
+            Workspace.create("test_ws", template, foundry_dir)
 
     def test_clean_after_commit_succeeds(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
 
         # Add and commit a new file -- tree is clean again
         (project_with_git / "extra.txt").write_text("committed")
@@ -257,15 +257,15 @@ class TestGitDirtyTreeRefused:
             capture_output=True,
         )
 
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         assert isinstance(ws.artifacts["engine"], GitArtifact)
 
 
 class TestSaveLoadRoundTrip:
     def test_round_trip_fields(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        original = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        original = Workspace.create("test_ws", template, foundry_dir)
 
         loaded = Workspace.load(original.path)
 
@@ -274,9 +274,9 @@ class TestSaveLoadRoundTrip:
         assert loaded.created_at == original.created_at
 
     def test_round_trip_git_artifact(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        original = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        original = Workspace.create("test_ws", template, foundry_dir)
 
         loaded = Workspace.load(original.path)
         engine_orig = original.artifacts["engine"]
@@ -289,34 +289,34 @@ class TestSaveLoadRoundTrip:
         assert engine_loaded.ref.path == engine_orig.ref.path
 
     def test_round_trip_none_artifacts(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        original = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        original = Workspace.create("test_ws", template, foundry_dir)
 
         loaded = Workspace.load(original.path)
         assert loaded.artifacts["checkpoint"] is None
         assert loaded.artifacts["score"] is None
 
     def test_round_trip_artifact_keys(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        original = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        original = Workspace.create("test_ws", template, foundry_dir)
 
         loaded = Workspace.load(original.path)
         assert set(loaded.artifacts.keys()) == set(original.artifacts.keys())
 
     def test_loaded_path(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        original = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        original = Workspace.create("test_ws", template, foundry_dir)
 
         loaded = Workspace.load(original.path)
         assert loaded.path == original.path
 
     def test_record_and_reload(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         ws.record_artifact(
             "checkpoint", CopyArtifact(name="checkpoint", path=Path("checkpoints/v1"))
@@ -331,9 +331,9 @@ class TestSaveLoadRoundTrip:
 
 class TestRecordArtifact:
     def test_record_undeclared_raises(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         with pytest.raises(KeyError, match="not declared"):
             ws.record_artifact(
@@ -341,9 +341,9 @@ class TestRecordArtifact:
             )
 
     def test_record_already_recorded_raises(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         ws.record_artifact(
             "checkpoint", CopyArtifact(name="checkpoint", path=Path("v1"))
@@ -354,18 +354,18 @@ class TestRecordArtifact:
             )
 
     def test_record_sets_artifact(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         artifact = CopyArtifact(name="checkpoint", path=Path("checkpoints/v1"))
         ws.record_artifact("checkpoint", artifact)
         assert ws.artifacts["checkpoint"] is artifact
 
     def test_record_mismatched_name_raises(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         with pytest.raises(ValueError, match="does not match slot"):
             ws.record_artifact(
@@ -373,9 +373,9 @@ class TestRecordArtifact:
             )
 
     def test_record_wrong_kind_raises(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         git_artifact = GitArtifact(
             name="checkpoint",
@@ -387,15 +387,15 @@ class TestRecordArtifact:
 
 class TestFailedCreateCleanup:
     def test_dirty_tree_leaves_no_directory(self, project_with_git: Path):
-        workforce_dir = project_with_git / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "my_template.yaml")
+        foundry_dir = project_with_git / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "my_template.yaml")
 
         # Make the repo dirty
         (project_with_git / "dirty.txt").write_text("uncommitted")
 
-        ws_path = workforce_dir / "workspaces" / "test_ws"
+        ws_path = foundry_dir / "workspaces" / "test_ws"
         with pytest.raises(RuntimeError):
-            Workspace.create("test_ws", template, workforce_dir)
+            Workspace.create("test_ws", template, foundry_dir)
 
         assert not ws_path.exists()
 
@@ -407,9 +407,9 @@ class TestGitArtifactPathValidation:
         project_root.mkdir()
         _init_git_repo(project_root)
 
-        workforce_dir = project_root / "workforce"
-        workforce_dir.mkdir()
-        templates_dir = workforce_dir / "templates"
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        templates_dir = foundry_dir / "templates"
         templates_dir.mkdir()
 
         # Template references "nonexistent/" which doesn't exist
@@ -428,45 +428,45 @@ blocks: []
             check=True, capture_output=True,
         )
         subprocess.run(
-            ["git", "-C", str(project_root), "commit", "-m", "add workforce"],
+            ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
             check=True, capture_output=True,
         )
 
         template = Template.from_yaml(template_yaml)
         with pytest.raises(FileNotFoundError, match="does not exist in repo"):
-            Workspace.create("test_ws", template, workforce_dir)
+            Workspace.create("test_ws", template, foundry_dir)
 
         # Should also clean up
-        assert not (workforce_dir / "workspaces" / "test_ws").exists()
+        assert not (foundry_dir / "workspaces" / "test_ws").exists()
 
 
 class TestWorkspaceNameValidation:
     def test_empty_name_raises(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
         with pytest.raises(ValueError, match="must not be empty"):
-            Workspace.create("", template, workforce_dir)
+            Workspace.create("", template, foundry_dir)
 
     def test_slash_in_name_raises(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
         with pytest.raises(ValueError, match="invalid"):
-            Workspace.create("my/ws", template, workforce_dir)
+            Workspace.create("my/ws", template, foundry_dir)
 
     def test_dotdot_in_name_raises(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
         with pytest.raises(ValueError, match="invalid"):
-            Workspace.create("..", template, workforce_dir)
+            Workspace.create("..", template, foundry_dir)
 
     def test_space_in_name_raises(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
         with pytest.raises(ValueError, match="invalid"):
-            Workspace.create("my ws", template, workforce_dir)
+            Workspace.create("my ws", template, foundry_dir)
 
     def test_valid_names_accepted(self, project_copy_only: Path):
-        workforce_dir = project_copy_only / "workforce"
-        template = Template.from_yaml(workforce_dir / "templates" / "simple.yaml")
-        ws = Workspace.create("my-workspace_01", template, workforce_dir)
+        foundry_dir = project_copy_only / "foundry"
+        template = Template.from_yaml(foundry_dir / "templates" / "simple.yaml")
+        ws = Workspace.create("my-workspace_01", template, foundry_dir)
         assert ws.name == "my-workspace_01"

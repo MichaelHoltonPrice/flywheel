@@ -70,8 +70,8 @@ def main(argv: list[str] | None = None) -> None:
 def create_workspace(name: str, template_name: str) -> None:
     """Create a workspace from project root (cwd).
 
-    Reads flywheel.yaml to find the workforce dir (harness_dir).
-    Looks for template at workforce_dir/templates/{template_name}.yaml.
+    Reads flywheel.yaml to find the foundry dir (foundry_dir).
+    Looks for template at foundry_dir/templates/{template_name}.yaml.
 
     Args:
         name: Workspace name.
@@ -87,7 +87,7 @@ def create_workspace(name: str, template_name: str) -> None:
     template_path = config.templates_dir / f"{template_name}.yaml"
     template = Template.from_yaml(template_path)
 
-    ws = Workspace.create(name, template, config.harness_dir)
+    ws = Workspace.create(name, template, config.foundry_dir)
     print(f"Created workspace {ws.name!r} at {ws.path}")
 
 
@@ -99,7 +99,7 @@ def run_block_command(
 ) -> None:
     """Run a block within an existing workspace.
 
-    Reads flywheel.yaml to find the workforce dir and project root.
+    Reads flywheel.yaml to find the foundry dir and project root.
     Loads the workspace and template, then executes the block.
 
     Args:

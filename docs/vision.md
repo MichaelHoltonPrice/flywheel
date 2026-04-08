@@ -23,6 +23,27 @@ These three reinforce each other. Visibility without artifact
 tracking is anecdotal. Artifact tracking without visibility is a
 data lake. Improvement loops without either are blind iteration.
 
+## The foundry
+
+Each project has a **foundry** — a directory managed by flywheel
+that holds templates, workspaces, and their artifacts. The project
+source code and the foundry are peers: the project is what's being
+built; the foundry is where flywheel orchestrates the building.
+
+Blocks consume project inputs (source code, configurations, data)
+and produce foundry artifacts (checkpoints, scores, logs). Results
+can also flow back into the project — blocks can modify project
+source code directly, and project directories are full git
+artifacts tracked by flywheel. The foundry and the project are
+separate but not isolated; they influence each other through
+tracked artifacts.
+
+The foundry is also where templates live. A template declares what
+a workspace can do — what artifacts exist, what blocks can run,
+and how containers are configured. When you create a workspace
+from a template, flywheel sets up the foundry directory structure
+and begins tracking artifacts.
+
 ## Why visibility and artifact tracking matter
 
 It is hard to predict ahead of time which problems an AI agent

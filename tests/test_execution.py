@@ -67,9 +67,9 @@ def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
         check=True, capture_output=True,
     )
 
-    workforce_dir = project_root / "workforce"
-    workforce_dir.mkdir()
-    templates_dir = workforce_dir / "templates"
+    foundry_dir = project_root / "foundry"
+    foundry_dir.mkdir()
+    templates_dir = foundry_dir / "templates"
     templates_dir.mkdir()
     template_path = templates_dir / "test_template.yaml"
     template_path.write_text(TEMPLATE_YAML)
@@ -79,12 +79,12 @@ def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
         check=True, capture_output=True,
     )
     subprocess.run(
-        ["git", "-C", str(project_root), "commit", "-m", "add workforce"],
+        ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
         check=True, capture_output=True,
     )
 
     template = Template.from_yaml(template_path)
-    return project_root, workforce_dir, template
+    return project_root, foundry_dir, template
 
 
 def _commit_all(project_root: Path, message: str = "auto") -> None:
@@ -114,15 +114,15 @@ def _fake_run_with_output(output_files: dict[str, str]):
 
 class TestBlockLookup:
     def test_nonexistent_block_raises_key_error(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         with pytest.raises(KeyError, match="nonexistent"):
             run_block(ws, "nonexistent", template, project_root)
 
     def test_valid_block_found(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         fake_run = _fake_run_with_output({"model.pt": "weights"})
@@ -134,8 +134,8 @@ class TestBlockLookup:
 
 class TestInputResolution:
     def test_git_input_mounts_repo_path(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         captured_config = {}
@@ -160,8 +160,8 @@ class TestInputResolution:
         assert host_path.endswith("src")
 
     def test_optional_input_skipped_when_missing(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         captured_config = {}
@@ -184,15 +184,15 @@ class TestInputResolution:
         assert len(checkpoint_mounts) == 0
 
     def test_required_input_raises_when_missing(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         with pytest.raises(ValueError, match="not available"):
             run_block(ws, "eval", template, project_root)
 
     def test_copy_input_mounts_when_available(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         cp_dir = ws.path / "artifacts" / "checkpoint"
         cp_dir.mkdir(parents=True)
@@ -226,8 +226,8 @@ class TestInputResolution:
 
 class TestConventionBasedOutput:
     def test_records_artifact_when_output_written(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         fake_run = _fake_run_with_output({"model.pt": "weights"})
@@ -238,8 +238,8 @@ class TestConventionBasedOutput:
         assert isinstance(ws.artifacts["checkpoint"], CopyArtifact)
 
     def test_output_file_exists_in_artifact_dir(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         fake_run = _fake_run_with_output({"model.pt": "weights"})
@@ -251,8 +251,8 @@ class TestConventionBasedOutput:
         assert artifact_file.read_text() == "weights"
 
     def test_empty_output_dir_not_recorded(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         def fake_run(config, args=None):
@@ -266,8 +266,8 @@ class TestConventionBasedOutput:
 
 class TestResourceConfig:
     def test_gpu_and_shm_passed_to_container(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         captured_config = {}
@@ -289,8 +289,8 @@ class TestResourceConfig:
 
 class TestErrorCases:
     def test_nonzero_exit_raises_runtime_error(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         with patch("flywheel.execution.run_container") as mock_run:
@@ -299,8 +299,8 @@ class TestErrorCases:
                 run_block(ws, "train", template, project_root)
 
     def test_already_recorded_output_fails_fast(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         # Record checkpoint so it's already filled
@@ -319,8 +319,8 @@ class TestErrorCases:
             mock_run.assert_not_called()
 
     def test_dirty_git_repo_raises(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         # Make the repo dirty
@@ -332,8 +332,8 @@ class TestErrorCases:
 
 class TestWorkspaceSaved:
     def test_workspace_saved_after_block(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         fake_run = _fake_run_with_output({"model.pt": "weights"})
@@ -345,8 +345,8 @@ class TestWorkspaceSaved:
         assert isinstance(reloaded.artifacts["checkpoint"], CopyArtifact)
 
     def test_extra_args_passed_through(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         captured_args = {}
@@ -371,8 +371,8 @@ class TestWorkspaceSaved:
 
 class TestGitBaselinePreserved:
     def test_baseline_not_overwritten_by_execution(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         # Record the baseline commit from workspace creation
@@ -396,11 +396,11 @@ class TestGitBaselinePreserved:
 
 class TestTemplateMismatch:
     def test_wrong_template_raises(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
 
         # Create a different template
-        other_path = workforce_dir / "templates" / "other.yaml"
+        other_path = foundry_dir / "templates" / "other.yaml"
         other_path.write_text(TEMPLATE_YAML)
         other_template = Template.from_yaml(other_path)
 
@@ -410,8 +410,8 @@ class TestTemplateMismatch:
 
 class TestStaleOutputCleanup:
     def test_stale_files_removed_before_run(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         # Plant a stale file in the output directory
@@ -431,8 +431,8 @@ class TestStaleOutputCleanup:
 
 class TestGitPathExistence:
     def test_deleted_git_path_raises(self, tmp_path: Path):
-        project_root, workforce_dir, template = _setup_git_project(tmp_path)
-        ws = Workspace.create("test_ws", template, workforce_dir)
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
         # Remove the src directory and commit
