@@ -268,7 +268,9 @@ def _log_event(event: dict) -> None:
                     text = block.get("text", "")
                     preview = text[:120].replace("\n", " ")
                     if preview:
-                        print(f"  [agent] {preview}")
+                        # Replace non-ASCII to avoid cp1252 errors on Windows.
+                        safe = preview.encode("ascii", "replace").decode("ascii")
+                        print(f"  [agent] {safe}")
                 elif btype == "tool_use":
                     tool = block.get("name", "?")
                     if tool.startswith("mcp__"):
