@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -103,9 +104,27 @@ def run_agent_block(
     Returns:
         AgentResult with exit code, elapsed time, and invocation count.
     """
-    # Create agent workspace directory.
+    # Create agent workspace directory (fresh each step).
     agent_ws = workspace.path / "agent_workspace"
-    agent_ws.mkdir(parents=True, exist_ok=True)
+    if agent_ws.exists():
+        shutil.rmtree(agent_ws)
+    agent_ws.mkdir(parents=True)
+
+    # Seed the agent workspace with the latest artifacts from
+    # prior steps so the agent can continue where the previous
+    # step left off. For each output name, find the latest
+    # artifact instance and copy its contents into the workspace.
+    if output_names:
+        for name in output_names:
+            instances = workspace.instances_for(name)
+            if instances:
+                latest = instances[-1]  # sorted by created_at
+                if latest.kind == "copy" and latest.copy_path:
+                    src_dir = workspace.path / "artifacts" / latest.copy_path
+                    if src_dir.exists():
+                        for f in src_dir.iterdir():
+                            if f.is_file():
+                                shutil.copy2(f, agent_ws / f.name)
 
     # Snapshot execution count to compute invocations later.
     executions_before = len(workspace.executions)
