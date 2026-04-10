@@ -77,6 +77,17 @@ provenance but not enforced at mount time. If the working tree
 has moved to a newer commit since the artifact was recorded,
 the container sees the newer code.
 
+### Imported artifacts
+
+Users and agents can import externally created artifacts into a
+workspace via ``Workspace.register_artifact()`` or the CLI command
+``flywheel import artifact``. Imported artifacts are copied into
+the workspace (preserving immutability) and recorded as normal
+artifact instances. They have ``produced_by=None`` (like baseline
+git snapshots) but carry a ``source`` field describing their
+origin. Once registered, they bind identically to block-produced
+artifacts.
+
 ### Immutability
 
 Artifact instances are immutable once created. They are never
@@ -275,16 +286,6 @@ Block executions can be interrupted (e.g., by Ctrl+C). The
 execution is recorded with "interrupted" status, and orphaned
 output directories are cleaned up. Partial outputs from
 interrupted executions are not preserved as artifact instances.
-
-### User-provided artifacts
-
-Currently, artifacts with ``produced_by=None`` are only created
-automatically at workspace setup (baseline git snapshots). Users
-will also need to register externally produced artifacts — for
-example, a pre-trained checkpoint from another project, or a
-hand-curated dataset. This will require a way to add artifact
-instances to a workspace outside of block execution, with
-appropriate provenance metadata indicating their origin.
 
 ### Commit-pinned git mounts
 

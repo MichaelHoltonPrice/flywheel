@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from flywheel.cli import _parse_bindings, create_workspace, main
+from flywheel.template import Template
+from flywheel.workspace import Workspace
 from tests.conftest import _init_git_repo
 
 
@@ -236,6 +238,63 @@ class TestParseBindings:
     def test_value_with_at_sign(self):
         result = _parse_bindings(["checkpoint=checkpoint@abc123"])
         assert result["checkpoint"] == "checkpoint@abc123"
+
+
+class TestMainImportArtifact:
+    def test_import_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+
+        # Create workspace (copy-only template, no git needed)
+        template = Template.from_yaml(
+            project_root / "foundry" / "templates" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        Workspace.create("test_ws", template, foundry_dir)
+
+        # Write a file to import
+        src = tmp_path / "myfile.txt"
+        src.write_text("hello")
+
+        ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
+        main(["import", "artifact",
+              "--workspace", ws_path,
+              "--name", "data",
+              "--from", str(src)])
+
+        # Verify the artifact was registered
+        loaded = Workspace.load(
+            project_root / "foundry" / "workspaces" / "test_ws")
+        data_instances = loaded.instances_for("data")
+        assert len(data_instances) == 1
+        assert data_instances[0].source is not None
+        assert "imported from" in data_instances[0].source
+
+    def test_import_with_custom_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+
+        template = Template.from_yaml(
+            project_root / "foundry" / "templates" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        Workspace.create("test_ws", template, foundry_dir)
+
+        src = tmp_path / "myfile.txt"
+        src.write_text("hello")
+
+        ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
+        main(["import", "artifact",
+              "--workspace", ws_path,
+              "--name", "data",
+              "--from", str(src),
+              "--source", "written by agent"])
+
+        loaded = Workspace.load(
+            project_root / "foundry" / "workspaces" / "test_ws")
+        data_instances = loaded.instances_for("data")
+        assert len(data_instances) == 1
+        assert data_instances[0].source == "written by agent"
 
 
 class TestMainRunBlock:

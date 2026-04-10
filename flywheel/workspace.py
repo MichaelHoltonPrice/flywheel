@@ -142,6 +142,79 @@ class Workspace:
             key=lambda a: a.created_at,
         )
 
+    def register_artifact(
+        self,
+        name: str,
+        source_path: Path,
+        source: str | None = None,
+    ) -> ArtifactInstance:
+        """Import an external file or directory as an artifact instance.
+
+        Copies the source into the workspace's artifact storage and
+        records it as a new artifact instance with provenance metadata.
+        The imported artifact binds identically to block-produced
+        artifacts.
+
+        Args:
+            name: The artifact declaration name (must be a declared
+                copy artifact).
+            source_path: Path to the file or directory to import.
+            source: Free-text description of where the artifact came
+                from. Defaults to the resolved source path.
+
+        Returns:
+            The created ArtifactInstance.
+
+        Raises:
+            ValueError: If the name is not declared or is not a copy
+                artifact.
+            FileNotFoundError: If source_path does not exist.
+        """
+        if name not in self.artifact_declarations:
+            raise ValueError(
+                f"Artifact {name!r} not declared in this workspace"
+            )
+        if self.artifact_declarations[name] != "copy":
+            raise ValueError(
+                f"Only copy artifacts can be imported; "
+                f"{name!r} is {self.artifact_declarations[name]!r}"
+            )
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"Source path does not exist: {source_path}"
+            )
+
+        artifact_id = self.generate_artifact_id(name)
+        target_dir = self.path / "artifacts" / artifact_id
+        target_dir.mkdir(parents=True)
+
+        try:
+            if source_path.is_file():
+                shutil.copy2(source_path, target_dir / source_path.name)
+            else:
+                shutil.copytree(
+                    source_path, target_dir, dirs_exist_ok=True
+                )
+
+            if source is None:
+                source = f"imported from {source_path.resolve()}"
+
+            instance = ArtifactInstance(
+                id=artifact_id,
+                name=name,
+                kind="copy",
+                created_at=datetime.now(UTC),
+                produced_by=None,
+                source=source,
+                copy_path=artifact_id,
+            )
+            self.add_artifact(instance)
+            self.save()
+            return instance
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+
     @classmethod
     def create(cls, name: str, template: Template, foundry_dir: Path) -> Workspace:
         """Create a new workspace directory from a template.
@@ -277,6 +350,7 @@ class Workspace:
                 kind=entry["kind"],
                 created_at=datetime.fromisoformat(entry["created_at"]),
                 produced_by=entry.get("produced_by"),
+                source=entry.get("source"),
                 copy_path=entry.get("copy_path"),
                 repo=entry.get("repo"),
                 commit=entry.get("commit"),
@@ -322,6 +396,8 @@ class Workspace:
             }
             if inst.produced_by is not None:
                 entry["produced_by"] = inst.produced_by
+            if inst.source is not None:
+                entry["source"] = inst.source
             if inst.kind == "copy" and inst.copy_path is not None:
                 entry["copy_path"] = inst.copy_path
             if inst.kind == "git":

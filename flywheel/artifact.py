@@ -28,7 +28,10 @@ class ArtifactInstance:
         created_at: When this instance was created.
         produced_by: The execution ID that produced this instance,
             or None for artifacts not produced by a block execution
-            (e.g., baseline git snapshots created at workspace setup).
+            (e.g., baseline git snapshots or imported artifacts).
+        source: For imported artifacts, a description of where the
+            artifact came from (e.g., a file path). None for
+            block-produced and baseline artifacts.
         copy_path: For copy artifacts, the directory name under
             ``workspace/artifacts/`` where files are stored.
         repo: For git artifacts, the absolute path to the repo root.
@@ -41,6 +44,7 @@ class ArtifactInstance:
     kind: Literal["copy", "git"]
     created_at: datetime
     produced_by: str | None = None
+    source: str | None = None
     copy_path: str | None = None
     repo: str | None = None
     commit: str | None = None
@@ -59,7 +63,8 @@ class BlockExecution:
         block_name: The name of the block that was executed.
         started_at: When execution began.
         finished_at: When execution ended, or None if not yet finished.
-        status: The outcome, either ``"succeeded"`` or ``"failed"``.
+        status: The outcome: ``"succeeded"``, ``"failed"``, or
+            ``"interrupted"``.
         input_bindings: Maps each input artifact name to the artifact
             instance ID that was consumed.
         output_bindings: Maps each output artifact name to the artifact

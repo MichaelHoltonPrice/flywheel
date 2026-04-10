@@ -362,6 +362,99 @@ class TestAddExecution:
             ws.add_execution(ex)
 
 
+class TestRegisterArtifact:
+    def test_register_file(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        bot_file = tmp_path / "bot.py"
+        bot_file.write_text("def player_fn(): pass")
+
+        inst = ws.register_artifact("checkpoint", bot_file)
+
+        target = ws.path / "artifacts" / inst.id / "bot.py"
+        assert target.exists()
+        assert target.read_text() == "def player_fn(): pass"
+
+    def test_register_directory(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src_dir = tmp_path / "bot_dir"
+        src_dir.mkdir()
+        (src_dir / "bot.py").write_text("def player_fn(): pass")
+        (src_dir / "helpers.py").write_text("# helpers")
+
+        inst = ws.register_artifact("checkpoint", src_dir)
+
+        target = ws.path / "artifacts" / inst.id
+        assert (target / "bot.py").exists()
+        assert (target / "helpers.py").exists()
+
+    def test_undeclared_name_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        f = tmp_path / "file.txt"
+        f.write_text("data")
+
+        with pytest.raises(ValueError, match="not declared"):
+            ws.register_artifact("nonexistent", f)
+
+    def test_git_artifact_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        f = tmp_path / "file.txt"
+        f.write_text("data")
+
+        with pytest.raises(ValueError, match="copy"):
+            ws.register_artifact("engine", f)
+
+    def test_nonexistent_source_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(FileNotFoundError):
+            ws.register_artifact("checkpoint", tmp_path / "nope.txt")
+
+    def test_artifact_instance_fields(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"\x00")
+
+        inst = ws.register_artifact("checkpoint", f, source="test import")
+
+        assert inst.name == "checkpoint"
+        assert inst.kind == "copy"
+        assert inst.produced_by is None
+        assert inst.source == "test import"
+        assert inst.copy_path == inst.id
+        assert inst.id in ws.artifacts
+
+    def test_default_source(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        f = tmp_path / "bot.py"
+        f.write_text("pass")
+
+        inst = ws.register_artifact("checkpoint", f)
+
+        assert inst.source is not None
+        assert "imported from" in inst.source
+
+    def test_round_trip_with_source(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        f = tmp_path / "bot.py"
+        f.write_text("pass")
+
+        inst = ws.register_artifact("checkpoint", f, source="from agent")
+        loaded = Workspace.load(ws.path)
+
+        assert inst.id in loaded.artifacts
+        loaded_inst = loaded.artifacts[inst.id]
+        assert loaded_inst.source == "from agent"
+        assert loaded_inst.produced_by is None
+
+
 class TestNameValidation:
     def test_empty_name_raises(self):
         with pytest.raises(ValueError, match="must not be empty"):
