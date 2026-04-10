@@ -45,17 +45,25 @@ class ContainerResult:
     elapsed_s: float
 
 
-def build_docker_command(config: ContainerConfig, args: list[str] | None = None) -> list[str]:
+def build_docker_command(
+    config: ContainerConfig,
+    args: list[str] | None = None,
+    name: str | None = None,
+) -> list[str]:
     """Build the docker run command list from a ContainerConfig.
 
     Args:
         config: Container configuration specifying image, mounts, env, etc.
         args: Optional extra arguments to pass to the container entrypoint.
+        name: Optional container name (for ``docker kill`` by name).
 
     Returns:
         A list of strings suitable for subprocess.Popen.
     """
     cmd = ["docker", "run", "--rm", "-t"]
+
+    if name:
+        cmd.extend(["--name", name])
 
     cmd.extend(config.docker_args)
 
@@ -75,7 +83,11 @@ def build_docker_command(config: ContainerConfig, args: list[str] | None = None)
     return cmd
 
 
-def run_container(config: ContainerConfig, args: list[str] | None = None) -> ContainerResult:
+def run_container(
+    config: ContainerConfig,
+    args: list[str] | None = None,
+    name: str | None = None,
+) -> ContainerResult:
     """Launch a Docker container and wait for it to complete.
 
     Builds a ``docker run`` command from the config, streams stdout and
@@ -84,6 +96,7 @@ def run_container(config: ContainerConfig, args: list[str] | None = None) -> Con
     Args:
         config: Container configuration specifying image, mounts, env, etc.
         args: Optional extra arguments to pass to the container entrypoint.
+        name: Optional container name (for ``docker kill`` by name).
 
     Returns:
         A ContainerResult with exit code and wall-clock elapsed seconds.
@@ -92,7 +105,7 @@ def run_container(config: ContainerConfig, args: list[str] | None = None) -> Con
         KeyboardInterrupt: Re-raised after terminating the container
             when the user presses Ctrl+C.
     """
-    cmd = build_docker_command(config, args)
+    cmd = build_docker_command(config, args, name=name)
 
     # Prevent MSYS/Git Bash from translating Unix-style paths
     # (e.g., /output -> C:/Program Files/Git/output) in Docker commands.

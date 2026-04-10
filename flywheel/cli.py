@@ -6,6 +6,9 @@ Supports:
         [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
     flywheel import artifact --workspace PATH --name NAME
         --from SOURCE [--source TEXT]
+    flywheel run agent --workspace PATH --template TEMPLATE
+        --prompt-file FILE [--model MODEL] [--max-invocations N]
+        [--allowed-block BLOCK ...] [-- container override args...]
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from flywheel.agent import run_agent_block
 from flywheel.config import load_project_config
 from flywheel.execution import run_block
 from flywheel.template import Template
@@ -67,6 +71,28 @@ def main(argv: list[str] | None = None) -> None:
         "as SLOT=ARTIFACT_ID (repeatable).",
     )
 
+    # flywheel run agent
+    agent_parser = run_sub.add_parser("agent")
+    agent_parser.add_argument("--workspace", required=True)
+    agent_parser.add_argument("--template", required=True)
+    agent_parser.add_argument("--prompt-file", required=True,
+                              help="Path to the agent system prompt file.")
+    agent_parser.add_argument("--model", default=None)
+    agent_parser.add_argument("--max-invocations", type=int, default=None,
+                              help="Max nested block invocations.")
+    agent_parser.add_argument("--max-turns", type=int, default=None)
+    agent_parser.add_argument("--auth-volume", default="claude-auth")
+    agent_parser.add_argument("--agent-image", default="flywheel-claude:latest")
+    agent_parser.add_argument(
+        "--allowed-block", action="append", default=[],
+        help="Block the agent can invoke (repeatable; default: all).")
+    agent_parser.add_argument(
+        "--source-dir", action="append", default=[],
+        help="Source directory to mount read-only (repeatable).")
+    agent_parser.add_argument(
+        "--output", action="append", default=[],
+        help="Artifact name to collect from agent workspace (repeatable).")
+
     # Split on '--' to separate flywheel args from container args
     if argv is None:
         argv = sys.argv[1:]
@@ -92,6 +118,8 @@ def main(argv: list[str] | None = None) -> None:
             args.workspace, args.block, args.template,
             bindings, extra_container_args,
         )
+    elif args.command == "run" and getattr(args, "target", None) == "agent":
+        run_agent_command(args, extra_container_args)
     else:
         parser.print_help()
         sys.exit(1)
@@ -212,3 +240,69 @@ def run_block_command(
         f"Block {block_name!r} completed: "
         f"exit_code={result.exit_code}, elapsed={result.elapsed_s:.1f}s"
     )
+
+
+def run_agent_command(args, extra_args: list[str]) -> None:
+    """Run an agent block within an existing workspace.
+
+    Reads the prompt file, starts the block bridge, and launches
+    the agent container.
+
+    Args:
+        args: Parsed argparse namespace with agent-specific fields.
+        extra_args: Extra arguments passed to invoked containers.
+    """
+    config = load_project_config(Path.cwd())
+
+    template_path = config.templates_dir / f"{args.template}.yaml"
+    template = Template.from_yaml(template_path)
+
+    ws = Workspace.load(Path(args.workspace))
+
+    prompt_path = Path(args.prompt_file)
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    # Parse extra_args as --key value overrides for invoked containers.
+    overrides = _parse_overrides(extra_args)
+
+    result = run_agent_block(
+        workspace=ws,
+        template=template,
+        project_root=config.project_root,
+        prompt=prompt,
+        agent_image=args.agent_image,
+        auth_volume=args.auth_volume,
+        model=args.model,
+        max_invocations=args.max_invocations,
+        max_turns=args.max_turns,
+        allowed_blocks=args.allowed_block or None,
+        source_dirs=args.source_dir or None,
+        output_names=args.output or None,
+        overrides=overrides or None,
+    )
+    print(
+        f"Agent completed: exit_code={result.exit_code}, "
+        f"elapsed={result.elapsed_s:.1f}s, "
+        f"invocations={result.evals_run}"
+    )
+
+
+def _parse_overrides(args: list[str]) -> dict[str, str]:
+    """Parse --key value pairs from extra args into a dict.
+
+    Args:
+        args: List of CLI arguments (e.g., ["--subclass", "dueling"]).
+
+    Returns:
+        Dict mapping keys (without --) to values.
+    """
+    overrides = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
+            key = args[i][2:].replace("-", "_")
+            overrides[key] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    return overrides
