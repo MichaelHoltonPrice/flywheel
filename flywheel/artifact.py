@@ -27,7 +27,8 @@ class ArtifactInstance:
         kind: Storage kind, either ``"copy"`` or ``"git"``.
         created_at: When this instance was created.
         produced_by: The execution ID that produced this instance,
-            or None for baseline artifacts created at workspace setup.
+            or None for artifacts not produced by a block execution
+            (e.g., baseline git snapshots created at workspace setup).
         copy_path: For copy artifacts, the directory name under
             ``workspace/artifacts/`` where files are stored.
         repo: For git artifacts, the absolute path to the repo root.

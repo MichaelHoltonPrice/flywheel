@@ -276,6 +276,16 @@ execution is recorded with "interrupted" status, and orphaned
 output directories are cleaned up. Partial outputs from
 interrupted executions are not preserved as artifact instances.
 
+### User-provided artifacts
+
+Currently, artifacts with ``produced_by=None`` are only created
+automatically at workspace setup (baseline git snapshots). Users
+will also need to register externally produced artifacts — for
+example, a pre-trained checkpoint from another project, or a
+hand-curated dataset. This will require a way to add artifact
+instances to a workspace outside of block execution, with
+appropriate provenance metadata indicating their origin.
+
 ### Commit-pinned git mounts
 
 Git artifact instances record a commit SHA, but the current
