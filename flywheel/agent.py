@@ -189,6 +189,7 @@ def run_agent_block(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             env=env,
         )
 

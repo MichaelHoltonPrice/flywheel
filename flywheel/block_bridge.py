@@ -69,9 +69,14 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
+        print(f"  [block-bridge] received {content_length} bytes: "
+              f"{body[:200]!r}", flush=True)
+
         try:
             payload = json.loads(body)
         except (json.JSONDecodeError, ValueError) as e:
+            print(f"  [block-bridge] JSON parse error: {e}",
+                  flush=True)
             self._send_json(400, {
                 "ok": False,
                 "error_type": "invalid_json",
@@ -82,6 +87,9 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
         block_name = payload.get("block_name", "")
         artifact_path = payload.get("artifact_path", "")
         if not block_name or not artifact_path:
+            print(f"  [block-bridge] missing fields: "
+                  f"block_name={block_name!r} "
+                  f"artifact_path={artifact_path!r}", flush=True)
             self._send_json(400, {
                 "ok": False,
                 "error_type": "missing_field",
