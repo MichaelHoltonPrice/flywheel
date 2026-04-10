@@ -1,55 +1,149 @@
-"""Workspace creation, persistence, and artifact recording.
+"""Workspace creation, persistence, and artifact/execution tracking.
 
-A workspace is a directory inside a project's workforce folder,
-created from a template. It holds all artifacts for a unit of work
-and enforces immutability once artifacts are recorded.
+A workspace is a directory inside a project's foundry folder,
+created from a template. It accumulates artifact instances and
+block execution records over its lifetime, forming a complete
+provenance graph.
 """
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
 
-from flywheel.artifact import Artifact, CopyArtifact, GitArtifact, GitRef
+from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.template import Template
-
-_VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
-
-
-def _validate_name(name: str, label: str) -> None:
-    """Validate that a name is safe for use as a directory or identifier."""
-    if not name:
-        raise ValueError(f"{label} name must not be empty")
-    if not _VALID_NAME.match(name):
-        raise ValueError(
-            f"{label} name {name!r} is invalid. "
-            f"Use only letters, digits, hyphens, and underscores."
-        )
+from flywheel.validation import validate_name as _validate_name
 
 
 @dataclass
 class Workspace:
     """A workspace instance created from a template.
 
-    Artifacts start as None (not yet produced/resolved) and are
-    filled via record_artifact(), which enforces immutability.
+    Accumulates artifact instances and block execution records.
+    Artifact instances are immutable and keyed by ID. Execution
+    records are append-only.
     """
 
     name: str
     path: Path
     template_name: str
     created_at: datetime
-    artifacts: dict[str, Artifact | None]  # None = declared but not yet produced
-    _artifact_kinds: dict[str, str]  # declared kind per artifact name
+    artifact_declarations: dict[str, str]  # declaration name -> kind
+    artifacts: dict[str, ArtifactInstance]  # id -> instance
+    executions: dict[str, BlockExecution] = field(default_factory=dict)
+
+    @staticmethod
+    def _short_uuid() -> str:
+        """Generate a short unique identifier (8 hex characters)."""
+        return uuid.uuid4().hex[:8]
+
+    def generate_artifact_id(self, artifact_name: str) -> str:
+        """Generate a unique artifact ID for a declaration.
+
+        Args:
+            artifact_name: The artifact declaration name.
+
+        Returns:
+            An ID in the form ``name@hexstring``, guaranteed unique
+            within this workspace.
+        """
+        while True:
+            candidate = f"{artifact_name}@{self._short_uuid()}"
+            if candidate not in self.artifacts:
+                return candidate
+
+    def generate_execution_id(self) -> str:
+        """Generate a unique execution ID.
+
+        Returns:
+            An ID in the form ``exec_hexstring``, guaranteed unique
+            within this workspace.
+        """
+        while True:
+            candidate = f"exec_{self._short_uuid()}"
+            if candidate not in self.executions:
+                return candidate
+
+    def add_artifact(self, instance: ArtifactInstance) -> None:
+        """Add an artifact instance to the workspace.
+
+        Args:
+            instance: The artifact instance to add.
+
+        Raises:
+            ValueError: If an artifact with this ID already exists,
+                the artifact name is not declared, the kind does not
+                match, or required fields for the kind are missing.
+        """
+        if instance.id in self.artifacts:
+            raise ValueError(
+                f"Artifact {instance.id!r} already exists in workspace"
+            )
+        if instance.name not in self.artifact_declarations:
+            raise ValueError(
+                f"Artifact {instance.name!r} not declared "
+                f"in this workspace"
+            )
+        expected_kind = self.artifact_declarations[instance.name]
+        if instance.kind != expected_kind:
+            raise ValueError(
+                f"Artifact {instance.id!r} has kind {instance.kind!r} "
+                f"but {instance.name!r} expects {expected_kind!r}"
+            )
+        if instance.kind == "copy" and instance.copy_path is None:
+            raise ValueError(
+                f"Copy artifact {instance.id!r} is missing copy_path"
+            )
+        if instance.kind == "git":
+            missing = [
+                f for f in ("repo", "commit", "git_path")
+                if getattr(instance, f) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Git artifact {instance.id!r} is missing "
+                    f"required fields: {', '.join(missing)}"
+                )
+        self.artifacts[instance.id] = instance
+
+    def add_execution(self, execution: BlockExecution) -> None:
+        """Add a block execution record to the workspace.
+
+        Args:
+            execution: The execution record to add.
+
+        Raises:
+            ValueError: If an execution with this ID already exists.
+        """
+        if execution.id in self.executions:
+            raise ValueError(
+                f"Execution {execution.id!r} already exists in workspace"
+            )
+        self.executions[execution.id] = execution
+
+    def instances_for(self, artifact_name: str) -> list[ArtifactInstance]:
+        """Return all artifact instances for a declaration, ordered by creation time.
+
+        Args:
+            artifact_name: The artifact declaration name.
+
+        Returns:
+            A list of artifact instances for this declaration, oldest first.
+        """
+        return sorted(
+            [a for a in self.artifacts.values() if a.name == artifact_name],
+            key=lambda a: a.created_at,
+        )
 
     @classmethod
-    def create(cls, name: str, template: Template, workforce_dir: Path) -> Workspace:
+    def create(cls, name: str, template: Template, foundry_dir: Path) -> Workspace:
         """Create a new workspace directory from a template.
 
         Creates the workspace directory, resolves git artifact baselines,
@@ -58,19 +152,21 @@ class Workspace:
         Args:
             name: Workspace name (letters, digits, hyphens, underscores).
             template: The template defining artifacts and blocks.
-            workforce_dir: Path to the workforce directory.
+            foundry_dir: Path to the foundry directory.
 
         Returns:
             The created Workspace instance.
 
         Raises:
             FileExistsError: If the workspace already exists.
-            ValueError: If the name is invalid or git artifact declarations are incomplete.
+            ValueError: If the name is invalid or git artifact
+                declarations are incomplete.
             RuntimeError: If a git repo has uncommitted changes.
-            FileNotFoundError: If a git artifact path does not exist in the repo.
+            FileNotFoundError: If a git artifact path does not exist
+                in the repo.
         """
         _validate_name(name, "Workspace")
-        ws_path = workforce_dir / "workspaces" / name
+        ws_path = foundry_dir / "workspaces" / name
         if ws_path.exists():
             raise FileExistsError(f"Workspace already exists: {ws_path}")
 
@@ -78,20 +174,25 @@ class Workspace:
         (ws_path / "artifacts").mkdir()
 
         try:
-            project_root = workforce_dir.parent
-            artifacts: dict[str, Artifact | None] = {}
-            artifact_kinds: dict[str, str] = {}
+            project_root = foundry_dir.parent
+            declarations: dict[str, str] = {}
+            artifacts: dict[str, ArtifactInstance] = {}
+            now = datetime.now(UTC)
 
             for decl in template.artifacts:
-                artifact_kinds[decl.name] = decl.kind
+                declarations[decl.name] = decl.kind
+
                 if decl.kind == "git":
                     if decl.repo is None:
-                        raise ValueError(f"Git artifact {decl.name!r} missing repo")
+                        raise ValueError(
+                            f"Git artifact {decl.name!r} missing repo"
+                        )
                     if decl.path is None:
-                        raise ValueError(f"Git artifact {decl.name!r} missing path")
+                        raise ValueError(
+                            f"Git artifact {decl.name!r} missing path"
+                        )
                     repo_path = (project_root / decl.repo).resolve()
 
-                    # Check for dirty working tree
                     status = subprocess.run(
                         ["git", "status", "--porcelain"],
                         cwd=repo_path,
@@ -101,21 +202,19 @@ class Workspace:
                     )
                     if status.stdout.strip():
                         raise RuntimeError(
-                            f"Git repo {repo_path} has uncommitted changes. "
-                            f"Commit or stash before creating a workspace."
+                            f"Git repo {repo_path} has uncommitted "
+                            f"changes. Commit or stash before creating "
+                            f"a workspace."
                         )
 
-                    # Check that the declared path exists in the repo
                     artifact_path = repo_path / decl.path
                     if not artifact_path.exists():
                         raise FileNotFoundError(
-                            f"Git artifact {decl.name!r} path {decl.path!r} "
-                            f"does not exist in repo {repo_path}"
+                            f"Git artifact {decl.name!r} path "
+                            f"{decl.path!r} does not exist in "
+                            f"repo {repo_path}"
                         )
 
-                    # Record baseline snapshot — what the code looked like
-                    # at workspace creation. Blocks re-resolve at execution
-                    # time to get the current committed state.
                     result = subprocess.run(
                         ["git", "rev-parse", "HEAD"],
                         cwd=repo_path,
@@ -125,26 +224,25 @@ class Workspace:
                     )
                     commit = result.stdout.strip()
 
-                    artifacts[decl.name] = GitArtifact(
+                    baseline_id = f"{decl.name}@baseline"
+                    artifacts[baseline_id] = ArtifactInstance(
+                        id=baseline_id,
                         name=decl.name,
-                        ref=GitRef(
-                            repo=str(repo_path),
-                            commit=commit,
-                            path=decl.path,
-                        ),
+                        kind="git",
+                        created_at=now,
+                        produced_by=None,
+                        repo=str(repo_path),
+                        commit=commit,
+                        git_path=decl.path,
                     )
-                else:
-                    # copy artifact -- not yet produced
-                    artifacts[decl.name] = None
 
-            now = datetime.now(UTC)
             ws = cls(
                 name=name,
                 path=ws_path,
                 template_name=template.name,
                 created_at=now,
+                artifact_declarations=declarations,
                 artifacts=artifacts,
-                _artifact_kinds=artifact_kinds,
             )
             ws.save()
             return ws
@@ -161,102 +259,103 @@ class Workspace:
 
         Returns:
             The loaded Workspace instance.
+
+        Raises:
+            ValueError: If the YAML contains invalid data.
         """
         yaml_path = path / "workspace.yaml"
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
 
-        artifacts: dict[str, Artifact | None] = {}
-        artifact_kinds: dict[str, str] = data.get("artifact_kinds", {})
-        for name, entry in data.get("artifacts", {}).items():
-            if entry is None:
-                artifacts[name] = None
-                # Infer kind from artifact_kinds if available, default to copy
-                if name not in artifact_kinds:
-                    artifact_kinds[name] = "copy"
-            elif entry["kind"] == "git":
-                artifacts[name] = GitArtifact(
-                    name=name,
-                    ref=GitRef(
-                        repo=entry["repo"],
-                        commit=entry["commit"],
-                        path=entry["path"],
-                    ),
-                )
-                artifact_kinds.setdefault(name, "git")
-            elif entry["kind"] == "copy":
-                artifacts[name] = CopyArtifact(
-                    name=name,
-                    path=Path(entry["path"]),
-                )
-                artifact_kinds.setdefault(name, "copy")
-            else:
-                raise ValueError(f"Artifact {name!r} has unknown kind {entry['kind']!r}")
+        declarations = data.get("artifact_declarations", {})
+
+        artifacts: dict[str, ArtifactInstance] = {}
+        for aid, entry in data.get("artifacts", {}).items():
+            artifacts[aid] = ArtifactInstance(
+                id=aid,
+                name=entry["name"],
+                kind=entry["kind"],
+                created_at=datetime.fromisoformat(entry["created_at"]),
+                produced_by=entry.get("produced_by"),
+                copy_path=entry.get("copy_path"),
+                repo=entry.get("repo"),
+                commit=entry.get("commit"),
+                git_path=entry.get("git_path"),
+            )
+
+        executions: dict[str, BlockExecution] = {}
+        for eid, entry in data.get("executions", {}).items():
+            finished = entry.get("finished_at")
+            executions[eid] = BlockExecution(
+                id=eid,
+                block_name=entry["block_name"],
+                started_at=datetime.fromisoformat(entry["started_at"]),
+                finished_at=(
+                    datetime.fromisoformat(finished) if finished else None
+                ),
+                status=entry.get("status", "failed"),
+                input_bindings=entry.get("input_bindings", {}),
+                output_bindings=entry.get("output_bindings", {}),
+                exit_code=entry.get("exit_code"),
+                elapsed_s=entry.get("elapsed_s"),
+                image=entry.get("image"),
+            )
 
         return cls(
             name=data["name"],
             path=path,
             template_name=data["template_name"],
             created_at=datetime.fromisoformat(data["created_at"]),
+            artifact_declarations=declarations,
             artifacts=artifacts,
-            _artifact_kinds=artifact_kinds,
+            executions=executions,
         )
-
-    def record_artifact(self, name: str, artifact: Artifact) -> None:
-        """Record a produced artifact.
-
-        Args:
-            name: The declared artifact slot name.
-            artifact: The artifact to record.
-
-        Raises:
-            KeyError: If the name is not declared in this workspace.
-            ValueError: If the slot is already recorded, or the artifact name
-                does not match the slot.
-            TypeError: If the artifact kind does not match the declared kind.
-        """
-        if name not in self.artifacts:
-            raise KeyError(f"Artifact {name!r} not declared in this workspace")
-        if self.artifacts[name] is not None:
-            raise ValueError(f"Artifact {name!r} already recorded and is immutable")
-        if artifact.name != name:
-            raise ValueError(
-                f"Artifact name {artifact.name!r} does not match slot {name!r}"
-            )
-        expected_kind = self._artifact_kinds[name]
-        actual_kind = "git" if isinstance(artifact, GitArtifact) else "copy"
-        if actual_kind != expected_kind:
-            raise TypeError(
-                f"Artifact {name!r} declared as {expected_kind!r} "
-                f"but received {actual_kind!r}"
-            )
-        self.artifacts[name] = artifact
 
     def save(self) -> None:
         """Write workspace.yaml to the workspace directory."""
-        serialized_artifacts: dict[str, dict[str, str] | None] = {}
-        for name, artifact in self.artifacts.items():
-            if artifact is None:
-                serialized_artifacts[name] = None
-            elif isinstance(artifact, GitArtifact):
-                serialized_artifacts[name] = {
-                    "kind": "git",
-                    "repo": artifact.ref.repo,
-                    "commit": artifact.ref.commit,
-                    "path": artifact.ref.path,
-                }
-            elif isinstance(artifact, CopyArtifact):
-                serialized_artifacts[name] = {
-                    "kind": "copy",
-                    "path": str(artifact.path),
-                }
+        serialized_artifacts = {}
+        for aid, inst in self.artifacts.items():
+            entry: dict = {
+                "name": inst.name,
+                "kind": inst.kind,
+                "created_at": inst.created_at.isoformat(),
+            }
+            if inst.produced_by is not None:
+                entry["produced_by"] = inst.produced_by
+            if inst.kind == "copy" and inst.copy_path is not None:
+                entry["copy_path"] = inst.copy_path
+            if inst.kind == "git":
+                entry["repo"] = inst.repo
+                entry["commit"] = inst.commit
+                entry["git_path"] = inst.git_path
+            serialized_artifacts[aid] = entry
+
+        serialized_executions = {}
+        for eid, ex in self.executions.items():
+            entry = {
+                "block_name": ex.block_name,
+                "started_at": ex.started_at.isoformat(),
+                "status": ex.status,
+                "input_bindings": ex.input_bindings,
+                "output_bindings": ex.output_bindings,
+            }
+            if ex.finished_at is not None:
+                entry["finished_at"] = ex.finished_at.isoformat()
+            if ex.exit_code is not None:
+                entry["exit_code"] = ex.exit_code
+            if ex.elapsed_s is not None:
+                entry["elapsed_s"] = ex.elapsed_s
+            if ex.image is not None:
+                entry["image"] = ex.image
+            serialized_executions[eid] = entry
 
         data = {
             "name": self.name,
             "template_name": self.template_name,
             "created_at": self.created_at.isoformat(),
-            "artifact_kinds": self._artifact_kinds,
+            "artifact_declarations": self.artifact_declarations,
             "artifacts": serialized_artifacts,
+            "executions": serialized_executions,
         }
 
         yaml_path = self.path / "workspace.yaml"

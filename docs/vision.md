@@ -1,5 +1,10 @@
 # Flywheel Vision
 
+This document describes what flywheel is for and where it is
+headed. It includes aspirational elements that are not yet
+implemented. For current implementation decisions, see
+[architecture.md](architecture.md).
+
 ## Core idea
 
 Flywheel is a framework for building AI systems that improve
@@ -22,6 +27,27 @@ Three things are co-equal in flywheel's design:
 These three reinforce each other. Visibility without artifact
 tracking is anecdotal. Artifact tracking without visibility is a
 data lake. Improvement loops without either are blind iteration.
+
+## The foundry
+
+Each project has a **foundry** — a directory managed by flywheel
+that holds templates, workspaces, and their artifacts. The project
+source code and the foundry are peers: the project is what's being
+built; the foundry is where flywheel orchestrates the building.
+
+Blocks consume project inputs (source code, configurations, data)
+and produce foundry artifacts (checkpoints, scores, logs). Results
+can also flow back into the project — blocks can modify project
+source code directly, and project directories are full git
+artifacts tracked by flywheel. The foundry and the project are
+separate but not isolated; they influence each other through
+tracked artifacts.
+
+The foundry is also where templates live. A template declares what
+a workspace can do — what artifacts exist, what blocks can run,
+and how containers are configured. When you create a workspace
+from a template, flywheel sets up the foundry directory structure
+and begins tracking artifacts.
 
 ## Why visibility and artifact tracking matter
 
@@ -55,19 +81,36 @@ block: find_click_target
   output: {x: int, y: int, confidence: float}
 ```
 
-A block may have one or more **implementations**, ordered by cost:
-1. A Python function (cheapest, fastest)
-2. An LLM agent with vision (expensive, flexible)
-3. A human annotator (most expensive, ground truth)
-
-Every implementation satisfies the same contract. Callers don't
-know or care which implementation runs.
-
 Success criteria may be an automated metric, a human judgment, an
 LLM evaluation, or something built up over time from initially
 human-mediated feedback. Not every block starts with an automated
 success criterion — the criterion itself can be improved as
 understanding deepens.
+
+### Implementations vs approaches
+
+There are two ways to have multiple solutions to a problem.
+
+**Implementations** are interchangeable behind a single contract.
+A click-targeting block might have a CV template matcher, an LLM
+vision agent, and a human annotator — all taking the same input
+and producing the same output. Callers don't know or care which
+one runs. This is the escalation chain case.
+
+**Approaches** are structurally different blocks that address the
+same goal with different contracts, inputs, and improvement
+trajectories. An RL training pipeline and a bot-writing agent
+both produce game-playing behavior, but they are different blocks
+with different inputs (checkpoints vs source code), different
+containers, and different improvement loops. They are not
+interchangeable at runtime.
+
+What connects approaches is evaluation. Both produce artifacts
+that can be scored by the same evaluator, and those scores are
+comparable. Flywheel's artifact tracking makes this comparison
+natural — different approaches produce different artifact
+provenance chains, but their evaluation artifacts land in the same
+workspace and can be inspected side by side.
 
 ## Contracts and dependency injection
 
@@ -131,18 +174,20 @@ caller varies and which it holds fixed.
 
 ### When dependency injection fits
 
-- The system applies blocks within the context of a dependency
-- Multiple blocks operate against the same shared context
-- The relationship is "roles in a coordinated process" rather
-  than "stages in a data pipeline"
-- Some pieces are running systems, not callables
+Dependency injection is a good fit when the system applies blocks
+within the context of a dependency, when multiple blocks operate
+against the same shared context, when the relationship is better
+described as "roles in a coordinated process" than "stages in a
+data pipeline", or when some pieces are running systems rather
+than callables.
 
 ## Escalation chains
 
-Some blocks maintain a ranked list of implementations, cheapest
-first. When the cheap implementation fails or reports low
-confidence, the framework escalates to the next one. The expensive
-result becomes training data for the cheap one.
+Where multiple implementations share a contract (see above),
+they can form an escalation chain — ranked cheapest first. When
+the cheap implementation fails or reports low confidence, the
+framework escalates to the next one. The expensive result becomes
+training data for the cheap one.
 
 ```
 find_click_target:
@@ -158,38 +203,62 @@ implementation?
 
 ## Progressive replacement
 
-The lifecycle of a block implementation:
+The lifecycle of a block implementation often follows a
+progression:
 
-1. **Human** performs the task manually. Results are stored.
-2. **LLM agent** is given the accumulated examples and automates
-   the task. Expensive per-call.
-3. **Code module** is trained or written using accumulated results.
-   Cheap and fast, but may not handle every case.
-4. **Escalation chain** combines code (most cases) with LLM
-   fallback (edge cases). The code module improves as more edge
-   cases are captured.
+1. A **human** performs the task manually, and the results are
+   stored.
+2. An **LLM agent** is given the accumulated examples and
+   automates the task, though at significant per-call cost.
+3. A **code module** is trained or written using accumulated
+   results. It is cheap and fast, but may not handle every case.
+4. An **escalation chain** combines code for most cases with LLM
+   fallback for edge cases. The code module improves as more
+   edge cases are captured.
 
 Not every block follows this progression. Some start as code. Some
 never need an LLM. The framework supports any trajectory, but the
 common pattern is expensive → cheap with escalation.
 
-## Execution ledger
+## Artifact provenance
 
-Every block execution is recorded:
-- Full inputs and outputs
-- Which implementation ran
-- Cost (compute, API, human time)
-- Latency
-- Success/failure and confidence
-- Whether it was an escalation
-- Side artifacts — additional outputs beyond the contract
-  (logs, intermediate files, debug snapshots) that may be
-  useful for inspection or downstream improvement
+Artifacts come in two forms: **declarations** and **instances**.
 
-The ledger is not just for debugging. It is training data, the
-evaluation corpus, and the decision basis for progressive
-replacement. It is analogous to a replay buffer in reinforcement
-learning, but for an entire system of blocks.
+A declaration is a template-level concept — a named type of
+artifact (e.g., "checkpoint", "score"). An instance is a
+concrete, immutable record produced by a specific block
+execution. A workspace accumulates instances over its lifetime;
+each block execution consumes specific input instances and
+produces new output instances.
+
+This means a block can execute repeatedly within a workspace.
+Each execution produces distinct outputs, and the full
+provenance is explicit: which execution consumed which artifacts
+and produced which artifacts. The workspace is not a snapshot —
+it is a history.
+
+Provenance is not a separate feature layered on top of the
+system. It is the natural consequence of recording block
+executions and artifact instances correctly. The core primitives
+are BlockExecution and ArtifactInstance; provenance is the
+directed acyclic graph formed by their links.
+
+## Execution records
+
+Every block execution is recorded. The record captures which
+input artifact instances were consumed, which output artifact
+instances were produced, which implementation ran, the cost
+(compute, API, or human time), the latency, whether the
+execution succeeded or failed and with what confidence, and
+whether escalation was involved. Blocks may also emit side
+artifacts — additional outputs beyond the contract such as
+logs, intermediate files, or debug snapshots — that may be
+useful for inspection or downstream improvement.
+
+These records are not just for debugging. They are training data,
+the evaluation corpus, and the decision basis for progressive
+replacement. They are analogous to a replay buffer in
+reinforcement learning, but for an entire system of blocks.
 
 ## Agent-mediated pipeline influence
 
@@ -205,12 +274,13 @@ evaluate it, read the score, revise. The agent needs the evaluator
 The evaluator is the same functional either way. What differs is
 who initiates it and when:
 
-- **Pipeline eval.** The orchestrator runs eval after the work
-  step. The worker never calls eval itself.
-- **Agent-requested eval.** The agent invokes eval during its run.
-  The orchestrator exposes the capability through a constrained
-  tool interface, fulfills requests, and returns results. Intermediate
-  evaluations can be stored as side artifacts.
+- In a **pipeline eval**, the orchestrator runs eval after the
+  work step, and the worker never calls eval itself.
+- In an **agent-requested eval**, the agent invokes eval during
+  its run. The orchestrator exposes the capability through a
+  constrained tool interface, fulfills requests, and returns
+  results. Intermediate evaluations can be stored as side
+  artifacts.
 
 This generalizes: an agent step can request any orchestrator-owned
 capability during execution through a constrained tool interface.
@@ -229,28 +299,30 @@ influence legible and governable.
 Some capabilities are hard to build, reusable across projects, and
 belong in flywheel rather than in each project:
 
-- **Computer use agents.** Session management, screenshot loops,
-  click targeting, and verification for visual interaction with
-  applications.
-- **Agent wrappers.** Container launch, authentication, MCP tool
-  exposure, and output collection for the Anthropic Agents SDK,
-  Codex, and similar agent runtimes.
+- **Computer use agents** provide session management, screenshot
+  loops, click targeting, and verification for visual interaction
+  with applications.
+- **Agent wrappers** handle container launch, authentication, MCP
+  tool exposure, and output collection for the Anthropic Agents
+  SDK, Codex, and similar agent runtimes.
 
 Projects provide their domain-specific containers and artifacts.
 Flywheel provides the orchestration and these shared capabilities.
 
 ## Design principles
 
-1. **Contracts first.** Define what a block does before how.
+1. **Contracts first.** Define what a block does before deciding
+   how it does it.
 2. **Record everything.** Every execution is future training data.
-3. **Cheapest first.** Always try the cheapest implementation.
+3. **Cheapest first.** Always try the cheapest implementation
+   before escalating.
 4. **Escalate, don't fail.** Fall back to expensive implementations
    rather than returning errors.
 5. **Visibility is not optional.** If a human or agent cannot
    inspect the state of a workflow, the workflow cannot adapt.
 6. **Right wiring for the situation.** Compose when data flows
-   naturally. Use dependency injection when the system coordinates
-   roles against shared context. Don't force composition when it
-   obscures the actual structure.
+   naturally, and use dependency injection when the system
+   coordinates roles against shared context. Do not force
+   composition when it obscures the actual structure.
 7. **Humans are implementations.** A human doing a task is just
    another block implementation with high cost and high accuracy.
