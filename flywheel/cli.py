@@ -81,6 +81,8 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--max-invocations", type=int, default=None,
                               help="Max nested block invocations.")
     agent_parser.add_argument("--max-turns", type=int, default=None)
+    agent_parser.add_argument("--total-timeout", type=int, default=14400,
+                              help="Max wall-clock seconds (default: 14400 = 4h).")
     agent_parser.add_argument("--auth-volume", default="claude-auth")
     agent_parser.add_argument("--agent-image", default="flywheel-claude:latest")
     agent_parser.add_argument(
@@ -279,6 +281,7 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         model=args.model,
         max_invocations=args.max_invocations,
         max_turns=args.max_turns,
+        total_timeout=args.total_timeout,
         allowed_blocks=args.allowed_block or None,
         source_dirs=args.source_dir or None,
         output_names=args.output or None,

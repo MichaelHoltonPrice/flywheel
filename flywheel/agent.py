@@ -55,6 +55,10 @@ def _resolve_path(path: Path) -> str:
     return resolved
 
 
+# Default total timeout for an agent step (4 hours).
+DEFAULT_TOTAL_TIMEOUT = 14400
+
+
 def run_agent_block(
     workspace: Workspace,
     template: Template,
@@ -65,6 +69,7 @@ def run_agent_block(
     model: str | None = None,
     max_invocations: int | None = None,
     max_turns: int | None = None,
+    total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
     allowed_blocks: list[str] | None = None,
     source_dirs: list[str] | None = None,
     input_artifacts: dict[str, str] | None = None,
@@ -90,6 +95,9 @@ def run_agent_block(
         max_invocations: Maximum block invocations the agent can
             trigger (None = unlimited).
         max_turns: Maximum agent conversation turns.
+        total_timeout: Maximum wall-clock seconds for the entire
+            agent step. The agent container is killed if exceeded.
+            Default: 14400 (4 hours).
         allowed_blocks: Block names the agent is allowed to invoke.
             None means all blocks in the template.
         source_dirs: Paths to source directories (relative to
@@ -231,6 +239,13 @@ def run_agent_block(
                     _log_event(event)
                 except json.JSONDecodeError:
                     pass
+
+                # Kill the agent if the total timeout is exceeded.
+                if time.monotonic() - start > total_timeout:
+                    print(f"  [agent] total timeout "
+                          f"({total_timeout}s) exceeded — killing")
+                    process.kill()
+                    break
 
         process.wait()
     except KeyboardInterrupt:
