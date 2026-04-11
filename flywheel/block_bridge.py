@@ -312,17 +312,8 @@ def _process_block_invocation(
     container_args: list[str] = []
     if overrides:
         for key, value in overrides.items():
-            if key == "seed":
-                continue  # Seed is set per-invocation below.
             flag = f"--{key.replace('_', '-')}"
             container_args += [flag, str(value)]
-
-    # Vary the seed per invocation so the agent gets different game
-    # scenarios each time it evaluates. The agent cannot control the
-    # seed — it is set by the bridge based on the invocation number.
-    invocation_num = int(request_id.split("_")[-1])
-    base_seed = int(overrides.get("seed", "42")) if overrides else 42
-    container_args += ["--seed", str(base_seed + invocation_num * 1000)]
 
     # ── Run container ─────────────────────────────────────────────
     if active_container is not None:
