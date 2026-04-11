@@ -1,0 +1,35 @@
+FROM python:3.12-slim
+
+# Install Node.js 22 (required for Claude Code CLI).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+       > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# The Agents SDK spawns the Claude Code CLI as a subprocess.
+RUN npm install -g @anthropic-ai/claude-code
+
+# Install the Agents SDK, HTTP client, and ARC-AGI-3 toolkit.
+RUN pip install claude-agent-sdk httpx mcp "arc-agi>=0.9.6"
+
+# Copy the agent runner and MCP server scripts.
+COPY agent_runner.py /app/agent_runner.py
+COPY eval_mcp_server.py /app/eval_mcp_server.py
+COPY arc_mcp_server.py /app/arc_mcp_server.py
+
+# Claude Code refuses --dangerously-skip-permissions as root.
+RUN useradd -m claude \
+    && mkdir -p /home/claude/.claude /workspace \
+    && chown -R claude:claude /home/claude /workspace /app
+
+USER claude
+WORKDIR /workspace
+
+ENTRYPOINT ["python3", "/app/agent_runner.py"]
