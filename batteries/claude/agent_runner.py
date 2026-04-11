@@ -2,8 +2,11 @@
 """Agent runner using the Claude Agent SDK.
 
 Reads a prompt from stdin, runs a Claude Code agent via the SDK's
-query() function, and streams JSON events to stdout. The SDK
-manages context compaction automatically.
+query() function, and streams JSON events to stdout. The SDK is
+supposed to manage context compaction automatically, but in practice
+this has been unreliable -- agents frequently hit context limits
+and stop before using all their eval budget. The root cause is
+not understood.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
