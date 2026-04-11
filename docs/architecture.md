@@ -227,6 +227,54 @@ The lifecycle:
 A total timeout (default 4 hours) kills the agent container if
 exceeded, ensuring hung agents do not block indefinitely.
 
+### Agent pause and resume
+
+Long-running agents can hit API rate limits or consume excessive
+budget in a single session. The agent runner
+(`batteries/claude/agent_runner.py`) supports pausing and resuming
+to handle both cases.
+
+**Pause triggers:**
+
+- **Max turns** (`MAX_TURNS` env var). The SDK stops the query
+  and emits a `ResultMessage` with `subtype == "error_max_turns"`.
+  The runner detects this and pauses. This is opt-in — omit
+  `MAX_TURNS` to let the agent run to natural completion.
+- **Rate limit rejection**. The SDK yields a `RateLimitEvent`
+  with `rate_limit_info.status == "rejected"`. The runner breaks
+  out of the query loop and pauses. Rate limit exceptions raised
+  outside the event stream are also caught.
+
+**Pause behavior:**
+
+On pause, the runner:
+1. Writes `.agent_state.json` to the workspace with the session
+   ID, status (`"paused"`), and reason (`"max_turns"` or
+   `"rate_limit"`).
+2. Emits an `agent_state` JSON event to stdout.
+3. Polls every 5 seconds for a `.agent_resume` file in the
+   workspace.
+
+**Resume:**
+
+The host (or user) writes a `.agent_resume` file to the shared
+workspace mount. The file content is used as the resume prompt
+(an empty file defaults to "Continue from where you left off.").
+The runner reads and deletes the file, then calls `query()` with
+`options.resume = session_id` to continue the conversation with
+full history.
+
+On startup, the runner also checks for:
+- `RESUME_SESSION` env var — resume a specific session immediately.
+- A saved `.agent_state.json` with `status == "paused"` — resume
+  the interrupted session automatically.
+
+**Assumptions:** The Docker container remains running between
+pause and resume. Session history is stored in the container's
+filesystem by the SDK. Cross-container resume would require
+mounting the SDK's session storage directory, which is not yet
+supported.
+
 ### Block bridge
 
 The block bridge is a generic HTTP service that lets containers
