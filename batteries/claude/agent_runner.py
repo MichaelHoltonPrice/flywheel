@@ -45,8 +45,29 @@ def _eval_server():
     return config, tools
 
 
+def _arc_server():
+    """ARC-AGI-3 game interaction — requires GAME_ID to be set."""
+    game_id = os.environ.get("GAME_ID", "")
+    if not game_id:
+        return None
+    envs_dir = os.environ.get("ENVIRONMENTS_DIR", "/game_files")
+    config = {
+        "command": "python3",
+        "args": ["/app/arc_mcp_server.py"],
+        "env": {"GAME_ID": game_id, "ENVIRONMENTS_DIR": envs_dir},
+    }
+    tools = [
+        "mcp__arc__start_game",
+        "mcp__arc__take_action",
+        "mcp__arc__reset_level",
+        "mcp__arc__get_status",
+    ]
+    return config, tools
+
+
 _MCP_REGISTRY = {
     "eval": ("run_eval", _eval_server),
+    "arc": ("arc", _arc_server),
 }
 
 

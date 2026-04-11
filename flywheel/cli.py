@@ -94,6 +94,18 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument(
         "--output", action="append", default=[],
         help="Artifact name to collect from agent workspace (repeatable).")
+    agent_parser.add_argument(
+        "--mcp-servers", default=None,
+        help="Comma-separated MCP server names (default: eval).")
+    agent_parser.add_argument(
+        "--allowed-tools", default=None,
+        help="Comma-separated tool whitelist (default: Read,Write,Edit,Glob,Grep).")
+    agent_parser.add_argument(
+        "--env", action="append", default=[], dest="extra_env",
+        help="Extra env var as KEY=VALUE (repeatable).")
+    agent_parser.add_argument(
+        "--mount", action="append", default=[], dest="extra_mounts",
+        help="Extra mount as HOST:CONTAINER:MODE (repeatable).")
 
     # Split on '--' to separate flywheel args from container args
     if argv is None:
@@ -271,6 +283,25 @@ def run_agent_command(args, extra_args: list[str]) -> None:
     for key, value in overrides.items():
         prompt = prompt.replace("{{" + key.upper() + "}}", value)
 
+    # Parse --env KEY=VALUE arguments into a dict.
+    extra_env = {}
+    for entry in args.extra_env:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            extra_env[k] = v
+
+    # Parse --mount HOST:CONTAINER:MODE arguments into tuples.
+    extra_mounts = []
+    for entry in args.extra_mounts:
+        parts = entry.split(":")
+        if len(parts) >= 3:
+            # Rejoin first parts in case of Windows drive letter (C:...)
+            # Format: HOST:CONTAINER:MODE
+            mode = parts[-1]
+            container_path = parts[-2]
+            host_path = ":".join(parts[:-2])
+            extra_mounts.append((host_path, container_path, mode))
+
     result = run_agent_block(
         workspace=ws,
         template=template,
@@ -286,6 +317,10 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         source_dirs=args.source_dir or None,
         output_names=args.output or None,
         overrides=overrides or None,
+        mcp_servers=args.mcp_servers,
+        allowed_tools=args.allowed_tools,
+        extra_env=extra_env or None,
+        extra_mounts=extra_mounts or None,
     )
     print(
         f"Agent completed: exit_code={result.exit_code}, "
