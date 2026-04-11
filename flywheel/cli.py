@@ -265,6 +265,10 @@ def run_agent_command(args, extra_args: list[str]) -> None:
     # Parse extra_args as --key value overrides for invoked containers.
     overrides = _parse_overrides(extra_args)
 
+    # Substitute {{KEY}} placeholders in the prompt with override values.
+    for key, value in overrides.items():
+        prompt = prompt.replace("{{" + key.upper() + "}}", value)
+
     result = run_agent_block(
         workspace=ws,
         template=template,
