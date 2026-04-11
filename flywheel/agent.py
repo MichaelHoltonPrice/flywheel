@@ -209,6 +209,7 @@ def run_agent_block(
     start = time.monotonic()
     event_log = workspace.path / "agent_events.jsonl"
 
+    process = None
     try:
         process = subprocess.Popen(
             cmd,
@@ -243,19 +244,20 @@ def run_agent_block(
                 # Kill the agent if the total timeout is exceeded.
                 if time.monotonic() - start > total_timeout:
                     print(f"  [agent] total timeout "
-                          f"({total_timeout}s) exceeded — killing")
+                          f"({total_timeout}s) exceeded -- killing")
                     process.kill()
                     break
 
         process.wait()
     except KeyboardInterrupt:
-        print("  [agent] interrupted — terminating container")
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        if process is not None:
+            print("  [agent] interrupted -- terminating container")
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         raise
     finally:
         bridge.stop()
@@ -263,7 +265,7 @@ def run_agent_block(
     elapsed = time.monotonic() - start
 
     # Collect output artifacts from agent workspace.
-    if output_names:
+    if output_names and agent_ws.exists():
         for name in output_names:
             # Convention: agent writes {name}.py or {name}.txt to
             # /workspace. Match by exact stem.
@@ -277,13 +279,15 @@ def run_agent_block(
 
     evals_run = len(workspace.executions) - executions_before
 
+    exit_code = process.returncode if process is not None else -1
+
     print(
-        f"  [agent] completed: exit_code={process.returncode}, "
+        f"  [agent] completed: exit_code={exit_code}, "
         f"elapsed={elapsed:.1f}s, evals={evals_run}"
     )
 
     return AgentResult(
-        exit_code=process.returncode,
+        exit_code=exit_code,
         elapsed_s=elapsed,
         evals_run=evals_run,
     )

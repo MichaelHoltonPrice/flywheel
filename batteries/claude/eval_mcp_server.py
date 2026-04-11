@@ -15,6 +15,7 @@ corrupt the JSON-RPC stdio channel. All diagnostics go to stderr.
 
 from __future__ import annotations
 
+import json
 import os
 
 import httpx
@@ -66,12 +67,11 @@ def evaluate(artifact_path: str) -> str:
             ' "message": "Request timed out after 300s"}'
         )
     except Exception as e:
-        msg = str(e).replace('"', '\\"')
-        return (
-            '{"ok": false, "error_type": "request_error",'
-            f' "message": "{msg}"'
-            "}"
-        )
+        return json.dumps({
+            "ok": False,
+            "error_type": "request_error",
+            "message": str(e),
+        })
 
 
 if __name__ == "__main__":

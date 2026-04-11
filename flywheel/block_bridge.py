@@ -120,17 +120,26 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
             self._invocation_count[0] += 1
             invocations_used = self._invocation_count[0]
 
-        response = _process_block_invocation(
-            request_id=request_id,
-            block_name=block_name,
-            artifact_rel=artifact_path,
-            template=self.template,
-            workspace=self.workspace,
-            overrides=self.overrides,
-            allowed_blocks=self.allowed_blocks,
-            stopping=self._stopping,
-            active_container=self._active_container,
-        )
+        try:
+            response = _process_block_invocation(
+                request_id=request_id,
+                block_name=block_name,
+                artifact_rel=artifact_path,
+                template=self.template,
+                workspace=self.workspace,
+                overrides=self.overrides,
+                allowed_blocks=self.allowed_blocks,
+                stopping=self._stopping,
+                active_container=self._active_container,
+            )
+        except Exception as e:
+            self._send_json(500, {
+                "request_id": request_id,
+                "ok": False,
+                "error_type": "internal_error",
+                "message": str(e),
+            })
+            return
 
         if self._max_invocations is not None:
             response["max_invocations"] = self._max_invocations

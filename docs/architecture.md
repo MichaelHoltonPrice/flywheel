@@ -203,6 +203,53 @@ and passed directly to `docker run` before the image name.
 8. On failure, record the execution with failure status and
    preserve state for inspection.
 
+### Agent block execution
+
+An agent block is a special execution variant where an AI agent
+runs inside a Docker container with the ability to trigger nested
+block executions. The agent reads source code, writes artifacts,
+and iteratively invokes other blocks (e.g., evaluation) via an
+MCP tool.
+
+The lifecycle:
+
+1. Create a fresh agent workspace directory. Seed it with the
+   latest artifacts from prior steps so the agent can continue
+   where the previous step left off.
+2. Start a block bridge service (HTTP, background thread).
+3. Launch the agent container with the workspace, source mounts,
+   auth volume, and the bridge endpoint as an environment variable.
+4. Stream JSON events from the agent's stdout and log them.
+5. On completion (or timeout), collect output artifacts from the
+   agent workspace by matching filenames to declared output names.
+6. Stop the bridge service.
+
+A total timeout (default 4 hours) kills the agent container if
+exceeded, ensuring hung agents do not block indefinitely.
+
+### Block bridge
+
+The block bridge is a generic HTTP service that lets containers
+trigger nested block executions within the same workspace. It is
+not specific to evaluation -- the invoked block and what it does
+are defined by the project's template, not by flywheel.
+
+When a request arrives, the bridge:
+
+1. Validates the block name against the template and an optional
+   allowed-blocks list.
+2. Imports the provided artifact into the workspace via
+   ``register_artifact()``.
+3. Looks up the block definition from the template to determine
+   the image, docker args, input slots, and output slots.
+4. Runs the container with proper mounts.
+5. Records the output artifacts and block execution in the
+   workspace with full provenance.
+6. Returns the results (including any scores) to the caller.
+
+An invocation budget (``max_invocations``) limits how many
+blocks the agent can trigger per step.
+
 ## Workspaces
 
 A workspace is a directory inside a project's foundry folder.
