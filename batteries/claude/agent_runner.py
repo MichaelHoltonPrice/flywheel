@@ -46,15 +46,15 @@ def _eval_server():
 
 
 def _arc_server():
-    """ARC-AGI-3 game interaction — requires GAME_ID to be set."""
+    """ARC-AGI-3 game interaction — requires GAME_ID and ARC_SERVER_URL."""
     game_id = os.environ.get("GAME_ID", "")
-    if not game_id:
+    server_url = os.environ.get("ARC_SERVER_URL", "")
+    if not game_id or not server_url:
         return None
-    envs_dir = os.environ.get("ENVIRONMENTS_DIR", "/game_files")
     config = {
         "command": "python3",
         "args": ["/app/arc_mcp_server.py"],
-        "env": {"GAME_ID": game_id, "ENVIRONMENTS_DIR": envs_dir},
+        "env": {"GAME_ID": game_id, "ARC_SERVER_URL": server_url},
     }
     tools = [
         "mcp__arc__start_game",

@@ -16,8 +16,11 @@ RUN apt-get update \
 # The Agents SDK spawns the Claude Code CLI as a subprocess.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install the Agents SDK, HTTP client, and ARC-AGI-3 toolkit.
-RUN pip install claude-agent-sdk httpx mcp "arc-agi>=0.9.6"
+# Install the Agents SDK and HTTP client.
+# Note: arc-agi is NOT installed here. The game server runs on
+# the host; the MCP server calls it via HTTP. This prevents the
+# agent from reading game source files.
+RUN pip install claude-agent-sdk httpx mcp
 
 # Copy the agent runner and MCP server scripts.
 COPY agent_runner.py /app/agent_runner.py
