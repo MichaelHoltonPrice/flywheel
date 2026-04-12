@@ -23,6 +23,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +59,79 @@ def _resolve_path(path: Path) -> str:
 
 # Default total timeout for an agent step (4 hours).
 DEFAULT_TOTAL_TIMEOUT = 14400
+
+
+def _arc_post(url: str, payload: dict) -> tuple[int, dict]:
+    """POST JSON to the ARC game server. Returns (status_code, body)."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, {"error": e.read().decode()[:200]}
+
+
+def _init_arc_game(server_url: str, game_id: str) -> tuple[str, str, str]:
+    """Create a scorecard and start an ARC-AGI-3 game on the host game server.
+
+    Returns:
+        (card_id, guid, initial_frame) -- the scorecard ID, game session
+        GUID, and formatted initial frame text for the agent prompt.
+
+    Raises:
+        RuntimeError: If the game server is unreachable or returns errors.
+    """
+    # Open a scorecard.
+    status, resp = _arc_post(f"{server_url}/api/scorecard/open", {})
+    if status != 200:
+        raise RuntimeError(
+            f"Failed to open scorecard: {status} {resp}"
+        )
+    card_id = resp.get("card_id", "")
+
+    # RESET starts the game and returns the initial frame.
+    status, data = _arc_post(
+        f"{server_url}/api/cmd/RESET",
+        {"card_id": card_id, "game_id": game_id},
+    )
+    if status != 200:
+        raise RuntimeError(f"Failed to start game: {status} {data}")
+    guid = data.get("guid", "")
+
+    # Format the initial frame for the agent prompt.
+    frame_lines: list[str] = []
+    frame = data.get("frame")
+    if frame and isinstance(frame, list) and len(frame) > 0:
+        grid = frame[0]
+        if isinstance(grid, list) and len(grid) > 0:
+            for row in grid:
+                frame_lines.append(" ".join(str(int(v)) for v in row))
+
+    initial_frame = (
+        f"STATE: {data.get('state', 'UNKNOWN')}\n"
+        f"LEVELS_COMPLETED: {data.get('levels_completed', '?')}\n"
+        f"WIN_LEVELS: {data.get('win_levels', '?')}\n"
+        f"AVAILABLE_ACTIONS: {data.get('available_actions', [])}\n"
+    )
+    if frame_lines:
+        h = len(frame_lines)
+        w = len(frame_lines[0].split()) if frame_lines else 0
+        colors = set()
+        for row in data["frame"][0]:
+            colors.update(row)
+        initial_frame += (
+            f"FRAME_SHAPE: {h}x{w}\n"
+            f"COLORS_PRESENT: {sorted(colors)}\n"
+            f"FRAME:\n" + "\n".join(frame_lines)
+        )
+
+    return card_id, guid, initial_frame
 
 
 def run_agent_block(
@@ -218,6 +293,30 @@ def run_agent_block(
 
     if extra_env:
         env_vars.update(extra_env)
+
+    # ARC-AGI-3: create scorecard and start game on the host side
+    # before launching the container.  The agent receives the card
+    # ID, GUID, and initial frame — it never opens scorecards.
+    arc_server = env_vars.get("ARC_SERVER_URL", "")
+    arc_game = env_vars.get("GAME_ID", "")
+    if arc_server and arc_game:
+        # Rewrite ARC_SERVER_URL for the container (Docker alias).
+        host_url = arc_server.replace(
+            "host.docker.internal", "localhost",
+        ).replace("localhost", "host.docker.internal")
+        card_id, guid, initial_frame = _init_arc_game(
+            # Use localhost URL for host-side HTTP call.
+            arc_server.replace("host.docker.internal", "localhost"),
+            arc_game,
+        )
+        env_vars["ARC_CARD_ID"] = card_id
+        env_vars["ARC_GUID"] = guid
+        env_vars["ARC_SERVER_URL"] = host_url
+        # Inject the initial frame into the prompt so the agent
+        # can start playing immediately.
+        prompt += f"\n\n# Initial game state\n\n{initial_frame}"
+        print(f"  [agent] ARC game initialized: card={card_id[:8]}... "
+              f"guid={guid[:8]}...")
 
     for key, value in env_vars.items():
         cmd.extend(["-e", f"{key}={value}"])

@@ -88,13 +88,20 @@ def _arc_server():
     server_url = os.environ.get("ARC_SERVER_URL", "")
     if not game_id or not server_url:
         return None
+    env = {"GAME_ID": game_id, "ARC_SERVER_URL": server_url}
+    # Pass through host-created scorecard and session IDs.
+    card_id = os.environ.get("ARC_CARD_ID", "")
+    guid = os.environ.get("ARC_GUID", "")
+    if card_id:
+        env["ARC_CARD_ID"] = card_id
+    if guid:
+        env["ARC_GUID"] = guid
     config = {
         "command": "python3",
         "args": ["/app/arc_mcp_server.py"],
-        "env": {"GAME_ID": game_id, "ARC_SERVER_URL": server_url},
+        "env": env,
     }
     tools = [
-        "mcp__arc__start_game",
         "mcp__arc__take_action",
         "mcp__arc__reset_level",
         "mcp__arc__get_status",

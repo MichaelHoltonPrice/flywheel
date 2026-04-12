@@ -3,13 +3,19 @@
 
 Provides tools for an agent to play ARC-AGI-3 games by calling a
 remote game server via HTTP. The agent never sees the game source
-code — it only receives frames and state through the API, matching
+code -- it only receives frames and state through the API, matching
 the competition setup.
 
+The game is initialized by the host before the agent starts.  The
+agent receives ARC_CARD_ID and ARC_GUID as environment variables
+and connects automatically on the first tool call.
+
 Environment variables:
-    ARC_SERVER_URL  — Base URL of the game server
+    ARC_SERVER_URL  -- Base URL of the game server
                       (e.g., "http://host.docker.internal:8001").
-    GAME_ID         — Game to play (e.g., "vc33-9851e02b").
+    GAME_ID         -- Game being played (e.g., "vc33-9851e02b").
+    ARC_CARD_ID     -- Scorecard ID (created by host).
+    ARC_GUID        -- Game session GUID (created by host).
 """
 
 from __future__ import annotations
@@ -21,13 +27,42 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("arc")
 
-# Global game state.
+# Global game state -- set from environment on first tool call.
 _client: httpx.Client | None = None
 _base_url: str = ""
 _game_id: str = ""
 _card_id: str = ""
 _guid: str = ""
 _action_count: int = 0
+
+
+def _ensure_connected() -> str | None:
+    """Initialize connection from environment variables on first call.
+
+    Returns an error string if required env vars are missing, or
+    None on success.
+    """
+    global _client, _base_url, _game_id, _card_id, _guid
+
+    if _client is not None:
+        return None
+
+    _base_url = os.environ.get("ARC_SERVER_URL", "")
+    _game_id = os.environ.get("GAME_ID", "")
+    _card_id = os.environ.get("ARC_CARD_ID", "")
+    _guid = os.environ.get("ARC_GUID", "")
+
+    if not _base_url:
+        return "ERROR: ARC_SERVER_URL environment variable not set."
+    if not _game_id:
+        return "ERROR: GAME_ID environment variable not set."
+    if not _card_id:
+        return "ERROR: ARC_CARD_ID environment variable not set."
+    if not _guid:
+        return "ERROR: ARC_GUID environment variable not set."
+
+    _client = httpx.Client(timeout=30.0)
+    return None
 
 
 def _frame_to_text(frame: list) -> str:
@@ -73,7 +108,7 @@ def _format_response(data: dict, action_desc: str = "") -> str:
 def _post(endpoint: str, payload: dict) -> dict:
     """POST to the game server and return JSON response."""
     if _client is None:
-        return {"error": "Not connected. Call start_game() first."}
+        return {"error": "Not connected."}
     payload["card_id"] = _card_id
     payload["game_id"] = _game_id
     if _guid:
@@ -89,53 +124,13 @@ def _post(endpoint: str, payload: dict) -> dict:
 
 
 @mcp.tool()
-def start_game() -> str:
-    """Start (or restart) the current game. Returns the initial frame.
-
-    The game server and game ID are configured via environment
-    variables. Call this once at the beginning.
-    """
-    global _client, _base_url, _game_id, _card_id, _guid, _action_count
-
-    _base_url = os.environ.get("ARC_SERVER_URL", "")
-    _game_id = os.environ.get("GAME_ID", "")
-
-    if not _base_url:
-        return "ERROR: ARC_SERVER_URL environment variable not set."
-    if not _game_id:
-        return "ERROR: GAME_ID environment variable not set."
-
-    _client = httpx.Client(timeout=30.0)
-    _action_count = 0
-    _guid = ""
-
-    # Open a scorecard.
-    r = _client.post(
-        f"{_base_url}/api/scorecard/open",
-        json={},
-        headers={"Content-Type": "application/json"},
-    )
-    if r.status_code != 200:
-        return f"ERROR: Failed to open scorecard: {r.status_code} {r.text[:200]}"
-    _card_id = r.json().get("card_id", "")
-
-    # Reset (start the game).
-    data = _post("RESET", {})
-    if "error" in data:
-        return f"ERROR: {data['error']} {data.get('detail', '')}"
-    _guid = data.get("guid", "")
-
-    return _format_response(data, "start_game")
-
-
-@mcp.tool()
 def take_action(action: int, x: int = -1, y: int = -1) -> str:
     """Take a game action and return the resulting frame.
 
     Args:
         action: Action number (1-5 for simple actions, 6 for click
             with coordinates, 7 for undo). Do NOT send 0 (RESET)
-            here — use reset_level() instead.
+            here -- use reset_level() instead.
         x: X coordinate (0-63) for ACTION6 clicks. Ignored for
             other actions.
         y: Y coordinate (0-63) for ACTION6 clicks. Ignored for
@@ -147,8 +142,9 @@ def take_action(action: int, x: int = -1, y: int = -1) -> str:
     """
     global _action_count, _guid
 
-    if _client is None:
-        return "ERROR: No game started. Call start_game() first."
+    err = _ensure_connected()
+    if err:
+        return err
 
     if action < 1 or action > 7:
         return f"ERROR: Invalid action {action}. Must be 1-7."
@@ -184,8 +180,9 @@ def reset_level() -> str:
     """
     global _guid
 
-    if _client is None:
-        return "ERROR: No game started. Call start_game() first."
+    err = _ensure_connected()
+    if err:
+        return err
 
     data = _post("RESET", {})
     if "error" in data:
@@ -203,14 +200,15 @@ def get_status() -> str:
 
     Returns: actions taken and connection status.
     """
-    if _client is None:
-        return "ERROR: No game started. Call start_game() first."
+    err = _ensure_connected()
+    if err:
+        return err
 
     parts = [
         f"ACTIONS_TAKEN: {_action_count}",
         f"GAME_ID: {_game_id}",
         f"SERVER: {_base_url}",
-        "GAME_STARTED: true",
+        f"CARD_ID: {_card_id}",
     ]
     return "\n".join(parts)
 
