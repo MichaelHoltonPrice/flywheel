@@ -396,6 +396,14 @@ async def main() -> None:
                         "threshold": compact_token_limit,
                     })
 
+                    # Interrupt the current generation so the CLI
+                    # can accept the /compact command.  Then drain
+                    # any remaining messages from the interrupted
+                    # response before sending /compact.
+                    await client.interrupt()
+                    async for msg in client.receive_response():
+                        _emit_message(msg)
+
                     # Send /compact in the live session.
                     await client.query("/compact")
                     async for msg in client.receive_response():
