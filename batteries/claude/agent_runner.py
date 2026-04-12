@@ -423,85 +423,35 @@ async def main() -> None:
         # --- Proactive compaction ---
         #
         # When the mid-session token check (above) or a "prompt too
-        # long" API error triggers compaction, we resume the existing
-        # session with the "/compact" slash command.  This tells the
-        # Claude Code CLI to summarize the conversation history,
-        # freeing context space.
+        # long" API error triggers compaction, we resume the session
+        # with "/compact" as the prompt.  The Claude Code CLI
+        # compacts the conversation history, then the agent continues
+        # working in the same session.
         #
-        # The compact session uses max_turns=1 because /compact only
-        # needs one turn.  IMPORTANT: the Claude Code CLI always
-        # exits with code 1 when max_turns is reached, and the SDK
-        # raises a Python exception for any non-zero exit code.  The
-        # compaction itself completes before the CLI exits, so
-        # exit-code-1 from the compact session is EXPECTED and
-        # treated as success — it is not a failure.
+        # We do NOT use a separate query() call with max_turns=1 for
+        # compaction — that corrupts the session state (the CLI exits
+        # with code 1 on max_turns, leaving the session in a terminal
+        # state that cannot be resumed).  Instead, /compact is sent
+        # as the resume prompt for the main session, which keeps the
+        # session alive after compaction.
         needs_compact = pause_reason in ("compact_needed", "context_overflow")
         if needs_compact and session_id:
-            _emit({
-                "type": "compact",
-                "message": (
-                    f"Context at {last_input_tokens:,} tokens "
-                    f"(limit {compact_token_limit:,}), compacting"
-                ),
-                "tokens_before": last_input_tokens,
-                "threshold": compact_token_limit,
-            })
-
-            compact_options = ClaudeAgentOptions(
-                cwd="/workspace",
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",
-            )
-            if model:
-                compact_options.model = model
-            compact_options.resume = session_id
-            compact_options.max_turns = 1
-
-            compact_ok = False
-            try:
-                async for msg in query(
-                    prompt="/compact", options=compact_options,
-                ):
-                    sid = _get_session_id(msg)
-                    if sid:
-                        session_id = sid
-                compact_ok = True
-            except Exception as e:
-                # Exit code 1 is the CLI's normal signal for "I used
-                # all my allowed turns."  Since we set max_turns=1,
-                # this fires every time.  The /compact work finishes
-                # before the exit, so this is success, not failure.
-                if "exit code 1" in str(e).lower():
-                    compact_ok = True
-                else:
-                    _emit({
-                        "type": "error",
-                        "message": f"Compact failed: {e}",
-                    })
-
             tokens_before = last_input_tokens
             last_input_tokens = 0
             _emit({
                 "type": "compact",
                 "message": (
-                    "Compaction complete" if compact_ok
-                    else "Compaction failed"
+                    f"Context at {tokens_before:,} tokens "
+                    f"(limit {compact_token_limit:,}), resuming "
+                    f"with /compact"
                 ),
                 "tokens_before": tokens_before,
-                "success": compact_ok,
+                "threshold": compact_token_limit,
             })
 
-            # Resume the agent after compaction.  The prompt must
-            # make clear that the task is NOT finished — a vague
-            # "continue from where you left off" causes the agent to
-            # treat the resume as a wrap-up signal and stop working.
-            prompt = (
-                "Your session was automatically interrupted for "
-                "context management. This is routine — nothing went "
-                "wrong. Resume exactly what you were doing. Do NOT "
-                "stop, summarize, or wrap up. Keep working on your "
-                "task."
-            )
+            # Resume with /compact.  The agent will compact context
+            # and then continue working in the same session.
+            prompt = "/compact"
             continue
 
         # Reset empty-session counter on progress.
