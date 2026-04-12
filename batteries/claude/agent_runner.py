@@ -321,6 +321,10 @@ async def main() -> None:
             if ("rate" in err and "limit" in err) or "overloaded" in err:
                 pause_reason = "rate_limit"
                 _emit({"type": "error", "message": f"Rate limit: {e}"})
+            elif pause_reason:
+                # Expected: CLI exits non-zero after a known pause
+                # trigger (e.g., exit code 1 on max_turns).
+                pass
             else:
                 _emit({"type": "error", "message": str(e)})
                 raise

@@ -211,6 +211,11 @@ def run_agent_block(
         env_vars["MODEL"] = model
     if max_turns is not None:
         env_vars["MAX_TURNS"] = str(max_turns)
+    # Disable Python output buffering so the host sees events
+    # immediately (without this, stdout is block-buffered inside
+    # Docker and the host event log lags behind).
+    env_vars["PYTHONUNBUFFERED"] = "1"
+
     if extra_env:
         env_vars.update(extra_env)
 
