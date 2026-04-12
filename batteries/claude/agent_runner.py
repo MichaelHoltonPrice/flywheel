@@ -12,7 +12,7 @@ enough to prevent "prompt is too long" errors in token-heavy
 workloads (e.g. ARC-AGI-3 games returning 64x64 grid frames on
 every action).  This runner monitors token usage on every
 AssistantMessage *during* the live session.  When usage crosses
-COMPACT_THRESHOLD (default 50%) of the estimated context window,
+COMPACT_THRESHOLD (default 20%) of the estimated context window,
 the runner breaks out of the message loop, sends a ``/compact``
 command via a one-turn resume session, and then resumes the agent.
 
@@ -68,7 +68,7 @@ POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Proactive compaction: compact when input tokens exceed this fraction
 # of the estimated context window.
-COMPACT_THRESHOLD = 0.50
+COMPACT_THRESHOLD = 0.20
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 
@@ -276,6 +276,7 @@ async def main() -> None:
     compact_token_limit = int(context_window * COMPACT_THRESHOLD)
 
     last_input_tokens = 0
+    consecutive_empty_sessions = 0
 
     while True:
         # Build options for this query session.
@@ -295,6 +296,7 @@ async def main() -> None:
 
         # Run one query session.
         pause_reason = None
+        got_assistant_message = False
 
         try:
             async for message in query(prompt=prompt, options=options):
@@ -308,6 +310,7 @@ async def main() -> None:
 
                     # --- Token usage tracking ---
                     if cls_name == "AssistantMessage":
+                        got_assistant_message = True
                         usage = getattr(message, "usage", None)
                         if isinstance(usage, dict):
                             inp = usage.get("input_tokens", 0)
@@ -395,6 +398,24 @@ async def main() -> None:
             elif "auth" in err or "401" in err:
                 pause_reason = "auth_error"
                 _emit({"type": "error", "message": f"Auth error: {e}"})
+            elif "exit code 1" in err:
+                # The CLI exits with code 1 in several non-fatal
+                # scenarios: max_turns reached, session resume after
+                # compaction, etc.  If the session produced assistant
+                # messages, it made progress and this is normal.  If
+                # not, the resume may have failed — track consecutive
+                # empty sessions and bail after 3 to avoid spinning.
+                if not got_assistant_message:
+                    consecutive_empty_sessions += 1
+                    if consecutive_empty_sessions >= 3:
+                        pause_reason = "error"
+                        _emit({
+                            "type": "error",
+                            "message": (
+                                "3 consecutive sessions with no "
+                                "progress (exit code 1). Pausing."
+                            ),
+                        })
             else:
                 pause_reason = "error"
                 _emit({"type": "error", "message": str(e)})
@@ -473,6 +494,10 @@ async def main() -> None:
             # Resume the agent after compaction.
             prompt = "Continue from where you left off."
             continue
+
+        # Reset empty-session counter on progress.
+        if got_assistant_message:
+            consecutive_empty_sessions = 0
 
         # --- Decide next action ---
         if pause_reason:
