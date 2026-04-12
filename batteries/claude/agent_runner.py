@@ -424,6 +424,15 @@ async def main() -> None:
                         "success": True,
                     })
 
+                    # Raise the threshold so we don't compact again
+                    # immediately if tokens didn't drop much.  Next
+                    # compaction triggers at current level + 50% of
+                    # the original threshold.
+                    compact_token_limit = (
+                        last_input_tokens
+                        + int(context_window * COMPACT_THRESHOLD * 0.5)
+                    )
+
                     # Tell the agent to keep working.
                     await client.query(
                         "Your context was compacted automatically. "
