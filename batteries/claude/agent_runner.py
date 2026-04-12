@@ -491,8 +491,17 @@ async def main() -> None:
                 "success": compact_ok,
             })
 
-            # Resume the agent after compaction.
-            prompt = "Continue from where you left off."
+            # Resume the agent after compaction.  The prompt must
+            # make clear that the task is NOT finished — a vague
+            # "continue from where you left off" causes the agent to
+            # treat the resume as a wrap-up signal and stop working.
+            prompt = (
+                "Your session was automatically interrupted for "
+                "context management. This is routine — nothing went "
+                "wrong. Resume exactly what you were doing. Do NOT "
+                "stop, summarize, or wrap up. Keep working on your "
+                "task."
+            )
             continue
 
         # Reset empty-session counter on progress.
