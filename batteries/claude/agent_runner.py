@@ -325,9 +325,14 @@ async def main() -> None:
                 # Expected: CLI exits non-zero after a known pause
                 # trigger (e.g., exit code 1 on max_turns).
                 pass
+            elif "auth" in err or "401" in err:
+                pause_reason = "auth_error"
+                _emit({"type": "error", "message": f"Auth error: {e}"})
             else:
+                # Unknown error — still pause rather than crash,
+                # so we preserve the session for potential resume.
+                pause_reason = "error"
                 _emit({"type": "error", "message": str(e)})
-                raise
 
         # --- Decide next action ---
         if pause_reason:
