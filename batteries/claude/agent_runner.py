@@ -1,40 +1,27 @@
 #!/usr/bin/env python3
-"""Agent runner using the Claude Agent SDK.
+"""Agent runner using the Claude Agent SDK (ClaudeSDKClient).
 
-Runs a Claude Code agent via the SDK's query() function and streams
-JSON events to stdout.
+Runs a Claude Code agent via ClaudeSDKClient in streaming mode,
+which keeps a persistent connection to the CLI subprocess.  This
+enables mid-session /compact without killing the session.
 
 Context compaction
 ------------------
 
-The Claude Code CLI does not compact context automatically soon
-enough to prevent "prompt is too long" errors in token-heavy
-workloads (e.g. ARC-AGI-3 games returning 64x64 grid frames on
-every action).  This runner monitors token usage on every
-AssistantMessage *during* the live session.  When usage crosses
-COMPACT_THRESHOLD (default 20%) of the estimated context window,
-the runner breaks out of the message loop, sends a ``/compact``
-command via a one-turn resume session, and then resumes the agent.
-
-Implementation detail — exit code 1 on max_turns:
-    The ``/compact`` session uses ``max_turns=1``.  The Claude Code
-    CLI always exits with code 1 when max_turns is reached, and the
-    SDK raises a Python exception for any non-zero exit code.  This
-    is normal and expected.  The compaction itself completes before
-    the CLI exits, so exit-code-1 from the compact session is
-    treated as success.  This is NOT a failure — it is the only way
-    the SDK signals that a max_turns session has ended.
+After each assistant response, the runner checks token usage.  When
+usage crosses COMPACT_THRESHOLD of the estimated context window, the
+runner sends /compact as a new message in the live session.  The CLI
+compacts the conversation history and the agent continues working —
+all within the same subprocess, with no session interruption.
 
 Pause/resume
 ------------
 
-- **Max turns**: MAX_TURNS sets the total turn budget.  When
-  reached, the runner pauses and waits for a resume signal.
-- **Rate limit**: Detected automatically; pauses and waits.
-- **Resume**: On pause, the runner writes session state to
-  .agent_state.json and polls for .agent_resume in the workspace.
-  Write a prompt to that file (or leave it empty) to continue.
-  Alternatively, set RESUME_SESSION at startup to resume immediately.
+- **Rate limit**: Detected from RateLimitEvent; pauses and waits
+  for .agent_resume file.
+- **Auth error**: Detected from error messages; pauses and waits.
+- **External resume**: Write a prompt (or empty) to .agent_resume
+  in the workspace to continue after a pause.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
@@ -55,7 +42,11 @@ import time
 from pathlib import Path
 
 import anyio
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+)
 
 # ------------------------------------------------------------------
 # Paths
@@ -152,6 +143,15 @@ def _serialize(obj):
 # Event emission and state management
 # ------------------------------------------------------------------
 
+_TYPE_MAP = {
+    "AssistantMessage": "assistant",
+    "UserMessage": "user",
+    "SystemMessage": "system",
+    "ResultMessage": "result",
+    "RateLimitEvent": "rate_limit",
+}
+
+
 def _emit(data: dict) -> None:
     """Emit a JSON event to stdout."""
     print(json.dumps(data, default=str), flush=True)
@@ -170,11 +170,7 @@ def _save_state(session_id: str, status: str, reason: str = "") -> None:
 
 
 async def _wait_for_resume() -> str:
-    """Block until .agent_resume file appears in the workspace.
-
-    Returns the file content as the resume prompt (or a default).
-    The host writes this file when it's time to continue.
-    """
+    """Block until .agent_resume file appears in the workspace."""
     _emit({
         "type": "agent_state",
         "status": "waiting_for_resume",
@@ -188,10 +184,33 @@ async def _wait_for_resume() -> str:
         await anyio.sleep(POLL_INTERVAL)
 
 
-def _get_session_id(message) -> str | None:
-    """Extract session_id from an SDK message if present."""
-    sid = getattr(message, "session_id", None)
-    return sid if sid else None
+def _emit_message(message) -> None:
+    """Serialize and emit an SDK message."""
+    cls_name = type(message).__name__
+    if hasattr(message, "model_dump"):
+        data = message.model_dump()
+    elif hasattr(message, "to_dict"):
+        data = message.to_dict()
+    elif hasattr(message, "__dict__"):
+        data = message.__dict__
+        if "content" in data and isinstance(data["content"], list):
+            data["content"] = [_serialize(b) for b in data["content"]]
+    else:
+        data = {"type": "unknown", "repr": repr(message)}
+    data["type"] = _TYPE_MAP.get(cls_name, cls_name)
+    _emit(data)
+
+
+def _get_input_tokens(message) -> int:
+    """Extract total input tokens from an AssistantMessage."""
+    usage = getattr(message, "usage", None)
+    if not isinstance(usage, dict):
+        return 0
+    inp = usage.get("input_tokens", 0)
+    cache_c = usage.get("cache_creation_input_tokens", 0)
+    cache_r = usage.get("cache_read_input_tokens", 0)
+    total = inp + cache_c + cache_r
+    return total
 
 
 # ------------------------------------------------------------------
@@ -199,26 +218,12 @@ def _get_session_id(message) -> str | None:
 # ------------------------------------------------------------------
 
 async def main() -> None:
-    """Run the Claude Code agent with proactive compaction."""
-    # --- Determine initial state ---
-    session_id = os.environ.get("RESUME_SESSION", "")
-
-    # Check for saved paused state from a previous session.
-    if not session_id and STATE_FILE.exists():
-        try:
-            saved = json.loads(STATE_FILE.read_text())
-            if saved.get("status") == "paused":
-                session_id = saved.get("session_id", "")
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if session_id:
-        prompt = "Continue from where you left off."
-    else:
-        prompt = sys.stdin.read()
-        if not prompt.strip():
-            _emit({"type": "error", "message": "Empty prompt"})
-            sys.exit(1)
+    """Run the Claude Code agent with mid-session compaction."""
+    # --- Read initial prompt ---
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        _emit({"type": "error", "message": "Empty prompt"})
+        sys.exit(1)
 
     # --- Setup ---
     claude_json = os.path.expanduser("~/.claude.json")
@@ -236,7 +241,7 @@ async def main() -> None:
     max_turns_str = os.environ.get("MAX_TURNS", "")
     max_turns = int(max_turns_str) if max_turns_str else None
 
-    # Register MCP servers declared in MCP_SERVERS.
+    # Register MCP servers.
     mcp_servers_str = os.environ.get("MCP_SERVERS", "")
     requested = [
         s.strip() for s in mcp_servers_str.split(",") if s.strip()
@@ -260,213 +265,169 @@ async def main() -> None:
             if t not in allowed_tools:
                 allowed_tools.append(t)
 
-    # --- Pause/resume loop ---
-    _TYPE_MAP = {
-        "AssistantMessage": "assistant",
-        "UserMessage": "user",
-        "SystemMessage": "system",
-        "ResultMessage": "result",
-        "RateLimitEvent": "rate_limit",
-    }
-
     # Context window estimate.
     context_window = DEFAULT_CONTEXT_WINDOW
     if model and "1m" in model.lower():
         context_window = 1_000_000
     compact_token_limit = int(context_window * COMPACT_THRESHOLD)
 
+    # --- Build options ---
+    options = ClaudeAgentOptions(
+        cwd="/workspace",
+        allowed_tools=allowed_tools,
+        permission_mode="bypassPermissions",
+    )
+    if model:
+        options.model = model
+    if mcp_servers:
+        options.mcp_servers = mcp_servers
+    if max_turns:
+        options.max_turns = max_turns
+
+    # --- Connect and run ---
     last_input_tokens = 0
-    consecutive_empty_sessions = 0
+    session_id = ""
 
-    while True:
-        # Build options for this query session.
-        options = ClaudeAgentOptions(
-            cwd="/workspace",
-            allowed_tools=allowed_tools,
-            permission_mode="bypassPermissions",
-        )
-        if model:
-            options.model = model
-        if mcp_servers:
-            options.mcp_servers = mcp_servers
-        if max_turns:
-            options.max_turns = max_turns
-        if session_id:
-            options.resume = session_id
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            # Send initial prompt.
+            await client.query(prompt)
 
-        # Run one query session.
-        pause_reason = None
-        got_assistant_message = False
+            # Process responses.  receive_response() yields messages
+            # until a ResultMessage, then stops.  After compaction or
+            # follow-up queries, we call receive_response() again to
+            # continue processing.
+            while True:
+                completed = False
+                pause_reason = None
 
-        try:
-            async for message in query(prompt=prompt, options=options):
-                try:
-                    cls_name = type(message).__name__
+                async for message in client.receive_response():
+                    try:
+                        cls_name = type(message).__name__
 
-                    # Capture session_id from any message that has it.
-                    sid = _get_session_id(message)
-                    if sid:
-                        session_id = sid
+                        # Capture session_id.
+                        sid = getattr(message, "session_id", None)
+                        if sid:
+                            session_id = sid
 
-                    # --- Token usage tracking ---
-                    if cls_name == "AssistantMessage":
-                        got_assistant_message = True
-                        usage = getattr(message, "usage", None)
-                        if isinstance(usage, dict):
-                            inp = usage.get("input_tokens", 0)
-                            cache_c = usage.get(
-                                "cache_creation_input_tokens", 0,
+                        # Track token usage.
+                        if isinstance(message, AssistantMessage):
+                            tokens = _get_input_tokens(message)
+                            if tokens > 0:
+                                last_input_tokens = tokens
+
+                        # Rate limit detection.
+                        if cls_name == "RateLimitEvent":
+                            info = getattr(
+                                message, "rate_limit_info", None,
                             )
-                            cache_r = usage.get(
-                                "cache_read_input_tokens", 0,
-                            )
-                            total = inp + cache_c + cache_r
-                            if total > 0:
-                                last_input_tokens = total
-
-                        # --- Mid-session compaction trigger ---
-                        # Check after every assistant message whether
-                        # context has grown past the threshold.  If so,
-                        # break out of the message loop to compact
-                        # before the context overflows.  The session is
-                        # resumed after compaction with "Continue from
-                        # where you left off."
-                        if last_input_tokens >= compact_token_limit:
-                            pause_reason = "compact_needed"
-                            break
-
-                    # --- Rate limit detection ---
-                    if cls_name == "RateLimitEvent":
-                        status = "unknown"
-                        info = getattr(message, "rate_limit_info", None)
-                        if info:
-                            status = getattr(info, "status", "unknown")
-                        if status == "rejected":
-                            pause_reason = "rate_limit"
+                            status = "unknown"
+                            if info:
+                                status = getattr(
+                                    info, "status", "unknown",
+                                )
+                            if status == "rejected":
+                                pause_reason = "rate_limit"
+                                _emit({
+                                    "type": "rate_limit",
+                                    "status": "rejected",
+                                })
+                                break
                             _emit({
                                 "type": "rate_limit",
-                                "status": "rejected",
+                                "status": status,
                             })
-                            break
-                        # Warning or allowed — log and continue.
-                        _emit({"type": "rate_limit", "status": status})
-                        continue
+                            continue
 
-                    # --- Max turns detection ---
-                    if cls_name == "ResultMessage":
-                        subtype = getattr(message, "subtype", "")
-                        if subtype == "error_max_turns":
-                            pause_reason = "max_turns"
+                        # Completion detection.
+                        if isinstance(message, ResultMessage):
+                            subtype = getattr(message, "subtype", "")
+                            if subtype == "success":
+                                completed = True
 
-                    # --- Serialize and emit ---
-                    if hasattr(message, "model_dump"):
-                        data = message.model_dump()
-                    elif hasattr(message, "to_dict"):
-                        data = message.to_dict()
-                    elif hasattr(message, "__dict__"):
-                        data = message.__dict__
-                        if "content" in data and isinstance(
-                            data["content"], list,
-                        ):
-                            data["content"] = [
-                                _serialize(b) for b in data["content"]
-                            ]
-                    else:
-                        data = {"type": "unknown", "repr": repr(message)}
+                        # Emit the message.
+                        _emit_message(message)
 
-                    data["type"] = _TYPE_MAP.get(cls_name, cls_name)
-                    _emit(data)
-
-                except Exception as e:
-                    _emit({"type": "error", "message": str(e)})
-
-        except Exception as e:
-            err = str(e).lower()
-            if ("rate" in err and "limit" in err) or "overloaded" in err:
-                pause_reason = "rate_limit"
-                _emit({"type": "error", "message": f"Rate limit: {e}"})
-            elif "prompt" in err and "too long" in err:
-                pause_reason = "context_overflow"
-                _emit({
-                    "type": "error",
-                    "message": f"Context overflow: {e}",
-                })
-            elif pause_reason:
-                # Expected: CLI exits non-zero after we broke out of
-                # the loop (compact_needed) or after max_turns.
-                pass
-            elif "auth" in err or "401" in err:
-                pause_reason = "auth_error"
-                _emit({"type": "error", "message": f"Auth error: {e}"})
-            elif "exit code 1" in err:
-                # The CLI exits with code 1 in several non-fatal
-                # scenarios: max_turns reached, session resume after
-                # compaction, etc.  If the session produced assistant
-                # messages, it made progress and this is normal.  If
-                # not, the resume may have failed — track consecutive
-                # empty sessions and bail after 3 to avoid spinning.
-                if not got_assistant_message:
-                    consecutive_empty_sessions += 1
-                    if consecutive_empty_sessions >= 3:
-                        pause_reason = "error"
+                    except Exception as e:
                         _emit({
                             "type": "error",
-                            "message": (
-                                "3 consecutive sessions with no "
-                                "progress (exit code 1). Pausing."
-                            ),
+                            "message": str(e),
                         })
-            else:
-                pause_reason = "error"
-                _emit({"type": "error", "message": str(e)})
 
-        # --- Proactive compaction ---
-        #
-        # When the mid-session token check (above) or a "prompt too
-        # long" API error triggers compaction, we resume the session
-        # with "/compact" as the prompt.  The Claude Code CLI
-        # compacts the conversation history, then the agent continues
-        # working in the same session.
-        #
-        # We do NOT use a separate query() call with max_turns=1 for
-        # compaction — that corrupts the session state (the CLI exits
-        # with code 1 on max_turns, leaving the session in a terminal
-        # state that cannot be resumed).  Instead, /compact is sent
-        # as the resume prompt for the main session, which keeps the
-        # session alive after compaction.
-        needs_compact = pause_reason in ("compact_needed", "context_overflow")
-        if needs_compact and session_id:
-            tokens_before = last_input_tokens
-            last_input_tokens = 0
-            _emit({
-                "type": "compact",
-                "message": (
-                    f"Context at {tokens_before:,} tokens "
-                    f"(limit {compact_token_limit:,}), resuming "
-                    f"with /compact"
-                ),
-                "tokens_before": tokens_before,
-                "threshold": compact_token_limit,
-            })
+                # --- After receive_response() returns ---
 
-            # Resume with /compact.  The agent will compact context
-            # and then continue working in the same session.
-            prompt = "/compact"
-            continue
+                # Natural completion.
+                if completed:
+                    _save_state(session_id, "complete")
+                    return
 
-        # Reset empty-session counter on progress.
-        if got_assistant_message:
-            consecutive_empty_sessions = 0
+                # External pause (rate limit, auth).
+                if pause_reason:
+                    _save_state(session_id, "paused", pause_reason)
+                    resume_prompt = await _wait_for_resume()
+                    await client.query(resume_prompt)
+                    continue
 
-        # --- Decide next action ---
-        if pause_reason:
-            _save_state(session_id, "paused", pause_reason)
-            prompt = await _wait_for_resume()
-            continue
+                # --- Proactive compaction ---
+                # receive_response() returned after a ResultMessage
+                # (likely error_max_turns).  Check if we need to
+                # compact before continuing.
+                if last_input_tokens >= compact_token_limit:
+                    tokens_before = last_input_tokens
+                    _emit({
+                        "type": "compact",
+                        "message": (
+                            f"Context at {tokens_before:,} tokens "
+                            f"(limit {compact_token_limit:,}), "
+                            f"sending /compact"
+                        ),
+                        "tokens_before": tokens_before,
+                        "threshold": compact_token_limit,
+                    })
 
-        # Natural completion.
-        _save_state(session_id, "complete")
-        break
+                    # Send /compact in the live session.
+                    await client.query("/compact")
+                    async for msg in client.receive_response():
+                        sid = getattr(msg, "session_id", None)
+                        if sid:
+                            session_id = sid
+                        # Track post-compact tokens.
+                        if isinstance(msg, AssistantMessage):
+                            tokens = _get_input_tokens(msg)
+                            if tokens > 0:
+                                last_input_tokens = tokens
+
+                    _emit({
+                        "type": "compact",
+                        "message": "Compaction complete",
+                        "tokens_before": tokens_before,
+                        "tokens_after": last_input_tokens,
+                        "success": True,
+                    })
+
+                    # Tell the agent to keep working.
+                    await client.query(
+                        "Your context was compacted automatically. "
+                        "This is routine. Resume what you were doing."
+                    )
+                    continue
+
+                # ResultMessage without completion and without needing
+                # compact — this is error_max_turns or similar.  The
+                # agent used all its turns.
+                _save_state(session_id, "paused", "max_turns")
+                resume_prompt = await _wait_for_resume()
+                await client.query(resume_prompt)
+
+    except Exception as e:
+        err = str(e).lower()
+        if "auth" in err or "401" in err:
+            _emit({"type": "error", "message": f"Auth error: {e}"})
+            _save_state(session_id, "paused", "auth_error")
+            # Can't resume inside ClaudeSDKClient after auth failure.
+            return
+        _emit({"type": "error", "message": str(e)})
+        _save_state(session_id, "paused", "error")
 
 
 if __name__ == "__main__":
