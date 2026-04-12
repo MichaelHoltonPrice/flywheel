@@ -2,23 +2,45 @@
 """Agent runner using the Claude Agent SDK.
 
 Runs a Claude Code agent via the SDK's query() function and streams
-JSON events to stdout. Supports pause/resume for long-running agents:
+JSON events to stdout.
 
-- **Max turns**: Set MAX_TURNS to limit turns per query session.
-  When reached, the runner pauses and waits for a resume signal.
-- **Rate limit**: Detects rate limit rejections and pauses
-  automatically, waiting for a resume signal.
+Context compaction
+------------------
+
+The Claude Code CLI does not compact context automatically soon
+enough to prevent "prompt is too long" errors in token-heavy
+workloads (e.g. ARC-AGI-3 games returning 64x64 grid frames on
+every action).  This runner monitors token usage on every
+AssistantMessage *during* the live session.  When usage crosses
+COMPACT_THRESHOLD (default 50%) of the estimated context window,
+the runner breaks out of the message loop, sends a ``/compact``
+command via a one-turn resume session, and then resumes the agent.
+
+Implementation detail — exit code 1 on max_turns:
+    The ``/compact`` session uses ``max_turns=1``.  The Claude Code
+    CLI always exits with code 1 when max_turns is reached, and the
+    SDK raises a Python exception for any non-zero exit code.  This
+    is normal and expected.  The compaction itself completes before
+    the CLI exits, so exit-code-1 from the compact session is
+    treated as success.  This is NOT a failure — it is the only way
+    the SDK signals that a max_turns session has ended.
+
+Pause/resume
+------------
+
+- **Max turns**: MAX_TURNS sets the total turn budget.  When
+  reached, the runner pauses and waits for a resume signal.
+- **Rate limit**: Detected automatically; pauses and waits.
 - **Resume**: On pause, the runner writes session state to
   .agent_state.json and polls for .agent_resume in the workspace.
-  Write a prompt to that file (or leave it empty for a default) to
-  continue. Alternatively, set RESUME_SESSION at startup to resume
-  a specific session immediately.
+  Write a prompt to that file (or leave it empty) to continue.
+  Alternatively, set RESUME_SESSION at startup to resume immediately.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
     EVAL_ENDPOINT   — URL of the host-side eval HTTP service
     ALLOWED_TOOLS   — Comma-separated tool whitelist
-    MAX_TURNS       — Maximum turns per query session (optional)
+    MAX_TURNS       — Total turn budget for the agent (optional)
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
                       Known servers: eval, arc.
     RESUME_SESSION  — Session ID to resume on startup (optional)
@@ -43,6 +65,11 @@ WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
 STATE_FILE = WORKSPACE / ".agent_state.json"
 RESUME_FILE = WORKSPACE / ".agent_resume"
 POLL_INTERVAL = 5  # seconds between resume-file checks
+
+# Proactive compaction: compact when input tokens exceed this fraction
+# of the estimated context window.
+COMPACT_THRESHOLD = 0.50
+DEFAULT_CONTEXT_WINDOW = 200_000
 
 
 # ------------------------------------------------------------------
@@ -172,7 +199,7 @@ def _get_session_id(message) -> str | None:
 # ------------------------------------------------------------------
 
 async def main() -> None:
-    """Run the Claude Code agent with pause/resume support."""
+    """Run the Claude Code agent with proactive compaction."""
     # --- Determine initial state ---
     session_id = os.environ.get("RESUME_SESSION", "")
 
@@ -242,6 +269,14 @@ async def main() -> None:
         "RateLimitEvent": "rate_limit",
     }
 
+    # Context window estimate.
+    context_window = DEFAULT_CONTEXT_WINDOW
+    if model and "1m" in model.lower():
+        context_window = 1_000_000
+    compact_token_limit = int(context_window * COMPACT_THRESHOLD)
+
+    last_input_tokens = 0
+
     while True:
         # Build options for this query session.
         options = ClaudeAgentOptions(
@@ -270,6 +305,32 @@ async def main() -> None:
                     sid = _get_session_id(message)
                     if sid:
                         session_id = sid
+
+                    # --- Token usage tracking ---
+                    if cls_name == "AssistantMessage":
+                        usage = getattr(message, "usage", None)
+                        if isinstance(usage, dict):
+                            inp = usage.get("input_tokens", 0)
+                            cache_c = usage.get(
+                                "cache_creation_input_tokens", 0,
+                            )
+                            cache_r = usage.get(
+                                "cache_read_input_tokens", 0,
+                            )
+                            total = inp + cache_c + cache_r
+                            if total > 0:
+                                last_input_tokens = total
+
+                        # --- Mid-session compaction trigger ---
+                        # Check after every assistant message whether
+                        # context has grown past the threshold.  If so,
+                        # break out of the message loop to compact
+                        # before the context overflows.  The session is
+                        # resumed after compaction with "Continue from
+                        # where you left off."
+                        if last_input_tokens >= compact_token_limit:
+                            pause_reason = "compact_needed"
+                            break
 
                     # --- Rate limit detection ---
                     if cls_name == "RateLimitEvent":
@@ -321,18 +382,97 @@ async def main() -> None:
             if ("rate" in err and "limit" in err) or "overloaded" in err:
                 pause_reason = "rate_limit"
                 _emit({"type": "error", "message": f"Rate limit: {e}"})
+            elif "prompt" in err and "too long" in err:
+                pause_reason = "context_overflow"
+                _emit({
+                    "type": "error",
+                    "message": f"Context overflow: {e}",
+                })
             elif pause_reason:
-                # Expected: CLI exits non-zero after a known pause
-                # trigger (e.g., exit code 1 on max_turns).
+                # Expected: CLI exits non-zero after we broke out of
+                # the loop (compact_needed) or after max_turns.
                 pass
             elif "auth" in err or "401" in err:
                 pause_reason = "auth_error"
                 _emit({"type": "error", "message": f"Auth error: {e}"})
             else:
-                # Unknown error — still pause rather than crash,
-                # so we preserve the session for potential resume.
                 pause_reason = "error"
                 _emit({"type": "error", "message": str(e)})
+
+        # --- Proactive compaction ---
+        #
+        # When the mid-session token check (above) or a "prompt too
+        # long" API error triggers compaction, we resume the existing
+        # session with the "/compact" slash command.  This tells the
+        # Claude Code CLI to summarize the conversation history,
+        # freeing context space.
+        #
+        # The compact session uses max_turns=1 because /compact only
+        # needs one turn.  IMPORTANT: the Claude Code CLI always
+        # exits with code 1 when max_turns is reached, and the SDK
+        # raises a Python exception for any non-zero exit code.  The
+        # compaction itself completes before the CLI exits, so
+        # exit-code-1 from the compact session is EXPECTED and
+        # treated as success — it is not a failure.
+        needs_compact = pause_reason in ("compact_needed", "context_overflow")
+        if needs_compact and session_id:
+            _emit({
+                "type": "compact",
+                "message": (
+                    f"Context at {last_input_tokens:,} tokens "
+                    f"(limit {compact_token_limit:,}), compacting"
+                ),
+                "tokens_before": last_input_tokens,
+                "threshold": compact_token_limit,
+            })
+
+            compact_options = ClaudeAgentOptions(
+                cwd="/workspace",
+                allowed_tools=allowed_tools,
+                permission_mode="bypassPermissions",
+            )
+            if model:
+                compact_options.model = model
+            compact_options.resume = session_id
+            compact_options.max_turns = 1
+
+            compact_ok = False
+            try:
+                async for msg in query(
+                    prompt="/compact", options=compact_options,
+                ):
+                    sid = _get_session_id(msg)
+                    if sid:
+                        session_id = sid
+                compact_ok = True
+            except Exception as e:
+                # Exit code 1 is the CLI's normal signal for "I used
+                # all my allowed turns."  Since we set max_turns=1,
+                # this fires every time.  The /compact work finishes
+                # before the exit, so this is success, not failure.
+                if "exit code 1" in str(e).lower():
+                    compact_ok = True
+                else:
+                    _emit({
+                        "type": "error",
+                        "message": f"Compact failed: {e}",
+                    })
+
+            tokens_before = last_input_tokens
+            last_input_tokens = 0
+            _emit({
+                "type": "compact",
+                "message": (
+                    "Compaction complete" if compact_ok
+                    else "Compaction failed"
+                ),
+                "tokens_before": tokens_before,
+                "success": compact_ok,
+            })
+
+            # Resume the agent after compaction.
+            prompt = "Continue from where you left off."
+            continue
 
         # --- Decide next action ---
         if pause_reason:
