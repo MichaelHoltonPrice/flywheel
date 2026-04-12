@@ -316,6 +316,15 @@ async def main() -> None:
                             if tokens > 0:
                                 last_input_tokens = tokens
 
+                            # Mid-session compaction trigger.
+                            # Breaking out of receive_response() does
+                            # NOT kill the ClaudeSDKClient connection.
+                            # We can send /compact and then continue.
+                            if last_input_tokens >= compact_token_limit:
+                                pause_reason = "compact_needed"
+                                _emit_message(message)
+                                break
+
                         # Rate limit detection.
                         if cls_name == "RateLimitEvent":
                             info = getattr(
@@ -362,17 +371,19 @@ async def main() -> None:
                     return
 
                 # External pause (rate limit, auth).
-                if pause_reason:
+                if pause_reason and pause_reason != "compact_needed":
                     _save_state(session_id, "paused", pause_reason)
                     resume_prompt = await _wait_for_resume()
                     await client.query(resume_prompt)
                     continue
 
                 # --- Proactive compaction ---
-                # receive_response() returned after a ResultMessage
-                # (likely error_max_turns).  Check if we need to
-                # compact before continuing.
-                if last_input_tokens >= compact_token_limit:
+                # Triggered either mid-session (compact_needed) or
+                # after a ResultMessage when tokens are high.
+                if (
+                    pause_reason == "compact_needed"
+                    or last_input_tokens >= compact_token_limit
+                ):
                     tokens_before = last_input_tokens
                     _emit({
                         "type": "compact",
