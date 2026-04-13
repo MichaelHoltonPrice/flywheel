@@ -85,6 +85,49 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
             return
 
         block_name = payload.get("block_name", "")
+        mode = payload.get("mode", "invoke")
+
+        if mode == "record":
+            # Record mode: create artifacts without launching a
+            # container.  Used for provenance tracking of actions
+            # that already happened (e.g., game steps).
+            if not block_name:
+                self._send_json(400, {
+                    "ok": False,
+                    "error_type": "missing_field",
+                    "message": "Record request requires 'block_name'",
+                })
+                return
+
+            with self._lock:
+                self._counter[0] += 1
+                request_id = (
+                    f"{self._service_id}_{self._counter[0]:04d}")
+
+            try:
+                response = _process_record_invocation(
+                    request_id=request_id,
+                    block_name=block_name,
+                    inputs=payload.get("inputs", {}),
+                    outputs=payload.get("outputs", {}),
+                    elapsed_s=payload.get("elapsed_s"),
+                    template=self.template,
+                    workspace=self.workspace,
+                    allowed_blocks=self.allowed_blocks,
+                )
+            except Exception as e:
+                self._send_json(500, {
+                    "request_id": request_id,
+                    "ok": False,
+                    "error_type": "internal_error",
+                    "message": str(e),
+                })
+                return
+
+            self._send_json(200, response)
+            return
+
+        # Invoke mode (default): launch a container.
         artifact_path = payload.get("artifact_path", "")
         if not block_name or not artifact_path:
             print(f"  [block-bridge] missing fields: "
@@ -168,6 +211,161 @@ def _find_block(template: Template, block_name: str) -> BlockDefinition | None:
         if block.name == block_name:
             return block
     return None
+
+
+RECORD_SENTINEL = "__record__"
+
+
+def _process_record_invocation(
+    request_id: str,
+    block_name: str,
+    inputs: dict[str, str],
+    outputs: dict[str, Any],
+    elapsed_s: float | None,
+    template: Template,
+    workspace: Workspace,
+    allowed_blocks: list[str] | None = None,
+) -> dict:
+    """Record artifacts and a block execution without launching a container.
+
+    Used for provenance tracking of actions that already happened
+    (e.g., game steps executed via a REST API).  Each output value
+    is written as a JSON file in a new artifact directory.
+
+    Args:
+        request_id: Unique ID for this request.
+        block_name: Name of the block (must have ``__record__`` image).
+        inputs: Maps input slot names to existing artifact instance IDs.
+        outputs: Maps output slot names to JSON-serializable data.
+        elapsed_s: Wall-clock time of the recorded action.
+        template: The template containing block definitions.
+        workspace: The flywheel workspace (modified in place).
+        allowed_blocks: If set, only these block names can be invoked.
+
+    Returns:
+        Response dict with ``ok``, artifact IDs, and execution ID.
+    """
+    if allowed_blocks and block_name not in allowed_blocks:
+        return {
+            "request_id": request_id,
+            "ok": False,
+            "retryable": False,
+            "error_type": "block_not_allowed",
+            "message": (
+                f"Block {block_name!r} is not in the allowed "
+                f"list: {allowed_blocks}"),
+        }
+
+    block_def = _find_block(template, block_name)
+    if block_def is None:
+        return {
+            "request_id": request_id,
+            "ok": False,
+            "retryable": False,
+            "error_type": "unknown_block",
+            "message": f"Block {block_name!r} not found in template",
+        }
+
+    if block_def.image != RECORD_SENTINEL:
+        return {
+            "request_id": request_id,
+            "ok": False,
+            "retryable": False,
+            "error_type": "not_record_block",
+            "message": (
+                f"Block {block_name!r} is not a record block "
+                f"(image is {block_def.image!r}, expected "
+                f"{RECORD_SENTINEL!r})"),
+        }
+
+    # Validate input artifact IDs exist in workspace.
+    input_bindings: dict[str, str] = {}
+    for slot in block_def.inputs:
+        artifact_id = inputs.get(slot.name, "")
+        if artifact_id:
+            if artifact_id not in workspace.artifacts:
+                return {
+                    "request_id": request_id,
+                    "ok": False,
+                    "retryable": False,
+                    "error_type": "unknown_artifact",
+                    "message": (
+                        f"Input artifact {artifact_id!r} not found "
+                        f"in workspace"),
+                }
+            input_bindings[slot.name] = artifact_id
+        elif not slot.optional:
+            # Try latest instance for this slot name.
+            instances = workspace.instances_for(slot.name)
+            if instances:
+                input_bindings[slot.name] = instances[-1].id
+            else:
+                return {
+                    "request_id": request_id,
+                    "ok": False,
+                    "retryable": False,
+                    "error_type": "missing_input",
+                    "message": (
+                        f"Required input {slot.name!r} not provided "
+                        f"and no instances exist in workspace"),
+                }
+
+    # Write output data as artifact instances.
+    execution_id = workspace.generate_execution_id()
+    started_at = datetime.now(UTC)
+    output_bindings: dict[str, str] = {}
+
+    for slot in block_def.outputs:
+        data = outputs.get(slot.name)
+        if data is None:
+            continue
+
+        artifact_id = workspace.generate_artifact_id(slot.name)
+        output_dir = workspace.path / "artifacts" / artifact_id
+        output_dir.mkdir(parents=True)
+
+        output_file = output_dir / f"{slot.name}.json"
+        output_file.write_text(
+            json.dumps(data, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+        instance = ArtifactInstance(
+            id=artifact_id,
+            name=slot.name,
+            kind="copy",
+            created_at=started_at,
+            produced_by=execution_id,
+            copy_path=artifact_id,
+        )
+        workspace.add_artifact(instance)
+        output_bindings[slot.name] = artifact_id
+
+    # Record the execution.
+    execution = BlockExecution(
+        id=execution_id,
+        block_name=block_name,
+        started_at=started_at,
+        finished_at=started_at,
+        status="succeeded",
+        input_bindings=input_bindings,
+        output_bindings=output_bindings,
+        elapsed_s=elapsed_s,
+        image=RECORD_SENTINEL,
+    )
+    workspace.add_execution(execution)
+    workspace.save()
+
+    print(f"  [block-bridge] {request_id}: recorded {block_name} "
+          f"({len(output_bindings)} outputs)", flush=True)
+
+    return {
+        "request_id": request_id,
+        "ok": True,
+        "execution_id": execution_id,
+        **{f"{name}_artifact_id": aid
+           for name, aid in output_bindings.items()},
+    }
 
 
 def _process_block_invocation(

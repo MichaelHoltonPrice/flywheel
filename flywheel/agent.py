@@ -62,7 +62,15 @@ DEFAULT_TOTAL_TIMEOUT = 14400
 
 
 def _arc_post(url: str, payload: dict) -> tuple[int, dict]:
-    """POST JSON to the ARC game server. Returns (status_code, body)."""
+    """POST JSON to the ARC game server.
+
+    Args:
+        url: Full endpoint URL.
+        payload: JSON-serializable request body.
+
+    Returns:
+        (status_code, body) tuple.
+    """
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url,
@@ -77,12 +85,19 @@ def _arc_post(url: str, payload: dict) -> tuple[int, dict]:
         return e.code, {"error": e.read().decode()[:200]}
 
 
-def _init_arc_game(server_url: str, game_id: str) -> tuple[str, str, str]:
+def _init_arc_game(
+    server_url: str, game_id: str,
+) -> tuple[str, str, str, dict]:
     """Create a scorecard and start an ARC-AGI-3 game on the host game server.
 
+    Args:
+        server_url: Base URL of the game server (e.g., ``http://localhost:8001``).
+        game_id: Game identifier (e.g., ``vc33-9851e02b``).
+
     Returns:
-        (card_id, guid, initial_frame) -- the scorecard ID, game session
-        GUID, and formatted initial frame text for the agent prompt.
+        (card_id, guid, initial_frame, raw_data) -- the scorecard ID,
+        game session GUID, formatted initial frame text for the agent
+        prompt, and the raw RESET response for artifact creation.
 
     Raises:
         RuntimeError: If the game server is unreachable or returns errors.
@@ -131,7 +146,7 @@ def _init_arc_game(server_url: str, game_id: str) -> tuple[str, str, str]:
             f"FRAME:\n" + "\n".join(frame_lines)
         )
 
-    return card_id, guid, initial_frame
+    return card_id, guid, initial_frame, data
 
 
 def run_agent_block(
@@ -304,7 +319,7 @@ def run_agent_block(
         host_url = arc_server.replace(
             "host.docker.internal", "localhost",
         ).replace("localhost", "host.docker.internal")
-        card_id, guid, initial_frame = _init_arc_game(
+        card_id, guid, initial_frame, raw_data = _init_arc_game(
             # Use localhost URL for host-side HTTP call.
             arc_server.replace("host.docker.internal", "localhost"),
             arc_game,
@@ -317,6 +332,47 @@ def run_agent_block(
         prompt += f"\n\n# Initial game state\n\n{initial_frame}"
         print(f"  [agent] ARC game initialized: card={card_id[:8]}... "
               f"guid={guid[:8]}...")
+
+        # Create initial game_spec and game_session artifacts if the
+        # template declares them.
+        if "game_spec" in workspace.artifact_declarations:
+            grid = raw_data.get("frame", [[]])[0]
+            grid_h = len(grid) if grid else 0
+            grid_w = len(grid[0]) if grid and grid[0] else 0
+            spec_data = {
+                "game_id": arc_game,
+                "server_url": arc_server,
+                "available_actions": raw_data.get(
+                    "available_actions", []),
+                "win_levels": raw_data.get("win_levels"),
+                "grid_size": f"{grid_h}x{grid_w}",
+            }
+            spec_file = agent_ws / "_game_spec.json"
+            spec_file.write_text(
+                json.dumps(spec_data, indent=2), encoding="utf-8")
+            workspace.register_artifact(
+                "game_spec", spec_file,
+                source="game initialization",
+            )
+            spec_file.unlink()
+
+        if "game_session" in workspace.artifact_declarations:
+            session_data = {
+                "card_id": card_id,
+                "guid": guid,
+                "level": raw_data.get("levels_completed", 0),
+                "action_count": 0,
+                "state": raw_data.get("state", "initialized"),
+            }
+            session_file = agent_ws / "_game_session.json"
+            session_file.write_text(
+                json.dumps(session_data, indent=2), encoding="utf-8")
+            session_instance = workspace.register_artifact(
+                "game_session", session_file,
+                source="game initialization",
+            )
+            session_file.unlink()
+            env_vars["ARC_SESSION_ARTIFACT_ID"] = session_instance.id
 
     for key, value in env_vars.items():
         cmd.extend(["-e", f"{key}={value}"])

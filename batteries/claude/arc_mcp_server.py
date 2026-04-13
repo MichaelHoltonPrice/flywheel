@@ -21,6 +21,7 @@ Environment variables:
 from __future__ import annotations
 
 import os
+import time
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -35,6 +36,12 @@ _card_id: str = ""
 _guid: str = ""
 _action_count: int = 0
 
+# Artifact tracking -- POST step data to the block bridge.
+_bridge_endpoint: str = ""
+_current_session_id: str = ""
+_last_frame: list | None = None  # last known frame for pre-state
+_last_score: int = 0
+
 
 def _ensure_connected() -> str | None:
     """Initialize connection from environment variables on first call.
@@ -43,6 +50,7 @@ def _ensure_connected() -> str | None:
     None on success.
     """
     global _client, _base_url, _game_id, _card_id, _guid
+    global _bridge_endpoint, _current_session_id
 
     if _client is not None:
         return None
@@ -62,6 +70,12 @@ def _ensure_connected() -> str | None:
         return "ERROR: ARC_GUID environment variable not set."
 
     _client = httpx.Client(timeout=30.0)
+
+    # Artifact tracking (optional -- graceful if absent).
+    _bridge_endpoint = os.environ.get("EVAL_ENDPOINT", "")
+    _current_session_id = os.environ.get(
+        "ARC_SESSION_ARTIFACT_ID", "")
+
     return None
 
 
@@ -105,6 +119,71 @@ def _format_response(data: dict, action_desc: str = "") -> str:
     return "\n".join(parts)
 
 
+def _record_step(
+    action_desc: dict,
+    pre_frame: list | None,
+    post_data: dict,
+    score_before: int,
+    elapsed: float,
+) -> None:
+    """POST step data to the block bridge for artifact tracking.
+
+    Silently drops errors — tracking failures must never break
+    gameplay.
+    """
+    global _current_session_id
+
+    if not _bridge_endpoint:
+        return
+
+    post_frame = post_data.get("frame", [[]])[0]
+    score_after = post_data.get("score", score_before)
+
+    try:
+        resp = httpx.post(
+            _bridge_endpoint,
+            json={
+                "mode": "record",
+                "block_name": "game_step",
+                "inputs": {
+                    "game_session": _current_session_id,
+                } if _current_session_id else {},
+                "outputs": {
+                    "game_session": {
+                        "card_id": _card_id,
+                        "guid": _guid,
+                        "level": post_data.get(
+                            "levels_completed", 0),
+                        "action_count": _action_count,
+                        "state": post_data.get(
+                            "state", "UNKNOWN"),
+                    },
+                    "game_step": {
+                        "step_index": _action_count,
+                        "action": action_desc,
+                        "pre_state": pre_frame,
+                        "post_state": post_frame,
+                        "score_before": score_before,
+                        "score_after": score_after,
+                        "level": post_data.get(
+                            "levels_completed", 0),
+                        "state": post_data.get(
+                            "state", "UNKNOWN"),
+                    },
+                },
+                "elapsed_s": elapsed,
+            },
+            timeout=10.0,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            new_session = data.get("game_session_artifact_id", "")
+            if new_session:
+                _current_session_id = new_session
+    except Exception:
+        pass  # Never break gameplay on tracking failure.
+
+
 def _post(endpoint: str, payload: dict) -> dict:
     """POST to the game server and return JSON response."""
     if _client is None:
@@ -140,7 +219,7 @@ def take_action(action: int, x: int = -1, y: int = -1) -> str:
         The new game state including the frame, state, levels
         completed, and available actions.
     """
-    global _action_count, _guid
+    global _action_count, _guid, _last_frame, _last_score
 
     err = _ensure_connected()
     if err:
@@ -154,6 +233,10 @@ def take_action(action: int, x: int = -1, y: int = -1) -> str:
         payload["x"] = x
         payload["y"] = y
 
+    pre_frame = _last_frame
+    score_before = _last_score
+    t0 = time.monotonic()
+
     _action_count += 1
     data = _post(f"ACTION{action}", payload)
 
@@ -161,12 +244,24 @@ def take_action(action: int, x: int = -1, y: int = -1) -> str:
         _action_count -= 1  # Don't count failed actions.
         return f"ERROR: {data['error']} {data.get('detail', '')}"
 
+    elapsed = time.monotonic() - t0
+
     if "guid" in data:
         _guid = data["guid"]
 
+    # Update tracking state.
+    post_frame = data.get("frame", [[]])[0]
+    _last_frame = post_frame
+    _last_score = data.get("score", _last_score)
+
     desc = f"ACTION{action}"
+    action_desc: dict = {"action": action}
     if action == 6:
         desc = f"ACTION6(x={x}, y={y})"
+        action_desc["x"] = x
+        action_desc["y"] = y
+
+    _record_step(action_desc, pre_frame, data, score_before, elapsed)
 
     return _format_response(data, desc)
 
@@ -178,18 +273,34 @@ def reset_level() -> str:
     Use this to restart the current level if you're stuck or
     want to try a different approach.
     """
-    global _guid
+    global _guid, _last_frame, _last_score
 
     err = _ensure_connected()
     if err:
         return err
 
+    pre_frame = _last_frame
+    score_before = _last_score
+    t0 = time.monotonic()
+
     data = _post("RESET", {})
     if "error" in data:
         return f"ERROR: {data['error']} {data.get('detail', '')}"
 
+    elapsed = time.monotonic() - t0
+
     if "guid" in data:
         _guid = data["guid"]
+
+    # Update tracking state.
+    post_frame = data.get("frame", [[]])[0]
+    _last_frame = post_frame
+    _last_score = data.get("score", _last_score)
+
+    _record_step(
+        {"action": 0, "type": "RESET"},
+        pre_frame, data, score_before, elapsed,
+    )
 
     return _format_response(data, "RESET (level restart)")
 

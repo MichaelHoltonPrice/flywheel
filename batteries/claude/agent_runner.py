@@ -96,6 +96,13 @@ def _arc_server():
         env["ARC_CARD_ID"] = card_id
     if guid:
         env["ARC_GUID"] = guid
+    # Pass bridge endpoint and session artifact ID for tracking.
+    bridge = os.environ.get("EVAL_ENDPOINT", "")
+    if bridge:
+        env["EVAL_ENDPOINT"] = bridge
+    session_aid = os.environ.get("ARC_SESSION_ARTIFACT_ID", "")
+    if session_aid:
+        env["ARC_SESSION_ARTIFACT_ID"] = session_aid
     config = {
         "command": "python3",
         "args": ["/app/arc_mcp_server.py"],

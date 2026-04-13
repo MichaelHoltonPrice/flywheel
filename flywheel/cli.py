@@ -107,6 +107,18 @@ def main(argv: list[str] | None = None) -> None:
         "--mount", action="append", default=[], dest="extra_mounts",
         help="Extra mount as HOST:CONTAINER:MODE (repeatable).")
 
+    # flywheel materialize
+    mat_parser = subparsers.add_parser("materialize")
+    mat_parser.add_argument("--workspace", required=True)
+    mat_parser.add_argument(
+        "--from", dest="source_name", required=True,
+        help="Source artifact name (e.g., game_step).",
+    )
+    mat_parser.add_argument(
+        "--to", dest="target_name", required=True,
+        help="Target artifact name (e.g., game_history).",
+    )
+
     # Split on '--' to separate flywheel args from container args
     if argv is None:
         argv = sys.argv[1:]
@@ -134,6 +146,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "run" and getattr(args, "target", None) == "agent":
         run_agent_command(args, extra_container_args)
+    elif args.command == "materialize":
+        materialize_command(
+            args.workspace, args.source_name, args.target_name,
+        )
     else:
         parser.print_help()
         sys.exit(1)
@@ -212,6 +228,29 @@ def import_artifact(
         name, Path(source_path), source=source,
     )
     print(f"Imported {name!r} as {instance.id!r}")
+
+
+def materialize_command(
+    workspace_path: str,
+    source_name: str,
+    target_name: str,
+) -> None:
+    """Assemble incremental artifacts into a single JSONL artifact.
+
+    Args:
+        workspace_path: Path to the workspace directory.
+        source_name: Artifact declaration name to read from.
+        target_name: Artifact declaration name to write to.
+
+    Raises:
+        ValueError: If the workspace YAML is malformed, artifact names
+            are not declared, or no source instances exist.
+    """
+    ws = Workspace.load(Path(workspace_path))
+    count = len(ws.instances_for(source_name))
+    instance = ws.materialize_sequence(source_name, target_name)
+    print(f"Materialized {count} {source_name!r} instances "
+          f"into {instance.id!r}")
 
 
 def run_block_command(
