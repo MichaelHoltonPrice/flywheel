@@ -19,10 +19,10 @@ RUN npm install -g @anthropic-ai/claude-code
 # Install the Agents SDK and HTTP client.
 RUN pip install claude-agent-sdk httpx mcp
 
-# Copy the agent runner and MCP server scripts.
+# Copy the agent runner and built-in MCP server scripts.
+# Project-specific MCP servers are mounted at runtime.
 COPY agent_runner.py /app/agent_runner.py
 COPY eval_mcp_server.py /app/eval_mcp_server.py
-COPY arc_mcp_server.py /app/arc_mcp_server.py
 
 # Claude Code refuses --dangerously-skip-permissions as root.
 RUN useradd -m claude \

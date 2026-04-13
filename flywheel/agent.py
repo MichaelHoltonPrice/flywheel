@@ -24,8 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,94 +61,6 @@ def _resolve_path(path: Path) -> str:
 DEFAULT_TOTAL_TIMEOUT = 14400
 
 
-def _arc_post(url: str, payload: dict) -> tuple[int, dict]:
-    """POST JSON to the ARC game server.
-
-    Args:
-        url: Full endpoint URL.
-        payload: JSON-serializable request body.
-
-    Returns:
-        (status_code, body) tuple.
-    """
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return e.code, {"error": e.read().decode()[:200]}
-
-
-def _init_arc_game(
-    server_url: str, game_id: str,
-) -> tuple[str, str, str, dict]:
-    """Create a scorecard and start an ARC-AGI-3 game on the host game server.
-
-    Args:
-        server_url: Base URL of the game server (e.g., ``http://localhost:8001``).
-        game_id: Game identifier (e.g., ``vc33-9851e02b``).
-
-    Returns:
-        (card_id, guid, initial_frame, raw_data) -- the scorecard ID,
-        game session GUID, formatted initial frame text for the agent
-        prompt, and the raw RESET response for artifact creation.
-
-    Raises:
-        RuntimeError: If the game server is unreachable or returns errors.
-    """
-    # Open a scorecard.
-    status, resp = _arc_post(f"{server_url}/api/scorecard/open", {})
-    if status != 200:
-        raise RuntimeError(
-            f"Failed to open scorecard: {status} {resp}"
-        )
-    card_id = resp.get("card_id", "")
-
-    # RESET starts the game and returns the initial frame.
-    status, data = _arc_post(
-        f"{server_url}/api/cmd/RESET",
-        {"card_id": card_id, "game_id": game_id},
-    )
-    if status != 200:
-        raise RuntimeError(f"Failed to start game: {status} {data}")
-    guid = data.get("guid", "")
-
-    # Format the initial frame for the agent prompt.
-    frame_lines: list[str] = []
-    frame = data.get("frame")
-    if frame and isinstance(frame, list) and len(frame) > 0:
-        grid = frame[0]
-        if isinstance(grid, list) and len(grid) > 0:
-            for row in grid:
-                frame_lines.append(" ".join(str(int(v)) for v in row))
-
-    initial_frame = (
-        f"STATE: {data.get('state', 'UNKNOWN')}\n"
-        f"LEVELS_COMPLETED: {data.get('levels_completed', '?')}\n"
-        f"WIN_LEVELS: {data.get('win_levels', '?')}\n"
-        f"AVAILABLE_ACTIONS: {data.get('available_actions', [])}\n"
-    )
-    if frame_lines:
-        h = len(frame_lines)
-        w = len(frame_lines[0].split()) if frame_lines else 0
-        colors = set()
-        for row in data["frame"][0]:
-            colors.update(row)
-        initial_frame += (
-            f"FRAME_SHAPE: {h}x{w}\n"
-            f"COLORS_PRESENT: {sorted(colors)}\n"
-            f"FRAME:\n" + "\n".join(frame_lines)
-        )
-
-    return card_id, guid, initial_frame, data
-
-
 def run_agent_block(
     workspace: Workspace,
     template: Template,
@@ -170,6 +81,7 @@ def run_agent_block(
     allowed_tools: str | None = None,
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str, str]] | None = None,
+    pre_launch_hook: Callable[[Path], None] | None = None,
 ) -> AgentResult:
     """Run an agent block execution.
 
@@ -204,13 +116,19 @@ def run_agent_block(
         overrides: CLI flag overrides passed to invoked containers
             (e.g., {"subclass": "dueling", "episodes": "4000"}).
         mcp_servers: Comma-separated MCP server names to enable
-            (default: "eval"). Use "arc" for ARC-AGI-3 games.
+            (default: "eval"). Project-specific servers are discovered
+            from mounted directories.
         allowed_tools: Comma-separated tool whitelist for the agent
             (default: "Read,Write,Edit,Glob,Grep").
         extra_env: Additional environment variables to pass to the
             agent container.
         extra_mounts: Additional volume mounts as (host, container,
             mode) tuples.
+        pre_launch_hook: Optional callback invoked after workspace
+            creation and seeding but before container launch.
+            Receives the agent workspace path. Use this for
+            project-specific setup (writing files, creating
+            artifacts, etc.).
 
     Returns:
         AgentResult with exit code, elapsed time, and invocation count.
@@ -283,7 +201,7 @@ def run_agent_block(
                         f"{_resolve_path(host_path)}:/input/{mount_name}:ro",
                     ])
 
-    # Extra mounts (e.g., game files for ARC-AGI-3).
+    # Extra mounts (e.g., project MCP servers, game data).
     if extra_mounts:
         for host_path, container_path, mode in extra_mounts:
             cmd.extend([
@@ -310,79 +228,13 @@ def run_agent_block(
     if extra_env:
         env_vars.update(extra_env)
 
-    # ARC-AGI-3: create scorecard and start game on the host side
-    # before launching the container.  The agent receives the card
-    # ID, GUID, and initial frame — it never opens scorecards.
-    arc_server = env_vars.get("ARC_SERVER_URL", "")
-    arc_game = env_vars.get("GAME_ID", "")
-    if arc_server and arc_game:
-        # Rewrite ARC_SERVER_URL for the container (Docker alias).
-        host_url = arc_server.replace(
-            "host.docker.internal", "localhost",
-        ).replace("localhost", "host.docker.internal")
-        card_id, guid, initial_frame, raw_data = _init_arc_game(
-            # Use localhost URL for host-side HTTP call.
-            arc_server.replace("host.docker.internal", "localhost"),
-            arc_game,
-        )
-        env_vars["ARC_CARD_ID"] = card_id
-        env_vars["ARC_GUID"] = guid
-        env_vars["ARC_SERVER_URL"] = host_url
-        # Inject the initial frame into the prompt so the agent
-        # can start playing immediately.
-        prompt += f"\n\n# Initial game state\n\n{initial_frame}"
-        print(f"  [agent] ARC game initialized: card={card_id[:8]}... "
-              f"guid={guid[:8]}...")
-
-        # Write initial frame to workspace so the MCP server can
-        # hydrate pre-state tracking for the first game step.
-        initial_state_file = agent_ws / ".arc_initial_state.json"
-        initial_grid = raw_data.get("frame", [[]])[0]
-        initial_state_file.write_text(json.dumps({
-            "frame": initial_grid,
-            "score": raw_data.get("score", 0),
-        }), encoding="utf-8")
-
-        # Create initial game_spec and game_session artifacts if the
-        # template declares them.
-        if "game_spec" in workspace.artifact_declarations:
-            grid = raw_data.get("frame", [[]])[0]
-            grid_h = len(grid) if grid else 0
-            grid_w = len(grid[0]) if grid and grid[0] else 0
-            spec_data = {
-                "game_id": arc_game,
-                "server_url": arc_server,
-                "available_actions": raw_data.get(
-                    "available_actions", []),
-                "win_levels": raw_data.get("win_levels"),
-                "grid_size": f"{grid_h}x{grid_w}",
-            }
-            spec_file = agent_ws / "_game_spec.json"
-            spec_file.write_text(
-                json.dumps(spec_data, indent=2), encoding="utf-8")
-            workspace.register_artifact(
-                "game_spec", spec_file,
-                source="game initialization",
-            )
-            spec_file.unlink()
-
-        if "game_session" in workspace.artifact_declarations:
-            session_data = {
-                "card_id": card_id,
-                "guid": guid,
-                "level": raw_data.get("levels_completed", 0),
-                "action_count": 0,
-                "state": raw_data.get("state", "initialized"),
-            }
-            session_file = agent_ws / "_game_session.json"
-            session_file.write_text(
-                json.dumps(session_data, indent=2), encoding="utf-8")
-            session_instance = workspace.register_artifact(
-                "game_session", session_file,
-                source="game initialization",
-            )
-            session_file.unlink()
-            env_vars["ARC_SESSION_ARTIFACT_ID"] = session_instance.id
+    # Project-specific pre-launch setup (e.g., game init, writing
+    # files to the workspace, creating artifacts).
+    if pre_launch_hook is not None:
+        pre_launch_hook(agent_ws)
+        # The hook may have added env vars via extra_env mutation.
+        if extra_env:
+            env_vars.update(extra_env)
 
     for key, value in env_vars.items():
         cmd.extend(["-e", f"{key}={value}"])

@@ -29,7 +29,8 @@ Environment variables:
     ALLOWED_TOOLS   — Comma-separated tool whitelist
     MAX_TURNS       — Total turn budget for the agent (optional)
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
-                      Known servers: eval, arc.
+                      Built-in: eval. Projects can mount additional
+                      servers at /workspace/.mcp_servers/.
     RESUME_SESSION  — Session ID to resume on startup (optional)
 """
 
@@ -82,44 +83,54 @@ def _eval_server():
     return config, tools
 
 
-def _arc_server():
-    """ARC-AGI-3 game interaction — requires GAME_ID and ARC_SERVER_URL."""
-    game_id = os.environ.get("GAME_ID", "")
-    server_url = os.environ.get("ARC_SERVER_URL", "")
-    if not game_id or not server_url:
-        return None
-    env = {"GAME_ID": game_id, "ARC_SERVER_URL": server_url}
-    # Pass through host-created scorecard and session IDs.
-    card_id = os.environ.get("ARC_CARD_ID", "")
-    guid = os.environ.get("ARC_GUID", "")
-    if card_id:
-        env["ARC_CARD_ID"] = card_id
-    if guid:
-        env["ARC_GUID"] = guid
-    # Pass bridge endpoint and session artifact ID for tracking.
-    bridge = os.environ.get("EVAL_ENDPOINT", "")
-    if bridge:
-        env["EVAL_ENDPOINT"] = bridge
-    session_aid = os.environ.get("ARC_SESSION_ARTIFACT_ID", "")
-    if session_aid:
-        env["ARC_SESSION_ARTIFACT_ID"] = session_aid
-    config = {
-        "command": "python3",
-        "args": ["/app/arc_mcp_server.py"],
-        "env": env,
-    }
-    tools = [
-        "mcp__arc__take_action",
-        "mcp__arc__reset_level",
-        "mcp__arc__get_status",
-    ]
-    return config, tools
-
-
 _MCP_REGISTRY = {
     "eval": ("run_eval", _eval_server),
-    "arc": ("arc", _arc_server),
 }
+
+# Default directory where project-provided MCP servers are mounted.
+MCP_SERVER_MOUNT_DIR = "/workspace/.mcp_servers"
+
+
+def _scan_mounted_servers() -> dict:
+    """Discover project-provided MCP servers from the mount directory.
+
+    Scans for ``*_mcp_server.py`` files. For each, derives the server
+    name (strip ``_mcp_server.py`` suffix), builds a config, and
+    returns a registry dict matching ``_MCP_REGISTRY`` format.
+
+    An optional sidecar ``*_mcp_server.json`` manifest provides tool
+    names to add to ``allowed_tools``. If absent, tools are discovered
+    via MCP handshake (no pre-registration).
+
+    Returns:
+        Dict mapping server names to ``(server_id, factory)`` tuples.
+    """
+    mount_dir = Path(os.environ.get(
+        "MCP_SERVER_MOUNT_DIR", MCP_SERVER_MOUNT_DIR))
+    if not mount_dir.is_dir():
+        return {}
+    servers = {}
+    for py_file in sorted(mount_dir.glob("*_mcp_server.py")):
+        name = py_file.name.removesuffix("_mcp_server.py")
+        config = {
+            "command": "python3",
+            "args": [str(py_file)],
+            "env": dict(os.environ),
+        }
+        # Read tool names from sidecar manifest if present.
+        manifest = py_file.with_suffix(".json")
+        tools: list[str] = []
+        if manifest.exists():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                tools = data.get("tools", [])
+            except Exception:
+                pass
+        # Capture config and tools in the closure.
+        def _factory(c=config, t=tools):
+            return c, t
+        servers[name] = (name, _factory)
+    return servers
 
 
 # ------------------------------------------------------------------
@@ -255,7 +266,8 @@ async def main() -> None:
     max_turns_str = os.environ.get("MAX_TURNS", "")
     max_turns = int(max_turns_str) if max_turns_str else None
 
-    # Register MCP servers.
+    # Register MCP servers (built-in + project-mounted).
+    mounted_servers = _scan_mounted_servers()
     mcp_servers_str = os.environ.get("MCP_SERVERS", "")
     requested = [
         s.strip() for s in mcp_servers_str.split(",") if s.strip()
@@ -263,6 +275,8 @@ async def main() -> None:
     mcp_servers = {}
     for name in requested:
         entry = _MCP_REGISTRY.get(name)
+        if entry is None:
+            entry = mounted_servers.get(name)
         if entry is None:
             _emit({
                 "type": "warning",

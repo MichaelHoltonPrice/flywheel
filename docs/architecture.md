@@ -216,11 +216,11 @@ The lifecycle:
 1. Create a fresh agent workspace directory. Seed it with the
    latest artifacts from prior steps so the agent can continue
    where the previous step left off.
-2. If ARC-AGI-3 env vars are present (`ARC_SERVER_URL`, `GAME_ID`),
-   create a scorecard on the game server, create initial
-   `game_spec` and `game_session` artifacts in the workspace, and
-   inject the initial frame into the agent prompt.
-3. Start a block bridge service (HTTP, background thread).
+2. Start a block bridge service (HTTP, background thread).
+3. Run the optional ``pre_launch_hook`` callback. Projects use
+   this for game-specific init, artifact creation, or writing
+   files to the workspace before the container starts. The
+   bridge is already running, so the hook can create artifacts.
 4. Launch the agent container with the workspace, source mounts,
    auth volume, and the bridge endpoint as an environment variable.
    Stderr is drained in a background thread to prevent pipe
@@ -314,6 +314,23 @@ directories and records a ``BlockExecution`` with input/output
 bindings. Record-mode blocks use the ``__record__`` sentinel as
 their image in the template. Input artifact IDs are validated
 for both existence and name match against the declared slot.
+
+### Project-provided MCP servers
+
+Projects can provide custom MCP servers by mounting a directory
+into the agent container at ``/workspace/.mcp_servers/``. The
+agent runner scans this directory on startup for files matching
+``*_mcp_server.py`` and registers each one by name (derived by
+stripping the ``_mcp_server.py`` suffix).
+
+An optional sidecar manifest (``*_mcp_server.json``) can list
+tool names to pre-register in ``allowed_tools``. If absent, tools
+are discovered via MCP handshake.
+
+All container environment variables are passed to mounted MCP
+server subprocesses. This is safe because the host controls the
+container's environment, and there are no secrets leaking from
+inside Docker.
 
 ## Workspaces
 
