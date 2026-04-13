@@ -183,7 +183,15 @@ def _emit(data: dict) -> None:
 
 
 def _save_state(session_id: str, status: str, reason: str = "") -> None:
-    """Persist agent state for resume and external visibility."""
+    """Persist agent state for resume and external visibility.
+
+    NOTE: The session_id saved here is only useful for resume if
+    the container is still running.  The SDK stores session history
+    as local files at ~/.claude/projects/<cwd>/<session-id>.jsonl
+    inside the container — these are lost when the container dies.
+    To support cross-container resume, mount a persistent volume
+    at /home/claude/.claude/projects/.  See docs/architecture.md.
+    """
     state = {
         "session_id": session_id,
         "status": status,

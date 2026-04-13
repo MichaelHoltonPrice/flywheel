@@ -276,10 +276,23 @@ On startup, the runner also checks for:
   the interrupted session automatically.
 
 **Assumptions:** The Docker container remains running between
-pause and resume. Session history is stored in the container's
-filesystem by the SDK. Cross-container resume would require
-mounting the SDK's session storage directory, which is not yet
-supported.
+pause and resume. The Claude Agent SDK stores session history
+as local JSONL files at
+``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` inside
+the container. These files are lost when the container dies.
+The ``session_id`` alone is not enough to resume — the SDK
+needs the local session file.
+
+To support cross-container resume, mount a persistent volume
+at ``/home/claude/.claude/projects/`` (in addition to the
+existing auth volume at ``/home/claude/.claude/``), and ensure
+the working directory matches across containers. This is not
+yet implemented.
+
+Alternatively, avoid session resume entirely: capture results
+as artifacts and pass them into a fresh session's prompt. This
+is the approach the artifact-based architecture naturally
+supports.
 
 ### Block bridge
 
