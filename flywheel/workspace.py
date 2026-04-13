@@ -8,6 +8,7 @@ provenance graph.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import uuid
@@ -141,6 +142,80 @@ class Workspace:
             [a for a in self.artifacts.values() if a.name == artifact_name],
             key=lambda a: a.created_at,
         )
+
+    def materialize_sequence(
+        self,
+        source_name: str,
+        target_name: str,
+        filename: str = "history.jsonl",
+    ) -> ArtifactInstance:
+        """Assemble all instances of *source_name* into a single JSONL artifact.
+
+        Reads the first JSON file from each source artifact directory
+        (ordered by ``created_at``), writes one JSON line per instance
+        to a new artifact registered under *target_name*.
+
+        Args:
+            source_name: The artifact declaration name to read from
+                (e.g., ``"game_step"``).
+            target_name: The artifact declaration name to write to
+                (e.g., ``"game_history"``). Must be a declared copy
+                artifact.
+            filename: Name of the output file inside the artifact
+                directory.
+
+        Returns:
+            The created ArtifactInstance for the materialized file.
+
+        Raises:
+            ValueError: If source or target names are not declared,
+                or no source instances exist.
+        """
+        instances = self.instances_for(source_name)
+        if not instances:
+            raise ValueError(
+                f"No instances of {source_name!r} to materialize"
+            )
+
+        # Allocate artifact directory for the output.
+        artifact_id = self.generate_artifact_id(target_name)
+        target_dir = self.path / "artifacts" / artifact_id
+        target_dir.mkdir(parents=True)
+
+        try:
+            output_path = target_dir / filename
+            with open(output_path, "w", encoding="utf-8") as out:
+                for inst in instances:
+                    if inst.kind != "copy" or inst.copy_path is None:
+                        continue
+                    src_dir = self.path / "artifacts" / inst.copy_path
+                    # Read the first .json file in the directory.
+                    json_files = sorted(src_dir.glob("*.json"))
+                    if not json_files:
+                        continue
+                    raw = json_files[0].read_text(encoding="utf-8")
+                    # Normalize to single line.
+                    data = json.loads(raw)
+                    out.write(
+                        json.dumps(data, separators=(",", ":")) + "\n"
+                    )
+
+            instance = ArtifactInstance(
+                id=artifact_id,
+                name=target_name,
+                kind="copy",
+                created_at=datetime.now(UTC),
+                produced_by=None,
+                source=f"materialized from {len(instances)} "
+                       f"{source_name!r} instances",
+                copy_path=artifact_id,
+            )
+            self.add_artifact(instance)
+            self.save()
+            return instance
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
 
     def register_artifact(
         self,

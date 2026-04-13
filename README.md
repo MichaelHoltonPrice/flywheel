@@ -16,6 +16,14 @@ decisions (future work is noted separately at the end).
 ## Setup
 
 ```bash
+python -m venv .venv
+
+# Windows (Git Bash)
+source .venv/Scripts/activate
+
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -e ".[dev]"
 ```
 

@@ -217,15 +217,82 @@ The lifecycle:
    latest artifacts from prior steps so the agent can continue
    where the previous step left off.
 2. Start a block bridge service (HTTP, background thread).
-3. Launch the agent container with the workspace, source mounts,
+3. Run the optional ``pre_launch_hook`` callback. Projects use
+   this for game-specific init, artifact creation, or writing
+   files to the workspace before the container starts. The
+   bridge is already running, so the hook can create artifacts.
+4. Launch the agent container with the workspace, source mounts,
    auth volume, and the bridge endpoint as an environment variable.
-4. Stream JSON events from the agent's stdout and log them.
-5. On completion (or timeout), collect output artifacts from the
+   Stderr is drained in a background thread to prevent pipe
+   deadlocks.
+5. Stream JSON events from the agent's stdout and log them.
+6. On completion (or timeout), collect output artifacts from the
    agent workspace by matching filenames to declared output names.
-6. Stop the bridge service.
+7. Stop the bridge service.
 
 A total timeout (default 4 hours) kills the agent container if
 exceeded, ensuring hung agents do not block indefinitely.
+
+### Agent pause and resume
+
+Long-running agents can hit API rate limits or consume excessive
+budget in a single session. The agent runner
+(`batteries/claude/agent_runner.py`) supports pausing and resuming
+to handle both cases.
+
+**Pause triggers:**
+
+- **Max turns** (`MAX_TURNS` env var). The SDK stops the query
+  and emits a `ResultMessage` with `subtype == "error_max_turns"`.
+  The runner detects this and pauses. This is opt-in — omit
+  `MAX_TURNS` to let the agent run to natural completion.
+- **Rate limit rejection**. The SDK yields a `RateLimitEvent`
+  with `rate_limit_info.status == "rejected"`. The runner breaks
+  out of the query loop and pauses. Rate limit exceptions raised
+  outside the event stream are also caught.
+
+**Pause behavior:**
+
+On pause, the runner:
+1. Writes `.agent_state.json` to the workspace with the session
+   ID, status (`"paused"`), and reason (`"max_turns"` or
+   `"rate_limit"`).
+2. Emits an `agent_state` JSON event to stdout.
+3. Polls every 5 seconds for a `.agent_resume` file in the
+   workspace.
+
+**Resume:**
+
+The host (or user) writes a `.agent_resume` file to the shared
+workspace mount. The file content is used as the resume prompt
+(an empty file defaults to "Continue from where you left off.").
+The runner reads and deletes the file, then calls `query()` with
+`options.resume = session_id` to continue the conversation with
+full history.
+
+On startup, the runner also checks for:
+- `RESUME_SESSION` env var — resume a specific session immediately.
+- A saved `.agent_state.json` with `status == "paused"` — resume
+  the interrupted session automatically.
+
+**Assumptions:** The Docker container remains running between
+pause and resume. The Claude Agent SDK stores session history
+as local JSONL files at
+``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` inside
+the container. These files are lost when the container dies.
+The ``session_id`` alone is not enough to resume — the SDK
+needs the local session file.
+
+To support cross-container resume, mount a persistent volume
+at ``/home/claude/.claude/projects/`` (in addition to the
+existing auth volume at ``/home/claude/.claude/``), and ensure
+the working directory matches across containers. This is not
+yet implemented.
+
+Alternatively, avoid session resume entirely: capture results
+as artifacts and pass them into a fresh session's prompt. This
+is the approach the artifact-based architecture naturally
+supports.
 
 ### Block bridge
 
@@ -234,7 +301,9 @@ trigger nested block executions within the same workspace. It is
 not specific to evaluation -- the invoked block and what it does
 are defined by the project's template, not by flywheel.
 
-When a request arrives, the bridge:
+The bridge supports two modes:
+
+**Invoke mode** (default): launches a Docker container.
 
 1. Validates the block name against the template and an optional
    allowed-blocks list.
@@ -249,6 +318,32 @@ When a request arrives, the bridge:
 
 An invocation budget (``max_invocations``) limits how many
 blocks the agent can trigger per step.
+
+**Record mode**: creates artifacts without launching a container.
+Used for provenance tracking of actions that already happened
+(e.g., game steps executed via a REST API). The request includes
+structured output data as JSON; the bridge writes it to artifact
+directories and records a ``BlockExecution`` with input/output
+bindings. Record-mode blocks use the ``__record__`` sentinel as
+their image in the template. Input artifact IDs are validated
+for both existence and name match against the declared slot.
+
+### Project-provided MCP servers
+
+Projects can provide custom MCP servers by mounting a directory
+into the agent container at ``/workspace/.mcp_servers/``. The
+agent runner scans this directory on startup for files matching
+``*_mcp_server.py`` and registers each one by name (derived by
+stripping the ``_mcp_server.py`` suffix).
+
+An optional sidecar manifest (``*_mcp_server.json``) can list
+tool names to pre-register in ``allowed_tools``. If absent, tools
+are discovered via MCP handshake.
+
+All container environment variables are passed to mounted MCP
+server subprocesses. This is safe because the host controls the
+container's environment, and there are no secrets leaking from
+inside Docker.
 
 ## Workspaces
 

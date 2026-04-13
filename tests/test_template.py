@@ -476,3 +476,50 @@ blocks:
         template = Template.from_yaml(path)
         assert template.artifacts[0].name == "my-data_01"
         assert template.blocks[0].name == "my-block_v2"
+
+
+class TestRecordSentinelImage:
+    def test_record_image_parses(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: session
+    kind: copy
+  - name: step
+    kind: copy
+blocks:
+  - name: game_step
+    image: "__record__"
+    inputs:
+      - name: session
+        container_path: /input/session
+    outputs:
+      - name: session
+        container_path: /output/session
+      - name: step
+        container_path: /output/step
+"""
+        path = tmp_path / "record.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        assert len(template.blocks) == 1
+        assert template.blocks[0].image == "__record__"
+        assert len(template.blocks[0].inputs) == 1
+        assert len(template.blocks[0].outputs) == 2
+
+    def test_same_artifact_in_input_and_output(self, tmp_path: Path):
+        """Session appears in both inputs and outputs — must be valid."""
+        yaml_content = """\
+artifacts:
+  - name: session
+    kind: copy
+blocks:
+  - name: step
+    image: "__record__"
+    inputs: [session]
+    outputs: [session]
+"""
+        path = tmp_path / "record.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+        assert template.blocks[0].inputs[0].name == "session"
+        assert template.blocks[0].outputs[0].name == "session"

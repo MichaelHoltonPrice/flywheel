@@ -22,7 +22,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,11 @@ def run_agent_block(
     input_artifacts: dict[str, str] | None = None,
     output_names: list[str] | None = None,
     overrides: dict[str, Any] | None = None,
+    mcp_servers: str | None = None,
+    allowed_tools: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    extra_mounts: list[tuple[str, str, str]] | None = None,
+    pre_launch_hook: Callable[[Path], None] | None = None,
 ) -> AgentResult:
     """Run an agent block execution.
 
@@ -108,6 +115,20 @@ def run_agent_block(
             the agent workspace after completion.
         overrides: CLI flag overrides passed to invoked containers
             (e.g., {"subclass": "dueling", "episodes": "4000"}).
+        mcp_servers: Comma-separated MCP server names to enable
+            (default: "eval"). Project-specific servers are discovered
+            from mounted directories.
+        allowed_tools: Comma-separated tool whitelist for the agent
+            (default: "Read,Write,Edit,Glob,Grep").
+        extra_env: Additional environment variables to pass to the
+            agent container.
+        extra_mounts: Additional volume mounts as (host, container,
+            mode) tuples.
+        pre_launch_hook: Optional callback invoked after workspace
+            creation and seeding but before container launch.
+            Receives the agent workspace path. Use this for
+            project-specific setup (writing files, creating
+            artifacts, etc.).
 
     Returns:
         AgentResult with exit code, elapsed time, and invocation count.
@@ -180,21 +201,40 @@ def run_agent_block(
                         f"{_resolve_path(host_path)}:/input/{mount_name}:ro",
                     ])
 
+    # Extra mounts (e.g., project MCP servers, game data).
+    if extra_mounts:
+        for host_path, container_path, mode in extra_mounts:
+            cmd.extend([
+                "-v", f"{_resolve_path(Path(host_path))}:{container_path}:{mode}",
+            ])
+
     # Environment variables.
-    # EVAL_BLOCK tells the MCP server which block to invoke by
-    # default when the agent calls evaluate(). Projects can override
-    # this to point at a different block name.
     default_block = allowed_blocks[0] if allowed_blocks else "eval_bot"
     env_vars = {
         "EVAL_ENDPOINT": bridge_endpoint,
         "EVAL_BLOCK": default_block,
-        "MCP_SERVERS": "eval",
-        "ALLOWED_TOOLS": "Read,Write,Edit,Glob,Grep",
+        "MCP_SERVERS": mcp_servers or "eval",
+        "ALLOWED_TOOLS": allowed_tools or "Read,Write,Edit,Glob,Grep",
     }
     if model:
         env_vars["MODEL"] = model
     if max_turns is not None:
         env_vars["MAX_TURNS"] = str(max_turns)
+    # Disable Python output buffering so the host sees events
+    # immediately (without this, stdout is block-buffered inside
+    # Docker and the host event log lags behind).
+    env_vars["PYTHONUNBUFFERED"] = "1"
+
+    if extra_env:
+        env_vars.update(extra_env)
+
+    # Project-specific pre-launch setup (e.g., game init, writing
+    # files to the workspace, creating artifacts).
+    if pre_launch_hook is not None:
+        pre_launch_hook(agent_ws)
+        # The hook may have added env vars via extra_env mutation.
+        if extra_env:
+            env_vars.update(extra_env)
 
     for key, value in env_vars.items():
         cmd.extend(["-e", f"{key}={value}"])
@@ -225,6 +265,17 @@ def run_agent_block(
         process.stdin.write(prompt)
         process.stdin.close()
 
+        # Drain stderr in a background thread to prevent deadlock
+        # if the child writes more than the OS pipe buffer allows.
+        stderr_log = workspace.path / "agent_stderr.log"
+        def _drain_stderr():
+            with open(stderr_log, "w", encoding="utf-8") as f:
+                for line in process.stderr:
+                    f.write(line)
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Stream stdout (JSON events from agent_runner.py).
         with open(event_log, "w") as log_f:
             for line in process.stdout:
@@ -249,6 +300,7 @@ def run_agent_block(
                     break
 
         process.wait()
+        stderr_thread.join(timeout=5)
     except KeyboardInterrupt:
         if process is not None:
             print("  [agent] interrupted -- terminating container")
