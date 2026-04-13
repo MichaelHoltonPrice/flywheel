@@ -10,18 +10,29 @@ The game is initialized by the host before the agent starts.  The
 agent receives ARC_CARD_ID and ARC_GUID as environment variables
 and connects automatically on the first tool call.
 
+After each action, the server POSTs step data to the host-side
+block bridge in record mode, creating ``game_step`` and
+``game_session`` artifacts with full provenance tracking. Tracking
+failures are silently dropped -- they never break gameplay.
+
 Environment variables:
     ARC_SERVER_URL  -- Base URL of the game server
                       (e.g., "http://host.docker.internal:8001").
     GAME_ID         -- Game being played (e.g., "vc33-9851e02b").
     ARC_CARD_ID     -- Scorecard ID (created by host).
     ARC_GUID        -- Game session GUID (created by host).
+    EVAL_ENDPOINT   -- Block bridge URL for artifact tracking
+                      (optional; no tracking if absent).
+    ARC_SESSION_ARTIFACT_ID -- Initial game_session artifact ID
+                      (optional; set by host for provenance chain).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -41,6 +52,24 @@ _bridge_endpoint: str = ""
 _current_session_id: str = ""
 _last_frame: list | None = None  # last known frame for pre-state
 _last_score: int = 0
+
+
+def _hydrate_initial_state() -> None:
+    """Read the initial frame written by the host into tracking globals.
+
+    The host writes ``.arc_initial_state.json`` to /workspace before
+    the agent starts. This gives the first game_step a valid pre_state.
+    """
+    global _last_frame, _last_score
+    state_path = Path("/workspace/.arc_initial_state.json")
+    if not state_path.exists():
+        return
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        _last_frame = data.get("frame")
+        _last_score = data.get("score", 0)
+    except Exception:
+        pass  # Best-effort; don't break startup.
 
 
 def _ensure_connected() -> str | None:
@@ -70,6 +99,10 @@ def _ensure_connected() -> str | None:
         return "ERROR: ARC_GUID environment variable not set."
 
     _client = httpx.Client(timeout=30.0)
+
+    # Hydrate initial frame from host-written file so the first
+    # game_step artifact has a valid pre_state.
+    _hydrate_initial_state()
 
     # Artifact tracking (optional -- graceful if absent).
     _bridge_endpoint = os.environ.get("EVAL_ENDPOINT", "")
@@ -273,7 +306,7 @@ def reset_level() -> str:
     Use this to restart the current level if you're stuck or
     want to try a different approach.
     """
-    global _guid, _last_frame, _last_score
+    global _action_count, _guid, _last_frame, _last_score
 
     err = _ensure_connected()
     if err:
@@ -283,8 +316,10 @@ def reset_level() -> str:
     score_before = _last_score
     t0 = time.monotonic()
 
+    _action_count += 1
     data = _post("RESET", {})
     if "error" in data:
+        _action_count -= 1  # Don't count failed resets.
         return f"ERROR: {data['error']} {data.get('detail', '')}"
 
     elapsed = time.monotonic() - t0

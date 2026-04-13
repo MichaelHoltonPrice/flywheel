@@ -261,6 +261,42 @@ class TestRecordMode:
         assert resp["ok"] is False
         assert resp["error_type"] == "unknown_artifact"
 
+    def test_slot_name_mismatch_returns_error(self, tmp_path: Path):
+        """Binding a game_step artifact to a game_session slot is rejected."""
+        template, ws = _make_workspace(tmp_path)
+        session = _seed_session(ws)
+
+        # First create a game_step artifact.
+        resp1 = _process_record_invocation(
+            request_id="test_0001",
+            block_name="game_step",
+            inputs={"game_session": session.id},
+            outputs={
+                "game_session": {"card_id": "c1", "action_count": 1},
+                "game_step": {"step_index": 1},
+            },
+            elapsed_s=0.1,
+            template=template,
+            workspace=ws,
+        )
+        step_aid = resp1["game_step_artifact_id"]
+
+        # Try to use the game_step artifact as a game_session input.
+        resp2 = _process_record_invocation(
+            request_id="test_0002",
+            block_name="game_step",
+            inputs={"game_session": step_aid},
+            outputs={
+                "game_session": {"card_id": "c1", "action_count": 2},
+                "game_step": {"step_index": 2},
+            },
+            elapsed_s=0.1,
+            template=template,
+            workspace=ws,
+        )
+        assert resp2["ok"] is False
+        assert resp2["error_type"] == "slot_mismatch"
+
     def test_missing_required_input_no_instances(self, tmp_path: Path):
         template, ws = _make_workspace(tmp_path)
 

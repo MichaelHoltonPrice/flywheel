@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -333,6 +334,15 @@ def run_agent_block(
         print(f"  [agent] ARC game initialized: card={card_id[:8]}... "
               f"guid={guid[:8]}...")
 
+        # Write initial frame to workspace so the MCP server can
+        # hydrate pre-state tracking for the first game step.
+        initial_state_file = agent_ws / ".arc_initial_state.json"
+        initial_grid = raw_data.get("frame", [[]])[0]
+        initial_state_file.write_text(json.dumps({
+            "frame": initial_grid,
+            "score": raw_data.get("score", 0),
+        }), encoding="utf-8")
+
         # Create initial game_spec and game_session artifacts if the
         # template declares them.
         if "game_spec" in workspace.artifact_declarations:
@@ -403,6 +413,17 @@ def run_agent_block(
         process.stdin.write(prompt)
         process.stdin.close()
 
+        # Drain stderr in a background thread to prevent deadlock
+        # if the child writes more than the OS pipe buffer allows.
+        stderr_log = workspace.path / "agent_stderr.log"
+        def _drain_stderr():
+            with open(stderr_log, "w", encoding="utf-8") as f:
+                for line in process.stderr:
+                    f.write(line)
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Stream stdout (JSON events from agent_runner.py).
         with open(event_log, "w") as log_f:
             for line in process.stdout:
@@ -427,6 +448,7 @@ def run_agent_block(
                     break
 
         process.wait()
+        stderr_thread.join(timeout=5)
     except KeyboardInterrupt:
         if process is not None:
             print("  [agent] interrupted -- terminating container")

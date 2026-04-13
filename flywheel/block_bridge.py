@@ -7,6 +7,16 @@ HTTP service that receives such requests and dispatches them as
 real flywheel block executions, reading the block definition from
 the template.
 
+Two modes are supported:
+
+- **Invoke mode** (default): launches a Docker container for the
+  block, mounts input/output artifact directories, and records
+  the execution.
+- **Record mode**: creates artifacts and execution records without
+  launching a container. Used for provenance tracking of actions
+  that already happened (e.g., game steps via a REST API).
+  Record-mode blocks use the ``__record__`` sentinel image.
+
 This is a generic flywheel capability. The blocks being invoked
 and what they do (evaluation, validation, compilation, etc.) are
 project-specific — defined by the template, not by flywheel.
@@ -278,7 +288,7 @@ def _process_record_invocation(
                 f"{RECORD_SENTINEL!r})"),
         }
 
-    # Validate input artifact IDs exist in workspace.
+    # Validate input artifact IDs exist in workspace and match the slot.
     input_bindings: dict[str, str] = {}
     for slot in block_def.inputs:
         artifact_id = inputs.get(slot.name, "")
@@ -292,6 +302,18 @@ def _process_record_invocation(
                     "message": (
                         f"Input artifact {artifact_id!r} not found "
                         f"in workspace"),
+                }
+            actual_name = workspace.artifacts[artifact_id].name
+            if actual_name != slot.name:
+                return {
+                    "request_id": request_id,
+                    "ok": False,
+                    "retryable": False,
+                    "error_type": "slot_mismatch",
+                    "message": (
+                        f"Input artifact {artifact_id!r} has name "
+                        f"{actual_name!r} but slot expects "
+                        f"{slot.name!r}"),
                 }
             input_bindings[slot.name] = artifact_id
         elif not slot.optional:

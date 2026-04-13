@@ -216,13 +216,19 @@ The lifecycle:
 1. Create a fresh agent workspace directory. Seed it with the
    latest artifacts from prior steps so the agent can continue
    where the previous step left off.
-2. Start a block bridge service (HTTP, background thread).
-3. Launch the agent container with the workspace, source mounts,
+2. If ARC-AGI-3 env vars are present (`ARC_SERVER_URL`, `GAME_ID`),
+   create a scorecard on the game server, create initial
+   `game_spec` and `game_session` artifacts in the workspace, and
+   inject the initial frame into the agent prompt.
+3. Start a block bridge service (HTTP, background thread).
+4. Launch the agent container with the workspace, source mounts,
    auth volume, and the bridge endpoint as an environment variable.
-4. Stream JSON events from the agent's stdout and log them.
-5. On completion (or timeout), collect output artifacts from the
+   Stderr is drained in a background thread to prevent pipe
+   deadlocks.
+5. Stream JSON events from the agent's stdout and log them.
+6. On completion (or timeout), collect output artifacts from the
    agent workspace by matching filenames to declared output names.
-6. Stop the bridge service.
+7. Stop the bridge service.
 
 A total timeout (default 4 hours) kills the agent container if
 exceeded, ensuring hung agents do not block indefinitely.
@@ -282,7 +288,9 @@ trigger nested block executions within the same workspace. It is
 not specific to evaluation -- the invoked block and what it does
 are defined by the project's template, not by flywheel.
 
-When a request arrives, the bridge:
+The bridge supports two modes:
+
+**Invoke mode** (default): launches a Docker container.
 
 1. Validates the block name against the template and an optional
    allowed-blocks list.
@@ -297,6 +305,15 @@ When a request arrives, the bridge:
 
 An invocation budget (``max_invocations``) limits how many
 blocks the agent can trigger per step.
+
+**Record mode**: creates artifacts without launching a container.
+Used for provenance tracking of actions that already happened
+(e.g., game steps executed via a REST API). The request includes
+structured output data as JSON; the bridge writes it to artifact
+directories and records a ``BlockExecution`` with input/output
+bindings. Record-mode blocks use the ``__record__`` sentinel as
+their image in the template. Input artifact IDs are validated
+for both existence and name match against the declared slot.
 
 ## Workspaces
 

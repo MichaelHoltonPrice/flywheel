@@ -9,12 +9,12 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 - **Artifacts** have two levels: declarations (template-level types like "checkpoint" or "score") and instances (concrete, immutable records produced by block executions). Two storage kinds exist: copy artifacts (files in the workspace) and git artifacts (references to version-controlled code).
 - **Workspaces** are created from templates and accumulate artifact instances and execution records over their lifetime. The workspace is a history, not a snapshot.
 - **The foundry** is the flywheel-managed directory within a project, holding templates and workspaces. It is a peer to the project source code.
-- **Agent blocks** are a special block execution variant where an AI agent can trigger nested block executions via a block bridge HTTP service. The bridge reads block definitions from the template -- what those blocks do (evaluation, validation, etc.) is project-specific, not a flywheel concern. See `flywheel/agent.py` and `flywheel/block_bridge.py`.
+- **Agent blocks** are a special block execution variant where an AI agent can trigger nested block executions via a block bridge HTTP service. The bridge reads block definitions from the template -- what those blocks do (evaluation, validation, etc.) is project-specific, not a flywheel concern. The bridge supports two modes: **invoke** (launches a Docker container) and **record** (creates artifacts without containers, for provenance tracking of actions that already happened). Record-mode blocks use the `__record__` sentinel as their image. See `flywheel/agent.py` and `flywheel/block_bridge.py`.
 
 ## Batteries (solve-once capabilities)
 
 - Computer use agent (CUA) -- X11 session management, screenshot loop
-- Claude Code agent wrapper (`batteries/claude/`) -- Dockerfile, agent runner with pause/resume support, MCP server for nested block invocation. See `docs/architecture.md` "Agent pause and resume" for the mechanism.
+- Claude Code agent wrapper (`batteries/claude/`) -- Dockerfile, agent runner with pause/resume support, MCP servers for nested block invocation and ARC-AGI-3 game interaction. See `docs/architecture.md` "Agent pause and resume" for the mechanism.
 
 ## Build and test
 
