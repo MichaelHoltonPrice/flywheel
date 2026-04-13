@@ -7,6 +7,7 @@ Tests _scan_mounted_servers() which scans a directory for
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -125,3 +126,13 @@ class TestScanMountedServers:
         config, _ = factory()
         assert config["env"]["GAME_ID"] == "vc33-test"
         assert config["env"]["CUSTOM_VAR"] == "hello"
+
+    def test_default_mount_dir_when_env_unset(self):
+        """When MCP_SERVER_MOUNT_DIR is not set, uses the default path."""
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MCP_SERVER_MOUNT_DIR", None)
+            servers = _scan_mounted_servers()
+
+        # Default is /workspace/.mcp_servers which won't exist on
+        # the host, so this should return empty — not crash.
+        assert servers == {}
