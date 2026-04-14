@@ -33,6 +33,11 @@ Environment variables:
                       servers at /workspace/.mcp_servers/.
     RESUME_SESSION_FILE — Path to a .jsonl session file to resume
                       on startup. The filename stem is the session ID.
+    TOOLS           — Comma-separated list of built-in tools to
+                      enable. Overrides the default tool set. Use to
+                      restrict agents to a safe subset (e.g., no web
+                      access). If unset, all built-in tools are
+                      available.
     PAUSE_ON_TOOLS  — Comma-separated tool names that trigger a
                       PostToolUse pause check. After each listed tool
                       completes, the hook checks for .agent_pause in
@@ -415,12 +420,20 @@ async def main() -> None:
         context_window = 1_000_000
     compact_token_limit = int(context_window * COMPACT_THRESHOLD)
 
+    # --- Built-in tool whitelist ---
+    tools_str = os.environ.get("TOOLS", "")
+    tools_whitelist = [
+        t.strip() for t in tools_str.split(",") if t.strip()
+    ] if tools_str else None
+
     # --- Build options ---
     options = ClaudeAgentOptions(
         cwd="/workspace",
         allowed_tools=allowed_tools,
         permission_mode="bypassPermissions",
     )
+    if tools_whitelist is not None:
+        options.tools = tools_whitelist
     if model:
         options.model = model
     if mcp_servers:
