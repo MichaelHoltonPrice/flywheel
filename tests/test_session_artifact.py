@@ -22,9 +22,13 @@ def _import_helpers():
     sdk_mock = type(sys)("claude_agent_sdk")
     sdk_mock.ClaudeAgentOptions = object
     sdk_mock.ClaudeSDKClient = object
+    sdk_mock.HookMatcher = object
     types_mock = type(sys)("claude_agent_sdk.types")
     types_mock.AssistantMessage = object
     types_mock.ResultMessage = object
+    types_mock.HookContext = object
+    types_mock.PostToolUseHookInput = dict
+    types_mock.SyncHookJSONOutput = dict
 
     with patch.dict(sys.modules, {
         "claude_agent_sdk": sdk_mock,
