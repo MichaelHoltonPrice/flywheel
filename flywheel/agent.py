@@ -76,12 +76,13 @@ def _read_stdout(
     event_log: Path,
     start_time: float,
     total_timeout: int,
+    container_name: str = "",
 ) -> None:
     """Read agent stdout in a background thread.
 
     Writes JSON events to the event log, prints summaries via
-    ``_log_event``, and kills the process if the total timeout is
-    exceeded.
+    ``_log_event``, and requests a graceful stop if the total
+    timeout is exceeded.
     """
     with open(event_log, "w") as log_f:
         for line in process.stdout:
@@ -99,8 +100,15 @@ def _read_stdout(
 
             if time.monotonic() - start_time > total_timeout:
                 print(f"  [agent] total timeout "
-                      f"({total_timeout}s) exceeded -- killing")
-                process.kill()
+                      f"({total_timeout}s) exceeded -- stopping")
+                if container_name:
+                    subprocess.run(
+                        ["docker", "exec", container_name,
+                         "touch", "/workspace/.agent_stop"],
+                        capture_output=True, timeout=10,
+                    )
+                else:
+                    process.kill()
                 break
 
 
@@ -440,7 +448,8 @@ def launch_agent_block(
 
     stdout_thread = threading.Thread(
         target=_read_stdout,
-        args=(process, event_log, start, total_timeout),
+        args=(process, event_log, start, total_timeout,
+              container_name),
         daemon=True,
     )
     stdout_thread.start()
