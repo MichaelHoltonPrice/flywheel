@@ -31,13 +31,15 @@ Environment variables:
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
                       Built-in: eval. Projects can mount additional
                       servers at /workspace/.mcp_servers/.
-    RESUME_SESSION  — Session ID to resume on startup (optional)
+    RESUME_SESSION_FILE — Path to a .jsonl session file to resume
+                      on startup. The filename stem is the session ID.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -62,6 +64,58 @@ POLL_INTERVAL = 5  # seconds between resume-file checks
 # of the estimated context window.
 COMPACT_THRESHOLD = 0.20
 DEFAULT_CONTEXT_WINDOW = 200_000
+
+# Session artifact: export the SDK session JSONL on exit so flywheel
+# can collect it as an artifact for cross-container resume.
+SESSION_OUTPUT_FILE = WORKSPACE / "agent_session.jsonl"
+SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _encode_cwd(cwd: str) -> str:
+    """Encode a cwd path the way the Claude SDK does internally.
+
+    Every non-alphanumeric character is replaced with a hyphen.
+    For cwd="/workspace", the result is "-workspace".
+    """
+    return "".join(c if c.isalnum() else "-" for c in cwd)
+
+
+def _sdk_session_path(
+    session_id: str, cwd: str = "/workspace",
+) -> Path:
+    """Return the path where the Claude SDK stores session history."""
+    encoded = _encode_cwd(cwd)
+    return SDK_PROJECTS_DIR / encoded / f"{session_id}.jsonl"
+
+
+def _export_session(session_id: str) -> None:
+    """Copy the SDK session JSONL to the workspace for artifact collection.
+
+    Called in a finally block on exit, so it must not raise.
+    """
+    if not session_id:
+        return
+    try:
+        src = _sdk_session_path(session_id)
+        if src.exists():
+            shutil.copy2(src, SESSION_OUTPUT_FILE)
+            _emit({
+                "type": "session_export",
+                "session_id": session_id,
+                "path": str(SESSION_OUTPUT_FILE),
+            })
+        else:
+            _emit({
+                "type": "session_export_skip",
+                "session_id": session_id,
+                "reason": f"SDK session file not found: {src}",
+            })
+    except Exception as exc:
+        _emit({
+            "type": "session_export_error",
+            "session_id": session_id,
+            "message": str(exc),
+        })
 
 
 # ------------------------------------------------------------------
@@ -320,9 +374,26 @@ async def main() -> None:
     if max_turns:
         options.max_turns = max_turns
 
+    # --- Session resume from file ---
+    resume_session_file = os.environ.get("RESUME_SESSION_FILE", "")
+    session_id = ""
+    if resume_session_file:
+        resume_path = Path(resume_session_file)
+        if resume_path.exists() and resume_path.suffix == ".jsonl":
+            resume_sid = resume_path.stem
+            sdk_dest = _sdk_session_path(resume_sid)
+            sdk_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resume_path, sdk_dest)
+            options.resume = resume_sid
+            session_id = resume_sid
+            _emit({
+                "type": "session_resume",
+                "session_id": resume_sid,
+                "source": str(resume_path),
+            })
+
     # --- Connect and run ---
     last_input_tokens = 0
-    session_id = ""
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -492,6 +563,10 @@ async def main() -> None:
             return
         _emit({"type": "error", "message": str(e)})
         _save_state(session_id, "paused", "error")
+    finally:
+        # Export the session JSONL for artifact collection, regardless
+        # of how the agent exited (success, error, SIGTERM).
+        _export_session(session_id)
 
 
 if __name__ == "__main__":

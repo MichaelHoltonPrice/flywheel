@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -65,6 +66,7 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
     _stopping: threading.Event
     _active_container: list  # [str | None]
     _service_id: str
+    _on_record: Callable[[str, dict], None] | None
 
     def do_POST(self):  # noqa: N802
         """Handle a POST request to invoke a block execution."""
@@ -135,6 +137,13 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(200, response)
+
+            # Notify caller of the successful record.
+            if self._on_record is not None and response.get("ok"):
+                with contextlib.suppress(Exception):
+                    self._on_record(
+                        block_name, payload.get("outputs", {}))
+
             return
 
         # Invoke mode (default): launch a container.
@@ -673,6 +682,7 @@ class BlockBridgeService:
         max_invocations: int | None = None,
         host: str = "0.0.0.0",
         port: int = 0,
+        on_record: Callable[[str, dict], None] | None = None,
     ):
         """Initialize the block bridge service.
 
@@ -686,6 +696,9 @@ class BlockBridgeService:
                 (None = unlimited).
             host: Host to bind to.
             port: Port to listen on (0 = auto-assign).
+            on_record: Callback fired after a successful record-mode
+                invocation. Receives (block_name, outputs). Runs in
+                the HTTP handler thread — must be thread-safe.
         """
         self.template = template
         self.workspace = workspace
@@ -694,6 +707,7 @@ class BlockBridgeService:
         self.max_invocations = max_invocations
         self.host = host
         self.port = port
+        self.on_record = on_record
 
         self._service_id = secrets.token_hex(4)
         self._server: HTTPServer | None = None
@@ -725,6 +739,7 @@ class BlockBridgeService:
             _stopping = stopping
             _active_container = active_container
             _service_id = service_id
+            _on_record = self.on_record
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
