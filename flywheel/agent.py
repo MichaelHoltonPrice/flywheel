@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +129,7 @@ class AgentHandle:
         agent_image: str,
         stdout_thread: threading.Thread,
         stderr_thread: threading.Thread,
+        container_name: str = "",
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
@@ -140,6 +142,7 @@ class AgentHandle:
         self._agent_image = agent_image
         self._stdout_thread = stdout_thread
         self._stderr_thread = stderr_thread
+        self._container_name = container_name
         self._waited = False
 
     def is_alive(self) -> bool:
@@ -147,11 +150,22 @@ class AgentHandle:
         return self._process.poll() is None
 
     def kill(self) -> None:
-        """Kill the container process.
+        """Stop the Docker container.
+
+        Uses ``docker stop`` to reliably terminate the container
+        (``process.kill()`` only kills the docker CLI on Windows,
+        leaving the container running).
 
         The caller **must** still call ``wait()`` afterward to join
         threads, stop the bridge, and collect artifacts.
         """
+        if self._container_name:
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["docker", "stop", "-t", "5",
+                     self._container_name],
+                    capture_output=True, timeout=15,
+                )
         with contextlib.suppress(OSError):
             self._process.kill()
 
@@ -311,8 +325,9 @@ def launch_agent_block(
     port = bridge.start()
     bridge_endpoint = f"http://host.docker.internal:{port}"
 
-    # Build Docker command.
-    cmd = ["docker", "run", "--rm", "-i"]
+    # Build Docker command with a named container for reliable stop.
+    container_name = f"flywheel-{uuid.uuid4().hex[:12]}"
+    cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
 
     if isolated_network:
         cmd.extend(["--cap-add=NET_ADMIN"])
@@ -439,6 +454,7 @@ def launch_agent_block(
         agent_image=agent_image,
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
+        container_name=container_name,
     )
 
 
