@@ -232,7 +232,7 @@ def launch_agent_block(
     extra_mounts: list[tuple[str, str, str]] | None = None,
     pre_launch_hook: Callable[[Path], None] | None = None,
     on_record: Callable[[str, dict], None] | None = None,
-    isolated_network: str | None = None,
+    isolated_network: bool = False,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -315,10 +315,7 @@ def launch_agent_block(
     cmd = ["docker", "run", "--rm", "-i"]
 
     if isolated_network:
-        cmd.extend(["--network", isolated_network])
-        cmd.extend([
-            "--add-host", "host.docker.internal:host-gateway",
-        ])
+        cmd.extend(["--cap-add=NET_ADMIN"])
 
     cmd.extend(["-v", f"{auth_volume}:/home/claude/.claude"])
     cmd.extend(["-v", f"{_resolve_path(agent_ws)}:/workspace"])
@@ -371,6 +368,8 @@ def launch_agent_block(
     if max_turns is not None:
         env_vars["MAX_TURNS"] = str(max_turns)
     env_vars["PYTHONUNBUFFERED"] = "1"
+    if isolated_network:
+        env_vars["NETWORK_ISOLATION"] = "1"
 
     if extra_env:
         env_vars.update(extra_env)
@@ -463,7 +462,7 @@ def run_agent_block(
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str, str]] | None = None,
     pre_launch_hook: Callable[[Path], None] | None = None,
-    isolated_network: str | None = None,
+    isolated_network: bool = False,
 ) -> AgentResult:
     """Run an agent block execution (blocking).
 
