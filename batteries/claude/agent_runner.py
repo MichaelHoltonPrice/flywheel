@@ -38,6 +38,11 @@ Environment variables:
                       restrict agents to a safe subset (e.g., no web
                       access). If unset, all built-in tools are
                       available.
+    COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
+                      compaction. Overrides the default percentage-
+                      based calculation. Use for large-context models
+                      or image-heavy workloads where the default is
+                      too aggressive.
     PAUSE_ON_TOOLS  — Comma-separated tool names that trigger a
                       PostToolUse pause check. After each listed tool
                       completes, the hook checks for .agent_pause in
@@ -414,11 +419,15 @@ async def main() -> None:
             if t not in allowed_tools:
                 allowed_tools.append(t)
 
-    # Context window estimate.
+    # Context window estimate and compaction limit.
     context_window = DEFAULT_CONTEXT_WINDOW
     if model and "1m" in model.lower():
         context_window = 1_000_000
-    compact_token_limit = int(context_window * COMPACT_THRESHOLD)
+    compact_env = os.environ.get("COMPACT_TOKEN_LIMIT", "")
+    if compact_env:
+        compact_token_limit = int(compact_env)
+    else:
+        compact_token_limit = int(context_window * COMPACT_THRESHOLD)
 
     # --- Built-in tool whitelist ---
     tools_str = os.environ.get("TOOLS", "")
