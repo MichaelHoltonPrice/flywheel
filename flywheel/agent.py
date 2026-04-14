@@ -368,6 +368,7 @@ def launch_agent_block(
     if max_turns is not None:
         env_vars["MAX_TURNS"] = str(max_turns)
     env_vars["PYTHONUNBUFFERED"] = "1"
+    env_vars["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "128000"
     if isolated_network:
         env_vars["NETWORK_ISOLATION"] = "1"
 
