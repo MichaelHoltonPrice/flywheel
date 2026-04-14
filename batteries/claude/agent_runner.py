@@ -63,6 +63,7 @@ from claude_agent_sdk.types import (
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
 STATE_FILE = WORKSPACE / ".agent_state.json"
 RESUME_FILE = WORKSPACE / ".agent_resume"
+STOP_FILE = WORKSPACE / ".agent_stop"
 POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Proactive compaction: compact when input tokens exceed this fraction
@@ -396,7 +397,19 @@ async def main() -> None:
     if resume_session_file:
         resume_path = Path(resume_session_file)
         if resume_path.exists() and resume_path.suffix == ".jsonl":
+            # Extract the real session ID from the JSONL content.
+            # The filename is a fixed name (agent_session.jsonl) but
+            # the SDK needs the original session UUID.
             resume_sid = resume_path.stem
+            try:
+                first_line = resume_path.read_text(
+                    encoding="utf-8").split("\n", 1)[0]
+                entry = json.loads(first_line)
+                sid_from_file = entry.get("sessionId", "")
+                if sid_from_file:
+                    resume_sid = sid_from_file
+            except Exception:
+                pass  # Fall back to filename stem.
             sdk_dest = _sdk_session_path(resume_sid)
             sdk_dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(resume_path, sdk_dest)
@@ -480,6 +493,14 @@ async def main() -> None:
                         # Emit the message.
                         _emit_message(message)
 
+                        # Graceful stop: the host wrote .agent_stop
+                        # to the workspace.  The current tool response
+                        # is already in the session — exit cleanly so
+                        # the finally block exports it.
+                        if STOP_FILE.exists():
+                            pause_reason = "stop_requested"
+                            break
+
                     except Exception as e:
                         _emit({
                             "type": "error",
@@ -487,6 +508,17 @@ async def main() -> None:
                         })
 
                 # --- After receive_response() returns ---
+
+                # Graceful stop.
+                if pause_reason == "stop_requested":
+                    _emit({
+                        "type": "agent_state",
+                        "status": "stopping",
+                        "reason": "stop_requested",
+                    })
+                    STOP_FILE.unlink(missing_ok=True)
+                    _save_state(session_id, "stopped", "stop_requested")
+                    return
 
                 # Natural completion.
                 if completed:

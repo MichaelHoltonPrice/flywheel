@@ -98,23 +98,24 @@ class TestAgentHandleBasics:
         bridge.stop.assert_called_once()
 
 
-class TestAgentHandleKill:
-    def test_kill_calls_process_kill(self):
+class TestAgentHandleStop:
+    @mock_patch("flywheel.agent.subprocess.run")
+    def test_stop_calls_docker_exec(self, mock_run):
         handle = _make_handle()
-        handle._process.poll.return_value = None  # Still alive.
-        handle.kill()
-        handle._process.kill.assert_called_once()
+        handle._container_name = "flywheel-test123"
+        handle.stop()
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args[:3] == ["docker", "exec", "flywheel-test123"]
+        assert "/workspace/.agent_stop" in args
 
-    def test_kill_then_wait(self):
-        handle = _make_handle(exit_code=-9)
-        handle.kill()
+    @mock_patch("flywheel.agent.subprocess.run")
+    def test_stop_then_wait(self, mock_run):
+        handle = _make_handle(exit_code=0)
+        handle._container_name = "flywheel-test123"
+        handle.stop()
         result = handle.wait()
-        assert result.exit_code == -9
-
-    def test_kill_already_exited_is_safe(self):
-        handle = _make_handle()
-        handle._process.kill.side_effect = OSError("already exited")
-        handle.kill()  # Should not raise.
+        assert result.exit_code == 0
 
 
 class TestAgentHandleIsAlive:

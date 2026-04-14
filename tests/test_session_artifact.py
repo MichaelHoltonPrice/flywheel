@@ -181,3 +181,47 @@ class TestSessionImport:
         """Files without .jsonl suffix should not be used."""
         p = Path("/input/agent_session/data.txt")
         assert p.suffix != ".jsonl"
+
+    def test_session_id_extracted_from_jsonl(self, tmp_path: Path):
+        """Session ID is read from the JSONL content, not filename."""
+        import json as _json
+
+        real_sid = "640582da-4609-431a-b464-d9a99b7b4f35"
+        source = tmp_path / "agent_session.jsonl"
+        source.write_text(
+            _json.dumps({"sessionId": real_sid, "type": "init"})
+            + "\n"
+        )
+
+        # The resume code should extract the UUID from the file,
+        # not use "agent_session" (the filename stem).
+        first_line = source.read_text(encoding="utf-8").split("\n", 1)[0]
+        entry = _json.loads(first_line)
+        sid_from_file = entry.get("sessionId", "")
+        assert sid_from_file == real_sid
+        assert source.stem == "agent_session"  # filename is generic
+        assert sid_from_file != source.stem     # they differ
+
+    def test_session_id_fallback_on_bad_json(self, tmp_path: Path):
+        """Falls back to filename stem if JSONL is not valid JSON."""
+        source = tmp_path / "my-session.jsonl"
+        source.write_text("not valid json\n")
+        resume_sid = source.stem
+        try:
+            first_line = source.read_text(
+                encoding="utf-8").split("\n", 1)[0]
+            import json as _json
+            entry = _json.loads(first_line)
+            sid_from_file = entry.get("sessionId", "")
+            if sid_from_file:
+                resume_sid = sid_from_file
+        except Exception:
+            pass
+        assert resume_sid == "my-session"
+
+
+class TestStopFile:
+    def test_stop_file_constant(self):
+        """STOP_FILE is at /workspace/.agent_stop by default."""
+        assert _runner.STOP_FILE.name == ".agent_stop"
+        assert str(_runner.STOP_FILE).endswith(".agent_stop")

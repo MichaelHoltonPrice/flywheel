@@ -17,8 +17,8 @@ with full artifact provenance in the workspace.
 Two APIs are provided:
 
 - ``launch_agent_block()`` returns an ``AgentHandle`` immediately
-  for non-blocking control.  The handle supports ``kill()`` to
-  terminate the container (e.g., from a bridge callback) and
+  for non-blocking control.  The handle supports ``stop()`` to
+  request a graceful shutdown (e.g., from a bridge callback) and
   ``wait()`` to block until completion and collect artifacts.
 - ``run_agent_block()`` is a blocking convenience wrapper that
   calls ``launch_agent_block()`` then ``handle.wait()``.
@@ -26,7 +26,6 @@ Two APIs are provided:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -113,8 +112,9 @@ class AgentHandle:
 
     The caller **must** call ``wait()`` exactly once to clean up
     resources (join threads, stop bridge, collect artifacts).
-    Calling ``kill()`` does not clean up — it only terminates the
-    container process.
+    Call ``stop()`` to request a graceful shutdown — the agent
+    runner detects the stop file, exports its session, and exits
+    on its own.
     """
 
     def __init__(
@@ -149,25 +149,27 @@ class AgentHandle:
         """Check if the container process is still running."""
         return self._process.poll() is None
 
-    def kill(self) -> None:
-        """Stop the Docker container.
+    def stop(self) -> None:
+        """Request a graceful shutdown of the agent.
 
-        Uses ``docker stop`` to reliably terminate the container
-        (``process.kill()`` only kills the docker CLI on Windows,
-        leaving the container running).
+        Creates a ``.agent_stop`` file inside the container via
+        ``docker exec``.  The agent runner checks for this file
+        between turns, exports the session artifact, and exits
+        cleanly.
+
+        Uses ``docker exec`` rather than host-side file writes
+        because Docker Desktop bind mounts on Windows don't
+        reliably propagate host writes to the container.
 
         The caller **must** still call ``wait()`` afterward to join
         threads, stop the bridge, and collect artifacts.
         """
         if self._container_name:
-            with contextlib.suppress(Exception):
-                subprocess.run(
-                    ["docker", "stop", "-t", "5",
-                     self._container_name],
-                    capture_output=True, timeout=15,
-                )
-        with contextlib.suppress(OSError):
-            self._process.kill()
+            subprocess.run(
+                ["docker", "exec", self._container_name,
+                 "touch", "/workspace/.agent_stop"],
+                capture_output=True, timeout=10,
+            )
 
     def wait(self) -> AgentResult:
         """Block until the container exits and return results.
@@ -255,8 +257,8 @@ def launch_agent_block(
     The container runs in the background.
 
     The caller must call ``handle.wait()`` to clean up and get
-    the result.  Call ``handle.kill()`` to terminate the container
-    early (e.g., from a bridge callback), then ``wait()`` to
+    the result.  Call ``handle.stop()`` to request a graceful
+    shutdown (e.g., from a bridge callback), then ``wait()`` to
     finalize.
 
     Args:
@@ -516,12 +518,13 @@ def run_agent_block(
     try:
         return handle.wait()
     except KeyboardInterrupt:
-        print("  [agent] interrupted -- terminating container")
-        handle._process.terminate()
+        print("  [agent] interrupted -- requesting graceful stop")
+        handle.stop()
         try:
-            handle._process.wait(timeout=10)
+            handle._process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            handle.kill()
+            print("  [agent] stop timed out -- terminating")
+            handle._process.terminate()
             handle._process.wait()
         raise
 
