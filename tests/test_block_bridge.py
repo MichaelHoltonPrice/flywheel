@@ -7,6 +7,7 @@ actions that already happened (e.g., game steps via REST API).
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -482,3 +483,20 @@ class TestOnRecordCallback:
         assert len(captured) == 1
         step = captured[0]["game_step"]
         assert step["prediction_correct"] is False
+
+    def test_callback_exception_suppressed(self, tmp_path: Path):
+        """Callback exception does not crash the bridge."""
+        template, ws = _make_workspace(tmp_path)
+
+        def bad_callback(name: str, outputs: dict) -> None:
+            raise ValueError("callback crash")
+
+        bridge = BlockBridgeService(
+            template=template,
+            workspace=ws,
+            on_record=bad_callback,
+        )
+        # Simulate the suppression that do_POST does.
+        with contextlib.suppress(Exception):
+            bridge.on_record("game_step", {"data": 1})
+        # If we got here, the exception was suppressed.

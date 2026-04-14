@@ -11,10 +11,11 @@ import time
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock
+from unittest.mock import patch as mock_patch
 
 import pytest
 
-from flywheel.agent import AgentHandle, AgentResult
+from flywheel.agent import AgentHandle, AgentResult, launch_agent_block
 from flywheel.block_bridge import BlockBridgeService
 
 
@@ -186,3 +187,35 @@ class TestAgentHandleEvals:
         # executions_before was 0, now there are 2.
         result = handle.wait()
         assert result.evals_run == 2
+
+
+class TestLaunchFailure:
+    def test_bridge_stopped_on_popen_failure(self):
+        """If Popen raises, launch_agent_block stops the bridge."""
+        ws = MagicMock()
+        ws.path = Path("/tmp/test-ws")
+        ws.executions = {}
+        ws.artifacts = {}
+        ws.instances_for = MagicMock(return_value=[])
+
+        template = MagicMock()
+        bridge_mock = MagicMock()
+        bridge_mock.start.return_value = 9999
+
+        with (
+            mock_patch("flywheel.agent.BlockBridgeService",
+                       return_value=bridge_mock),
+            mock_patch("flywheel.agent.shutil"),
+            mock_patch("flywheel.agent.subprocess.Popen",
+                       side_effect=OSError("Docker not found")),
+            pytest.raises(OSError, match="Docker not found"),
+        ):
+            launch_agent_block(
+                workspace=ws,
+                template=template,
+                project_root=Path("/tmp"),
+                prompt="test",
+            )
+
+        # Bridge must be stopped even though Popen failed.
+        bridge_mock.stop.assert_called_once()

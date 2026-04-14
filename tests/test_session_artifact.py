@@ -7,6 +7,7 @@ export logic in isolation (without the Claude SDK or Docker).
 from __future__ import annotations
 
 import importlib
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -130,3 +131,53 @@ class TestExportSession:
         ):
             _runner._export_session("missing-session")
         assert not output_file.exists()
+
+    def test_export_creates_parent_dir(self, tmp_path: Path):
+        """Parent directory of output file is created if missing."""
+        sdk_dir = tmp_path / ".claude" / "projects" / "-workspace"
+        sdk_dir.mkdir(parents=True)
+        session_file = sdk_dir / "sess1.jsonl"
+        session_file.write_text('{"role": "user"}\n')
+
+        # Output in a subdirectory that doesn't exist yet.
+        output_file = tmp_path / "deep" / "nested" / "agent_session.jsonl"
+
+        with (
+            patch.object(_runner, "SDK_PROJECTS_DIR",
+                         tmp_path / ".claude" / "projects"),
+            patch.object(_runner, "SESSION_OUTPUT_FILE",
+                         output_file),
+        ):
+            _runner._export_session("sess1")
+
+        assert output_file.exists()
+
+
+class TestSessionImport:
+    def test_copies_to_sdk_path(self, tmp_path: Path):
+        """RESUME_SESSION_FILE is copied to the SDK expected path."""
+        # Create a session file as if mounted at /input/agent_session/.
+        source = tmp_path / "agent_session.jsonl"
+        source.write_text('{"role": "user"}\n')
+
+        sdk_projects = tmp_path / ".claude" / "projects"
+
+        with patch.object(_runner, "SDK_PROJECTS_DIR", sdk_projects):
+            dest = _runner._sdk_session_path("agent_session")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+
+        expected = sdk_projects / "-workspace" / "agent_session.jsonl"
+        assert expected.exists()
+        assert expected.read_text() == '{"role": "user"}\n'
+
+    def test_session_id_from_filename_stem(self):
+        """Session ID is extracted from the filename stem."""
+        p = Path("/input/agent_session/my-session-id.jsonl")
+        assert p.stem == "my-session-id"
+        assert p.suffix == ".jsonl"
+
+    def test_non_jsonl_file_rejected(self):
+        """Files without .jsonl suffix should not be used."""
+        p = Path("/input/agent_session/data.txt")
+        assert p.suffix != ".jsonl"

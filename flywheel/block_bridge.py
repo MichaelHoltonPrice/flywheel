@@ -25,6 +25,12 @@ Deployment pattern: one service per agent step. Each agent step
 creates its own ``BlockBridgeService`` instance with its own port,
 invocation budget, and service ID. Parallel agents get independent
 services.
+
+``BlockBridgeService`` accepts an optional ``on_record`` callback,
+fired after each successful record-mode invocation with the block
+name and output data. This enables the host to react in real-time
+to artifacts created by the agent (e.g., killing the agent on a
+prediction mismatch).
 """
 
 from __future__ import annotations

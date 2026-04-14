@@ -233,6 +233,38 @@ The lifecycle:
 A total timeout (default 4 hours) kills the agent container if
 exceeded, ensuring hung agents do not block indefinitely.
 
+### Non-blocking agent handle
+
+``launch_agent_block()`` returns an ``AgentHandle`` immediately,
+allowing the caller to control the container while it runs:
+
+- ``handle.kill()`` — terminate the container (e.g., from a
+  bridge callback when an artifact triggers a policy decision).
+- ``handle.wait()`` — block until exit, stop the bridge, collect
+  output artifacts, and return ``AgentResult``.  Must be called
+  exactly once, even after ``kill()``.
+- ``handle.is_alive()`` — check if the container is still running.
+
+The blocking ``run_agent_block()`` is a convenience wrapper that
+calls ``launch_agent_block()`` then ``handle.wait()``.
+
+### Agent session artifacts
+
+The agent runner exports the Claude SDK session history as
+``agent_session.jsonl`` to the workspace on exit (including on
+SIGTERM from ``docker stop``). If ``output_names`` includes
+``agent_session``, flywheel collects this as a regular copy
+artifact.
+
+To resume a session in a new container, pass the session artifact
+as an input artifact and set ``RESUME_SESSION_FILE`` in
+``extra_env`` pointing to the mounted file path. The agent runner
+copies the session to the SDK's expected location and passes
+``resume=session_id`` to the SDK client.
+
+This enables cross-container session resume without persistent
+volumes — the session round-trips through the artifact system.
+
 ### Agent pause and resume
 
 Long-running agents can hit API rate limits or consume excessive
@@ -327,6 +359,14 @@ directories and records a ``BlockExecution`` with input/output
 bindings. Record-mode blocks use the ``__record__`` sentinel as
 their image in the template. Input artifact IDs are validated
 for both existence and name match against the declared slot.
+
+**Record callback**: ``BlockBridgeService`` accepts an optional
+``on_record`` callback, fired after each successful record-mode
+invocation with ``(block_name, outputs)``. The callback runs in
+the bridge's HTTP handler thread. This enables the host to react
+in real-time to artifacts created by the agent — for example,
+killing the agent container via ``AgentHandle.kill()`` when a
+recorded game step indicates a prediction mismatch.
 
 ### Project-provided MCP servers
 

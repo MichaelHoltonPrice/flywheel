@@ -13,6 +13,15 @@ The agent container receives:
 
 Each block the agent invokes becomes a tracked block execution
 with full artifact provenance in the workspace.
+
+Two APIs are provided:
+
+- ``launch_agent_block()`` returns an ``AgentHandle`` immediately
+  for non-blocking control.  The handle supports ``kill()`` to
+  terminate the container (e.g., from a bridge callback) and
+  ``wait()`` to block until completion and collect artifacts.
+- ``run_agent_block()`` is a blocking convenience wrapper that
+  calls ``launch_agent_block()`` then ``handle.wait()``.
 """
 
 from __future__ import annotations
@@ -164,8 +173,8 @@ class AgentHandle:
         try:
             self._stdout_thread.join()
             self._process.wait()
-            self._stderr_thread.join(timeout=5)
         finally:
+            self._stderr_thread.join(timeout=5)
             self._bridge.stop()
 
         elapsed = time.monotonic() - self._start_time
@@ -378,18 +387,22 @@ def launch_agent_block(
     event_log = workspace.path / "agent_events.jsonl"
     stderr_log = workspace.path / "agent_stderr.log"
 
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=env,
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
 
-    process.stdin.write(prompt)
-    process.stdin.close()
+        process.stdin.write(prompt)
+        process.stdin.close()
+    except Exception:
+        bridge.stop()
+        raise
 
     # Background threads for stdout and stderr.
     def _drain_stderr():

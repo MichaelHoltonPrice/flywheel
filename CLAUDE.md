@@ -10,6 +10,9 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 - **Workspaces** are created from templates and accumulate artifact instances and execution records over their lifetime. The workspace is a history, not a snapshot.
 - **The foundry** is the flywheel-managed directory within a project, holding templates and workspaces. It is a peer to the project source code.
 - **Agent blocks** are a special block execution variant where an AI agent can trigger nested block executions via a block bridge HTTP service. The bridge reads block definitions from the template -- what those blocks do (evaluation, validation, etc.) is project-specific, not a flywheel concern. The bridge supports two modes: **invoke** (launches a Docker container) and **record** (creates artifacts without containers, for provenance tracking of actions that already happened). Record-mode blocks use the `__record__` sentinel as their image. See `flywheel/agent.py` and `flywheel/block_bridge.py`.
+- **Non-blocking agent handle**: `launch_agent_block()` returns an `AgentHandle` with `kill()`, `wait()`, and `is_alive()`. Enables system-controlled agent interruption (e.g., killing an agent from a bridge callback). `run_agent_block()` is a blocking wrapper.
+- **Bridge record callback**: `BlockBridgeService` accepts `on_record` — a callback fired after each successful record-mode invocation. Runs in the bridge HTTP thread.
+- **Session artifacts**: The agent runner exports the SDK session JSONL to the workspace on exit and can resume from a session artifact via `RESUME_SESSION_FILE`. Sessions are regular copy artifacts with standard provenance.
 
 ## Batteries (solve-once capabilities)
 

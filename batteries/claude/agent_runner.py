@@ -98,6 +98,8 @@ def _export_session(session_id: str) -> None:
     try:
         src = _sdk_session_path(session_id)
         if src.exists():
+            SESSION_OUTPUT_FILE.parent.mkdir(
+                parents=True, exist_ok=True)
             shutil.copy2(src, SESSION_OUTPUT_FILE)
             _emit({
                 "type": "session_export",
