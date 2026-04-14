@@ -745,7 +745,10 @@ class BlockBridgeService:
             _stopping = stopping
             _active_container = active_container
             _service_id = service_id
-            _on_record = self.on_record
+            _on_record = (
+                staticmethod(self.on_record)
+                if self.on_record else None
+            )
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
