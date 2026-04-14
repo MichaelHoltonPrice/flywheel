@@ -38,11 +38,6 @@ Environment variables:
                       restrict agents to a safe subset (e.g., no web
                       access). If unset, all built-in tools are
                       available.
-    PAUSE_ON_TOOLS  — Comma-separated tool names that trigger a
-                      PostToolUse pause check. After each listed tool
-                      completes, the hook checks for .agent_pause in
-                      the workspace and blocks until .agent_pause_done
-                      appears. Used for external escalation loops.
 """
 
 from __future__ import annotations
@@ -55,13 +50,10 @@ import time
 from pathlib import Path
 
 import anyio
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import (
     AssistantMessage,
-    HookContext,
-    PostToolUseHookInput,
     ResultMessage,
-    SyncHookJSONOutput,
 )
 
 # ------------------------------------------------------------------
@@ -83,11 +75,6 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 SESSION_OUTPUT_FILE = WORKSPACE / "agent_session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-# External pause: the host writes .agent_pause to the shared workspace
-# mount; the PostToolUse hook blocks until .agent_pause_done appears.
-PAUSE_FILE = WORKSPACE / ".agent_pause"
-PAUSE_DONE_FILE = WORKSPACE / ".agent_pause_done"
-PAUSE_POLL_INTERVAL = 2  # seconds between checks
 
 
 def _encode_cwd(cwd: str) -> str:
@@ -137,44 +124,6 @@ def _export_session(session_id: str) -> None:
             "session_id": session_id,
             "message": str(exc),
         })
-
-
-# ------------------------------------------------------------------
-# PostToolUse pause hook
-# ------------------------------------------------------------------
-
-async def _pause_hook(
-    input_data: PostToolUseHookInput,
-    tool_use_id: str | None,
-    context: HookContext,
-) -> SyncHookJSONOutput:
-    """Block if the host has requested an escalation pause.
-
-    The host writes ``.agent_pause`` to the shared workspace mount
-    when an action triggers escalation.  This hook polls until the
-    host writes ``.agent_pause_done`` after escalation completes.
-    The agent's session stays alive throughout.
-    """
-    if not PAUSE_FILE.exists():
-        return SyncHookJSONOutput()
-
-    _emit({
-        "type": "pause",
-        "tool": input_data.get("tool_name", ""),
-        "reason": "escalation",
-    })
-
-    while not PAUSE_DONE_FILE.exists():
-        await anyio.sleep(PAUSE_POLL_INTERVAL)
-
-    PAUSE_FILE.unlink(missing_ok=True)
-    PAUSE_DONE_FILE.unlink(missing_ok=True)
-
-    _emit({
-        "type": "resume",
-        "tool": input_data.get("tool_name", ""),
-    })
-    return SyncHookJSONOutput()
 
 
 # ------------------------------------------------------------------
@@ -440,19 +389,6 @@ async def main() -> None:
         options.mcp_servers = mcp_servers
     if max_turns:
         options.max_turns = max_turns
-
-    # --- PostToolUse pause hook ---
-    pause_tools = os.environ.get("PAUSE_ON_TOOLS", "")
-    if pause_tools:
-        tool_matcher = "|".join(
-            t.strip() for t in pause_tools.split(",") if t.strip())
-        options.hooks = {
-            "PostToolUse": [HookMatcher(
-                matcher=tool_matcher,
-                hooks=[_pause_hook],
-                timeout=7200,
-            )],
-        }
 
     # --- Session resume from file ---
     resume_session_file = os.environ.get("RESUME_SESSION_FILE", "")
