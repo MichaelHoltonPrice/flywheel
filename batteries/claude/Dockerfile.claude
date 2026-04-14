@@ -16,8 +16,8 @@ RUN apt-get update \
 # The Agents SDK spawns the Claude Code CLI as a subprocess.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install the Agents SDK and HTTP client.
-RUN pip install claude-agent-sdk httpx mcp
+# Install the Agents SDK, HTTP client, and image rendering deps.
+RUN pip install claude-agent-sdk httpx mcp Pillow numpy
 
 # Copy the agent runner and built-in MCP server scripts.
 # Project-specific MCP servers are mounted at runtime.

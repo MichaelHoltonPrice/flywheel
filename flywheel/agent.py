@@ -269,6 +269,9 @@ def launch_agent_block(
         on_record: Callback fired after each successful record-mode
             bridge invocation.  Receives ``(block_name, outputs)``.
             Runs in the bridge HTTP handler thread.
+        isolated_network: Docker network name for iptables-based
+            isolation.  When set, the container is attached to this
+            network and host.docker.internal is added.
 
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
