@@ -217,6 +217,65 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, response)
 
+    def do_GET(self):  # noqa: N802
+        """Handle GET requests to query artifact instances.
+
+        ``GET /<artifact_name>`` returns all instances of that
+        artifact as a JSON array, ordered by creation time.  Each
+        element contains the instance metadata and the contents of
+        the first JSON file in the artifact directory.
+
+        ``GET /<artifact_name>/latest`` returns only the last
+        instance.
+
+        ``GET /<artifact_name>/count`` returns ``{"count": N}``.
+        """
+        path = self.path.strip("/")
+        parts = path.split("/", 1)
+        artifact_name = parts[0]
+        suffix = parts[1] if len(parts) > 1 else ""
+
+        if not artifact_name:
+            self._send_json(400, {
+                "ok": False,
+                "message": "Artifact name required in path",
+            })
+            return
+
+        instances = self.workspace.instances_for(artifact_name)
+
+        if suffix == "count":
+            self._send_json(200, {
+                "ok": True,
+                "count": len(instances),
+            })
+            return
+
+        if suffix == "latest":
+            instances = instances[-1:] if instances else []
+
+        result = []
+        for inst in instances:
+            entry: dict[str, Any] = {
+                "id": inst.id,
+                "created_at": inst.created_at.isoformat()
+                if inst.created_at else None,
+            }
+            if inst.copy_path:
+                artifact_dir = (
+                    self.workspace.path / "artifacts" / inst.copy_path
+                )
+                json_files = sorted(artifact_dir.glob("*.json"))
+                if json_files:
+                    try:
+                        entry["data"] = json.loads(
+                            json_files[0].read_text(encoding="utf-8"))
+                    except Exception:
+                        entry["data"] = None
+            result.append(entry)
+
+        self._send_json(200, {"ok": True, "instances": result})
+
     def _send_json(self, status: int, data: dict) -> None:
         """Send a JSON response."""
         body = json.dumps(data).encode("utf-8")
@@ -396,12 +455,21 @@ def _process_record_invocation(
     print(f"  [block-bridge] {request_id}: recorded {block_name} "
           f"({len(output_bindings)} outputs)", flush=True)
 
+    # Include instance counts for each output artifact name so
+    # callers can derive sequence positions without a separate query.
+    instance_counts = {}
+    for slot in block_def.outputs:
+        if slot.name in output_bindings:
+            instance_counts[f"{slot.name}_instance_count"] = len(
+                workspace.instances_for(slot.name))
+
     return {
         "request_id": request_id,
         "ok": True,
         "execution_id": execution_id,
         **{f"{name}_artifact_id": aid
            for name, aid in output_bindings.items()},
+        **instance_counts,
     }
 
 
