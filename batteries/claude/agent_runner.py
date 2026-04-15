@@ -33,6 +33,11 @@ Environment variables:
                       servers at /workspace/.mcp_servers/.
     RESUME_SESSION_FILE — Path to a .jsonl session file to resume
                       on startup. The filename stem is the session ID.
+    COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
+                      compaction. Overrides the default percentage-
+                      based calculation. Use for large-context models
+                      or image-heavy workloads where the default is
+                      too aggressive.
     TOOLS           — Comma-separated list of built-in tools to
                       enable. Overrides the default tool set. Use to
                       restrict agents to a safe subset (e.g., no web
@@ -368,7 +373,11 @@ async def main() -> None:
     context_window = DEFAULT_CONTEXT_WINDOW
     if model and "1m" in model.lower():
         context_window = 1_000_000
-    compact_token_limit = int(context_window * COMPACT_THRESHOLD)
+    compact_env = os.environ.get("COMPACT_TOKEN_LIMIT", "")
+    if compact_env:
+        compact_token_limit = int(compact_env)
+    else:
+        compact_token_limit = int(context_window * COMPACT_THRESHOLD)
 
     # --- Built-in tool whitelist ---
     tools_str = os.environ.get("TOOLS", "")
