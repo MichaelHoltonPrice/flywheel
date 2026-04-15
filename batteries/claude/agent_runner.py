@@ -641,10 +641,10 @@ async def main() -> None:
 
                 # ResultMessage without completion and without needing
                 # compact — this is error_max_turns or similar.  The
-                # agent used all its turns.
-                _save_state(session_id, "paused", "max_turns")
-                resume_prompt = await _wait_for_resume()
-                await client.query(resume_prompt)
+                # agent used all its turns.  Exit cleanly so the
+                # orchestrator can relaunch with session resume.
+                _save_state(session_id, "complete", "max_turns")
+                return
 
     except Exception as e:
         err = str(e).lower()
