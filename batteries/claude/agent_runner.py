@@ -17,9 +17,11 @@ all within the same subprocess, with no session interruption.
 Pause/resume
 ------------
 
-- **Rate limit**: Detected from RateLimitEvent; pauses and waits
+- **Rate limit**: Detected from RateLimitEvent; auto-retries with
+  exponential backoff (60s, 120s, 300s, 300s, 300s).  Falls back
+  to .agent_resume after exhausting retries.
+- **Auth error**: Detected from error messages; pauses and waits
   for .agent_resume file.
-- **Auth error**: Detected from error messages; pauses and waits.
 - **External resume**: Write a prompt (or empty) to .agent_resume
   in the workspace to continue after a pause.
 
@@ -70,6 +72,10 @@ STATE_FILE = WORKSPACE / ".agent_state.json"
 RESUME_FILE = WORKSPACE / ".agent_resume"
 STOP_FILE = WORKSPACE / ".agent_stop"
 POLL_INTERVAL = 5  # seconds between resume-file checks
+
+# Rate limit auto-retry: sleep with exponential backoff before
+# retrying.  Falls back to .agent_resume after max retries.
+RATE_LIMIT_BACKOFFS = [60, 120, 300, 300, 300]  # seconds per attempt
 
 # Proactive compaction: compact when input tokens exceed this fraction
 # of the estimated context window.
@@ -432,6 +438,7 @@ async def main() -> None:
 
     # --- Connect and run ---
     last_input_tokens = 0
+    rate_limit_retries = 0
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -457,6 +464,7 @@ async def main() -> None:
 
                         # Track token usage.
                         if isinstance(message, AssistantMessage):
+                            rate_limit_retries = 0  # Reset on success.
                             tokens = _get_input_tokens(message)
                             if tokens > 0:
                                 last_input_tokens = tokens
@@ -534,7 +542,34 @@ async def main() -> None:
                     _save_state(session_id, "complete")
                     return
 
-                # External pause (rate limit, auth).
+                # Rate limit: auto-retry with backoff.
+                if pause_reason == "rate_limit":
+                    if rate_limit_retries < len(RATE_LIMIT_BACKOFFS):
+                        delay = RATE_LIMIT_BACKOFFS[rate_limit_retries]
+                        rate_limit_retries += 1
+                        _emit({
+                            "type": "rate_limit_retry",
+                            "attempt": rate_limit_retries,
+                            "max_attempts": len(RATE_LIMIT_BACKOFFS),
+                            "delay_s": delay,
+                        })
+                        _save_state(
+                            session_id, "paused",
+                            f"rate_limit (retry {rate_limit_retries}"
+                            f"/{len(RATE_LIMIT_BACKOFFS)} in {delay}s)",
+                        )
+                        await anyio.sleep(delay)
+                        await client.query(
+                            "Continue from where you left off."
+                        )
+                        continue
+                    # Exhausted retries — fall through to manual resume.
+                    _emit({
+                        "type": "rate_limit_exhausted",
+                        "attempts": rate_limit_retries,
+                    })
+
+                # External pause (auth error, exhausted rate limit).
                 if pause_reason and pause_reason != "compact_needed":
                     _save_state(session_id, "paused", pause_reason)
                     resume_prompt = await _wait_for_resume()
