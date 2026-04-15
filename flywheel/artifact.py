@@ -1,15 +1,17 @@
-"""Core data models for flywheel: artifact instances and block executions.
+"""Core data models for flywheel artifacts, executions, and events.
 
 An artifact instance is a concrete, immutable record of data produced
 by a block execution or captured at workspace creation. A block
 execution is the record of running a single block within a workspace.
+A lifecycle event records an operational occurrence (e.g., agent
+stopped, group completed) that is not itself a block execution.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,12 @@ class BlockExecution:
         exit_code: The container's exit code, if available.
         elapsed_s: Wall-clock time in seconds, if available.
         image: The Docker image that was used.
+        stop_reason: Why the execution ended, if it was stopped
+            externally (e.g., ``"exploration_request"``,
+            ``"prediction_mismatch"``, ``"timeout"``). None for
+            normal completion.
+        predecessor_id: Execution ID that this block resumes from,
+            enabling resume chains. None if this is a fresh start.
     """
 
     id: str
@@ -84,3 +92,29 @@ class BlockExecution:
     exit_code: int | None = None
     elapsed_s: float | None = None
     image: str | None = None
+    stop_reason: str | None = None
+    predecessor_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LifecycleEvent:
+    """An operational event recorded in the workspace.
+
+    Captures orchestration-level events that are not block
+    executions: agent stops, group completions, mode transitions,
+    and other operational milestones.
+
+    Attributes:
+        id: Unique identifier (e.g., ``"evt_a3f7b2"``).
+        kind: Event type (e.g., ``"agent_stopped"``,
+            ``"group_completed"``, ``"exploration_started"``).
+        timestamp: When the event occurred.
+        execution_id: Related execution ID, if any.
+        detail: Free-form metadata dict.
+    """
+
+    id: str
+    kind: str
+    timestamp: datetime
+    execution_id: str | None = None
+    detail: dict[str, Any] = field(default_factory=dict)

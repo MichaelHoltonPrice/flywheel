@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.template import ArtifactDeclaration, BlockDefinition, Template
+from flywheel.template import (
+    ArtifactDeclaration,
+    BlockDefinition,
+    Template,
+    check_service_dependencies,
+)
 
 VALID_TEMPLATE_YAML = """\
 artifacts:
@@ -523,3 +528,93 @@ blocks:
         template = Template.from_yaml(path)
         assert template.blocks[0].inputs[0].name == "session"
         assert template.blocks[0].outputs[0].name == "session"
+
+
+class TestServiceDependencies:
+    def test_parse_services(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+
+blocks: []
+
+services:
+  - name: game_server
+    url_env: ARC_SERVER_URL
+    description: "ARC-AGI-3 game server"
+  - name: auth_service
+    url_env: AUTH_URL
+"""
+        path = tmp_path / "with_services.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+
+        assert len(template.services) == 2
+        assert template.services[0].name == "game_server"
+        assert template.services[0].url_env == "ARC_SERVER_URL"
+        assert template.services[0].description == "ARC-AGI-3 game server"
+        assert template.services[1].name == "auth_service"
+        assert template.services[1].description == ""
+
+    def test_no_services_key(self, tmp_path: Path):
+        """Templates without services key default to empty list."""
+        path = tmp_path / "no_services.yaml"
+        path.write_text(VALID_TEMPLATE_YAML)
+        template = Template.from_yaml(path)
+        assert template.services == []
+
+    def test_service_name_validated(self, tmp_path: Path):
+        yaml_content = """\
+artifacts: []
+blocks: []
+services:
+  - name: "invalid/name"
+    url_env: SOME_URL
+"""
+        path = tmp_path / "bad_service.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="invalid"):
+            Template.from_yaml(path)
+
+    def test_check_service_dependencies_warns(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        yaml_content = """\
+artifacts: []
+blocks: []
+services:
+  - name: game_server
+    url_env: ARC_SERVER_URL
+  - name: other
+    url_env: OTHER_URL
+"""
+        path = tmp_path / "svc.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+
+        monkeypatch.delenv("ARC_SERVER_URL", raising=False)
+        monkeypatch.delenv("OTHER_URL", raising=False)
+
+        warnings = check_service_dependencies(template)
+        assert len(warnings) == 2
+        assert "ARC_SERVER_URL" in warnings[0]
+
+    def test_check_service_dependencies_no_warning_when_set(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        yaml_content = """\
+artifacts: []
+blocks: []
+services:
+  - name: game_server
+    url_env: ARC_SERVER_URL
+"""
+        path = tmp_path / "svc.yaml"
+        path.write_text(yaml_content)
+        template = Template.from_yaml(path)
+
+        monkeypatch.setenv("ARC_SERVER_URL", "http://localhost:8001")
+
+        warnings = check_service_dependencies(template)
+        assert warnings == []

@@ -15,7 +15,12 @@ from unittest.mock import patch as mock_patch
 
 import pytest
 
-from flywheel.agent import AgentHandle, AgentResult, launch_agent_block
+from flywheel.agent import (
+    AgentHandle,
+    AgentResult,
+    launch_agent_block,
+    prepare_agent_workspace,
+)
 from flywheel.block_bridge import BlockBridgeService
 
 
@@ -28,6 +33,7 @@ def _make_handle(
     agent_ws: Path | None = None,
     output_names: list[str] | None = None,
     bridge: MagicMock | None = None,
+    predecessor_id: str | None = None,
 ) -> AgentHandle:
     """Create an AgentHandle with a mock process."""
     process = MagicMock()
@@ -65,6 +71,7 @@ def _make_handle(
         agent_image="test-image:latest",
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
+        predecessor_id=predecessor_id,
     )
 
 
@@ -219,3 +226,184 @@ class TestLaunchFailure:
 
         # Bridge must be stopped even though Popen failed.
         bridge_mock.stop.assert_called_once()
+
+
+class TestStopReason:
+    @mock_patch("flywheel.agent.subprocess.run")
+    def test_stop_stores_reason(self, mock_run):
+        handle = _make_handle()
+        handle._container_name = "flywheel-test123"
+        handle.stop(reason="exploration_request")
+        assert handle._stop_reason == "exploration_request"
+
+    @mock_patch("flywheel.agent.subprocess.run")
+    def test_stop_default_reason(self, mock_run):
+        handle = _make_handle()
+        handle._container_name = "flywheel-test123"
+        handle.stop()
+        assert handle._stop_reason == "requested"
+
+    def test_wait_returns_stop_reason(self):
+        handle = _make_handle()
+        handle._stop_reason = "prediction_mismatch"
+        result = handle.wait()
+        assert result.stop_reason == "prediction_mismatch"
+
+    def test_wait_returns_none_when_not_stopped(self):
+        handle = _make_handle()
+        result = handle.wait()
+        assert result.stop_reason is None
+
+
+class TestExecutionRecording:
+    def test_wait_records_execution(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_test1"
+        ws.generate_event_id.return_value = "evt_test1"
+
+        handle = _make_handle(workspace=ws, exit_code=0)
+        result = handle.wait()
+
+        ws.add_execution.assert_called_once()
+        execution = ws.add_execution.call_args[0][0]
+        assert execution.id == "exec_test1"
+        assert execution.block_name == "__agent__"
+        assert execution.status == "succeeded"
+        assert execution.image == "test-image:latest"
+        assert result.execution_id == "exec_test1"
+
+    def test_failed_execution_recorded(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_fail"
+
+        handle = _make_handle(workspace=ws, exit_code=1)
+        handle.wait()
+
+        execution = ws.add_execution.call_args[0][0]
+        assert execution.status == "failed"
+        assert execution.exit_code == 1
+
+    def test_stopped_execution_recorded_as_interrupted(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_stop"
+        ws.generate_event_id.return_value = "evt_stop"
+
+        handle = _make_handle(workspace=ws, exit_code=0)
+        handle._stop_reason = "exploration_request"
+        handle.wait()
+
+        execution = ws.add_execution.call_args[0][0]
+        assert execution.status == "interrupted"
+        assert execution.stop_reason == "exploration_request"
+
+    def test_predecessor_id_recorded(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_resume"
+
+        handle = _make_handle(
+            workspace=ws, predecessor_id="exec_prev")
+        handle.wait()
+
+        execution = ws.add_execution.call_args[0][0]
+        assert execution.predecessor_id == "exec_prev"
+
+    def test_lifecycle_event_on_stop(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_ev"
+        ws.generate_event_id.return_value = "evt_ev"
+
+        handle = _make_handle(workspace=ws)
+        handle._stop_reason = "timeout"
+        handle.wait()
+
+        ws.add_event.assert_called_once()
+        event = ws.add_event.call_args[0][0]
+        assert event.kind == "agent_stopped"
+        assert event.execution_id == "exec_ev"
+        assert event.detail == {"reason": "timeout"}
+
+    def test_no_lifecycle_event_on_normal_exit(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_ok"
+
+        handle = _make_handle(workspace=ws)
+        handle.wait()
+
+        ws.add_event.assert_not_called()
+
+    def test_wait_saves_workspace(self):
+        ws = MagicMock()
+        ws.executions = {}
+        ws.generate_execution_id.return_value = "exec_s"
+
+        handle = _make_handle(workspace=ws)
+        handle.wait()
+
+        ws.save.assert_called_once()
+
+
+class TestPrepareAgentWorkspace:
+    def test_creates_fresh_directory(self, tmp_path: Path):
+        ws = MagicMock()
+        ws.path = tmp_path
+        ws.instances_for = MagicMock(return_value=[])
+
+        agent_ws = prepare_agent_workspace(ws)
+        assert agent_ws.exists()
+        assert agent_ws.is_dir()
+        assert agent_ws.name == "agent_workspace"
+
+    def test_custom_dir_name(self, tmp_path: Path):
+        ws = MagicMock()
+        ws.path = tmp_path
+        ws.instances_for = MagicMock(return_value=[])
+
+        agent_ws = prepare_agent_workspace(
+            ws, agent_workspace_dir="explore_0")
+        assert agent_ws.name == "explore_0"
+        assert agent_ws.exists()
+
+    def test_removes_existing_directory(self, tmp_path: Path):
+        ws = MagicMock()
+        ws.path = tmp_path
+        ws.instances_for = MagicMock(return_value=[])
+
+        # Pre-create with a file.
+        existing = tmp_path / "agent_workspace"
+        existing.mkdir()
+        (existing / "old_file.txt").write_text("old")
+
+        agent_ws = prepare_agent_workspace(ws)
+        assert agent_ws.exists()
+        assert not (agent_ws / "old_file.txt").exists()
+
+    def test_seeds_latest_artifacts(self, tmp_path: Path):
+        ws = MagicMock()
+        ws.path = tmp_path
+
+        # Create a mock artifact instance.
+        art_dir = tmp_path / "artifacts" / "game_log@abc"
+        art_dir.mkdir(parents=True)
+        (art_dir / "game_log.txt").write_text("log data")
+
+        inst = MagicMock()
+        inst.kind = "copy"
+        inst.copy_path = "game_log@abc"
+        ws.instances_for = MagicMock(return_value=[inst])
+
+        agent_ws = prepare_agent_workspace(
+            ws, output_names=["game_log"])
+        assert (agent_ws / "game_log.txt").read_text() == "log data"
+
+    def test_no_output_names_skips_seeding(self, tmp_path: Path):
+        ws = MagicMock()
+        ws.path = tmp_path
+
+        agent_ws = prepare_agent_workspace(ws, output_names=None)
+        assert list(agent_ws.iterdir()) == []

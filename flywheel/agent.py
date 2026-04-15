@@ -36,9 +36,11 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from flywheel.artifact import BlockExecution, LifecycleEvent
 from flywheel.block_bridge import BlockBridgeService
 from flywheel.template import Template
 from flywheel.workspace import Workspace
@@ -52,11 +54,16 @@ class AgentResult:
         exit_code: The agent container's exit code.
         elapsed_s: Wall-clock time in seconds.
         evals_run: Number of evaluations the agent triggered.
+        execution_id: The workspace execution ID recorded for
+            this agent run, or None if recording was skipped.
+        stop_reason: Why the agent was stopped, if applicable.
     """
 
     exit_code: int
     elapsed_s: float
     evals_run: int
+    execution_id: str | None = None
+    stop_reason: str | None = None
 
 
 def _resolve_path(path: Path) -> str:
@@ -138,6 +145,8 @@ class AgentHandle:
         stdout_thread: threading.Thread,
         stderr_thread: threading.Thread,
         container_name: str = "",
+        predecessor_id: str | None = None,
+        block_name: str = "__agent__",
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
@@ -151,13 +160,16 @@ class AgentHandle:
         self._stdout_thread = stdout_thread
         self._stderr_thread = stderr_thread
         self._container_name = container_name
+        self._predecessor_id = predecessor_id
+        self._block_name = block_name
+        self._stop_reason: str | None = None
         self._waited = False
 
     def is_alive(self) -> bool:
         """Check if the container process is still running."""
         return self._process.poll() is None
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "requested") -> None:
         """Request a graceful shutdown of the agent.
 
         Creates a ``.agent_stop`` file inside the container via
@@ -171,7 +183,13 @@ class AgentHandle:
 
         The caller **must** still call ``wait()`` afterward to join
         threads, stop the bridge, and collect artifacts.
+
+        Args:
+            reason: Why the agent is being stopped (e.g.,
+                ``"exploration_request"``, ``"prediction_mismatch"``).
+                Recorded in the workspace execution record.
         """
+        self._stop_reason = reason
         if self._container_name:
             subprocess.run(
                 ["docker", "exec", self._container_name,
@@ -183,8 +201,8 @@ class AgentHandle:
         """Block until the container exits and return results.
 
         Joins background threads, stops the bridge, collects output
-        artifacts, and returns ``AgentResult``.  Must be called
-        exactly once.
+        artifacts, records the agent execution in the workspace, and
+        returns ``AgentResult``.  Must be called exactly once.
 
         Raises:
             RuntimeError: If ``wait()`` has already been called.
@@ -194,6 +212,11 @@ class AgentHandle:
                 "wait() already called on this AgentHandle")
         self._waited = True
 
+        started_at = datetime.fromtimestamp(
+            self._start_time - time.monotonic() + time.time(),
+            tz=UTC,
+        )
+
         try:
             self._stdout_thread.join()
             self._process.wait()
@@ -202,16 +225,19 @@ class AgentHandle:
             self._bridge.stop()
 
         elapsed = time.monotonic() - self._start_time
+        finished_at = datetime.now(UTC)
 
         # Collect output artifacts from agent workspace.
+        output_bindings: dict[str, str] = {}
         if self._output_names and self._agent_ws.exists():
             for name in self._output_names:
                 for candidate in self._agent_ws.iterdir():
                     if candidate.is_file() and candidate.stem == name:
-                        self._workspace.register_artifact(
+                        inst = self._workspace.register_artifact(
                             name, candidate,
                             source=f"agent output ({self._agent_image})",
                         )
+                        output_bindings[name] = inst.id
                         break
 
         evals_run = (
@@ -222,6 +248,43 @@ class AgentHandle:
             if self._process is not None else -1
         )
 
+        # Record the agent execution in the workspace.
+        if self._stop_reason:
+            status = "interrupted"
+        elif exit_code == 0:
+            status = "succeeded"
+        else:
+            status = "failed"
+
+        execution_id = self._workspace.generate_execution_id()
+        execution = BlockExecution(
+            id=execution_id,
+            block_name=self._block_name,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            output_bindings=output_bindings,
+            exit_code=exit_code,
+            elapsed_s=elapsed,
+            image=self._agent_image,
+            stop_reason=self._stop_reason,
+            predecessor_id=self._predecessor_id,
+        )
+        self._workspace.add_execution(execution)
+
+        # Record a lifecycle event if the agent was stopped.
+        if self._stop_reason:
+            event = LifecycleEvent(
+                id=self._workspace.generate_event_id(),
+                kind="agent_stopped",
+                timestamp=finished_at,
+                execution_id=execution_id,
+                detail={"reason": self._stop_reason},
+            )
+            self._workspace.add_event(event)
+
+        self._workspace.save()
+
         print(
             f"  [agent] completed: exit_code={exit_code}, "
             f"elapsed={elapsed:.1f}s, evals={evals_run}"
@@ -231,7 +294,116 @@ class AgentHandle:
             exit_code=exit_code,
             elapsed_s=elapsed,
             evals_run=evals_run,
+            execution_id=execution_id,
+            stop_reason=self._stop_reason,
         )
+
+
+@dataclass
+class AgentBlockConfig:
+    """Configuration for an agent block launch.
+
+    Groups the parameters for ``launch_agent_block`` into a
+    reusable, inspectable object.  Used by ``AgentGroup`` to
+    define a base config with per-member overrides.
+
+    Attributes:
+        workspace: The flywheel workspace for artifact tracking.
+        template: The template containing block definitions.
+        project_root: Path to the project root.
+        prompt: The system prompt for the agent.
+        agent_image: Docker image for the agent container.
+        auth_volume: Docker named volume with API credentials.
+        model: Model name (e.g., ``"claude-sonnet-4-6"``).
+        max_invocations: Maximum nested block invocations.
+        max_turns: Maximum agent conversation turns.
+        total_timeout: Maximum wall-clock seconds.
+        allowed_blocks: Block names the agent may invoke.
+        source_dirs: Source directories to mount read-only.
+        input_artifacts: Maps mount names to artifact instance IDs.
+        output_names: Artifact names to collect after completion.
+        overrides: CLI flag overrides for invoked containers.
+        mcp_servers: Comma-separated MCP server names.
+        allowed_tools: Comma-separated tool whitelist.
+        extra_env: Additional environment variables.
+        extra_mounts: Additional volume mounts.
+        pre_launch_hook: Callback before container launch.
+        on_record: Callback fired after each successful record-mode
+            bridge invocation.
+        isolated_network: Enable iptables-based network isolation.
+        agent_workspace_dir: Subdirectory name for the agent workspace.
+        predecessor_id: Execution ID of a previous agent run that
+            this launch resumes from.
+    """
+
+    workspace: Workspace
+    template: Template
+    project_root: Path
+    prompt: str
+    agent_image: str = "flywheel-claude:latest"
+    auth_volume: str = "claude-auth"
+    model: str | None = None
+    max_invocations: int | None = None
+    max_turns: int | None = None
+    total_timeout: int = DEFAULT_TOTAL_TIMEOUT
+    allowed_blocks: list[str] | None = None
+    source_dirs: list[str] | None = None
+    input_artifacts: dict[str, str] | None = None
+    output_names: list[str] | None = None
+    overrides: dict[str, Any] | None = None
+    mcp_servers: str | None = None
+    allowed_tools: str | None = None
+    extra_env: dict[str, str] | None = None
+    extra_mounts: list[tuple[str, str, str]] | None = None
+    pre_launch_hook: Callable[[Path], None] | None = None
+    on_record: Callable[[str, dict], None] | None = None
+    isolated_network: bool = False
+    agent_workspace_dir: str | None = None
+    predecessor_id: str | None = None
+
+
+def prepare_agent_workspace(
+    workspace: Workspace,
+    output_names: list[str] | None = None,
+    agent_workspace_dir: str | None = None,
+) -> Path:
+    """Prepare a fresh agent workspace directory.
+
+    Creates the directory (removing any existing one) and seeds it
+    with the latest artifacts from prior steps so the agent can
+    continue where the previous step left off.
+
+    Args:
+        workspace: The flywheel workspace.
+        output_names: Artifact names whose latest instances should
+            be seeded into the workspace.
+        agent_workspace_dir: Subdirectory name under the workspace.
+            Defaults to ``"agent_workspace"``.
+
+    Returns:
+        Path to the prepared agent workspace directory.
+    """
+    ws_dir_name = agent_workspace_dir or "agent_workspace"
+    agent_ws = workspace.path / ws_dir_name
+    if agent_ws.exists():
+        shutil.rmtree(agent_ws)
+    agent_ws.mkdir(parents=True)
+
+    if output_names:
+        for name in output_names:
+            instances = workspace.instances_for(name)
+            if instances:
+                latest = instances[-1]
+                if latest.kind == "copy" and latest.copy_path:
+                    src_dir = (
+                        workspace.path / "artifacts" / latest.copy_path
+                    )
+                    if src_dir.exists():
+                        for f in src_dir.iterdir():
+                            if f.is_file():
+                                shutil.copy2(f, agent_ws / f.name)
+
+    return agent_ws
 
 
 def launch_agent_block(
@@ -258,6 +430,7 @@ def launch_agent_block(
     on_record: Callable[[str, dict], None] | None = None,
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
+    predecessor_id: str | None = None,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -300,33 +473,16 @@ def launch_agent_block(
             Defaults to ``"agent_workspace"``.  Use distinct names
             when launching multiple agents in parallel against the
             same flywheel workspace.
+        predecessor_id: Execution ID of a previous agent run that
+            this launch resumes from.  Recorded in the workspace
+            execution for resume chain tracking.
 
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
     """
-    # Create agent workspace directory (fresh each step).
-    ws_dir_name = agent_workspace_dir or "agent_workspace"
-    agent_ws = workspace.path / ws_dir_name
-    if agent_ws.exists():
-        shutil.rmtree(agent_ws)
-    agent_ws.mkdir(parents=True)
-
-    # Seed the agent workspace with the latest artifacts from
-    # prior steps so the agent can continue where the previous
-    # step left off.
-    if output_names:
-        for name in output_names:
-            instances = workspace.instances_for(name)
-            if instances:
-                latest = instances[-1]
-                if latest.kind == "copy" and latest.copy_path:
-                    src_dir = (
-                        workspace.path / "artifacts" / latest.copy_path
-                    )
-                    if src_dir.exists():
-                        for f in src_dir.iterdir():
-                            if f.is_file():
-                                shutil.copy2(f, agent_ws / f.name)
+    # Prepare agent workspace (create dir, seed prior artifacts).
+    agent_ws = prepare_agent_workspace(
+        workspace, output_names, agent_workspace_dir)
 
     # Snapshot execution count to compute invocations later.
     executions_before = len(workspace.executions)
@@ -474,6 +630,7 @@ def launch_agent_block(
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
         container_name=container_name,
+        predecessor_id=predecessor_id,
     )
 
 
@@ -500,6 +657,7 @@ def run_agent_block(
     pre_launch_hook: Callable[[Path], None] | None = None,
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
+    predecessor_id: str | None = None,
 ) -> AgentResult:
     """Run an agent block execution (blocking).
 
@@ -533,12 +691,13 @@ def run_agent_block(
         pre_launch_hook=pre_launch_hook,
         isolated_network=isolated_network,
         agent_workspace_dir=agent_workspace_dir,
+        predecessor_id=predecessor_id,
     )
     try:
         return handle.wait()
     except KeyboardInterrupt:
         print("  [agent] interrupted -- requesting graceful stop")
-        handle.stop()
+        handle.stop(reason="keyboard_interrupt")
         try:
             handle._process.wait(timeout=30)
         except subprocess.TimeoutExpired:

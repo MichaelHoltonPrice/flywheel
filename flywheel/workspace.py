@@ -18,7 +18,11 @@ from pathlib import Path
 
 import yaml
 
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    LifecycleEvent,
+)
 from flywheel.template import Template
 from flywheel.validation import validate_name as _validate_name
 
@@ -39,6 +43,7 @@ class Workspace:
     artifact_declarations: dict[str, str]  # declaration name -> kind
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
+    events: dict[str, LifecycleEvent] = field(default_factory=dict)
 
     @staticmethod
     def _short_uuid() -> str:
@@ -128,6 +133,47 @@ class Workspace:
                 f"Execution {execution.id!r} already exists in workspace"
             )
         self.executions[execution.id] = execution
+
+    def generate_event_id(self) -> str:
+        """Generate a unique lifecycle event ID.
+
+        Returns:
+            An ID in the form ``evt_hexstring``, guaranteed unique
+            within this workspace.
+        """
+        while True:
+            candidate = f"evt_{self._short_uuid()}"
+            if candidate not in self.events:
+                return candidate
+
+    def add_event(self, event: LifecycleEvent) -> None:
+        """Add a lifecycle event to the workspace.
+
+        Args:
+            event: The lifecycle event to add.
+
+        Raises:
+            ValueError: If an event with this ID already exists.
+        """
+        if event.id in self.events:
+            raise ValueError(
+                f"Event {event.id!r} already exists in workspace"
+            )
+        self.events[event.id] = event
+
+    def events_for(self, kind: str) -> list[LifecycleEvent]:
+        """Return all lifecycle events of a given kind, ordered by timestamp.
+
+        Args:
+            kind: The event kind to filter by.
+
+        Returns:
+            A list of matching events, oldest first.
+        """
+        return sorted(
+            [e for e in self.events.values() if e.kind == kind],
+            key=lambda e: e.timestamp,
+        )
 
     def instances_for(self, artifact_name: str) -> list[ArtifactInstance]:
         """Return all artifact instances for a declaration, ordered by creation time.
@@ -448,6 +494,18 @@ class Workspace:
                 exit_code=entry.get("exit_code"),
                 elapsed_s=entry.get("elapsed_s"),
                 image=entry.get("image"),
+                stop_reason=entry.get("stop_reason"),
+                predecessor_id=entry.get("predecessor_id"),
+            )
+
+        events: dict[str, LifecycleEvent] = {}
+        for evid, entry in data.get("events", {}).items():
+            events[evid] = LifecycleEvent(
+                id=evid,
+                kind=entry["kind"],
+                timestamp=datetime.fromisoformat(entry["timestamp"]),
+                execution_id=entry.get("execution_id"),
+                detail=entry.get("detail", {}),
             )
 
         return cls(
@@ -458,6 +516,7 @@ class Workspace:
             artifact_declarations=declarations,
             artifacts=artifacts,
             executions=executions,
+            events=events,
         )
 
     def save(self) -> None:
@@ -498,9 +557,25 @@ class Workspace:
                 entry["elapsed_s"] = ex.elapsed_s
             if ex.image is not None:
                 entry["image"] = ex.image
+            if ex.stop_reason is not None:
+                entry["stop_reason"] = ex.stop_reason
+            if ex.predecessor_id is not None:
+                entry["predecessor_id"] = ex.predecessor_id
             serialized_executions[eid] = entry
 
-        data = {
+        serialized_events = {}
+        for evid, ev in self.events.items():
+            entry = {
+                "kind": ev.kind,
+                "timestamp": ev.timestamp.isoformat(),
+            }
+            if ev.execution_id is not None:
+                entry["execution_id"] = ev.execution_id
+            if ev.detail:
+                entry["detail"] = ev.detail
+            serialized_events[evid] = entry
+
+        data: dict = {
             "name": self.name,
             "template_name": self.template_name,
             "created_at": self.created_at.isoformat(),
@@ -508,6 +583,8 @@ class Workspace:
             "artifacts": serialized_artifacts,
             "executions": serialized_executions,
         }
+        if serialized_events:
+            data["events"] = serialized_events
 
         yaml_path = self.path / "workspace.yaml"
         with open(yaml_path, "w") as f:

@@ -7,6 +7,7 @@ are parsed from YAML files and validated at load time.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -55,12 +56,34 @@ class BlockDefinition:
 
 
 @dataclass(frozen=True)
+class ServiceDependency:
+    """A declared external service dependency.
+
+    Documents that a workspace requires an external service to
+    be running.  Flywheel does not start or manage the service,
+    but records the dependency for documentation, validation,
+    and future automation.
+
+    Attributes:
+        name: Service name (e.g., ``"game_server"``).
+        url_env: Environment variable name that blocks expect
+            to contain the service URL.
+        description: Human-readable description.
+    """
+
+    name: str
+    url_env: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class Template:
     """A workspace template parsed from YAML. Validated at load time."""
 
     name: str
     artifacts: list[ArtifactDeclaration]
     blocks: list[BlockDefinition]
+    services: list[ServiceDependency] = field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: Path) -> Template:
@@ -188,4 +211,42 @@ class Template:
                 env=entry.get("env", {}),
             ))
 
-        return cls(name=path.stem, artifacts=artifacts, blocks=blocks)
+        services: list[ServiceDependency] = []
+        for entry in data.get("services", []):
+            svc_name = entry["name"]
+            _validate_name(svc_name, "Service")
+            services.append(ServiceDependency(
+                name=svc_name,
+                url_env=entry["url_env"],
+                description=entry.get("description", ""),
+            ))
+
+        return cls(
+            name=path.stem,
+            artifacts=artifacts,
+            blocks=blocks,
+            services=services,
+        )
+
+
+def check_service_dependencies(template: Template) -> list[str]:
+    """Return warnings for unset service URL environment variables.
+
+    Checks each service dependency declared in the template and
+    returns a warning string for any whose ``url_env`` is not set
+    in the current environment.
+
+    Args:
+        template: The template to check.
+
+    Returns:
+        List of warning strings (empty if all services are available).
+    """
+    warnings: list[str] = []
+    for svc in template.services:
+        if not os.environ.get(svc.url_env):
+            warnings.append(
+                f"Service {svc.name!r} expects {svc.url_env} "
+                f"but it is not set"
+            )
+    return warnings

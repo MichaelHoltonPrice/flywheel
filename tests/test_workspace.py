@@ -6,8 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    LifecycleEvent,
+)
 from flywheel.template import Template
 from flywheel.validation import validate_name
 from flywheel.workspace import Workspace
@@ -590,3 +595,154 @@ class TestNameValidation:
 
     def test_valid_name(self):
         validate_name("my-workspace_01", "Test")
+
+
+class TestBlockExecutionNewFields:
+    """Tests for stop_reason and predecessor_id on BlockExecution."""
+
+    def test_round_trip_with_stop_reason(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="__agent__", started_at=now,
+            finished_at=now, status="interrupted",
+            exit_code=0, elapsed_s=5.0,
+            stop_reason="exploration_request",
+            predecessor_id="exec0",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        loaded_ex = loaded.executions["exec1"]
+        assert loaded_ex.stop_reason == "exploration_request"
+        assert loaded_ex.predecessor_id == "exec0"
+
+    def test_none_fields_not_serialized(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            status="succeeded",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        # Read raw YAML to confirm stop_reason is absent.
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        exec_data = raw["executions"]["exec1"]
+        assert "stop_reason" not in exec_data
+        assert "predecessor_id" not in exec_data
+
+    def test_load_old_format_defaults_none(self, tmp_path: Path):
+        """Old workspace.yaml without stop_reason loads correctly."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            status="succeeded",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.executions["exec1"].stop_reason is None
+        assert loaded.executions["exec1"].predecessor_id is None
+
+
+class TestLifecycleEvents:
+    """Tests for the LifecycleEvent entity on Workspace."""
+
+    def test_add_and_retrieve_event(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        event = LifecycleEvent(
+            id="evt_abc1", kind="agent_stopped",
+            timestamp=now, execution_id="exec1",
+            detail={"reason": "timeout"},
+        )
+        ws.add_event(event)
+        assert "evt_abc1" in ws.events
+        assert ws.events["evt_abc1"].kind == "agent_stopped"
+
+    def test_duplicate_event_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        event = LifecycleEvent(
+            id="evt_dup", kind="test", timestamp=now)
+        ws.add_event(event)
+        with pytest.raises(ValueError, match="already exists"):
+            ws.add_event(event)
+
+    def test_events_for_filters_by_kind(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_event(LifecycleEvent(
+            id="evt_1", kind="agent_stopped", timestamp=now))
+        ws.add_event(LifecycleEvent(
+            id="evt_2", kind="group_completed", timestamp=now))
+        ws.add_event(LifecycleEvent(
+            id="evt_3", kind="agent_stopped", timestamp=now))
+
+        stopped = ws.events_for("agent_stopped")
+        assert len(stopped) == 2
+        assert all(e.kind == "agent_stopped" for e in stopped)
+
+    def test_generate_event_id_unique(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ids = {ws.generate_event_id() for _ in range(50)}
+        assert len(ids) == 50
+        assert all(eid.startswith("evt_") for eid in ids)
+
+    def test_round_trip_with_events(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_event(LifecycleEvent(
+            id="evt_rt", kind="agent_stopped", timestamp=now,
+            execution_id="exec_x",
+            detail={"reason": "exploration_request"},
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert "evt_rt" in loaded.events
+        evt = loaded.events["evt_rt"]
+        assert evt.kind == "agent_stopped"
+        assert evt.execution_id == "exec_x"
+        assert evt.detail == {"reason": "exploration_request"}
+
+    def test_load_without_events_key(self, tmp_path: Path):
+        """Old workspace.yaml without events key loads correctly."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.events == {}
+
+    def test_empty_events_not_serialized(self, tmp_path: Path):
+        """Events key omitted from YAML when empty."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert "events" not in raw
