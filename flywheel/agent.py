@@ -257,6 +257,7 @@ def launch_agent_block(
     pre_launch_hook: Callable[[Path], None] | None = None,
     on_record: Callable[[str, dict], None] | None = None,
     isolated_network: bool = False,
+    agent_workspace_dir: str | None = None,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -293,12 +294,19 @@ def launch_agent_block(
         on_record: Callback fired after each successful record-mode
             bridge invocation.  Receives ``(block_name, outputs)``.
             Runs in the bridge HTTP handler thread.
+        isolated_network: Enable iptables-based network isolation
+            inside the container.
+        agent_workspace_dir: Subdirectory name for the agent workspace.
+            Defaults to ``"agent_workspace"``.  Use distinct names
+            when launching multiple agents in parallel against the
+            same flywheel workspace.
 
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
     """
     # Create agent workspace directory (fresh each step).
-    agent_ws = workspace.path / "agent_workspace"
+    ws_dir_name = agent_workspace_dir or "agent_workspace"
+    agent_ws = workspace.path / ws_dir_name
     if agent_ws.exists():
         shutil.rmtree(agent_ws)
     agent_ws.mkdir(parents=True)
@@ -491,6 +499,7 @@ def run_agent_block(
     extra_mounts: list[tuple[str, str, str]] | None = None,
     pre_launch_hook: Callable[[Path], None] | None = None,
     isolated_network: bool = False,
+    agent_workspace_dir: str | None = None,
 ) -> AgentResult:
     """Run an agent block execution (blocking).
 
@@ -523,6 +532,7 @@ def run_agent_block(
         extra_mounts=extra_mounts,
         pre_launch_hook=pre_launch_hook,
         isolated_network=isolated_network,
+        agent_workspace_dir=agent_workspace_dir,
     )
     try:
         return handle.wait()
