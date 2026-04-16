@@ -4,6 +4,7 @@ import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -302,17 +303,18 @@ class TestMainImportArtifact:
 
 class TestMainRunBlock:
     def test_argument_parsing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """Verify that main() parses run block args and calls the right path."""
+        """Verify that main() parses run block args and calls run_block."""
         project_root = make_project(tmp_path)
         monkeypatch.chdir(project_root)
 
-        # Create a workspace first
         main(["create", "workspace", "--name", "test_ws",
               "--template", "my_template"])
 
-        # run block should fail at container launch (Docker not available
-        # in tests), but it should get past argument parsing
-        with pytest.raises((RuntimeError, FileNotFoundError, OSError, ValueError)):
+        mock_result = MagicMock()
+        mock_result.exit_code = 0
+        mock_result.elapsed_s = 1.0
+
+        with patch("flywheel.cli.run_block", return_value=mock_result) as mock_rb:
             main([
                 "run", "block",
                 "--workspace",
@@ -321,6 +323,9 @@ class TestMainRunBlock:
                 "--template", "my_template",
                 "--", "--subclass", "dueling",
             ])
+            mock_rb.assert_called_once()
+            call_args = mock_rb.call_args
+            assert call_args[0][1] == "train"
 
 
 def _make_materialize_project(tmp_path: Path) -> Path:

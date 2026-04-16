@@ -9,8 +9,10 @@ provenance graph.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -44,6 +46,9 @@ class Workspace:
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
 
     @staticmethod
     def _short_uuid() -> str:
@@ -80,6 +85,8 @@ class Workspace:
     def add_artifact(self, instance: ArtifactInstance) -> None:
         """Add an artifact instance to the workspace.
 
+        Thread-safe: acquires the workspace lock.
+
         Args:
             instance: The artifact instance to add.
 
@@ -88,39 +95,45 @@ class Workspace:
                 the artifact name is not declared, the kind does not
                 match, or required fields for the kind are missing.
         """
-        if instance.id in self.artifacts:
-            raise ValueError(
-                f"Artifact {instance.id!r} already exists in workspace"
-            )
-        if instance.name not in self.artifact_declarations:
-            raise ValueError(
-                f"Artifact {instance.name!r} not declared "
-                f"in this workspace"
-            )
-        expected_kind = self.artifact_declarations[instance.name]
-        if instance.kind != expected_kind:
-            raise ValueError(
-                f"Artifact {instance.id!r} has kind {instance.kind!r} "
-                f"but {instance.name!r} expects {expected_kind!r}"
-            )
-        if instance.kind == "copy" and instance.copy_path is None:
-            raise ValueError(
-                f"Copy artifact {instance.id!r} is missing copy_path"
-            )
-        if instance.kind == "git":
-            missing = [
-                f for f in ("repo", "commit", "git_path")
-                if getattr(instance, f) is None
-            ]
-            if missing:
+        with self._lock:
+            if instance.id in self.artifacts:
                 raise ValueError(
-                    f"Git artifact {instance.id!r} is missing "
-                    f"required fields: {', '.join(missing)}"
+                    f"Artifact {instance.id!r} already exists "
+                    f"in workspace"
                 )
-        self.artifacts[instance.id] = instance
+            if instance.name not in self.artifact_declarations:
+                raise ValueError(
+                    f"Artifact {instance.name!r} not declared "
+                    f"in this workspace"
+                )
+            expected_kind = self.artifact_declarations[instance.name]
+            if instance.kind != expected_kind:
+                raise ValueError(
+                    f"Artifact {instance.id!r} has kind "
+                    f"{instance.kind!r} but {instance.name!r} "
+                    f"expects {expected_kind!r}"
+                )
+            if instance.kind == "copy" and instance.copy_path is None:
+                raise ValueError(
+                    f"Copy artifact {instance.id!r} is missing "
+                    f"copy_path"
+                )
+            if instance.kind == "git":
+                missing = [
+                    f for f in ("repo", "commit", "git_path")
+                    if getattr(instance, f) is None
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Git artifact {instance.id!r} is missing "
+                        f"required fields: {', '.join(missing)}"
+                    )
+            self.artifacts[instance.id] = instance
 
     def add_execution(self, execution: BlockExecution) -> None:
         """Add a block execution record to the workspace.
+
+        Thread-safe: acquires the workspace lock.
 
         Args:
             execution: The execution record to add.
@@ -128,11 +141,13 @@ class Workspace:
         Raises:
             ValueError: If an execution with this ID already exists.
         """
-        if execution.id in self.executions:
-            raise ValueError(
-                f"Execution {execution.id!r} already exists in workspace"
-            )
-        self.executions[execution.id] = execution
+        with self._lock:
+            if execution.id in self.executions:
+                raise ValueError(
+                    f"Execution {execution.id!r} already exists "
+                    f"in workspace"
+                )
+            self.executions[execution.id] = execution
 
     def generate_event_id(self) -> str:
         """Generate a unique lifecycle event ID.
@@ -149,17 +164,20 @@ class Workspace:
     def add_event(self, event: LifecycleEvent) -> None:
         """Add a lifecycle event to the workspace.
 
+        Thread-safe: acquires the workspace lock.
+
         Args:
             event: The lifecycle event to add.
 
         Raises:
             ValueError: If an event with this ID already exists.
         """
-        if event.id in self.events:
-            raise ValueError(
-                f"Event {event.id!r} already exists in workspace"
-            )
-        self.events[event.id] = event
+        with self._lock:
+            if event.id in self.events:
+                raise ValueError(
+                    f"Event {event.id!r} already exists in workspace"
+                )
+            self.events[event.id] = event
 
     def events_for(self, kind: str) -> list[LifecycleEvent]:
         """Return all lifecycle events of a given kind, ordered by timestamp.
@@ -202,11 +220,9 @@ class Workspace:
         to a new artifact registered under *target_name*.
 
         Args:
-            source_name: The artifact declaration name to read from
-                (e.g., ``"game_step"``).
-            target_name: The artifact declaration name to write to
-                (e.g., ``"game_history"``). Must be a declared copy
-                artifact.
+            source_name: The artifact declaration name to read from.
+            target_name: The artifact declaration name to write to.
+                Must be a declared copy artifact.
             filename: Name of the output file inside the artifact
                 directory.
 
@@ -520,72 +536,80 @@ class Workspace:
         )
 
     def save(self) -> None:
-        """Write workspace.yaml to the workspace directory."""
-        serialized_artifacts = {}
-        for aid, inst in self.artifacts.items():
-            entry: dict = {
-                "name": inst.name,
-                "kind": inst.kind,
-                "created_at": inst.created_at.isoformat(),
+        """Write workspace.yaml to the workspace directory.
+
+        Thread-safe: acquires the workspace lock.  Uses atomic
+        write (write to temp file, then rename) to prevent torn
+        YAML from concurrent saves or crashes.
+        """
+        with self._lock:
+            serialized_artifacts = {}
+            for aid, inst in self.artifacts.items():
+                entry: dict = {
+                    "name": inst.name,
+                    "kind": inst.kind,
+                    "created_at": inst.created_at.isoformat(),
+                }
+                if inst.produced_by is not None:
+                    entry["produced_by"] = inst.produced_by
+                if inst.source is not None:
+                    entry["source"] = inst.source
+                if inst.kind == "copy" and inst.copy_path is not None:
+                    entry["copy_path"] = inst.copy_path
+                if inst.kind == "git":
+                    entry["repo"] = inst.repo
+                    entry["commit"] = inst.commit
+                    entry["git_path"] = inst.git_path
+                serialized_artifacts[aid] = entry
+
+            serialized_executions = {}
+            for eid, ex in self.executions.items():
+                entry = {
+                    "block_name": ex.block_name,
+                    "started_at": ex.started_at.isoformat(),
+                    "status": ex.status,
+                    "input_bindings": ex.input_bindings,
+                    "output_bindings": ex.output_bindings,
+                }
+                if ex.finished_at is not None:
+                    entry["finished_at"] = ex.finished_at.isoformat()
+                if ex.exit_code is not None:
+                    entry["exit_code"] = ex.exit_code
+                if ex.elapsed_s is not None:
+                    entry["elapsed_s"] = ex.elapsed_s
+                if ex.image is not None:
+                    entry["image"] = ex.image
+                if ex.stop_reason is not None:
+                    entry["stop_reason"] = ex.stop_reason
+                if ex.predecessor_id is not None:
+                    entry["predecessor_id"] = ex.predecessor_id
+                serialized_executions[eid] = entry
+
+            serialized_events = {}
+            for evid, ev in self.events.items():
+                entry = {
+                    "kind": ev.kind,
+                    "timestamp": ev.timestamp.isoformat(),
+                }
+                if ev.execution_id is not None:
+                    entry["execution_id"] = ev.execution_id
+                if ev.detail:
+                    entry["detail"] = ev.detail
+                serialized_events[evid] = entry
+
+            data: dict = {
+                "name": self.name,
+                "template_name": self.template_name,
+                "created_at": self.created_at.isoformat(),
+                "artifact_declarations": self.artifact_declarations,
+                "artifacts": serialized_artifacts,
+                "executions": serialized_executions,
             }
-            if inst.produced_by is not None:
-                entry["produced_by"] = inst.produced_by
-            if inst.source is not None:
-                entry["source"] = inst.source
-            if inst.kind == "copy" and inst.copy_path is not None:
-                entry["copy_path"] = inst.copy_path
-            if inst.kind == "git":
-                entry["repo"] = inst.repo
-                entry["commit"] = inst.commit
-                entry["git_path"] = inst.git_path
-            serialized_artifacts[aid] = entry
+            if serialized_events:
+                data["events"] = serialized_events
 
-        serialized_executions = {}
-        for eid, ex in self.executions.items():
-            entry = {
-                "block_name": ex.block_name,
-                "started_at": ex.started_at.isoformat(),
-                "status": ex.status,
-                "input_bindings": ex.input_bindings,
-                "output_bindings": ex.output_bindings,
-            }
-            if ex.finished_at is not None:
-                entry["finished_at"] = ex.finished_at.isoformat()
-            if ex.exit_code is not None:
-                entry["exit_code"] = ex.exit_code
-            if ex.elapsed_s is not None:
-                entry["elapsed_s"] = ex.elapsed_s
-            if ex.image is not None:
-                entry["image"] = ex.image
-            if ex.stop_reason is not None:
-                entry["stop_reason"] = ex.stop_reason
-            if ex.predecessor_id is not None:
-                entry["predecessor_id"] = ex.predecessor_id
-            serialized_executions[eid] = entry
-
-        serialized_events = {}
-        for evid, ev in self.events.items():
-            entry = {
-                "kind": ev.kind,
-                "timestamp": ev.timestamp.isoformat(),
-            }
-            if ev.execution_id is not None:
-                entry["execution_id"] = ev.execution_id
-            if ev.detail:
-                entry["detail"] = ev.detail
-            serialized_events[evid] = entry
-
-        data: dict = {
-            "name": self.name,
-            "template_name": self.template_name,
-            "created_at": self.created_at.isoformat(),
-            "artifact_declarations": self.artifact_declarations,
-            "artifacts": serialized_artifacts,
-            "executions": serialized_executions,
-        }
-        if serialized_events:
-            data["events"] = serialized_events
-
-        yaml_path = self.path / "workspace.yaml"
-        with open(yaml_path, "w") as f:
-            yaml.safe_dump(data, f, sort_keys=False)
+            yaml_path = self.path / "workspace.yaml"
+            tmp_path = yaml_path.with_suffix(".yaml.tmp")
+            with open(tmp_path, "w") as f:
+                yaml.safe_dump(data, f, sort_keys=False)
+            os.replace(tmp_path, yaml_path)

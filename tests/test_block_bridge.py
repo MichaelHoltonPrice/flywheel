@@ -7,8 +7,8 @@ actions that already happened (e.g., game steps via REST API).
 
 from __future__ import annotations
 
-import contextlib
 import json
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -409,9 +409,10 @@ class TestRecordMode:
 
 
 class TestOnRecordCallback:
-    def test_callback_fires_on_success(self, tmp_path: Path):
-        """on_record is called with block_name and outputs."""
+    def test_callback_fires_via_http(self, tmp_path: Path):
+        """on_record callback fires through the HTTP handler."""
         template, ws = _make_workspace(tmp_path)
+        session = _seed_session(ws)
         captured = []
 
         def on_record(block_name: str, outputs: dict) -> None:
@@ -422,25 +423,28 @@ class TestOnRecordCallback:
             workspace=ws,
             on_record=on_record,
         )
-        # Don't start the HTTP server — test the Handler directly.
-        # Simulate what do_POST does: call _process_record_invocation
-        # and then invoke the callback.
-        outputs_data = {
-            "game_session": {"card_id": "c1", "level": 0},
-            "game_step": {"step_index": 1},
-        }
-        _process_record_invocation(
-            request_id="test_001",
-            block_name="game_step",
-            inputs={},
-            outputs=outputs_data,
-            elapsed_s=0.1,
-            template=template,
-            workspace=ws,
-        )
-        # Manually fire the callback as do_POST would.
-        if bridge.on_record is not None:
-            bridge.on_record("game_step", outputs_data)
+        port = bridge.start()
+        try:
+            outputs_data = {
+                "game_session": {"card_id": "c1", "level": 0},
+                "game_step": {"step_index": 1},
+            }
+            payload = json.dumps({
+                "mode": "record",
+                "block_name": "game_step",
+                "inputs": {"game_session": session.id},
+                "outputs": outputs_data,
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read())
+            assert result["ok"] is True
+        finally:
+            bridge.stop()
 
         assert len(captured) == 1
         assert captured[0][0] == "game_step"
@@ -455,38 +459,16 @@ class TestOnRecordCallback:
             on_record=None,
         )
         assert bridge.on_record is None
-        # Bridge can still start and stop without errors.
         port = bridge.start()
         assert port > 0
         bridge.stop()
 
-    def test_callback_receives_outputs_dict(self, tmp_path: Path):
-        """Callback receives the raw outputs dict from the request."""
+    def test_callback_exception_suppressed_via_http(
+        self, tmp_path: Path,
+    ):
+        """Callback exception does not crash the bridge HTTP handler."""
         template, ws = _make_workspace(tmp_path)
-        captured = []
-
-        bridge = BlockBridgeService(
-            template=template,
-            workspace=ws,
-            on_record=lambda name, out: captured.append(out),
-        )
-
-        outputs_data = {
-            "game_session": {"card_id": "c1"},
-            "game_step": {
-                "step_index": 1,
-                "prediction_correct": False,
-            },
-        }
-        bridge.on_record("game_step", outputs_data)
-
-        assert len(captured) == 1
-        step = captured[0]["game_step"]
-        assert step["prediction_correct"] is False
-
-    def test_callback_exception_suppressed(self, tmp_path: Path):
-        """Callback exception does not crash the bridge."""
-        template, ws = _make_workspace(tmp_path)
+        session = _seed_session(ws)
 
         def bad_callback(name: str, outputs: dict) -> None:
             raise ValueError("callback crash")
@@ -496,7 +478,24 @@ class TestOnRecordCallback:
             workspace=ws,
             on_record=bad_callback,
         )
-        # Simulate the suppression that do_POST does.
-        with contextlib.suppress(Exception):
-            bridge.on_record("game_step", {"data": 1})
-        # If we got here, the exception was suppressed.
+        port = bridge.start()
+        try:
+            payload = json.dumps({
+                "mode": "record",
+                "block_name": "game_step",
+                "inputs": {"game_session": session.id},
+                "outputs": {
+                    "game_session": {"card_id": "c1"},
+                    "game_step": {"step_index": 1},
+                },
+            }).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read())
+            assert result["ok"] is True
+        finally:
+            bridge.stop()

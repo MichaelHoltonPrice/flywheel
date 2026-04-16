@@ -555,6 +555,7 @@ def launch_agent_block(
         allowed_blocks=allowed_blocks,
         max_invocations=max_invocations,
         on_record=on_record,
+        agent_workspace_dir=agent_workspace_dir,
     )
     port = bridge.start()
     bridge_endpoint = f"http://host.docker.internal:{port}"

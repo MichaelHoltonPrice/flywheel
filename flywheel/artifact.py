@@ -61,7 +61,7 @@ class BlockExecution:
     which were produced, and the outcome.
 
     Attributes:
-        id: Unique identifier within the workspace (e.g., ``exec1``).
+        id: Unique identifier within the workspace (e.g., ``exec_a3f7b2e1``).
         block_name: The name of the block that was executed.
         started_at: When execution began.
         finished_at: When execution ended, or None if not yet finished.

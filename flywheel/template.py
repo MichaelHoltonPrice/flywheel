@@ -65,7 +65,7 @@ class ServiceDependency:
     and future automation.
 
     Attributes:
-        name: Service name (e.g., ``"game_server"``).
+        name: Service name.
         url_env: Environment variable name that blocks expect
             to contain the service URL.
         description: Human-readable description.

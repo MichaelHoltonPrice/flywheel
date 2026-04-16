@@ -216,7 +216,7 @@ The lifecycle:
 1. Create a fresh agent workspace directory. Seed it with the
    latest artifacts from prior steps so the agent can continue
    where the previous step left off.
-2. Start a block bridge service (HTTP, background thread).
+2. Start an execution channel service (HTTP, background thread).
 3. Run the optional ``pre_launch_hook`` callback. Projects use
    this for game-specific init, artifact creation, or writing
    files to the workspace before the container starts. The
@@ -238,11 +238,12 @@ exceeded, ensuring hung agents do not block indefinitely.
 ``launch_agent_block()`` returns an ``AgentHandle`` immediately,
 allowing the caller to control the container while it runs:
 
-- ``handle.kill()`` — terminate the container (e.g., from a
-  bridge callback when an artifact triggers a policy decision).
+- ``handle.stop(reason)`` — terminate the container (e.g., from
+  an execution callback when an artifact triggers a policy
+  decision). The optional ``reason`` is recorded in the execution.
 - ``handle.wait()`` — block until exit, stop the bridge, collect
   output artifacts, and return ``AgentResult``.  Must be called
-  exactly once, even after ``kill()``.
+  exactly once, even after ``stop()``.
 - ``handle.is_alive()`` — check if the container is still running.
 
 The blocking ``run_agent_block()`` is a convenience wrapper that
@@ -326,14 +327,18 @@ as artifacts and pass them into a fresh session's prompt. This
 is the approach the artifact-based architecture naturally
 supports.
 
-### Block bridge
+### Execution channel (block bridge)
 
-The block bridge is a generic HTTP service that lets containers
-trigger nested block executions within the same workspace. It is
-not specific to evaluation -- the invoked block and what it does
-are defined by the project's template, not by flywheel.
+The execution channel (``ExecutionChannel``, aliased as
+``BlockBridgeService``) is a generic HTTP service that lets
+containers trigger nested block executions within the same
+workspace. It routes requests to block executors:
+``RecordExecutor`` for ``mode=record``, ``ContainerExecutor``
+otherwise. It is not specific to evaluation — the invoked block
+and what it does are defined by the project's template, not by
+flywheel.
 
-The bridge supports two modes:
+The channel supports two modes:
 
 **Invoke mode** (default): launches a Docker container.
 
@@ -360,13 +365,14 @@ bindings. Record-mode blocks use the ``__record__`` sentinel as
 their image in the template. Input artifact IDs are validated
 for both existence and name match against the declared slot.
 
-**Record callback**: ``BlockBridgeService`` accepts an optional
-``on_record`` callback, fired after each successful record-mode
-invocation with ``(block_name, outputs)``. The callback runs in
-the bridge's HTTP handler thread. This enables the host to react
-in real-time to artifacts created by the agent — for example,
-killing the agent container via ``AgentHandle.kill()`` when a
-recorded game step indicates a prediction mismatch.
+**Record callback**: ``ExecutionChannel`` (aliased as
+``BlockBridgeService`` for backward compatibility) accepts an
+optional ``on_record`` callback, fired after each successful
+record-mode invocation with an ``ExecutionEvent``. The callback
+runs in the channel's HTTP handler thread. This enables the host
+to react in real-time to artifacts created by the agent — for
+example, stopping the agent container via ``AgentHandle.stop()``
+when a recorded step indicates a policy-relevant condition.
 
 ### Project-provided MCP servers
 
@@ -440,6 +446,13 @@ The workspace.yaml file contains workspace metadata (name,
 template, creation time), all artifact instances keyed by ID,
 and all block execution records keyed by ID. Together these
 form the complete provenance record for the workspace.
+
+**Thread safety:** ``Workspace`` uses a ``threading.Lock`` to
+serialize mutations (``add_artifact``, ``add_execution``,
+``add_event``, ``save``). ``save()`` writes to a temporary file
+and atomically renames it to ``workspace.yaml`` via
+``os.replace()``, preventing torn writes from concurrent saves
+or crashes.
 
 ## Lifecycle tracking
 
@@ -527,6 +540,49 @@ automation.
 ``check_service_dependencies(template)`` returns warnings for
 any declared service whose ``url_env`` is not set in the current
 environment.
+
+## Agent loop
+
+``AgentLoop`` (in ``flywheel.agent_loop``) is flywheel's
+orchestration loop for multi-round agent workflows. Projects
+provide hooks; flywheel manages the run-decide-repeat lifecycle.
+
+### Hooks protocol
+
+Projects implement ``AgentLoopHooks``:
+
+- ``decide(state: LoopState) -> Action``: Given what just
+  happened (round number, last result, exit reason), decide
+  what to do next.
+- ``build_prompt(action, state) -> str``: Build the prompt for
+  the next agent round.
+
+Optional hooks: ``on_execution(event, handle)`` receives
+``ExecutionEvent`` callbacks during agent execution, and
+``auto_mount_artifacts()`` and ``make_pre_launch_hook()`` are
+auto-detected via ``hasattr`` for projects that need them.
+
+### Actions
+
+``decide()`` returns one of four actions:
+
+- ``Continue`` — launch a new agent round.
+- ``SpawnGroup`` — launch parallel sub-agents via
+  ``AgentGroup``, then resume deciding.
+- ``Stop`` — stop the loop (with a reason string).
+- ``Finished`` — the task is complete (with optional summary).
+
+### Lifecycle management
+
+The loop handles:
+
+- **Round counting** with a configurable ``max_rounds`` budget.
+- **Session resume**: detects prior agent executions in the
+  workspace and links them via ``predecessor_id``.
+- **Circuit breaker**: consecutive auth or rate-limit failures
+  trigger an automatic stop (default threshold: 3).
+- **Lifecycle events**: records ``loop_completed`` events in
+  the workspace.
 
 ## Future work
 

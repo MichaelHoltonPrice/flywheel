@@ -156,7 +156,6 @@ class TestExportSession:
 class TestSessionImport:
     def test_copies_to_sdk_path(self, tmp_path: Path):
         """RESUME_SESSION_FILE is copied to the SDK expected path."""
-        # Create a session file as if mounted at /input/agent_session/.
         source = tmp_path / "agent_session.jsonl"
         source.write_text('{"role": "user"}\n')
 
@@ -171,53 +170,25 @@ class TestSessionImport:
         assert expected.exists()
         assert expected.read_text() == '{"role": "user"}\n'
 
-    def test_session_id_from_filename_stem(self):
-        """Session ID is extracted from the filename stem."""
-        p = Path("/input/agent_session/my-session-id.jsonl")
-        assert p.stem == "my-session-id"
-        assert p.suffix == ".jsonl"
+    def test_sdk_session_path_uses_encode_cwd(self):
+        """_sdk_session_path encodes the cwd and appends session ID."""
+        result = _runner._sdk_session_path("my-session", "/home/user")
+        assert result.name == "my-session.jsonl"
+        assert "-home-user" in str(result)
 
-    def test_non_jsonl_file_rejected(self):
-        """Files without .jsonl suffix should not be used."""
-        p = Path("/input/agent_session/data.txt")
-        assert p.suffix != ".jsonl"
+    def test_export_skips_non_jsonl_suffix(self, tmp_path: Path):
+        """_export_session only copies .jsonl files via _sdk_session_path."""
+        sdk_projects = tmp_path / ".claude" / "projects"
+        output_file = tmp_path / "agent_session.jsonl"
 
-    def test_session_id_extracted_from_jsonl(self, tmp_path: Path):
-        """Session ID is read from the JSONL content, not filename."""
-        import json as _json
+        with (
+            patch.object(_runner, "SDK_PROJECTS_DIR", sdk_projects),
+            patch.object(_runner, "SESSION_OUTPUT_FILE", output_file),
+        ):
+            # Non-existent session -> no file created.
+            _runner._export_session("nonexistent-id")
 
-        real_sid = "640582da-4609-431a-b464-d9a99b7b4f35"
-        source = tmp_path / "agent_session.jsonl"
-        source.write_text(
-            _json.dumps({"sessionId": real_sid, "type": "init"})
-            + "\n"
-        )
-
-        # The resume code should extract the UUID from the file,
-        # not use "agent_session" (the filename stem).
-        first_line = source.read_text(encoding="utf-8").split("\n", 1)[0]
-        entry = _json.loads(first_line)
-        sid_from_file = entry.get("sessionId", "")
-        assert sid_from_file == real_sid
-        assert source.stem == "agent_session"  # filename is generic
-        assert sid_from_file != source.stem     # they differ
-
-    def test_session_id_fallback_on_bad_json(self, tmp_path: Path):
-        """Falls back to filename stem if JSONL is not valid JSON."""
-        source = tmp_path / "my-session.jsonl"
-        source.write_text("not valid json\n")
-        resume_sid = source.stem
-        try:
-            first_line = source.read_text(
-                encoding="utf-8").split("\n", 1)[0]
-            import json as _json
-            entry = _json.loads(first_line)
-            sid_from_file = entry.get("sessionId", "")
-            if sid_from_file:
-                resume_sid = sid_from_file
-        except Exception:
-            pass
-        assert resume_sid == "my-session"
+        assert not output_file.exists()
 
 
 class TestStopFile:

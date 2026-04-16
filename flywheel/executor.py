@@ -383,6 +383,7 @@ class ContainerExecutor:
         artifact_path: str | None = None,
         stopping: Any | None = None,
         active_container: list | None = None,
+        agent_workspace_dir: str | None = None,
     ) -> SyncExecutionHandle:
         """Launch a block in a Docker container (blocking).
 
@@ -400,6 +401,8 @@ class ContainerExecutor:
             stopping: Threading event for cancellation.
             active_container: Single-element list tracking the
                 running container name.
+            agent_workspace_dir: Subdirectory name for the agent
+                workspace. Defaults to ``"agent_workspace"``.
 
         Returns:
             A ``SyncExecutionHandle`` with the result.
@@ -421,7 +424,8 @@ class ContainerExecutor:
 
         # Resolve artifact path if provided (bridge-style).
         if artifact_path is not None:
-            agent_ws = workspace.path / "agent_workspace"
+            agent_ws_name = agent_workspace_dir or "agent_workspace"
+            agent_ws = workspace.path / agent_ws_name
             resolved = (agent_ws / artifact_path).resolve()
 
             if not resolved.is_relative_to(agent_ws.resolve()):

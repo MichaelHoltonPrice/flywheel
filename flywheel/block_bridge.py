@@ -73,6 +73,7 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
     _active_container: list  # [str | None]
     _service_id: str
     _on_record: Callable[[str, dict], None] | None
+    _agent_workspace_dir: str | None
 
     def do_POST(self):  # noqa: N802
         """Handle a POST request to invoke a block execution."""
@@ -199,6 +200,7 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
                 allowed_blocks=self.allowed_blocks,
                 stopping=self._stopping,
                 active_container=self._active_container,
+                agent_workspace_dir=self._agent_workspace_dir,
             )
         except Exception as e:
             self._send_json(500, {
@@ -483,6 +485,7 @@ def _process_block_invocation(
     allowed_blocks: list[str] | None = None,
     stopping: threading.Event | None = None,
     active_container: list | None = None,
+    agent_workspace_dir: str | None = None,
 ) -> dict:
     """Process a nested block execution request.
 
@@ -503,6 +506,8 @@ def _process_block_invocation(
         stopping: Event flag for cancellation.
         active_container: Single-element list tracking the running
             container name for kill-on-shutdown.
+        agent_workspace_dir: Subdirectory name for the agent
+            workspace. Defaults to ``"agent_workspace"``.
 
     Returns:
         Response dict with "ok" key and results or error details.
@@ -529,8 +534,8 @@ def _process_block_invocation(
             "message": f"Block {block_name!r} not found in template",
         }
 
-    # Resolve the artifact file from the agent workspace.
-    agent_ws = workspace.path / "agent_workspace"
+    agent_ws_name = agent_workspace_dir or "agent_workspace"
+    agent_ws = workspace.path / agent_ws_name
     artifact_path = (agent_ws / artifact_rel).resolve()
 
     if not artifact_path.is_relative_to(agent_ws.resolve()):
@@ -757,6 +762,7 @@ class BlockBridgeService:
         host: str = "0.0.0.0",
         port: int = 0,
         on_record: Callable[[str, dict], None] | None = None,
+        agent_workspace_dir: str | None = None,
     ):
         """Initialize the block bridge service.
 
@@ -773,6 +779,8 @@ class BlockBridgeService:
             on_record: Callback fired after a successful record-mode
                 invocation. Receives (block_name, outputs). Runs in
                 the HTTP handler thread — must be thread-safe.
+            agent_workspace_dir: Subdirectory name for the agent
+                workspace. Defaults to ``"agent_workspace"``.
         """
         self.template = template
         self.workspace = workspace
@@ -782,6 +790,7 @@ class BlockBridgeService:
         self.host = host
         self.port = port
         self.on_record = on_record
+        self.agent_workspace_dir = agent_workspace_dir
 
         self._service_id = secrets.token_hex(4)
         self._server: HTTPServer | None = None
@@ -801,6 +810,8 @@ class BlockBridgeService:
         active_container = self._active_container
         service_id = self._service_id
 
+        agent_ws_dir = self.agent_workspace_dir
+
         class Handler(_BridgeRequestHandler):
             template = self.template
             workspace = self.workspace
@@ -817,6 +828,7 @@ class BlockBridgeService:
                 staticmethod(self.on_record)
                 if self.on_record else None
             )
+            _agent_workspace_dir = agent_ws_dir
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]

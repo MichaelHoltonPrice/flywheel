@@ -112,11 +112,11 @@ def main(argv: list[str] | None = None) -> None:
     mat_parser.add_argument("--workspace", required=True)
     mat_parser.add_argument(
         "--from", dest="source_name", required=True,
-        help="Source artifact name (e.g., game_step).",
+        help="Source artifact declaration name.",
     )
     mat_parser.add_argument(
         "--to", dest="target_name", required=True,
-        help="Target artifact name (e.g., game_history).",
+        help="Target artifact declaration name.",
     )
 
     # Split on '--' to separate flywheel args from container args

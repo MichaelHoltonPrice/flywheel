@@ -327,20 +327,24 @@ class TestAgentLoopResume:
             "exec_prior2": prior_exec,
         }
 
+        prompts_seen = []
+
         class ResumeHooks:
             def decide(self, state):
                 if state.is_resumed:
-                    return Continue()  # Resume round
+                    return Continue()
                 return Finished()
 
             def build_prompt(self, action, state):
+                prompts_seen.append(state.round_number)
                 return f"Round {state.round_number}"
 
         loop = AgentLoop(ResumeHooks(), config, max_rounds=5)
         result = loop.run()
 
-        # Round numbers start at 3 (after 2 prior).
         assert result["is_finished"] is True
+        assert result["rounds_completed"] == 1
+        assert prompts_seen[0] == 3
 
     @patch("flywheel.agent_loop.launch_agent_block")
     def test_predecessor_id_set_on_resume(
@@ -382,18 +386,44 @@ class TestAgentLoopOnExecution:
         mock_launch.return_value = MagicMock(
             wait=MagicMock(return_value=_mock_result()))
 
+        received_events = []
+
         class HooksWithOnExecution:
             def decide(self, state):
                 return Finished()
             def build_prompt(self, action, state):
                 return "go"
             def on_execution(self, event, handle):
-                pass
+                received_events.append(event)
 
         config = _mock_config(tmp_path)
         loop = AgentLoop(HooksWithOnExecution(), config)
         loop.run()
 
-        # on_record callback should be wired.
         call_kwargs = mock_launch.call_args.kwargs
-        assert call_kwargs["on_record"] is not None
+        on_record = call_kwargs["on_record"]
+        assert on_record is not None
+
+        on_record("test_block", {"test": "data"})
+        assert len(received_events) == 1
+        assert received_events[0].block_name == "test_block"
+
+    @patch("flywheel.agent_loop.launch_agent_block")
+    def test_on_execution_not_wired_without_hook(
+        self, mock_launch, tmp_path,
+    ):
+        mock_launch.return_value = MagicMock(
+            wait=MagicMock(return_value=_mock_result()))
+
+        class HooksWithoutOnExecution:
+            def decide(self, state):
+                return Finished()
+            def build_prompt(self, action, state):
+                return "go"
+
+        config = _mock_config(tmp_path)
+        loop = AgentLoop(HooksWithoutOnExecution(), config)
+        loop.run()
+
+        call_kwargs = mock_launch.call_args.kwargs
+        assert call_kwargs["on_record"] is None

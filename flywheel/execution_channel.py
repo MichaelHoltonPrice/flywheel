@@ -7,8 +7,7 @@ the appropriate executor based on the request mode:
 - Default (invoke) → ``ContainerExecutor``
 
 Preserves the exact HTTP protocol so that MCP servers inside
-containers (``eval_mcp_server.py``, ``arc_mcp_server.py``) need
-zero changes.
+containers need zero changes.
 
 Fires ``ExecutionEvent`` callbacks after each execution, replacing
 the former ``on_record`` callback with a typed, executor-agnostic
@@ -51,6 +50,7 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
     _active_container: list  # [str | None]
     _service_id: str
     _on_execution: Callable[[ExecutionEvent], None] | None
+    _agent_workspace_dir: str | None
 
     def do_POST(self):  # noqa: N802
         """Handle a POST request to execute a block."""
@@ -220,6 +220,7 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
                 allowed_blocks=self._allowed_blocks,
                 stopping=self._stopping,
                 active_container=self._active_container,
+                agent_workspace_dir=self._agent_workspace_dir,
             )
             result = handle.wait()
         except (ValueError, FileNotFoundError) as e:
@@ -436,6 +437,7 @@ class ExecutionChannel:
         port: int = 0,
         on_execution: Callable[[ExecutionEvent], None] | None = None,
         on_record: Callable[[str, dict], None] | None = None,
+        agent_workspace_dir: str | None = None,
     ):
         """Initialize the execution channel."""
         self.template = template
@@ -445,6 +447,7 @@ class ExecutionChannel:
         self.max_invocations = max_invocations
         self.host = host
         self.port = port
+        self.agent_workspace_dir = agent_workspace_dir
 
         # on_record backward compat: wrap into on_execution.
         if on_execution is not None:
@@ -482,6 +485,8 @@ class ExecutionChannel:
         record_executor = self._record_executor
         container_executor = self._container_executor
 
+        agent_ws_dir = self.agent_workspace_dir
+
         class Handler(_ChannelRequestHandler):
             workspace = self.workspace
             _record_executor = record_executor
@@ -498,6 +503,7 @@ class ExecutionChannel:
                 staticmethod(on_execution)
                 if on_execution else None
             )
+            _agent_workspace_dir = agent_ws_dir
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
