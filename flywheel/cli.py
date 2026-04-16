@@ -4,11 +4,14 @@ Supports:
     flywheel create workspace --name NAME --template TEMPLATE
     flywheel run block --workspace PATH --block BLOCK --template TEMPLATE
         [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
-    flywheel import artifact --workspace PATH --name NAME
-        --from SOURCE [--source TEXT]
     flywheel run agent --workspace PATH --template TEMPLATE
         --prompt-file FILE [--model MODEL] [--max-invocations N]
         [--allowed-block BLOCK ...] [-- container override args...]
+    flywheel run loop --workspace PATH --template TEMPLATE
+        [--hooks MODULE:CLASS] [--model MODEL] [--max-rounds N]
+        [-- project-specific args...]
+    flywheel import artifact --workspace PATH --name NAME
+        --from SOURCE [--source TEXT]
 """
 
 from __future__ import annotations
@@ -16,11 +19,13 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
-from flywheel.agent import run_agent_block
+from flywheel.agent import AgentBlockConfig, run_agent_block
+from flywheel.agent_loop import AgentLoop, load_hooks_class
 from flywheel.config import load_project_config
 from flywheel.execution import run_block
-from flywheel.template import Template
+from flywheel.template import Template, check_service_dependencies
 from flywheel.workspace import Workspace
 
 
@@ -107,6 +112,27 @@ def main(argv: list[str] | None = None) -> None:
         "--mount", action="append", default=[], dest="extra_mounts",
         help="Extra mount as HOST:CONTAINER:MODE (repeatable).")
 
+    # flywheel run loop
+    loop_parser = run_sub.add_parser("loop")
+    loop_parser.add_argument("--workspace", required=True)
+    loop_parser.add_argument("--template", required=True)
+    loop_parser.add_argument(
+        "--hooks", default=None,
+        help="Hooks class as module.path:ClassName. "
+        "Overrides the hooks key in flywheel.yaml.")
+    loop_parser.add_argument("--model", default=None)
+    loop_parser.add_argument("--max-rounds", type=int, default=10)
+    loop_parser.add_argument("--max-turns", type=int, default=200)
+    loop_parser.add_argument("--total-timeout", type=int, default=14400,
+                             help="Max wall-clock seconds per agent "
+                             "round (default: 14400 = 4h).")
+    loop_parser.add_argument("--auth-volume", default="claude-auth")
+    loop_parser.add_argument("--agent-image",
+                             default="flywheel-claude:latest")
+    loop_parser.add_argument(
+        "--max-consecutive-failures", type=int, default=3,
+        help="Circuit breaker threshold (default: 3).")
+
     # flywheel materialize
     mat_parser = subparsers.add_parser("materialize")
     mat_parser.add_argument("--workspace", required=True)
@@ -146,6 +172,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "run" and getattr(args, "target", None) == "agent":
         run_agent_command(args, extra_container_args)
+    elif args.command == "run" and getattr(args, "target", None) == "loop":
+        run_loop_command(args, extra_container_args)
     elif args.command == "materialize":
         materialize_command(
             args.workspace, args.source_name, args.target_name,
@@ -366,6 +394,90 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         f"elapsed={result.elapsed_s:.1f}s, "
         f"invocations={result.evals_run}"
     )
+
+
+def run_loop_command(args, extra_args: list[str]) -> None:
+    """Run an agent loop with project-provided hooks.
+
+    Loads the hooks class (from ``--hooks`` or ``flywheel.yaml``),
+    calls ``hooks.init()`` for project-specific setup, builds the
+    agent config from CLI flags merged with hooks overrides, and
+    runs the loop.
+
+    Args:
+        args: Parsed argparse namespace with loop-specific fields.
+        extra_args: Project-specific arguments passed after ``--``.
+    """
+    config = load_project_config(Path.cwd())
+
+    template_path = config.templates_dir / f"{args.template}.yaml"
+    template = Template.from_yaml(template_path)
+
+    ws = Workspace.load(Path(args.workspace))
+
+    # Check service dependencies.
+    warnings = check_service_dependencies(template)
+    for w in warnings:
+        print(f"  [flywheel] WARNING: {w}")
+
+    # Resolve hooks class.
+    hooks_path = args.hooks or config.hooks
+    if not hooks_path:
+        print("ERROR: No hooks specified. Use --hooks or set "
+              "'hooks' in flywheel.yaml.")
+        sys.exit(1)
+
+    hooks_cls = load_hooks_class(hooks_path)
+    hooks = hooks_cls()
+
+    # Project-specific initialization.
+    overrides: dict[str, Any] = {}
+    if hasattr(hooks, "init"):
+        overrides = hooks.init(
+            ws, template, config.project_root, extra_args,
+        ) or {}
+
+    # Build agent config from CLI flags + hooks overrides.
+    agent_config = AgentBlockConfig(
+        workspace=ws,
+        template=template,
+        project_root=config.project_root,
+        prompt="",  # Set by hooks.build_prompt()
+        agent_image=overrides.get(
+            "agent_image", args.agent_image),
+        auth_volume=overrides.get(
+            "auth_volume", args.auth_volume),
+        model=overrides.get("model", args.model),
+        max_turns=overrides.get("max_turns", args.max_turns),
+        total_timeout=overrides.get(
+            "total_timeout", args.total_timeout),
+        output_names=overrides.get("output_names"),
+        mcp_servers=overrides.get("mcp_servers"),
+        allowed_tools=overrides.get("allowed_tools"),
+        extra_env=overrides.get("extra_env"),
+        extra_mounts=overrides.get("extra_mounts"),
+        pre_launch_hook=overrides.get("pre_launch_hook"),
+        isolated_network=overrides.get(
+            "isolated_network", True),
+    )
+
+    # Run the loop.
+    loop = AgentLoop(
+        hooks=hooks,
+        base_config=agent_config,
+        max_rounds=args.max_rounds,
+        max_consecutive_failures=args.max_consecutive_failures,
+    )
+    result = loop.run()
+
+    # Print summary.
+    print(f"\nLoop complete: "
+          f"{result.get('rounds_completed', 0)} rounds, "
+          f"exit={result.get('last_exit_reason', 'unknown')}")
+    if result.get("is_finished"):
+        print("  Game finished!")
+    if result.get("stop_reason"):
+        print(f"  Stop reason: {result['stop_reason']}")
 
 
 def _parse_overrides(args: list[str]) -> dict[str, str]:

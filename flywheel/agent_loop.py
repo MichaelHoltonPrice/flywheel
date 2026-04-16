@@ -6,12 +6,25 @@ what to do next.  Handles session resume, circuit breaking on
 auth/rate-limit failures, lifecycle events, and restart from
 workspace state.
 
-Projects provide two hooks:
+Projects provide a hooks class implementing ``AgentLoopHooks``:
 
+- ``init(workspace, template, project_root, args)``: One-time
+  setup.  Parse project-specific CLI args, initialize external
+  services, register initial artifacts.  Returns a dict of
+  agent launch config overrides (extra_env, extra_mounts,
+  output_names, mcp_servers, pre_launch_hook, etc.).
 - ``decide(state) -> Action``: Given what just happened, return
   what to do next (Continue, SpawnGroup, Stop, Finished).
 - ``build_prompt(action, state) -> str``: Build the prompt for
   the next agent round.
+
+Optional hooks (detected via ``hasattr``):
+- ``on_execution(event, handle)``: React to mid-execution
+  artifacts (e.g., stop the agent on a policy trigger).
+- ``auto_mount_artifacts() -> list[str]``: Declare artifact
+  names to auto-mount on each agent launch.
+- ``make_pre_launch_hook()``: Return a callback for agent
+  workspace setup before container launch.
 
 Usage::
 
@@ -27,8 +40,10 @@ Usage::
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from flywheel.agent import (
@@ -40,6 +55,7 @@ from flywheel.agent import (
 from flywheel.agent_group import AgentGroup, AgentGroupMember
 from flywheel.artifact import LifecycleEvent
 from flywheel.executor import ExecutionEvent
+from flywheel.template import Template
 from flywheel.workspace import Workspace
 
 # ── Loop state and actions ───────────────────────────────────────
@@ -127,6 +143,27 @@ class AgentLoopHooks(Protocol):
     Flywheel controls how it runs.
     """
 
+    def init(
+        self,
+        workspace: Workspace,
+        template: Template,
+        project_root: Path,
+        args: list[str],
+    ) -> dict[str, Any]:
+        """One-time setup before the loop starts.
+
+        Parse project-specific CLI args (passed after ``--``),
+        initialize external services, register initial artifacts,
+        and configure environment variables.
+
+        Returns:
+            Dict of ``AgentBlockConfig`` field overrides.  Common
+            keys: ``extra_env``, ``extra_mounts``, ``output_names``,
+            ``mcp_servers``, ``isolated_network``.  Unknown keys
+            are ignored.
+        """
+        ...
+
     def decide(self, state: LoopState) -> Action:
         """Decide what to do after each agent round.
 
@@ -144,6 +181,31 @@ class AgentLoopHooks(Protocol):
         ``state.last_result`` is None.
         """
         ...
+
+
+def load_hooks_class(import_path: str) -> type:
+    """Import a hooks class from a ``module.path:ClassName`` string.
+
+    Args:
+        import_path: Dotted module path and class name separated by
+            a colon (e.g., ``myproject.hooks:MyHooks``).
+
+    Returns:
+        The hooks class (not an instance).
+
+    Raises:
+        ValueError: If the import path format is invalid.
+        ImportError: If the module cannot be imported.
+        AttributeError: If the class is not found in the module.
+    """
+    if ":" not in import_path:
+        raise ValueError(
+            f"Hooks import path must be 'module.path:ClassName', "
+            f"got {import_path!r}"
+        )
+    module_path, class_name = import_path.rsplit(":", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)
 
 
 # ── AgentLoop ────────────────────────────────────────────────────

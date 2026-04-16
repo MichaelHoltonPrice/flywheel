@@ -64,6 +64,26 @@ class TestLoadProjectConfig:
         assert config.templates_dir == tmp_path / "some" / "nested" / "dir" / "templates"
 
 
+class TestHooksConfig:
+    def test_hooks_none_by_default(self, tmp_path: Path):
+        (tmp_path / CONFIG_FILENAME).write_text(
+            "foundry_dir: foundry\n")
+        config = load_project_config(tmp_path)
+        assert config.hooks is None
+
+    def test_hooks_loaded(self, tmp_path: Path):
+        (tmp_path / CONFIG_FILENAME).write_text(
+            "foundry_dir: foundry\nhooks: mymod:MyClass\n")
+        config = load_project_config(tmp_path)
+        assert config.hooks == "mymod:MyClass"
+
+    def test_hooks_non_string_raises(self, tmp_path: Path):
+        (tmp_path / CONFIG_FILENAME).write_text(
+            "foundry_dir: foundry\nhooks: 42\n")
+        with pytest.raises(ValueError, match="module.path:ClassName"):
+            load_project_config(tmp_path)
+
+
 class TestProjectConfigFrozen:
     def test_frozen(self, tmp_path: Path):
         (tmp_path / CONFIG_FILENAME).write_text("foundry_dir: foundry\n")

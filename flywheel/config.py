@@ -22,10 +22,13 @@ class ProjectConfig:
     Attributes:
         project_root: The project root directory containing flywheel.yaml.
         foundry_dir: Path to the foundry directory.
+        hooks: Optional Python import path for loop hooks, in the form
+            ``module.path:ClassName`` (e.g., ``myproject.hooks:MyHooks``).
     """
 
     project_root: Path
     foundry_dir: Path
+    hooks: str | None = None
 
     @property
     def templates_dir(self) -> Path:
@@ -90,7 +93,15 @@ def load_project_config(project_root: Path) -> ProjectConfig:
 
     foundry_dir = project_root / raw_foundry
 
+    hooks = data.get("hooks")
+    if hooks is not None and not isinstance(hooks, str):
+        raise ValueError(
+            f"'hooks' in {config_path} must be a string in the form "
+            f"'module.path:ClassName', got {type(hooks).__name__}"
+        )
+
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
+        hooks=hooks,
     )

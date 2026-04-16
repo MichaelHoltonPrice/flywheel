@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.agent_group import AgentGroupMember
 from flywheel.agent_loop import (
@@ -14,6 +16,7 @@ from flywheel.agent_loop import (
     LoopState,
     SpawnGroup,
     Stop,
+    load_hooks_class,
 )
 
 
@@ -427,3 +430,23 @@ class TestAgentLoopOnExecution:
 
         call_kwargs = mock_launch.call_args.kwargs
         assert call_kwargs["on_record"] is None
+
+
+class TestLoadHooksClass:
+    def test_loads_builtin_class(self):
+        cls = load_hooks_class(
+            "flywheel.agent_loop:AgentLoop")
+        assert cls is AgentLoop
+
+    def test_bad_format_raises(self):
+        with pytest.raises(ValueError, match="module.path:ClassName"):
+            load_hooks_class("no_colon_here")
+
+    def test_missing_module_raises(self):
+        with pytest.raises(ImportError):
+            load_hooks_class("nonexistent.module:Cls")
+
+    def test_missing_class_raises(self):
+        with pytest.raises(AttributeError):
+            load_hooks_class(
+                "flywheel.agent_loop:NonexistentClass")
