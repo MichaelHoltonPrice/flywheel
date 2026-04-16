@@ -547,20 +547,40 @@ environment.
 orchestration loop for multi-round agent workflows. Projects
 provide hooks; flywheel manages the run-decide-repeat lifecycle.
 
+### Hooks discovery
+
+Projects declare their hooks class in ``flywheel.yaml``:
+
+```yaml
+foundry_dir: foundry
+hooks: myproject.hooks:MyHooks
+```
+
+``flywheel run loop`` loads this class, instantiates it, and calls
+``init()`` for project-specific setup before starting the loop.
+The ``--hooks`` CLI flag overrides the config file.
+
 ### Hooks protocol
 
 Projects implement ``AgentLoopHooks``:
 
+- ``init(workspace, template, project_root, args) -> dict``:
+  One-time setup.  Parse project-specific CLI args (passed after
+  ``--``), initialize external services, register initial
+  artifacts.  Returns a dict of ``AgentBlockConfig`` field
+  overrides (``extra_env``, ``extra_mounts``, ``output_names``,
+  ``mcp_servers``, ``pre_launch_hook``, etc.).
 - ``decide(state: LoopState) -> Action``: Given what just
   happened (round number, last result, exit reason), decide
   what to do next.
 - ``build_prompt(action, state) -> str``: Build the prompt for
   the next agent round.
 
-Optional hooks: ``on_execution(event, handle)`` receives
-``ExecutionEvent`` callbacks during agent execution, and
-``auto_mount_artifacts()`` and ``make_pre_launch_hook()`` are
-auto-detected via ``hasattr`` for projects that need them.
+Optional hooks (detected via ``hasattr``):
+``on_execution(event, handle)`` receives ``ExecutionEvent``
+callbacks during agent execution.
+``auto_mount_artifacts()`` and ``make_pre_launch_hook()`` provide
+per-launch artifact mounting and workspace setup.
 
 ### Actions
 
