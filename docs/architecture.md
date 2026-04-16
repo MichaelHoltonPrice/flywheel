@@ -441,6 +441,93 @@ template, creation time), all artifact instances keyed by ID,
 and all block execution records keyed by ID. Together these
 form the complete provenance record for the workspace.
 
+## Lifecycle tracking
+
+### Block execution metadata
+
+``BlockExecution`` includes optional fields for lifecycle tracking:
+
+- ``stop_reason``: Why the execution ended, if it was stopped
+  externally (e.g., ``"exploration_request"``,
+  ``"prediction_mismatch"``, ``"timeout"``). None for normal
+  completion.
+- ``predecessor_id``: Execution ID that this block resumes from,
+  enabling resume chains across container restarts.
+
+### Agent execution recording
+
+``AgentHandle.wait()`` records the agent container itself as a
+``BlockExecution`` with ``block_name="__agent__"``. This fills
+a previous gap where the workspace tracked nested block executions
+(game steps, evaluations) but not the agent run that triggered
+them. The ``stop_reason`` field captures why the agent was stopped,
+and ``predecessor_id`` links consecutive runs of the same agent.
+
+### Lifecycle events
+
+``LifecycleEvent`` is a lightweight entity for operational events
+that are not block executions: agent stops, group completions,
+mode transitions. Each event has:
+
+- ``id``: Unique identifier (``"evt_hexstring"``).
+- ``kind``: Event type (e.g., ``"agent_stopped"``,
+  ``"group_completed"``).
+- ``timestamp``: When the event occurred.
+- ``execution_id``: Related execution, if any.
+- ``detail``: Free-form metadata dict.
+
+Events are stored in the workspace alongside artifacts and
+executions. They are serialized to workspace.yaml under an
+``events`` key (omitted when empty for backward compatibility).
+
+## Parallel agent groups
+
+``AgentGroup`` (in ``flywheel.agent_group``) provides a reusable
+primitive for launching multiple agents in parallel and collecting
+their results:
+
+1. Each member gets a distinct ``agent_workspace_dir`` to avoid
+   file conflicts.
+2. All agents are launched simultaneously via
+   ``launch_agent_block()``.
+3. Results are collected sequentially (serializes workspace writes
+   to avoid races on ``workspace.yaml``).
+4. After each wait, the group scans for output files and registers
+   them as artifacts. A ``fallback_fn`` can generate default output
+   for agents that produce nothing.
+5. A ``group_completed`` lifecycle event is recorded on completion.
+
+The ``AgentBlockConfig`` dataclass groups the 26+ parameters of
+``launch_agent_block()`` into an inspectable object, making it
+practical to define a base configuration and merge per-member
+overrides.
+
+``prepare_agent_workspace()`` is a standalone function that
+creates a fresh agent workspace directory and seeds it with the
+latest artifacts from prior steps. It is used internally by
+``launch_agent_block()`` and can be called independently.
+
+## Service dependencies
+
+Templates can declare external service dependencies:
+
+```yaml
+services:
+  - name: game_server
+    url_env: ARC_SERVER_URL
+    description: "ARC-AGI-3 game server"
+```
+
+``ServiceDependency`` records the service name, the environment
+variable that blocks expect to contain its URL, and an optional
+description. Flywheel does not start or manage the service — the
+declaration is for documentation, validation, and future
+automation.
+
+``check_service_dependencies(template)`` returns warnings for
+any declared service whose ``url_env`` is not set in the current
+environment.
+
 ## Future work
 
 ### Default binding policy

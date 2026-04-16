@@ -13,6 +13,9 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 - **Non-blocking agent handle**: `launch_agent_block()` returns an `AgentHandle` with `kill()`, `wait()`, and `is_alive()`. Enables system-controlled agent interruption (e.g., killing an agent from a bridge callback). `run_agent_block()` is a blocking wrapper.
 - **Bridge record callback**: `BlockBridgeService` accepts `on_record` — a callback fired after each successful record-mode invocation. Runs in the bridge HTTP thread.
 - **Session artifacts**: The agent runner exports the SDK session JSONL to the workspace on exit and can resume from a session artifact via `RESUME_SESSION_FILE`. Sessions are regular copy artifacts with standard provenance.
+- **Lifecycle tracking**: `BlockExecution` has `stop_reason` and `predecessor_id` for tracking why agents were stopped and linking resume chains. `AgentHandle.wait()` records the agent itself as a `BlockExecution` (block_name=`__agent__`). `LifecycleEvent` captures operational events (agent stops, group completions). See `docs/architecture.md` "Lifecycle tracking".
+- **Parallel agent groups**: `AgentGroup` (`flywheel/agent_group.py`) launches multiple agents with distinct workspace dirs, waits sequentially, and collects artifacts with optional fallbacks. `AgentBlockConfig` groups launch parameters. `prepare_agent_workspace()` is a standalone function for workspace setup.
+- **Service dependencies**: Templates declare external services via a `services` key. `ServiceDependency` records name, `url_env`, and description. `check_service_dependencies()` warns about unset env vars.
 
 ## Batteries (solve-once capabilities)
 
