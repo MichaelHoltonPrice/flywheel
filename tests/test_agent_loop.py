@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
-from flywheel.agent_group import AgentGroupMember
 from flywheel.agent_loop import (
     AgentLoop,
     Continue,
@@ -18,6 +17,7 @@ from flywheel.agent_loop import (
     Stop,
     load_hooks_class,
 )
+from flywheel.block_group import BlockGroupMember
 
 
 def _mock_result(
@@ -167,7 +167,7 @@ class TestAgentLoopActions:
         assert result["is_finished"] is True
         assert result["score"] == 100
 
-    @patch("flywheel.agent_loop.AgentGroup")
+    @patch("flywheel.agent_loop.BlockGroup")
     @patch("flywheel.agent_loop.launch_agent_block")
     def test_spawn_group(self, mock_launch, mock_group_cls, tmp_path):
         mock_launch.return_value = MagicMock(
@@ -183,9 +183,12 @@ class TestAgentLoopActions:
                 if call_count[0] == 1:
                     return SpawnGroup(
                         members=[
-                            AgentGroupMember(
-                                prompt="explore",
-                                agent_workspace_dir="ws_0",
+                            BlockGroupMember(
+                                overrides={
+                                    "prompt": "explore",
+                                    "agent_workspace_dir": "ws_0",
+                                },
+                                output_dir="ws_0",
                             ),
                         ],
                     )

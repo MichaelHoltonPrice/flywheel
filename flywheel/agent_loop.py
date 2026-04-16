@@ -52,8 +52,8 @@ from flywheel.agent import (
     AgentResult,
     launch_agent_block,
 )
-from flywheel.agent_group import AgentGroup, AgentGroupMember
 from flywheel.artifact import LifecycleEvent
+from flywheel.block_group import BlockGroup, BlockGroupMember
 from flywheel.executor import ExecutionEvent
 from flywheel.template import Template
 from flywheel.workspace import Workspace
@@ -96,7 +96,7 @@ class Continue(Action):
 
 @dataclass
 class SpawnGroup(Action):
-    """Spawn parallel sub-agents via AgentGroup.
+    """Spawn parallel sub-executions via BlockGroup.
 
     Attributes:
         members: List of group members to launch.
@@ -105,7 +105,7 @@ class SpawnGroup(Action):
         fallback_fn: Fallback function for missing outputs.
     """
 
-    members: list[AgentGroupMember] = field(default_factory=list)
+    members: list[BlockGroupMember] = field(default_factory=list)
     collect_artifacts: list[tuple[str, str]] | None = None
     base_kwargs_override: dict[str, Any] | None = None
     fallback_fn: Any = None
@@ -437,11 +437,13 @@ class AgentLoop:
     def _run_group(self, action: SpawnGroup) -> None:
         """Execute a SpawnGroup action."""
         kwargs = dict(action.base_kwargs_override or {})
+        kwargs["workspace"] = self._config.workspace
+        kwargs["template"] = self._config.template
+        kwargs["project_root"] = self._config.project_root
 
-        group = AgentGroup(
+        group = BlockGroup(
             workspace=self._config.workspace,
-            template=self._config.template,
-            project_root=self._config.project_root,
+            launch_fn=launch_agent_block,
             base_kwargs=kwargs,
             fallback_fn=action.fallback_fn,
         )

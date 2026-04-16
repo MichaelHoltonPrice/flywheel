@@ -1,54 +1,26 @@
-"""Parallel agent group execution.
+"""Backward-compatibility aliases for agent group execution.
 
-Launches multiple agent blocks simultaneously and collects their
-results sequentially.  All agents share the same flywheel workspace
-(for artifact tracking) but use distinct workspace subdirectories
-(to avoid file conflicts).
+Agent groups are now a usage pattern of :class:`BlockGroup` with
+``launch_agent_block`` as the launch function.  This module
+provides the old names so existing imports continue to work.
 
-Usage::
-
-    from flywheel.agent import AgentBlockConfig
-    from flywheel.agent_group import AgentGroup, AgentGroupMember
-
-    base = AgentBlockConfig(
-        workspace=workspace, template=template,
-        project_root=project_root, prompt="ignored",
-        agent_image="flywheel-claude:latest",
-    )
-
-    group = AgentGroup(base)
-    group.add(AgentGroupMember(
-        prompt="Analyze pattern X",
-        agent_workspace_dir="explore_0",
-    ))
-    group.add(AgentGroupMember(
-        prompt="Analyze pattern Y",
-        agent_workspace_dir="explore_1",
-    ))
-    results = group.run(
-        collect_artifacts=[("exploration_result", "exploration_result")],
-    )
+Prefer importing from ``flywheel.block_group`` directly.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
-from flywheel.agent import AgentResult, launch_agent_block
-from flywheel.artifact import LifecycleEvent
+from flywheel.agent import launch_agent_block
+from flywheel.block_group import BlockGroup, BlockGroupMember, BlockGroupResult
 from flywheel.workspace import Workspace
 
 
 @dataclass
 class AgentGroupMember:
-    """Configuration for one member of an agent group.
-
-    Overrides specific fields from the group's base config.
-    Only non-None fields override the base.
+    """Legacy member config — converts to BlockGroupMember.
 
     Attributes:
         prompt: The system prompt for this agent.
@@ -64,45 +36,55 @@ class AgentGroupMember:
     extra_env: dict[str, str] | None = None
     output_names: list[str] | None = None
 
+    def to_block_member(self) -> BlockGroupMember:
+        """Convert to a BlockGroupMember."""
+        overrides: dict[str, Any] = {
+            "prompt": self.prompt,
+            "agent_workspace_dir": self.agent_workspace_dir,
+        }
+        if self.input_artifacts is not None:
+            overrides["input_artifacts"] = self.input_artifacts
+        if self.output_names is not None:
+            overrides["output_names"] = self.output_names
+        return BlockGroupMember(
+            overrides=overrides,
+            merge_env=self.extra_env,
+            output_dir=self.agent_workspace_dir,
+        )
+
 
 @dataclass
 class AgentGroupResult:
-    """Result of a single agent in a group.
+    """Legacy result — wraps BlockGroupResult fields.
 
     Attributes:
         index: Position in the group (0-based).
         agent_result: The ``AgentResult`` from ``wait()``.
         agent_workspace_dir: The workspace subdirectory used.
-        artifacts_collected: Artifact instance IDs registered
-            for this member.
+        artifacts_collected: Artifact instance IDs registered.
     """
 
     index: int
-    agent_result: AgentResult
+    agent_result: Any
     agent_workspace_dir: str
     artifacts_collected: list[str] = field(default_factory=list)
 
+    @classmethod
+    def from_block_result(cls, r: BlockGroupResult) -> AgentGroupResult:
+        """Convert from BlockGroupResult."""
+        return cls(
+            index=r.index,
+            agent_result=r.result,
+            agent_workspace_dir=r.output_dir or "",
+            artifacts_collected=r.artifacts_collected,
+        )
+
 
 class AgentGroup:
-    """Launch and manage a group of parallel agents.
+    """Legacy wrapper — delegates to BlockGroup.
 
-    All agents share the same flywheel workspace but use distinct
-    workspace subdirectories.  Agents are launched simultaneously
-    and waited on sequentially to serialize artifact registration.
-
-    Args:
-        workspace: The flywheel workspace.
-        template: The workspace template.
-        project_root: Project root directory.
-        base_kwargs: Keyword arguments passed to every
-            ``launch_agent_block`` call.  Per-member overrides
-            (prompt, agent_workspace_dir, input_artifacts,
-            extra_env, output_names) are merged on top.
-        fallback_fn: Optional callback to generate fallback output
-            when an agent produces no output file for a collected
-            artifact.  Receives ``(index, member)`` and returns a
-            dict to write as JSON.  If None, missing outputs are
-            silently skipped.
+    Prefer using ``BlockGroup`` with ``launch_agent_block``
+    directly for new code.
     """
 
     def __init__(
@@ -114,145 +96,48 @@ class AgentGroup:
         fallback_fn: Callable[
             [int, AgentGroupMember], dict] | None = None,
     ):
-        """Initialize from workspace, template, and base launch kwargs."""
-        self._workspace = workspace
-        self._template = template
-        self._project_root = project_root
-        self._base_kwargs = base_kwargs or {}
-        self._fallback_fn = fallback_fn
-        self._members: list[AgentGroupMember] = []
+        """Initialize from workspace, template, and base kwargs."""
+        merged_base = dict(base_kwargs or {})
+        merged_base["workspace"] = workspace
+        merged_base["template"] = template
+        merged_base["project_root"] = project_root
+
+        adapted_fallback = None
+        if fallback_fn:
+            self._legacy_members: list[AgentGroupMember] = []
+
+            def _adapt(
+                index: int, member: BlockGroupMember,
+            ) -> dict | None:
+                if index < len(self._legacy_members):
+                    return fallback_fn(
+                        index, self._legacy_members[index])
+                return None
+
+            adapted_fallback = _adapt
+        else:
+            self._legacy_members = []
+
+        self._group = BlockGroup(
+            workspace=workspace,
+            launch_fn=launch_agent_block,
+            base_kwargs=merged_base,
+            fallback_fn=adapted_fallback,
+        )
 
     def add(self, member: AgentGroupMember) -> None:
-        """Add a member to the group.
-
-        Args:
-            member: Configuration for this group member.
-        """
-        self._members.append(member)
+        """Add a member to the group."""
+        self._legacy_members.append(member)
+        self._group.add(member.to_block_member())
 
     def run(
         self,
         collect_artifacts: list[tuple[str, str]] | None = None,
     ) -> list[AgentGroupResult]:
-        """Launch all members and wait sequentially.
-
-        Args:
-            collect_artifacts: List of ``(filename_stem, artifact_name)``
-                pairs.  For each member, after ``wait()``, look for a
-                file matching the stem in the agent workspace and
-                register it as an artifact.
-
-        Returns:
-            List of ``AgentGroupResult``, one per member, in order.
-        """
-        if not self._members:
-            return []
-
-        # Phase 1: launch all agents in parallel.
-        handles: list[tuple[int, AgentGroupMember, Any]] = []
-        for i, member in enumerate(self._members):
-            kwargs = dict(self._base_kwargs)
-            kwargs["workspace"] = self._workspace
-            kwargs["template"] = self._template
-            kwargs["project_root"] = self._project_root
-            kwargs["prompt"] = member.prompt
-            kwargs["agent_workspace_dir"] = member.agent_workspace_dir
-
-            if member.input_artifacts is not None:
-                kwargs["input_artifacts"] = member.input_artifacts
-
-            if member.output_names is not None:
-                kwargs["output_names"] = member.output_names
-
-            if member.extra_env is not None:
-                base_env = dict(kwargs.get("extra_env") or {})
-                base_env.update(member.extra_env)
-                kwargs["extra_env"] = base_env
-
-            print(f"  [agent-group] launching member {i + 1}/"
-                  f"{len(self._members)}")
-            handle = launch_agent_block(**kwargs)
-            handles.append((i, member, handle))
-
-        # Phase 2: wait sequentially (serializes workspace writes).
-        results: list[AgentGroupResult] = []
-        for i, member, handle in handles:
-            result = handle.wait()
-            print(
-                f"  [agent-group] member {i + 1} done: "
-                f"exit={result.exit_code}"
-                f" elapsed={result.elapsed_s:.0f}s"
-            )
-
-            collected: list[str] = []
-
-            if collect_artifacts:
-                agent_ws = (
-                    self._workspace.path / member.agent_workspace_dir
-                )
-                for file_stem, artifact_name in collect_artifacts:
-                    artifact_file = self._find_output_file(
-                        agent_ws, file_stem)
-
-                    if artifact_file is None and self._fallback_fn:
-                        fallback_data = self._fallback_fn(i, member)
-                        if fallback_data is not None:
-                            artifact_file = (
-                                agent_ws / f"{file_stem}.json")
-                            artifact_file.write_text(
-                                json.dumps(fallback_data),
-                                encoding="utf-8",
-                            )
-                            print(
-                                f"  [agent-group] member {i + 1}: "
-                                f"wrote fallback for {file_stem}")
-
-                    if artifact_file is not None:
-                        inst = self._workspace.register_artifact(
-                            artifact_name, artifact_file,
-                            source=f"agent group member {i + 1}",
-                        )
-                        collected.append(inst.id)
-
-            results.append(AgentGroupResult(
-                index=i,
-                agent_result=result,
-                agent_workspace_dir=member.agent_workspace_dir,
-                artifacts_collected=collected,
-            ))
-
-        # Record a lifecycle event for the group completion.
-        event = LifecycleEvent(
-            id=self._workspace.generate_event_id(),
-            kind="group_completed",
-            timestamp=datetime.now(UTC),
-            detail={
-                "members": str(len(self._members)),
-                "succeeded": str(
-                    sum(1 for r in results
-                        if r.agent_result.exit_code == 0)),
-            },
-        )
-        self._workspace.add_event(event)
-        self._workspace.save()
-
-        print(
-            f"  [agent-group] all {len(self._members)} members "
-            f"completed")
-
-        return results
-
-    @staticmethod
-    def _find_output_file(
-        agent_ws: Any, file_stem: str,
-    ) -> Any:
-        """Find a file in the agent workspace by stem name.
-
-        Returns the path if found, or None.
-        """
-        if not hasattr(agent_ws, 'exists') or not agent_ws.exists():
-            return None
-        for candidate in agent_ws.iterdir():
-            if candidate.is_file() and candidate.stem == file_stem:
-                return candidate
-        return None
+        """Launch all members and wait sequentially."""
+        block_results = self._group.run(
+            collect_artifacts=collect_artifacts)
+        return [
+            AgentGroupResult.from_block_result(r)
+            for r in block_results
+        ]
