@@ -266,12 +266,28 @@ class AgentLoop:
             elif is_resumed and agent_executions:
                 predecessor_id = agent_executions[-1].id
 
-            # Session resume: mount latest agent_session.
+            # Auto-mount latest instances of known artifacts.
             input_artifacts = dict(
                 self._config.input_artifacts or {})
+            extra_env = dict(self._config.extra_env or {})
+
+            # Session resume.
             sessions = workspace.instances_for("agent_session")
             if sessions:
                 input_artifacts["agent_session"] = sessions[-1].id
+                extra_env["RESUME_SESSION_FILE"] = (
+                    "/input/agent_session/agent_session.jsonl")
+
+            # Mount any declared input artifacts that exist.
+            # This allows hooks to create artifacts (e.g.,
+            # exploration_digest) that get auto-mounted.
+            if hasattr(self._hooks, "auto_mount_artifacts"):
+                for art_name in self._hooks.auto_mount_artifacts():
+                    if art_name not in input_artifacts:
+                        instances = workspace.instances_for(art_name)
+                        if instances:
+                            input_artifacts[art_name] = (
+                                instances[-1].id)
 
             print(f"\n  [agent-loop] === Round {round_num} ===")
 
@@ -293,7 +309,7 @@ class AgentLoop:
                 overrides=self._config.overrides,
                 mcp_servers=self._config.mcp_servers,
                 allowed_tools=self._config.allowed_tools,
-                extra_env=self._config.extra_env,
+                extra_env=extra_env or None,
                 extra_mounts=self._config.extra_mounts,
                 pre_launch_hook=self._config.pre_launch_hook,
                 on_record=on_record_cb,
