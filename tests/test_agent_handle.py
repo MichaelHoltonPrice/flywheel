@@ -21,7 +21,7 @@ from flywheel.agent import (
     launch_agent_block,
     prepare_agent_workspace,
 )
-from flywheel.block_bridge import BlockBridgeService
+from flywheel.execution_channel import ExecutionChannel
 
 
 def _make_handle(
@@ -49,7 +49,7 @@ def _make_handle(
     process.stderr = StringIO(stderr_data)
 
     if bridge is None:
-        bridge = MagicMock(spec=BlockBridgeService)
+        bridge = MagicMock(spec=ExecutionChannel)
 
     if workspace is None:
         workspace = MagicMock()
@@ -90,13 +90,13 @@ class TestAgentHandleBasics:
         handle._stderr_thread.join.assert_called_once_with(timeout=5)
 
     def test_wait_stops_bridge(self):
-        bridge = MagicMock(spec=BlockBridgeService)
+        bridge = MagicMock(spec=ExecutionChannel)
         handle = _make_handle(bridge=bridge)
         handle.wait()
         bridge.stop.assert_called_once()
 
     def test_bridge_stopped_even_on_error(self):
-        bridge = MagicMock(spec=BlockBridgeService)
+        bridge = MagicMock(spec=ExecutionChannel)
         handle = _make_handle(bridge=bridge)
         # Make process.wait() raise to simulate an error.
         handle._process.wait.side_effect = OSError("boom")
@@ -211,7 +211,7 @@ class TestLaunchFailure:
         bridge_mock.start.return_value = 9999
 
         with (
-            mock_patch("flywheel.agent.BlockBridgeService",
+            mock_patch("flywheel.agent.ExecutionChannel",
                        return_value=bridge_mock),
             mock_patch("flywheel.agent.subprocess.Popen",
                        side_effect=OSError("Docker not found")),

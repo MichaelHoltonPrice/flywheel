@@ -41,9 +41,12 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.artifact import BlockExecution, LifecycleEvent
-from flywheel.block_bridge import BlockBridgeService
+from flywheel.execution_channel import ExecutionChannel
 from flywheel.template import Template
 from flywheel.workspace import Workspace
+
+# Backward compatibility alias.
+BlockBridgeService = ExecutionChannel
 
 
 @dataclass(frozen=True)
@@ -487,8 +490,8 @@ def launch_agent_block(
     # Snapshot execution count to compute invocations later.
     executions_before = len(workspace.executions)
 
-    # Start block bridge service.
-    bridge = BlockBridgeService(
+    # Start execution channel (HTTP service for nested executions).
+    bridge = ExecutionChannel(
         template=template,
         workspace=workspace,
         overrides=overrides,
