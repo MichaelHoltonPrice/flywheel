@@ -60,6 +60,10 @@ class AgentResult:
         execution_id: The workspace execution ID recorded for
             this agent run, or None if recording was skipped.
         stop_reason: Why the agent was stopped, if applicable.
+        exit_reason: Semantic classification of why the agent
+            exited.  One of: ``"completed"``, ``"auth_failure"``,
+            ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
+            ``"crashed"``.
     """
 
     exit_code: int
@@ -67,6 +71,55 @@ class AgentResult:
     evals_run: int
     execution_id: str | None = None
     stop_reason: str | None = None
+    exit_reason: str | None = None
+
+
+def _classify_exit(
+    exit_code: int,
+    stop_reason: str | None,
+    agent_ws: Path,
+) -> str:
+    """Classify an agent exit into a semantic exit_reason.
+
+    Reads ``.agent_state.json`` from the agent workspace (written
+    by the agent_runner) to determine why the agent stopped.
+
+    Args:
+        exit_code: The container's exit code.
+        stop_reason: If the agent was externally stopped, the
+            reason string.
+        agent_ws: Path to the agent workspace directory.
+
+    Returns:
+        One of: ``"completed"``, ``"auth_failure"``,
+        ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
+        ``"crashed"``.
+    """
+    if stop_reason:
+        return "stopped"
+
+    state_file = agent_ws / ".agent_state.json"
+    if state_file.exists():
+        try:
+            state = json.loads(
+                state_file.read_text(encoding="utf-8"))
+            status = state.get("status", "")
+            reason = state.get("reason", "")
+
+            if "auth" in reason:
+                return "auth_failure"
+            if "rate_limit" in reason:
+                return "rate_limit"
+            if reason == "max_turns":
+                return "max_turns"
+            if status == "complete":
+                return "completed"
+        except Exception:
+            pass
+
+    if exit_code == 0:
+        return "completed"
+    return "crashed"
 
 
 def _resolve_path(path: Path) -> str:
@@ -293,12 +346,16 @@ class AgentHandle:
             f"elapsed={elapsed:.1f}s, evals={evals_run}"
         )
 
+        exit_reason = _classify_exit(
+            exit_code, self._stop_reason, self._agent_ws)
+
         return AgentResult(
             exit_code=exit_code,
             elapsed_s=elapsed,
             evals_run=evals_run,
             execution_id=execution_id,
             stop_reason=self._stop_reason,
+            exit_reason=exit_reason,
         )
 
 
