@@ -114,6 +114,26 @@ class BlockExecution:
             no params or for legacy rows.
         error: Error message if status is ``"failed"`` and the
             failure produced a string description. None otherwise.
+        synthetic: ``True`` when the channel created this row in
+            place of a request that never made it past
+            ``/execution/begin`` (e.g., manifest mismatch,
+            unknown block, missing input).  Synthetic rows let
+            post-execution checks see infrastructure failures the
+            same way they see body failures.  Default ``False``.
+        halt_directive: Persisted form of a
+            :class:`flywheel.post_check.HaltDirective` returned by
+            this block's post-execution callback.  Shape is
+            ``{"scope": "caller"|"run", "reason": str}``.  Means
+            "the post-check asked one or more runners to stop
+            after this row landed."  ``None`` when no directive
+            was issued.  Distinct from ``stop_reason``, which
+            describes why an *individual* execution ended.
+        post_check_error: Error string if the post-execution
+            callback itself raised.  The row is not retroactively
+            marked failed; the field exists so operators can see
+            the check is broken without it taking the run down.
+            ``None`` when no callback was configured or it
+            completed normally.
     """
 
     id: str
@@ -135,6 +155,9 @@ class BlockExecution:
     caller: dict[str, Any] | None = None
     params: dict[str, Any] | None = None
     error: str | None = None
+    synthetic: bool = False
+    halt_directive: dict[str, Any] | None = None
+    post_check_error: str | None = None
 
 
 @dataclass(frozen=True)

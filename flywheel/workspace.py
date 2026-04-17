@@ -517,6 +517,9 @@ class Workspace:
                 caller=entry.get("caller"),
                 params=entry.get("params"),
                 error=entry.get("error"),
+                synthetic=entry.get("synthetic", False),
+                halt_directive=entry.get("halt_directive"),
+                post_check_error=entry.get("post_check_error"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -598,6 +601,12 @@ class Workspace:
                     entry["params"] = ex.params
                 if ex.error is not None:
                     entry["error"] = ex.error
+                if ex.synthetic:
+                    entry["synthetic"] = True
+                if ex.halt_directive is not None:
+                    entry["halt_directive"] = ex.halt_directive
+                if ex.post_check_error is not None:
+                    entry["post_check_error"] = ex.post_check_error
                 serialized_executions[eid] = entry
 
             serialized_events = {}

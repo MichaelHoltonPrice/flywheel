@@ -349,9 +349,10 @@ def run_agent_command(args, extra_args: list[str]) -> None:
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{args.template}.yaml"
+    block_registry = config.load_block_registry()
     template = Template.from_yaml(
         template_path,
-        block_registry=config.load_block_registry(),
+        block_registry=block_registry,
     )
 
     ws = Workspace.load(Path(args.workspace))
@@ -419,6 +420,7 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         allowed_tools=args.allowed_tools,
         extra_env=extra_env or None,
         extra_mounts=extra_mounts or None,
+        post_checks=block_registry.post_checks or None,
     )
     print(
         f"Agent completed: exit_code={result.exit_code}, "
@@ -442,9 +444,10 @@ def run_loop_command(args, extra_args: list[str]) -> None:
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{args.template}.yaml"
+    block_registry = config.load_block_registry()
     template = Template.from_yaml(
         template_path,
-        block_registry=config.load_block_registry(),
+        block_registry=block_registry,
     )
 
     ws = Workspace.load(Path(args.workspace))
@@ -493,6 +496,7 @@ def run_loop_command(args, extra_args: list[str]) -> None:
         pre_launch_hook=overrides.get("pre_launch_hook"),
         isolated_network=overrides.get(
             "isolated_network", True),
+        post_checks=block_registry.post_checks or None,
     )
 
     # Run the loop.

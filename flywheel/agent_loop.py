@@ -378,6 +378,7 @@ class AgentLoop:
                 isolated_network=self._config.isolated_network,
                 agent_workspace_dir=self._config.agent_workspace_dir,
                 predecessor_id=predecessor_id,
+                post_checks=self._config.post_checks,
             )
             handle_ref[0] = handle
             last_result = handle.wait()

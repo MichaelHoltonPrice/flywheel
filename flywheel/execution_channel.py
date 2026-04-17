@@ -48,6 +48,11 @@ from flywheel.executor import (
     ContainerExecutor,
     ExecutionEvent,
 )
+from flywheel.post_check import (
+    HaltDirective,
+    PostCheckCallable,
+    PostCheckContext,
+)
 from flywheel.template import BlockDefinition, Template
 from flywheel.workspace import Workspace
 
@@ -164,6 +169,18 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
     # Manifest-driven tool→block table.  Empty dict means "no
     # manifest enforcement"; callers are accepted regardless.
     _invocation_table: dict[tuple[str, str], str]
+    # Post-execution callback table, keyed by block name.  Pre-
+    # resolved by :class:`flywheel.blocks.registry.BlockRegistry`
+    # at startup (so a typo in a dotted path fails the run before
+    # it begins).  Empty when no project-level checks are
+    # configured.
+    _post_checks: dict[str, PostCheckCallable]
+    # Mutable per-channel halt queue: list of HaltDirective dicts
+    # plus the originating execution_id.  Shared between the
+    # handler thread (writes) and runners (read via /halt).  All
+    # access goes through ``_halt_lock``.
+    _halt_queue: list[dict]
+    _halt_lock: threading.Lock
 
     def do_POST(self):  # noqa: N802
         """Handle a POST request to execute a block."""
@@ -185,6 +202,7 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             execution_id = path[len("/execution/end/"):]
             self._handle_lifecycle_end(execution_id)
             return
+
 
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -259,33 +277,39 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if (self._allowed_blocks
-                and block_name not in self._allowed_blocks):
-            self._send_json(200, {
-                "ok": False,
-                "retryable": False,
-                "error_type": "block_not_allowed",
-                "message": (
-                    f"Block {block_name!r} not in allowed list: "
-                    f"{self._allowed_blocks}"),
-            })
-            return
-
-        block_def = _find_block(self._template, block_name)
-        if block_def is None:
-            self._send_json(200, {
-                "ok": False,
-                "retryable": False,
-                "error_type": "unknown_block",
-                "message": (
-                    f"Block {block_name!r} not found in template"),
-            })
-            return
-
         params = payload.get("params") or {}
         caller = payload.get("caller")
         parent_execution_id = payload.get("parent_execution_id")
         runner = payload.get("runner")  # caller-declared, optional
+
+        if (self._allowed_blocks
+                and block_name not in self._allowed_blocks):
+            self._reject_with_synthetic_row(
+                block_name=block_name,
+                error_type="block_not_allowed",
+                message=(
+                    f"Block {block_name!r} not in allowed list: "
+                    f"{self._allowed_blocks}"),
+                params=params,
+                caller=caller,
+                parent_execution_id=parent_execution_id,
+                runner=runner,
+            )
+            return
+
+        block_def = _find_block(self._template, block_name)
+        if block_def is None:
+            self._reject_with_synthetic_row(
+                block_name=block_name,
+                error_type="unknown_block",
+                message=(
+                    f"Block {block_name!r} not found in template"),
+                params=params,
+                caller=caller,
+                parent_execution_id=parent_execution_id,
+                runner=runner,
+            )
+            return
 
         # Manifest enforcement.  When the channel was started with
         # any tool-to-block manifests, every begin call from a
@@ -303,30 +327,36 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
                 expected = self._invocation_table.get(
                     (mcp_server, tool_name))
                 if expected is None:
-                    self._send_json(200, {
-                        "ok": False,
-                        "retryable": False,
-                        "error_type": "manifest_violation",
-                        "message": (
+                    self._reject_with_synthetic_row(
+                        block_name=block_name,
+                        error_type="manifest_violation",
+                        message=(
                             f"Tool {tool_name!r} of MCP server "
                             f"{mcp_server!r} is not declared in "
                             f"the tool-to-block manifest; in-"
                             f"container code may not invent "
                             f"new artifact effects"),
-                    })
+                        params=params,
+                        caller=caller,
+                        parent_execution_id=parent_execution_id,
+                        runner=runner,
+                    )
                     return
                 if expected != block_name:
-                    self._send_json(200, {
-                        "ok": False,
-                        "retryable": False,
-                        "error_type": "manifest_violation",
-                        "message": (
+                    self._reject_with_synthetic_row(
+                        block_name=block_name,
+                        error_type="manifest_violation",
+                        message=(
                             f"Tool {tool_name!r} of MCP server "
                             f"{mcp_server!r} is bound to block "
                             f"{expected!r} by the manifest, but "
                             f"the request asked for block "
                             f"{block_name!r}"),
-                    })
+                        params=params,
+                        caller=caller,
+                        parent_execution_id=parent_execution_id,
+                        runner=runner,
+                    )
                     return
 
         # Resolve input artifact bindings.  Latest-instance for each
@@ -337,12 +367,15 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
                     block_def, self.workspace,
                 ))
         except ValueError as e:
-            self._send_json(200, {
-                "ok": False,
-                "retryable": False,
-                "error_type": "missing_input",
-                "message": str(e),
-            })
+            self._reject_with_synthetic_row(
+                block_name=block_name,
+                error_type="missing_input",
+                message=str(e),
+                params=params,
+                caller=caller,
+                parent_execution_id=parent_execution_id,
+                runner=runner,
+            )
             return
 
         # Open the ledger row.  Allocate a scratch dir for this
@@ -483,6 +516,11 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
                 params=existing.params,
                 error=error or "execution failed",
             )
+            failed = self._run_post_check(
+                execution=failed,
+                outputs={},
+                error=failed.error,
+            )
             self._replace_execution(failed)
             self.workspace.save()
             self._cleanup_scratch(execution_id)
@@ -569,6 +607,11 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             caller=existing.caller,
             params=existing.params,
         )
+        succeeded = self._run_post_check(
+            execution=succeeded,
+            outputs=outputs_data,
+            error=None,
+        )
         self._replace_execution(succeeded)
         self.workspace.save()
         self._cleanup_scratch(execution_id)
@@ -624,6 +667,185 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             self.workspace.path / "execution_scratch" / execution_id
         )
         shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    def _reject_with_synthetic_row(
+        self,
+        *,
+        block_name: str,
+        error_type: str,
+        message: str,
+        params: dict,
+        caller: dict | None,
+        parent_execution_id: str | None,
+        runner: str | None,
+    ) -> None:
+        """Reject an ``/execution/begin`` request after recording it.
+
+        Writes a synthetic failed :class:`BlockExecution` row so
+        post-execution checks can see infrastructure failures
+        (manifest mismatch, unknown block, missing input) the same
+        way they see body failures.  The synthetic row is finalized
+        immediately — it never enters ``"running"`` state.
+
+        Then sends the original error response (HTTP 200 with
+        ``ok: false``) so the client's ``BlockChannelClient.begin``
+        path raises ``BlockChannelError`` exactly as before.
+        """
+        now = datetime.now(UTC)
+        execution_id = self.workspace.generate_execution_id()
+        synthetic = BlockExecution(
+            id=execution_id,
+            block_name=block_name,
+            started_at=now,
+            finished_at=now,
+            status="failed",
+            input_bindings={},
+            output_bindings={},
+            parent_execution_id=parent_execution_id,
+            runner=runner,
+            caller=caller,
+            params=params or None,
+            error=f"{error_type}: {message}",
+            synthetic=True,
+        )
+        with contextlib.suppress(Exception):
+            self.workspace.add_execution(synthetic)
+            synthetic = self._run_post_check(
+                execution=synthetic,
+                outputs={},
+                error=synthetic.error,
+            )
+            self._replace_execution(synthetic)
+            self.workspace.save()
+
+        self._send_json(200, {
+            "ok": False,
+            "retryable": False,
+            "error_type": error_type,
+            "message": message,
+            "execution_id": execution_id,
+            "synthetic": True,
+        })
+
+    def _run_post_check(
+        self,
+        *,
+        execution: BlockExecution,
+        outputs: dict,
+        error: str | None,
+    ) -> BlockExecution:
+        """Invoke the configured post-check for an execution.
+
+        Returns a (possibly updated) ``BlockExecution`` that
+        carries any ``halt_directive`` and / or
+        ``post_check_error`` produced by the check.  Side effects:
+        on a halt directive, appends an entry to the channel's
+        per-run halt queue so runners can pick it up via ``/halt``.
+
+        The check is invoked synchronously in this thread (the
+        HTTP handler thread).  Project-side checks are documented
+        as sync-only; if a check raises, the row is not retro-
+        actively marked failed but ``post_check_error`` is set so
+        operators can see the check itself is broken.
+        """
+        callable_ = self._post_checks.get(execution.block_name)
+        if callable_ is None:
+            return execution
+
+        ctx = PostCheckContext(
+            block=execution.block_name,
+            execution_id=execution.id,
+            status=execution.status,  # type: ignore[arg-type]
+            caller=execution.caller,
+            params=execution.params,
+            error=error,
+            outputs=outputs,
+            parent_execution_id=execution.parent_execution_id,
+            synthetic=execution.synthetic,
+            workspace_path=self.workspace.path,
+        )
+
+        directive: HaltDirective | None = None
+        post_check_error: str | None = None
+        try:
+            directive = callable_(ctx)
+        except Exception as exc:  # noqa: BLE001
+            post_check_error = (
+                f"{type(exc).__name__}: {exc}")
+
+        if directive is not None and not isinstance(
+                directive, HaltDirective):
+            post_check_error = (
+                f"post_check returned {type(directive).__name__}, "
+                f"expected HaltDirective | None")
+            directive = None
+
+        halt_dict: dict | None = None
+        if directive is not None:
+            halt_dict = directive.to_dict()
+            with self._halt_lock:
+                self._halt_queue.append({
+                    "scope": directive.scope,
+                    "reason": directive.reason,
+                    "block": execution.block_name,
+                    "execution_id": execution.id,
+                    "parent_execution_id":
+                        execution.parent_execution_id,
+                })
+
+        if halt_dict is None and post_check_error is None:
+            return execution
+
+        # Rebuild the row with the new fields.  BlockExecution is
+        # frozen; this is the standard pattern.
+        from dataclasses import replace
+        return replace(
+            execution,
+            halt_directive=halt_dict,
+            post_check_error=post_check_error,
+        )
+
+    def _handle_halt_query(self, path_and_query: str) -> None:
+        """Handle ``GET /halt[?execution_id=X]``.
+
+        Returns the currently-active halt directives.  Runners
+        poll this between turns and exit when a directive
+        targeting them appears.  Filtering rules:
+
+        - Without ``execution_id``: returns every queued directive
+          (callers and runs).  Useful for operator-side debugging.
+        - With ``execution_id=X``: returns directives where
+          ``scope=="run"`` (every runner halts) or
+          ``scope=="caller"`` and ``parent_execution_id == X``
+          (the runner whose execution_id matches the originating
+          row's parent).
+
+        The queue is read-only here; directives stay queued until
+        the channel is stopped, so a runner that polls late after
+        crashing still sees the halt and can exit cleanly.
+        """
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(path_and_query)
+        query = parse_qs(parsed.query)
+        target = (query.get("execution_id") or [None])[0]
+
+        with self._halt_lock:
+            queue_snapshot = list(self._halt_queue)
+
+        if target is None:
+            matches = queue_snapshot
+        else:
+            matches = [
+                entry for entry in queue_snapshot
+                if entry.get("scope") == "run"
+                or (entry.get("scope") == "caller"
+                    and entry.get("parent_execution_id") == target)
+            ]
+
+        self._send_json(200, {
+            "ok": True,
+            "halts": matches,
+        })
 
     def _handle_invoke(
         self, payload: dict, block_name: str,
@@ -780,12 +1002,34 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
                 self._on_execution(event)
 
     def do_GET(self):  # noqa: N802
-        """Handle GET requests to query artifact instances.
+        """Handle GET requests.
+
+        ``GET /halt[?execution_id=X]`` returns currently-active
+        halt directives queued by post-execution callbacks.
+        Runners poll this endpoint between turns; see
+        :mod:`flywheel.post_check`.
 
         ``GET /<artifact_name>`` returns all instances.
         ``GET /<artifact_name>/latest`` returns only the last.
         ``GET /<artifact_name>/count`` returns ``{"count": N}``.
         """
+        if self._stopping.is_set():
+            self._send_json(503, {
+                "ok": False,
+                "error_type": "stopping",
+                "message": "Execution channel is shutting down",
+            })
+            return
+
+        # Halt-directive query routes ahead of artifact queries
+        # since "halt" could otherwise collide with an artifact
+        # named "halt".
+        path_and_query = self.path
+        bare_path = path_and_query.split("?", 1)[0].rstrip("/")
+        if bare_path == "/halt":
+            self._handle_halt_query(path_and_query)
+            return
+
         path = self.path.strip("/")
         parts = path.split("/", 1)
         artifact_name = parts[0]
@@ -892,6 +1136,7 @@ class ExecutionChannel:
         on_record: Callable[[str, dict], None] | None = None,
         agent_workspace_dir: str | None = None,
         manifests: "list[ToolBlockManifest] | None" = None,
+        post_checks: dict[str, PostCheckCallable] | None = None,
     ):
         """Initialize the execution channel.
 
@@ -941,6 +1186,10 @@ class ExecutionChannel:
         self._stopping = threading.Event()
         self._active_container: list = [None]
         self._lock = threading.Lock()
+        self._post_checks: dict[str, PostCheckCallable] = (
+            dict(post_checks) if post_checks else {})
+        self._halt_queue: list[dict] = []
+        self._halt_lock = threading.Lock()
 
     def start(self) -> int:
         """Start the HTTP server in a background thread.
@@ -957,6 +1206,11 @@ class ExecutionChannel:
 
         agent_ws_dir = self.agent_workspace_dir
         invocation_table = dict(self._invocation_table)
+        # Bind post_checks and halt-queue state by reference so all
+        # handler threads share the same per-channel queue.
+        post_checks = self._post_checks
+        halt_queue = self._halt_queue
+        halt_lock = self._halt_lock
 
         class Handler(_ChannelRequestHandler):
             workspace = self.workspace
@@ -976,6 +1230,9 @@ class ExecutionChannel:
             )
             _agent_workspace_dir = agent_ws_dir
             _invocation_table = invocation_table
+            _post_checks = post_checks
+            _halt_queue = halt_queue
+            _halt_lock = halt_lock
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
@@ -1013,3 +1270,14 @@ class ExecutionChannel:
     def url(self) -> str:
         """The base URL of the running server."""
         return f"http://{self.host}:{self.port}"
+
+    def halt_directives(self) -> list[dict]:
+        """Snapshot of the per-channel halt queue.
+
+        Useful for tests and for operator-side tooling that wants
+        to inspect what runners would see if they polled
+        ``/halt`` right now.  Returns a copy; mutating it has no
+        effect on the channel.
+        """
+        with self._halt_lock:
+            return list(self._halt_queue)

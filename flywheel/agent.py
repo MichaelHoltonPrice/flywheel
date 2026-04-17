@@ -417,6 +417,10 @@ class AgentBlockConfig:
     isolated_network: bool = False
     agent_workspace_dir: str | None = None
     predecessor_id: str | None = None
+    # Pre-resolved post-execution callbacks keyed by block name.
+    # See :mod:`flywheel.post_check`.  Optional; ``None`` means
+    # the channel runs no project-side checks.
+    post_checks: dict[str, Any] | None = None
 
 
 def prepare_agent_workspace(
@@ -488,6 +492,7 @@ def launch_agent_block(
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
+    post_checks: dict[str, Any] | None = None,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -553,6 +558,7 @@ def launch_agent_block(
         max_invocations=max_invocations,
         on_record=on_record,
         agent_workspace_dir=agent_workspace_dir,
+        post_checks=post_checks,
     )
     port = bridge.start()
     bridge_endpoint = f"http://host.docker.internal:{port}"
@@ -716,6 +722,7 @@ def run_agent_block(
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
+    post_checks: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Run an agent block execution (blocking).
 
@@ -750,6 +757,7 @@ def run_agent_block(
         isolated_network=isolated_network,
         agent_workspace_dir=agent_workspace_dir,
         predecessor_id=predecessor_id,
+        post_checks=post_checks,
     )
     try:
         return handle.wait()

@@ -134,6 +134,13 @@ class BlockDefinition:
         implementation: Where the runner finds the payload.
             Required for ``inprocess`` and ``subprocess``.
             Forbidden for ``container`` and ``lifecycle``.
+        post_check: Optional dotted Python path to a callable
+            invoked by :class:`flywheel.execution_channel.ExecutionChannel`
+            after the row is finalized.  See
+            :mod:`flywheel.post_check`.  ``None`` means no
+            post-execution check is configured for this block.
+            Resolved eagerly at registry-load time (a typo fails
+            startup, not the run).
     """
 
     name: str
@@ -147,6 +154,7 @@ class BlockDefinition:
     ] = "container"
     runner_justification: str | None = None
     implementation: BlockImplementation | None = None
+    post_check: str | None = None
 
 
 @dataclass(frozen=True)
@@ -499,6 +507,13 @@ def parse_block_definition(
             entry=raw_impl.get("entry", "run"),
         )
 
+    post_check = entry.get("post_check")
+    if post_check is not None and not isinstance(post_check, str):
+        raise ValueError(
+            f"Block {name!r}: 'post_check' must be a dotted "
+            f"Python path string (got {type(post_check).__name__})"
+        )
+
     return BlockDefinition(
         name=name,
         image=image,
@@ -510,6 +525,7 @@ def parse_block_definition(
         runner=runner,
         runner_justification=runner_justification,
         implementation=implementation,
+        post_check=post_check,
     )
 
 

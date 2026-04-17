@@ -38,6 +38,10 @@ from pathlib import Path
 
 import yaml
 
+from flywheel.post_check import (
+    PostCheckCallable,
+    resolve_dotted_path,
+)
 from flywheel.template import BlockDefinition, parse_block_definition
 
 
@@ -57,6 +61,14 @@ class BlockRegistry:
 
     blocks: dict[str, BlockDefinition] = field(default_factory=dict)
     sources: dict[str, Path] = field(default_factory=dict)
+    # Pre-resolved post_check callables keyed by block name.  Only
+    # blocks whose YAML declares a ``post_check:`` field appear
+    # here.  Resolution happens at registry-load time so a typo in
+    # the dotted path fails startup rather than mid-run.  Stored
+    # outside ``BlockDefinition`` because the callable isn't
+    # meaningfully serializable / comparable.
+    post_checks: dict[str, PostCheckCallable] = field(
+        default_factory=dict)
 
     def __contains__(self, name: str) -> bool:
         return name in self.blocks
@@ -73,6 +85,18 @@ class BlockRegistry:
                 f"known blocks: {sorted(self.blocks)}"
             )
         return self.blocks[name]
+
+    def post_check_for(
+        self, name: str,
+    ) -> PostCheckCallable | None:
+        """Return the resolved post-check callable for ``name``.
+
+        ``None`` if the block declared no ``post_check`` or is
+        not registered.  Exists so the channel can ask the
+        registry for callables without holding an importable
+        module reference itself.
+        """
+        return self.post_checks.get(name)
 
     def names(self) -> list[str]:
         """Return all registered block names, sorted."""
@@ -101,6 +125,7 @@ class BlockRegistry:
         """
         blocks: dict[str, BlockDefinition] = {}
         sources: dict[str, Path] = {}
+        post_checks: dict[str, PostCheckCallable] = {}
         for path in files:
             block = load_block_file(path)
             if path.stem != block.name:
@@ -116,7 +141,18 @@ class BlockRegistry:
                 )
             blocks[block.name] = block
             sources[block.name] = path
-        return cls(blocks=blocks, sources=sources)
+            if block.post_check is not None:
+                try:
+                    post_checks[block.name] = resolve_dotted_path(
+                        block.post_check)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Block file {path}: {exc}") from exc
+        return cls(
+            blocks=blocks,
+            sources=sources,
+            post_checks=post_checks,
+        )
 
     @classmethod
     def from_directory(
