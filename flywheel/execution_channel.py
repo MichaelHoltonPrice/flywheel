@@ -43,9 +43,12 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flywheel.artifact import ArtifactInstance, BlockExecution
+
+if TYPE_CHECKING:
+    from flywheel.blocks.manifest import ToolBlockManifest
 from flywheel.executor import (
     ContainerExecutor,
     ExecutionEvent,
@@ -129,6 +132,9 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
     _service_id: str
     _on_execution: Callable[[ExecutionEvent], None] | None
     _agent_workspace_dir: str | None
+    # Manifest-driven tool→block table.  Empty dict means "no
+    # manifest enforcement"; callers are accepted regardless.
+    _invocation_table: dict[tuple[str, str], str]
 
     def do_POST(self):  # noqa: N802
         """Handle a POST request to execute a block."""
@@ -171,6 +177,18 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             self._handle_record(payload, block_name)
         else:
             self._handle_invoke(payload, block_name)
+
+    def _has_any_binding_for(self, mcp_server: str) -> bool:
+        """Whether the channel's manifest declares this MCP server.
+
+        Used by manifest enforcement: a call from an MCP server
+        the channel has *no* manifest for is allowed through
+        without binding checks (back-compat during the Phase 3
+        rollout).  Calls from a *known* MCP server must match.
+        """
+        return any(
+            srv == mcp_server
+            for (srv, _tool) in self._invocation_table)
 
     def _read_json_body(self) -> tuple[dict | None, str | None]:
         """Read and JSON-parse the request body.
@@ -244,6 +262,48 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
         caller = payload.get("caller")
         parent_execution_id = payload.get("parent_execution_id")
         runner = payload.get("runner")  # caller-declared, optional
+
+        # Manifest enforcement.  When the channel was started with
+        # any tool-to-block manifests, every begin call from a
+        # known MCP server must match the manifest's binding for
+        # that tool.  Calls without a caller (e.g., direct CLI
+        # invocations, tests) bypass enforcement.  Calls from
+        # unknown MCP servers are also accepted, since not every
+        # MCP server has to ship a manifest yet during the Phase 3
+        # rollout.
+        if self._invocation_table and isinstance(caller, dict):
+            mcp_server = caller.get("mcp_server")
+            tool_name = caller.get("tool")
+            if (mcp_server and tool_name
+                    and self._has_any_binding_for(mcp_server)):
+                expected = self._invocation_table.get(
+                    (mcp_server, tool_name))
+                if expected is None:
+                    self._send_json(200, {
+                        "ok": False,
+                        "retryable": False,
+                        "error_type": "manifest_violation",
+                        "message": (
+                            f"Tool {tool_name!r} of MCP server "
+                            f"{mcp_server!r} is not declared in "
+                            f"the tool-to-block manifest; in-"
+                            f"container code may not invent "
+                            f"new artifact effects"),
+                    })
+                    return
+                if expected != block_name:
+                    self._send_json(200, {
+                        "ok": False,
+                        "retryable": False,
+                        "error_type": "manifest_violation",
+                        "message": (
+                            f"Tool {tool_name!r} of MCP server "
+                            f"{mcp_server!r} is bound to block "
+                            f"{expected!r} by the manifest, but "
+                            f"the request asked for block "
+                            f"{block_name!r}"),
+                    })
+                    return
 
         # Resolve input artifact bindings.  Latest-instance for each
         # declared input slot.  Missing required slots are an error.
@@ -896,8 +956,24 @@ class ExecutionChannel:
         on_execution: Callable[[ExecutionEvent], None] | None = None,
         on_record: Callable[[str, dict], None] | None = None,
         agent_workspace_dir: str | None = None,
+        manifests: "list[ToolBlockManifest] | None" = None,
     ):
-        """Initialize the execution channel."""
+        """Initialize the execution channel.
+
+        ``manifests`` is the list of tool-to-block manifests
+        (one per MCP server) that this channel is allowed to
+        serve.  When supplied, ``/execution/begin`` requests with
+        a ``caller`` field are validated against the resulting
+        ``(mcp_server, tool) → block`` table; mismatches are
+        rejected with ``error_type="manifest_violation"``.
+
+        When ``manifests`` is ``None`` or empty, the channel
+        accepts any caller (back-compat with non-manifest tools).
+        """
+        from flywheel.blocks.manifest import (
+            build_invocation_table,
+        )
+
         self.template = template
         self.workspace = workspace
         self.overrides = overrides
@@ -906,6 +982,9 @@ class ExecutionChannel:
         self.host = host
         self.port = port
         self.agent_workspace_dir = agent_workspace_dir
+        self.manifests = list(manifests) if manifests else []
+        self._invocation_table = (
+            build_invocation_table(self.manifests))
 
         # on_record backward compat: wrap into on_execution.
         if on_execution is not None:
@@ -944,6 +1023,7 @@ class ExecutionChannel:
         container_executor = self._container_executor
 
         agent_ws_dir = self.agent_workspace_dir
+        invocation_table = dict(self._invocation_table)
 
         class Handler(_ChannelRequestHandler):
             workspace = self.workspace
@@ -963,6 +1043,7 @@ class ExecutionChannel:
                 if on_execution else None
             )
             _agent_workspace_dir = agent_ws_dir
+            _invocation_table = invocation_table
 
         self._server = HTTPServer((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
