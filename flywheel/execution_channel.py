@@ -1,34 +1,30 @@
 """HTTP service for nested block execution from inside containers.
 
-Replaces the former ``BlockBridgeService``.  Routes requests to
-the appropriate executor based on the request mode:
+The channel exposes two surfaces:
 
-- ``mode=record`` → ``RecordExecutor``  (legacy sugar)
-- Default (invoke) → ``ContainerExecutor``
+1. The **block-execution lifecycle API**, the only path for
+   tool-triggered logical block executions:
 
-Also exposes the **block-execution lifecycle API**:
+   - ``POST /execution/begin`` opens a logical block execution.
+     Resolves declared inputs to their latest registered
+     instances, opens a ledger row with ``status="running"``, and
+     returns the execution_id and resolved input bindings.
+   - ``POST /execution/end/{id}`` closes a previously-opened
+     execution.  On success, registers output artifacts
+     atomically and updates the ledger row to ``"succeeded"``.
+     On failure, records the error and registers nothing.
 
-- ``POST /execution/begin`` opens a logical block execution.
-  Resolves declared inputs to their latest registered instances,
-  opens a ledger row with ``status="running"``, and returns the
-  execution_id and resolved input bindings.
-- ``POST /execution/end/{id}`` closes a previously-opened
-  execution.  On success, registers output artifacts atomically
-  and updates the ledger row to ``"succeeded"``.  On failure,
-  records the error and registers nothing.
+   See :mod:`flywheel.tool_block` for the client-side helper.
 
-This API is the runtime surface for tool-triggered logical block
-executions (e.g., an MCP tool inside an agent container that
-invokes a block via the ``flywheel.tool_block`` decorator).  See
-``plans/flywheel-block-execution-refactor.md`` for the full design.
+2. The legacy **invoke** POST endpoint, kept for the orchestrator
+   path that runs container-runner blocks against an artifact
+   directory (``mode`` field is ignored / defaults to invoke).
 
-Preserves the exact HTTP protocol of the legacy modes so that
-existing MCP servers inside containers need zero changes during
-the migration.
+The legacy ``mode=record`` path was removed in Phase 5; all
+callers now go through the lifecycle API.
 
-Fires ``ExecutionEvent`` callbacks after each execution, replacing
-the former ``on_record`` callback with a typed, executor-agnostic
-event system.
+Fires ``ExecutionEvent`` callbacks after each execution.  See
+``plans/flywheel-block-execution-refactor.md`` for the design.
 """
 
 from __future__ import annotations
@@ -39,7 +35,6 @@ import secrets
 import shutil
 import subprocess
 import threading
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -52,7 +47,6 @@ if TYPE_CHECKING:
 from flywheel.executor import (
     ContainerExecutor,
     ExecutionEvent,
-    RecordExecutor,
 )
 from flywheel.template import BlockDefinition, Template
 from flywheel.workspace import Workspace
@@ -156,7 +150,6 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
     # Assigned by ExecutionChannel before the server starts.
     workspace: Workspace
     _template: Template
-    _record_executor: RecordExecutor
     _container_executor: ContainerExecutor
     _allowed_blocks: list[str] | None
     _counter: list  # [int]
@@ -207,12 +200,7 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             return
 
         block_name = payload.get("block_name", "")
-        mode = payload.get("mode", "invoke")
-
-        if mode == "record":
-            self._handle_record(payload, block_name)
-        else:
-            self._handle_invoke(payload, block_name)
+        self._handle_invoke(payload, block_name)
 
     def _has_any_binding_for(self, mcp_server: str) -> bool:
         """Whether the channel's manifest declares this MCP server.
@@ -637,96 +625,6 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
         )
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
-    def _handle_record(
-        self, payload: dict, block_name: str,
-    ) -> None:
-        """Handle a record-mode request via RecordExecutor."""
-        if not block_name:
-            self._send_json(400, {
-                "ok": False,
-                "error_type": "missing_field",
-                "message": "Record request requires 'block_name'",
-            })
-            return
-
-        with self._lock:
-            self._counter[0] += 1
-            request_id = (
-                f"{self._service_id}_{self._counter[0]:04d}")
-
-        try:
-            handle = self._record_executor.launch(
-                block_name=block_name,
-                workspace=self.workspace,
-                input_bindings=payload.get("inputs", {}),
-                outputs_data=payload.get("outputs", {}),
-                elapsed_s=payload.get("elapsed_s"),
-                allowed_blocks=self._allowed_blocks,
-            )
-            result = handle.wait()
-        except (ValueError, FileNotFoundError) as e:
-            # Map executor errors to the old bridge response format.
-            error_type = "internal_error"
-            msg = str(e)
-            if "not found in template" in msg:
-                error_type = "unknown_block"
-            elif "not a record block" in msg:
-                error_type = "not_record_block"
-            elif "not in allowed" in msg:
-                error_type = "block_not_allowed"
-            elif "not provided" in msg:
-                error_type = "missing_input"
-            elif "slot expects" in msg:
-                error_type = "slot_mismatch"
-            elif "not found" in msg:
-                error_type = "unknown_artifact"
-
-            self._send_json(200, {
-                "request_id": request_id,
-                "ok": False,
-                "retryable": False,
-                "error_type": error_type,
-                "message": msg,
-            })
-            return
-        except Exception as e:
-            self._send_json(500, {
-                "request_id": request_id,
-                "ok": False,
-                "error_type": "internal_error",
-                "message": str(e),
-            })
-            return
-
-        # Build response in the old bridge format.
-        instance_counts = {}
-        for name in result.output_bindings:
-            instance_counts[f"{name}_instance_count"] = len(
-                self.workspace.instances_for(name))
-
-        response = {
-            "request_id": request_id,
-            "ok": True,
-            "execution_id": result.execution_id,
-            **{f"{name}_artifact_id": aid
-               for name, aid in result.output_bindings.items()},
-            **instance_counts,
-        }
-        self._send_json(200, response)
-
-        # Fire execution event.
-        if self._on_execution is not None:
-            with contextlib.suppress(Exception):
-                event = ExecutionEvent(
-                    executor_type="record",
-                    block_name=block_name,
-                    execution_id=result.execution_id,
-                    status=result.status,
-                    output_bindings=result.output_bindings,
-                    outputs_data=payload.get("outputs", {}),
-                )
-                self._on_execution(event)
-
     def _handle_invoke(
         self, payload: dict, block_name: str,
     ) -> None:
@@ -960,8 +858,9 @@ def _kill_container(name: str) -> None:
 class ExecutionChannel:
     """HTTP service for nested block execution from containers.
 
-    Replaces ``BlockBridgeService``.  Routes requests to executors
-    based on the request mode.  Preserves the same HTTP protocol.
+    Hosts the lifecycle API (``/execution/begin`` +
+    ``/execution/end/{id}``) and the legacy invoke endpoint that
+    runs container-runner blocks against an artifact directory.
 
     Args:
         template: Template containing block definitions.
@@ -1033,7 +932,6 @@ class ExecutionChannel:
         else:
             self._on_execution = None
 
-        self._record_executor = RecordExecutor(template)
         self._container_executor = ContainerExecutor(
             template, overrides)
 
@@ -1055,7 +953,6 @@ class ExecutionChannel:
         active_container = self._active_container
         service_id = self._service_id
         on_execution = self._on_execution
-        record_executor = self._record_executor
         container_executor = self._container_executor
 
         agent_ws_dir = self.agent_workspace_dir
@@ -1064,7 +961,6 @@ class ExecutionChannel:
         class Handler(_ChannelRequestHandler):
             workspace = self.workspace
             _template = self.template
-            _record_executor = record_executor
             _container_executor = container_executor
             _allowed_blocks = self.allowed_blocks
             _counter = [0]

@@ -33,15 +33,16 @@ from flywheel.execution_channel import (
     ExecutionChannel,
     _resolve_inputs_for_begin,
 )
+from flywheel.blocks.registry import BlockRegistry
 from flywheel.template import (
     InputSlot,
     Template,
     _parse_input_slots,
+    parse_block_definition,
 )
 from flywheel.workspace import Workspace
 
 
-# Template with one block that consumes a derived input.
 TEMPLATE_YAML = """\
 artifacts:
   - name: game_step
@@ -52,23 +53,34 @@ artifacts:
     kind: copy
 
 blocks:
-  - name: predict
-    image: "__record__"
-    inputs:
-      - name: game_history
-        container_path: /input/game_history
-        derive_from: game_step
-        derive_kind: jsonl_concat
-    outputs:
-      - name: prediction
-        container_path: /output/prediction
+  - predict
+"""
+
+PREDICT_BLOCK_YAML = """\
+name: predict
+runner: lifecycle
+runner_justification: "Tool-triggered logical block."
+inputs:
+  - name: game_history
+    container_path: /input/game_history
+    derive_from: game_step
+    derive_kind: jsonl_concat
+outputs:
+  - name: prediction
+    container_path: /output/prediction
 """
 
 
 def _make_workspace(tmp_path: Path) -> tuple[Template, Workspace]:
+    import yaml as _yaml
+
+    registry = BlockRegistry(blocks={
+        "predict": parse_block_definition(
+            _yaml.safe_load(PREDICT_BLOCK_YAML)),
+    })
     tmpl_path = tmp_path / "test.yaml"
     tmpl_path.write_text(TEMPLATE_YAML)
-    template = Template.from_yaml(tmpl_path)
+    template = Template.from_yaml(tmpl_path, block_registry=registry)
     ws_path = tmp_path / "workspace"
     ws_path.mkdir()
     (ws_path / "artifacts").mkdir()

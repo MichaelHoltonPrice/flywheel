@@ -16,6 +16,7 @@ from flywheel.artifact import (
 from flywheel.template import Template
 from flywheel.validation import validate_name
 from flywheel.workspace import Workspace
+from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
 
 TEMPLATE_YAML = """\
@@ -65,7 +66,7 @@ def _setup_project(tmp_path: Path) -> tuple[Path, Path, Template]:
         ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
         check=True, capture_output=True,
     )
-    template = Template.from_yaml(template_path)
+    template = from_yaml_with_inline_blocks(template_path)
     return project_root, foundry_dir, template
 
 

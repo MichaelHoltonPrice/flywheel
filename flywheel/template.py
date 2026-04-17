@@ -4,17 +4,16 @@ A template declares the capabilities of a workspace: what artifacts
 exist, what blocks can run, and their container images. Templates
 are parsed from YAML files and validated at load time.
 
-As of the Phase 2 refactor, blocks may either be defined inline in
-the template's ``blocks:`` list (the original, now-deprecated path)
-or referenced by name from a :class:`BlockRegistry` populated from
-``workforce/blocks/<name>.yaml`` files.  Mixed lists are supported
-so projects can migrate one block at a time.
+Block declarations live in ``workforce/blocks/<name>.yaml`` files
+and are loaded into a :class:`BlockRegistry`.  The template's
+``blocks:`` list contains string references to those blocks.  The
+inline-block-definition syntax was removed in Phase 5 of the
+block-execution refactor.
 """
 
 from __future__ import annotations
 
 import os
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -105,24 +104,36 @@ class BlockDefinition:
 
     Attributes:
         name: Block identifier, unique per template.
-        image: Docker image when ``runner == "container"``. Empty
-            string for non-container runners. Phase 2 keeps this
-            required-but-defaulted for back-compat; Phase 5 will
-            tighten the contract.
+        image: Docker image.  Required for ``runner == "container"``;
+            forbidden for every other runner (Phase 5 retired the
+            ``__record__`` sentinel and the empty-image fallback).
         inputs: Declared input artifact slots.
         outputs: Declared output artifact slots.
         docker_args: Extra docker run args for container blocks.
         env: Extra env vars for container blocks.
-        runner: How the block is physically performed.  One of
-            ``"container"`` (default), ``"inprocess"``, or
-            ``"subprocess"``.  Non-container runners require
-            ``implementation``.
+        runner: How the block is physically performed.  One of:
+
+            - ``"container"`` (default): launched as a Docker
+              container by ``ContainerExecutor``.  Requires ``image``.
+            - ``"inprocess"``: dispatched by the channel into a
+              Python entrypoint declared in ``implementation``.
+              Reserved for future phases; not currently used.
+            - ``"subprocess"``: dispatched as a local subprocess.
+              Reserved for future phases.
+            - ``"lifecycle"``: has no body of its own.  The block
+              is invoked exclusively through the ``/execution/begin
+              + /execution/end`` lifecycle API by an MCP tool.  The
+              tool→block binding lives in a tool-block manifest;
+              the manifest entry is what makes the block reachable.
+              Use this for blocks whose body is the tool function
+              itself (e.g., cyberarc's ``predict``, ``game_step``,
+              ``exploration_request``, ``brainstorm_request``).
         runner_justification: Required free-text rationale when
             ``runner != "container"``. Forces the author to state
             why container isolation isn't appropriate.
         implementation: Where the runner finds the payload.
             Required for ``inprocess`` and ``subprocess``.
-            Forbidden for ``container``.
+            Forbidden for ``container`` and ``lifecycle``.
     """
 
     name: str
@@ -131,8 +142,9 @@ class BlockDefinition:
     outputs: list[OutputSlot] = field(default_factory=list)
     docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    runner: Literal["container", "inprocess", "subprocess"] = (
-        "container")
+    runner: Literal[
+        "container", "inprocess", "subprocess", "lifecycle"
+    ] = "container"
     runner_justification: str | None = None
     implementation: BlockImplementation | None = None
 
@@ -202,35 +214,29 @@ class Template:
 
         block_names: set[str] = set()
         blocks: list[BlockDefinition] = []
-        inline_block_names: list[str] = []
         for entry in data.get("blocks", []):
-            if isinstance(entry, str):
-                # Registry-resolved block reference.
-                if block_registry is None:
-                    raise ValueError(
-                        f"Template {path.name!r} references block "
-                        f"{entry!r} by name, but no block_registry "
-                        f"was provided to Template.from_yaml"
-                    )
-                if entry not in block_registry:
-                    raise ValueError(
-                        f"Template {path.name!r} references unknown "
-                        f"block {entry!r}.  Known blocks: "
-                        f"{sorted(block_registry.names())}"
-                    )
-                block = block_registry.get(entry)
-            elif isinstance(entry, dict):
-                # Inline block definition (deprecated path; kept for
-                # back-compat through Phase 5).
-                block = _parse_block_dict(entry)
-                inline_block_names.append(block.name)
-            else:
+            if not isinstance(entry, str):
                 raise ValueError(
                     f"Template {path.name!r} block entry has "
                     f"unsupported type {type(entry).__name__!r}; "
-                    f"expected string (registry reference) or "
-                    f"mapping (inline definition)"
+                    f"templates must reference blocks by name "
+                    f"(string).  Define each block in its own "
+                    f"workforce/blocks/<name>.yaml file.  Inline "
+                    f"block definitions were removed in Phase 5."
                 )
+            if block_registry is None:
+                raise ValueError(
+                    f"Template {path.name!r} references block "
+                    f"{entry!r} by name, but no block_registry "
+                    f"was provided to Template.from_yaml"
+                )
+            if entry not in block_registry:
+                raise ValueError(
+                    f"Template {path.name!r} references unknown "
+                    f"block {entry!r}.  Known blocks: "
+                    f"{sorted(block_registry.names())}"
+                )
+            block = block_registry.get(entry)
 
             if block.name in block_names:
                 raise ValueError(
@@ -251,18 +257,6 @@ class Template:
                 url_env=entry["url_env"],
                 description=entry.get("description", ""),
             ))
-
-        if inline_block_names:
-            warnings.warn(
-                f"Template {path.name!r} defines blocks inline: "
-                f"{inline_block_names}.  Inline blocks are "
-                f"deprecated; move each definition into "
-                f"workforce/blocks/<name>.yaml and reference it by "
-                f"name from the template's blocks: list.  This "
-                f"path will be removed in a future release.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         return cls(
             name=path.stem,
@@ -426,10 +420,12 @@ def parse_block_definition(
     _validate_name(name, "Block")
 
     runner = entry.get("runner", "container")
-    if runner not in ("container", "inprocess", "subprocess"):
+    valid_runners = (
+        "container", "inprocess", "subprocess", "lifecycle")
+    if runner not in valid_runners:
         raise ValueError(
             f"Block {name!r}: unknown runner {runner!r}; "
-            f"expected one of container, inprocess, subprocess"
+            f"expected one of {', '.join(valid_runners)}"
         )
 
     image = entry.get("image", "")
@@ -446,6 +442,28 @@ def parse_block_definition(
             raise ValueError(
                 f"Block {name!r}: runner 'container' must not "
                 f"declare 'implementation'"
+            )
+    elif runner == "lifecycle":
+        # Lifecycle blocks have no body of their own; the channel
+        # never dispatches them.  The MCP-tool manifest binding is
+        # the implementation, so neither image nor implementation
+        # belongs on the block definition.
+        if image:
+            raise ValueError(
+                f"Block {name!r}: runner 'lifecycle' must not "
+                f"declare 'image' (got {image!r})"
+            )
+        if raw_impl is not None:
+            raise ValueError(
+                f"Block {name!r}: runner 'lifecycle' must not "
+                f"declare 'implementation' (the manifest binding "
+                f"to an MCP tool is the implementation)"
+            )
+        if not runner_justification:
+            raise ValueError(
+                f"Block {name!r}: runner 'lifecycle' requires "
+                f"'runner_justification' (free-text rationale "
+                f"for why the block has no container body)"
             )
     else:
         if image:
@@ -493,10 +511,6 @@ def parse_block_definition(
         runner_justification=runner_justification,
         implementation=implementation,
     )
-
-
-# Internal alias used during the Phase 2 transition.
-_parse_block_dict = parse_block_definition
 
 
 def _validate_block_against_artifacts(

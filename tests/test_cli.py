@@ -10,8 +10,8 @@ import pytest
 
 from flywheel.artifact import ArtifactInstance
 from flywheel.cli import _parse_bindings, create_workspace, main
-from flywheel.template import Template
 from flywheel.workspace import Workspace
+from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
 
 
@@ -61,14 +61,23 @@ artifacts:
     kind: copy
 
 blocks:
-  - name: train
-    image: cyberloop-train:latest
-    inputs: [checkpoint]
-    outputs: [checkpoint]
-  - name: eval
-    image: cyberloop-eval:latest
-    inputs: [checkpoint]
-    outputs: [score]
+  - train
+  - eval
+""")
+
+    blocks_dir = project_root / "workforce" / "blocks"
+    blocks_dir.mkdir(parents=True)
+    (blocks_dir / "train.yaml").write_text("""\
+name: train
+image: cyberloop-train:latest
+inputs: [checkpoint]
+outputs: [checkpoint]
+""")
+    (blocks_dir / "eval.yaml").write_text("""\
+name: eval
+image: cyberloop-eval:latest
+inputs: [checkpoint]
+outputs: [score]
 """)
 
     # Commit the project config files so the tree is clean
@@ -250,7 +259,7 @@ class TestMainImportArtifact:
         monkeypatch.chdir(project_root)
 
         # Create workspace (copy-only template, no git needed)
-        template = Template.from_yaml(
+        template = from_yaml_with_inline_blocks(
             project_root / "foundry" / "templates" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
@@ -279,7 +288,7 @@ class TestMainImportArtifact:
         project_root = make_copy_only_project(tmp_path)
         monkeypatch.chdir(project_root)
 
-        template = Template.from_yaml(
+        template = from_yaml_with_inline_blocks(
             project_root / "foundry" / "templates" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)

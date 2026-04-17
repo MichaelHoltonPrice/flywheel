@@ -31,15 +31,16 @@ from urllib.error import HTTPError
 
 import pytest
 
+from flywheel.blocks.registry import BlockRegistry
 from flywheel.execution_channel import ExecutionChannel
-from flywheel.template import Template
+from flywheel.template import Template, parse_block_definition
 from flywheel.tool_block import (
     BlockChannelClient,
     BlockChannelError,
 )
 from flywheel.workspace import Workspace
 
-# Template with a couple of blocks suitable for begin/end.
+# Template with a couple of lifecycle-runner blocks suitable for begin/end.
 TEMPLATE_YAML = """\
 artifacts:
   - name: predictor
@@ -54,30 +55,47 @@ artifacts:
     kind: copy
 
 blocks:
-  - name: predict
-    image: "__record__"
-    inputs:
-      - name: predictor
-        container_path: /input/predictor
-      - name: game_history
-        container_path: /input/game_history
-        optional: true
-    outputs:
-      - name: prediction
-        container_path: /output/prediction
+  - predict
+  - noop
+"""
 
-  - name: noop
-    image: "__record__"
-    inputs: []
-    outputs: []
+PREDICT_BLOCK_YAML = """\
+name: predict
+runner: lifecycle
+runner_justification: "Tool-triggered logical block; no container body."
+inputs:
+  - name: predictor
+    container_path: /input/predictor
+  - name: game_history
+    container_path: /input/game_history
+    optional: true
+outputs:
+  - name: prediction
+    container_path: /output/prediction
+"""
+
+NOOP_BLOCK_YAML = """\
+name: noop
+runner: lifecycle
+runner_justification: "Test-only no-op lifecycle block."
+inputs: []
+outputs: []
 """
 
 
 def _make_workspace(tmp_path: Path) -> tuple[Template, Workspace]:
     """Create a template and workspace under tmp_path."""
+    import yaml as _yaml
+
+    registry = BlockRegistry(blocks={
+        "predict": parse_block_definition(
+            _yaml.safe_load(PREDICT_BLOCK_YAML)),
+        "noop": parse_block_definition(
+            _yaml.safe_load(NOOP_BLOCK_YAML)),
+    })
     tmpl_path = tmp_path / "test.yaml"
     tmpl_path.write_text(TEMPLATE_YAML)
-    template = Template.from_yaml(tmpl_path)
+    template = Template.from_yaml(tmpl_path, block_registry=registry)
 
     ws_path = tmp_path / "workspace"
     ws_path.mkdir()

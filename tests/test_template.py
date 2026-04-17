@@ -7,8 +7,10 @@ import pytest
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
-    Template,
     check_service_dependencies,
+)
+from tests._inline_blocks import (
+    from_yaml_with_inline_blocks as _from_yaml_with_inline_blocks,
 )
 
 VALID_TEMPLATE_YAML = """\
@@ -43,15 +45,15 @@ def valid_template_path(tmp_path: Path) -> Path:
 
 class TestFromYaml:
     def test_name_from_file_stem(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         assert template.name == "my_template"
 
     def test_artifacts_parsed(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         assert len(template.artifacts) == 3
 
     def test_git_artifact_fields(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         git_art = template.artifacts[0]
         assert git_art.name == "game_engine"
         assert git_art.kind == "git"
@@ -59,7 +61,7 @@ class TestFromYaml:
         assert git_art.path == "crates/engine"
 
     def test_copy_artifact_fields(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         copy_art = template.artifacts[1]
         assert copy_art.name == "checkpoint"
         assert copy_art.kind == "copy"
@@ -67,11 +69,11 @@ class TestFromYaml:
         assert copy_art.path is None
 
     def test_blocks_parsed(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         assert len(template.blocks) == 2
 
     def test_block_fields(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         train_block = template.blocks[0]
         assert train_block.name == "train"
         assert train_block.image == "cyberloop-train:latest"
@@ -83,7 +85,7 @@ class TestFromYaml:
         assert train_block.outputs[0].container_path == "/output/checkpoint"
 
     def test_eval_block_fields(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         eval_block = template.blocks[1]
         assert eval_block.name == "eval"
         assert eval_block.image == "cyberloop-eval:latest"
@@ -105,7 +107,7 @@ blocks: []
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="requires 'repo'"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_missing_path_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -118,7 +120,7 @@ blocks: []
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="requires 'path'"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_missing_both_repo_and_path_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -130,7 +132,7 @@ blocks: []
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="requires 'repo'"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestBlockArtifactRefValidation:
@@ -148,7 +150,7 @@ blocks:
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="not declared in artifacts"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_undeclared_output_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -164,7 +166,7 @@ blocks:
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="not declared in artifacts"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_undeclared_input_names_block(self, tmp_path: Path):
         yaml_content = """\
@@ -180,7 +182,7 @@ blocks:
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="my_block"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestDataclassProperties:
@@ -195,7 +197,7 @@ class TestDataclassProperties:
             block.name = "other"
 
     def test_template_frozen(self, valid_template_path: Path):
-        template = Template.from_yaml(valid_template_path)
+        template = _from_yaml_with_inline_blocks(valid_template_path)
         with pytest.raises(AttributeError):
             template.name = "other"
 
@@ -208,7 +210,7 @@ blocks: []
 """
         path = tmp_path / "empty.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert template.name == "empty"
         assert template.artifacts == []
         assert template.blocks == []
@@ -222,7 +224,7 @@ blocks: []
 """
         path = tmp_path / "simple.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert len(template.artifacts) == 1
         assert template.artifacts[0].kind == "copy"
 
@@ -240,7 +242,7 @@ blocks: []
         path = tmp_path / "dup.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="Duplicate artifact name"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestUnknownKind:
@@ -254,7 +256,7 @@ blocks: []
         path = tmp_path / "bad_kind.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="unknown kind"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestGitArtifactCannotBeBlockOutput:
@@ -274,7 +276,7 @@ blocks:
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="git artifact and cannot be a block output"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_git_input_is_allowed(self, tmp_path: Path):
         yaml_content = """\
@@ -293,7 +295,7 @@ blocks:
 """
         path = tmp_path / "ok.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert template.blocks[0].inputs[0].name == "engine"
 
 
@@ -316,7 +318,7 @@ blocks:
         path = tmp_path / "dup_block.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="Duplicate block name"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestDuplicateOutputSlots:
@@ -334,7 +336,7 @@ blocks:
         path = tmp_path / "dup_output.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="duplicate output"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 
 class TestNameValidation:
@@ -348,7 +350,7 @@ blocks: []
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="must not be empty"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_artifact_name_with_slash_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -360,7 +362,7 @@ blocks: []
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="invalid"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_block_name_with_space_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -376,7 +378,7 @@ blocks:
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="invalid"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
 class TestExpandedBlockFormat:
     def test_expanded_inputs_with_container_path(self, tmp_path: Path):
@@ -395,7 +397,7 @@ blocks:
 """
         path = tmp_path / "expanded.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         inp = template.blocks[0].inputs[0]
         assert inp.name == "checkpoint"
         assert inp.container_path == "/data/input"
@@ -416,7 +418,7 @@ blocks:
 """
         path = tmp_path / "expanded.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         out = template.blocks[0].outputs[0]
         assert out.name == "checkpoint"
         assert out.container_path == "/output"
@@ -437,7 +439,7 @@ blocks:
 """
         path = tmp_path / "resources.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         block = template.blocks[0]
         assert block.docker_args == ["--gpus", "all", "--shm-size", "8g"]
         assert block.env == {"OMP_NUM_THREADS": "1"}
@@ -455,7 +457,7 @@ blocks:
 """
         path = tmp_path / "defaults.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         block = template.blocks[0]
         assert block.docker_args == []
         assert block.env == {}
@@ -478,39 +480,12 @@ blocks:
 """
         path = tmp_path / "ok.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert template.artifacts[0].name == "my-data_01"
         assert template.blocks[0].name == "my-block_v2"
 
 
-class TestRecordSentinelImage:
-    def test_record_image_parses(self, tmp_path: Path):
-        yaml_content = """\
-artifacts:
-  - name: session
-    kind: copy
-  - name: step
-    kind: copy
-blocks:
-  - name: game_step
-    image: "__record__"
-    inputs:
-      - name: session
-        container_path: /input/session
-    outputs:
-      - name: session
-        container_path: /output/session
-      - name: step
-        container_path: /output/step
-"""
-        path = tmp_path / "record.yaml"
-        path.write_text(yaml_content)
-        template = Template.from_yaml(path)
-        assert len(template.blocks) == 1
-        assert template.blocks[0].image == "__record__"
-        assert len(template.blocks[0].inputs) == 1
-        assert len(template.blocks[0].outputs) == 2
-
+class TestSameArtifactInInputAndOutput:
     def test_same_artifact_in_input_and_output(self, tmp_path: Path):
         """Session appears in both inputs and outputs — must be valid."""
         yaml_content = """\
@@ -519,13 +494,14 @@ artifacts:
     kind: copy
 blocks:
   - name: step
-    image: "__record__"
+    runner: lifecycle
+    runner_justification: "Test fixture"
     inputs: [session]
     outputs: [session]
 """
-        path = tmp_path / "record.yaml"
+        path = tmp_path / "lifecycle.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert template.blocks[0].inputs[0].name == "session"
         assert template.blocks[0].outputs[0].name == "session"
 
@@ -548,7 +524,7 @@ services:
 """
         path = tmp_path / "with_services.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
 
         assert len(template.services) == 2
         assert template.services[0].name == "game_server"
@@ -561,7 +537,7 @@ services:
         """Templates without services key default to empty list."""
         path = tmp_path / "no_services.yaml"
         path.write_text(VALID_TEMPLATE_YAML)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
         assert template.services == []
 
     def test_service_name_validated(self, tmp_path: Path):
@@ -575,7 +551,7 @@ services:
         path = tmp_path / "bad_service.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="invalid"):
-            Template.from_yaml(path)
+            _from_yaml_with_inline_blocks(path)
 
     def test_check_service_dependencies_warns(
         self, tmp_path: Path, monkeypatch,
@@ -591,7 +567,7 @@ services:
 """
         path = tmp_path / "svc.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
 
         monkeypatch.delenv("ARC_SERVER_URL", raising=False)
         monkeypatch.delenv("OTHER_URL", raising=False)
@@ -612,7 +588,7 @@ services:
 """
         path = tmp_path / "svc.yaml"
         path.write_text(yaml_content)
-        template = Template.from_yaml(path)
+        template = _from_yaml_with_inline_blocks(path)
 
         monkeypatch.setenv("ARC_SERVER_URL", "http://localhost:8001")
 

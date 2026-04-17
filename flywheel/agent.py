@@ -45,9 +45,6 @@ from flywheel.execution_channel import ExecutionChannel
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
-# Backward compatibility alias.
-BlockBridgeService = ExecutionChannel
-
 
 @dataclass(frozen=True)
 class AgentResult:
@@ -191,7 +188,7 @@ class AgentHandle:
     def __init__(
         self,
         process: subprocess.Popen,
-        bridge: BlockBridgeService,
+        bridge: ExecutionChannel,
         workspace: Workspace,
         agent_ws: Path,
         output_names: list[str] | None,

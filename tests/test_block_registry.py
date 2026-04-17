@@ -305,15 +305,16 @@ class TestTemplateRegistryIntegration:
                 ValueError, match="unknown block 'bogus'"):
             Template.from_yaml(tmpl_path, block_registry=registry)
 
-    def test_mixed_inline_and_registry_supported(
+    def test_mixed_inline_and_registry_no_longer_supported(
             self, tmp_path: Path, blocks_dir: Path):
+        # Phase 5 of the block-execution refactor removed inline
+        # block definitions; templates may only reference blocks
+        # by name from the registry.
         tmpl_path = tmp_path / "t.yaml"
         tmpl_path.write_text(
             "artifacts:\n"
             "  - {name: engine, kind: copy}\n"
             "  - {name: checkpoint, kind: copy}\n"
-            "  - {name: predictor, kind: copy}\n"
-            "  - {name: prediction, kind: copy}\n"
             "  - {name: misc, kind: copy}\n"
             "blocks:\n"
             "  - train\n"
@@ -323,10 +324,10 @@ class TestTemplateRegistryIntegration:
             "    outputs: [misc]\n"
         )
         registry = BlockRegistry.from_directory(blocks_dir)
-        template = Template.from_yaml(
-            tmpl_path, block_registry=registry)
-        names = [b.name for b in template.blocks]
-        assert names == ["train", "inline_block"]
+        with pytest.raises(
+                ValueError, match="unsupported type 'dict'"):
+            Template.from_yaml(
+                tmpl_path, block_registry=registry)
 
     def test_block_input_must_be_declared_artifact(
             self, tmp_path: Path):
@@ -367,9 +368,11 @@ class TestTemplateRegistryIntegration:
             Template.from_yaml(tmpl)
 
 
-class TestInlineBlockDeprecation:
-    def test_inline_block_emits_deprecation_warning(
+class TestInlineBlockRemoved:
+    def test_inline_block_definition_is_now_an_error(
             self, tmp_path: Path):
+        # Phase 5 of the block-execution refactor removed support
+        # for inline-dict block definitions in templates.
         tmpl = tmp_path / "t.yaml"
         tmpl.write_text(
             "artifacts:\n"
@@ -380,11 +383,11 @@ class TestInlineBlockDeprecation:
             "    inputs: [misc]\n"
             "    outputs: [misc]\n"
         )
-        with pytest.warns(
-                DeprecationWarning, match="defines blocks inline"):
+        with pytest.raises(
+                ValueError, match="unsupported type 'dict'"):
             Template.from_yaml(tmpl)
 
-    def test_registry_only_template_no_warning(
+    def test_registry_only_template_loads_cleanly(
             self, tmp_path: Path, blocks_dir: Path):
         tmpl_path = tmp_path / "t.yaml"
         tmpl_path.write_text(TEMPLATE_REGISTRY_ONLY)

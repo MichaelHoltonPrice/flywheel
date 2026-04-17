@@ -327,52 +327,72 @@ as artifacts and pass them into a fresh session's prompt. This
 is the approach the artifact-based architecture naturally
 supports.
 
-### Execution channel (block bridge)
+### Execution channel
 
-The execution channel (``ExecutionChannel``, aliased as
-``BlockBridgeService``) is a generic HTTP service that lets
-containers trigger nested block executions within the same
-workspace. It routes requests to block executors:
-``RecordExecutor`` for ``mode=record``, ``ContainerExecutor``
-otherwise. It is not specific to evaluation — the invoked block
-and what it does are defined by the project's template, not by
-flywheel.
+The execution channel (``ExecutionChannel``) is a generic HTTP
+service that lets containers trigger nested block executions
+within the same workspace. It is not specific to evaluation —
+the invoked block and what it does are defined by the project's
+template, not by flywheel.
 
-The channel supports two modes:
+The channel exposes two surfaces:
 
-**Invoke mode** (default): launches a Docker container.
+**Lifecycle API** (``POST /execution/begin`` and ``POST
+/execution/end/{id}``): the surface for *logical* block
+executions whose body is an MCP tool inside an agent container.
+The tool calls ``BlockChannelClient.begin(...)`` (see
+:mod:`flywheel.tool_block`) which:
+
+1. Resolves declared inputs to the latest registered instances
+   for each slot. Slots with ``derive_from``/``derive_kind``
+   (e.g., ``derive_kind: jsonl_concat``) are rebuilt at this
+   moment so the execution always sees fresh derived inputs.
+2. Opens a ``BlockExecution`` row with status ``"running"``,
+   recording the caller (MCP server + tool name) and any
+   parameters.
+3. Returns the execution ID and resolved input bindings.
+
+The tool body then runs (predicting an action, recording a game
+step, queueing an exploration request, etc.).
+``BlockChannelClient.end(...)`` writes the declared outputs as
+artifacts, sets the execution status to ``"succeeded"`` (or
+``"failed"`` with an error message), and fires an
+``ExecutionEvent`` callback. This is the only path for
+tool-triggered logical block executions and is how cyberarc's
+``predict``, ``game_step``, ``exploration_request``, and
+``brainstorm_request`` blocks operate; their block definitions
+declare ``runner: lifecycle``.
+
+**Invoke endpoint** (``POST /``): launches a ``runner:
+container`` block in a Docker container.
 
 1. Validates the block name against the template and an optional
    allowed-blocks list.
 2. Imports the provided artifact into the workspace via
    ``register_artifact()``.
-3. Looks up the block definition from the template to determine
-   the image, docker args, input slots, and output slots.
+3. Looks up the block definition to determine the image, docker
+   args, input slots, and output slots.
 4. Runs the container with proper mounts.
 5. Records the output artifacts and block execution in the
    workspace with full provenance.
 6. Returns the results (including any scores) to the caller.
 
 An invocation budget (``max_invocations``) limits how many
-blocks the agent can trigger per step.
+container blocks the agent can trigger per step.
 
-**Record mode**: creates artifacts without launching a container.
-Used for provenance tracking of actions that already happened
-(e.g., game steps executed via a REST API). The request includes
-structured output data as JSON; the bridge writes it to artifact
-directories and records a ``BlockExecution`` with input/output
-bindings. Record-mode blocks use the ``__record__`` sentinel as
-their image in the template. Input artifact IDs are validated
-for both existence and name match against the declared slot.
+**Execution events**: ``ExecutionChannel`` accepts an optional
+``on_execution`` callback that fires after each successful
+execution with an ``ExecutionEvent``. The callback runs in the
+channel's HTTP handler thread. This enables the host to react in
+real-time to artifacts created by the agent — for example,
+stopping the agent container via ``AgentHandle.stop()`` when a
+recorded step indicates a policy-relevant condition.
 
-**Record callback**: ``ExecutionChannel`` (aliased as
-``BlockBridgeService`` for backward compatibility) accepts an
-optional ``on_record`` callback, fired after each successful
-record-mode invocation with an ``ExecutionEvent``. The callback
-runs in the channel's HTTP handler thread. This enables the host
-to react in real-time to artifacts created by the agent — for
-example, stopping the agent container via ``AgentHandle.stop()``
-when a recorded step indicates a policy-relevant condition.
+Phase 5 of the block-execution refactor removed the legacy
+``mode=record`` HTTP path, the ``RecordExecutor`` class, the
+``__record__`` sentinel image, the ``BlockBridgeService`` alias,
+and the inline-block-in-template parser branch. All artifact-
+recording flows now ride the lifecycle API.
 
 ### Project-provided MCP servers
 

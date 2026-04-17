@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from flywheel.executor import (
-    RECORD_SENTINEL,
     ExecutionEvent,
     ExecutionHandle,
     ExecutionResult,
@@ -40,14 +39,14 @@ class TestExecutionResult:
 class TestExecutionEvent:
     def test_construction(self):
         e = ExecutionEvent(
-            executor_type="record",
+            executor_type="container",
             block_name="game_step",
             execution_id="exec_001",
             status="succeeded",
             output_bindings={"game_step": "game_step@abc"},
             outputs_data={"game_step": {"score": 10}},
         )
-        assert e.executor_type == "record"
+        assert e.executor_type == "container"
         assert e.block_name == "game_step"
         assert e.outputs_data == {"game_step": {"score": 10}}
 
@@ -107,8 +106,3 @@ class TestExecutionHandleBase:
             handle.stop()
         with pytest.raises(NotImplementedError):
             handle.wait()
-
-
-class TestRecordSentinel:
-    def test_value(self):
-        assert RECORD_SENTINEL == "__record__"

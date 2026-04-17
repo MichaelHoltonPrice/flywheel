@@ -1,17 +1,19 @@
 """Block executor abstractions and concrete implementations.
 
-Defines the protocol for executing blocks and three concrete
+Defines the protocol for executing blocks and the concrete
 executor types.  A block executor takes a block definition, a
 workspace, and input bindings, and produces an execution result
 with output artifacts.
 
 - **ContainerExecutor**: Runs a block in a Docker container.
-  Extracted from the former ``BlockBridgeService`` invoke mode.
-- **RecordExecutor**: Creates artifacts and execution records
-  without launching anything.  Replaces the ``__record__``
-  sentinel / record mode from the former bridge.
 - **ProcessExecutor**: Runs a block as a local subprocess.
   For trusted, host-local processes like game servers.
+
+Phase 5 of the block-execution refactor removed ``RecordExecutor``
+and the ``__record__`` sentinel.  Blocks that previously rode the
+record path are now ``runner: lifecycle`` blocks invoked through
+the ``ExecutionChannel`` lifecycle API (see
+:mod:`flywheel.tool_block`).
 
 All executors satisfy the ``BlockExecutor`` protocol and return
 an ``ExecutionHandle`` from ``launch()``.
@@ -19,7 +21,6 @@ an ``ExecutionHandle`` from ``launch()``.
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import time
@@ -32,18 +33,13 @@ from flywheel.container import ContainerConfig, run_container
 from flywheel.template import BlockDefinition, Template
 from flywheel.workspace import Workspace
 
-# Sentinel image for record-mode blocks (carried over from the
-# former block_bridge module).
-RECORD_SENTINEL = "__record__"
-
 
 @dataclass(frozen=True)
 class ExecutionResult:
     """Result of a block execution via any executor.
 
     Attributes:
-        exit_code: Process exit code (0 = success).  Always 0
-            for RecordExecutor.
+        exit_code: Process exit code (0 = success).
         elapsed_s: Wall-clock time in seconds.
         output_bindings: Maps output slot names to artifact
             instance IDs created by this execution.
@@ -63,19 +59,17 @@ class ExecutionResult:
 class ExecutionEvent:
     """Fired when an executor completes a block execution.
 
-    Replaces the former ``on_record`` callback with a typed,
-    executor-agnostic event.  Observers register via the
-    execution channel.
+    Observers register via the execution channel.
 
     Attributes:
         executor_type: Which executor ran (``"container"``,
-            ``"record"``, ``"process"``).
+            ``"process"``).
         block_name: The block that was executed.
         execution_id: The workspace execution ID.
         status: Outcome (``"succeeded"``, ``"failed"``, etc.).
         output_bindings: Maps output slot names to artifact IDs.
-        outputs_data: For record executor, the raw output dicts
-            passed by the caller.  None for other executors.
+        outputs_data: Raw output dicts when meaningful (currently
+            unused; reserved for future executors).
     """
 
     executor_type: str
@@ -92,9 +86,9 @@ class ExecutionHandle:
     Returned by ``BlockExecutor.launch()``.  The caller **must**
     call ``wait()`` exactly once to collect the result.
 
-    For synchronous executors (Record), ``wait()`` returns
-    immediately.  For asynchronous executors (Container, Process),
-    ``wait()`` blocks until the execution completes.
+    For asynchronous executors (Container, Process), ``wait()``
+    blocks until the execution completes.  Synchronous handles
+    (see :class:`SyncExecutionHandle`) return immediately.
     """
 
     def is_alive(self) -> bool:
@@ -113,8 +107,9 @@ class ExecutionHandle:
 class SyncExecutionHandle(ExecutionHandle):
     """Handle for an execution that completed synchronously.
 
-    Used by RecordExecutor and blocking ContainerExecutor calls.
-    ``wait()`` returns the pre-computed result immediately.
+    Used by blocking executor paths that have a result in hand at
+    ``launch()`` time.  ``wait()`` returns the pre-computed result
+    immediately.
     """
 
     def __init__(self, result: ExecutionResult):
@@ -171,10 +166,11 @@ class BlockExecutor(Protocol):
             workspace: The flywheel workspace.
             input_bindings: Maps input slot names to artifact
                 instance IDs.
-            outputs_data: For record executor, the output data
-                dicts to write as artifacts.
-            elapsed_s: For record executor, wall-clock time of
-                the recorded action.
+            outputs_data: Optional output data dicts to write as
+                artifacts (used by executors that produce outputs
+                from in-memory data rather than container output).
+            elapsed_s: Optional wall-clock time to record on the
+                execution row when known by the caller.
             execution_id: Optional pre-assigned execution ID.
             overrides: CLI flag overrides for container blocks.
             allowed_blocks: If set, only these block names are
@@ -197,160 +193,12 @@ def _find_block(
     return None
 
 
-# ── RecordExecutor ───────────────────────────────────────────────
-
-
-class RecordExecutor:
-    """Execute a block by recording artifacts directly.
-
-    Creates artifacts and execution records without launching a
-    container.  Replaces the ``__record__`` / record-mode logic
-    from the former ``BlockBridgeService``.
-
-    Args:
-        template: The template containing block definitions.
-    """
-
-    def __init__(self, template: Template):
-        """Initialize with a template for block lookups."""
-        self._template = template
-
-    def launch(
-        self,
-        block_name: str,
-        workspace: Workspace,
-        input_bindings: dict[str, str],
-        *,
-        outputs_data: dict[str, Any] | None = None,
-        elapsed_s: float | None = None,
-        execution_id: str | None = None,
-        overrides: dict[str, Any] | None = None,
-        allowed_blocks: list[str] | None = None,
-    ) -> SyncExecutionHandle:
-        """Record artifacts and an execution without launching anything.
-
-        Args:
-            block_name: Name of the record block.
-            workspace: The flywheel workspace.
-            input_bindings: Maps input slot names to artifact IDs.
-            outputs_data: Maps output slot names to JSON-serializable
-                data to write as artifacts.
-            elapsed_s: Wall-clock time of the recorded action.
-            execution_id: Pre-assigned execution ID (auto-generated
-                if None).
-            overrides: Unused (present for protocol compatibility).
-            allowed_blocks: If set, only these block names allowed.
-
-        Returns:
-            A ``SyncExecutionHandle`` with the result.
-
-        Raises:
-            ValueError: If the block is not found, not a record
-                block, inputs are invalid, or required inputs are
-                missing.
-        """
-        if allowed_blocks and block_name not in allowed_blocks:
-            raise ValueError(
-                f"Block {block_name!r} not in allowed list: "
-                f"{allowed_blocks}")
-
-        block_def = _find_block(self._template, block_name)
-        if block_def is None:
-            raise ValueError(
-                f"Block {block_name!r} not found in template")
-
-        if block_def.image != RECORD_SENTINEL:
-            raise ValueError(
-                f"Block {block_name!r} is not a record block "
-                f"(image is {block_def.image!r}, expected "
-                f"{RECORD_SENTINEL!r})")
-
-        # Resolve input bindings.
-        resolved_inputs: dict[str, str] = {}
-        for slot in block_def.inputs:
-            artifact_id = input_bindings.get(slot.name, "")
-            if artifact_id:
-                if artifact_id not in workspace.artifacts:
-                    raise ValueError(
-                        f"Input artifact {artifact_id!r} not found")
-                actual = workspace.artifacts[artifact_id].name
-                if actual != slot.name:
-                    raise ValueError(
-                        f"Input {artifact_id!r} has name "
-                        f"{actual!r} but slot expects {slot.name!r}")
-                resolved_inputs[slot.name] = artifact_id
-            elif not slot.optional:
-                instances = workspace.instances_for(slot.name)
-                if instances:
-                    resolved_inputs[slot.name] = instances[-1].id
-                else:
-                    raise ValueError(
-                        f"Required input {slot.name!r} not provided "
-                        f"and no instances exist")
-
-        # Write output artifacts.
-        exec_id = execution_id or workspace.generate_execution_id()
-        started_at = datetime.now(UTC)
-        output_bindings: dict[str, str] = {}
-        outputs = outputs_data or {}
-
-        for slot in block_def.outputs:
-            data = outputs.get(slot.name)
-            if data is None:
-                continue
-
-            artifact_id = workspace.generate_artifact_id(slot.name)
-            output_dir = workspace.path / "artifacts" / artifact_id
-            output_dir.mkdir(parents=True)
-
-            output_file = output_dir / f"{slot.name}.json"
-            output_file.write_text(
-                json.dumps(data, separators=(",", ":")),
-                encoding="utf-8",
-            )
-
-            instance = ArtifactInstance(
-                id=artifact_id,
-                name=slot.name,
-                kind="copy",
-                created_at=started_at,
-                produced_by=exec_id,
-                copy_path=artifact_id,
-            )
-            workspace.add_artifact(instance)
-            output_bindings[slot.name] = artifact_id
-
-        # Record the execution.
-        execution = BlockExecution(
-            id=exec_id,
-            block_name=block_name,
-            started_at=started_at,
-            finished_at=started_at,
-            status="succeeded",
-            input_bindings=resolved_inputs,
-            output_bindings=output_bindings,
-            elapsed_s=elapsed_s,
-            image=RECORD_SENTINEL,
-        )
-        workspace.add_execution(execution)
-        workspace.save()
-
-        return SyncExecutionHandle(ExecutionResult(
-            exit_code=0,
-            elapsed_s=elapsed_s or 0.0,
-            output_bindings=output_bindings,
-            execution_id=exec_id,
-            status="succeeded",
-        ))
-
-
 # ── ContainerExecutor ────────────────────────────────────────────
 
 
 class ContainerExecutor:
     """Execute a block by launching a Docker container.
 
-    Extracted from the former ``BlockBridgeService`` invoke mode.
     Resolves inputs, builds a container config from the block
     definition, runs the container, and records artifacts and
     execution in the workspace.
