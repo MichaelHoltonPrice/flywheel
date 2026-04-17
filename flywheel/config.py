@@ -35,6 +35,31 @@ class ProjectConfig:
         """Path to the templates directory."""
         return self.foundry_dir / "templates"
 
+    @property
+    def blocks_dir(self) -> Path:
+        """Path to the per-block YAML directory.
+
+        Convention: ``<project_root>/workforce/blocks/``.  Used by
+        :meth:`flywheel.blocks.BlockRegistry.from_directory` to
+        load block definitions referenced by name from templates.
+        The directory is optional; templates that only use inline
+        block definitions need not have it.
+        """
+        return self.project_root / "workforce" / "blocks"
+
+    def load_block_registry(self):  # type: ignore[no-untyped-def]
+        """Load the project's :class:`BlockRegistry`.
+
+        Convenience wrapper around
+        ``BlockRegistry.from_directory(self.blocks_dir)``.
+        Returns an empty registry if the directory does not exist,
+        which is the supported state during the Phase 2 migration
+        for projects whose blocks are still inline in templates.
+        """
+        # Local import to avoid a config → blocks → template cycle.
+        from flywheel.blocks.registry import BlockRegistry
+        return BlockRegistry.from_directory(self.blocks_dir)
+
 
 def load_project_config(project_root: Path) -> ProjectConfig:
     """Load flywheel.yaml from a project root directory.

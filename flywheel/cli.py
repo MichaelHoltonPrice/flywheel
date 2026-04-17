@@ -225,7 +225,10 @@ def create_workspace(name: str, template_name: str) -> None:
     config = load_project_config(project_root)
 
     template_path = config.templates_dir / f"{template_name}.yaml"
-    template = Template.from_yaml(template_path)
+    template = Template.from_yaml(
+        template_path,
+        block_registry=config.load_block_registry(),
+    )
 
     ws = Workspace.create(name, template, config.foundry_dir)
     print(f"Created workspace {ws.name!r} at {ws.path}")
@@ -309,7 +312,10 @@ def run_block_command(
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{template_name}.yaml"
-    template = Template.from_yaml(template_path)
+    template = Template.from_yaml(
+        template_path,
+        block_registry=config.load_block_registry(),
+    )
 
     ws = Workspace.load(Path(workspace_path))
     result = run_block(
@@ -336,7 +342,10 @@ def run_agent_command(args, extra_args: list[str]) -> None:
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{args.template}.yaml"
-    template = Template.from_yaml(template_path)
+    template = Template.from_yaml(
+        template_path,
+        block_registry=config.load_block_registry(),
+    )
 
     ws = Workspace.load(Path(args.workspace))
 
@@ -411,7 +420,10 @@ def run_loop_command(args, extra_args: list[str]) -> None:
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{args.template}.yaml"
-    template = Template.from_yaml(template_path)
+    template = Template.from_yaml(
+        template_path,
+        block_registry=config.load_block_registry(),
+    )
 
     ws = Workspace.load(Path(args.workspace))
 
