@@ -83,35 +83,71 @@ def _resolve_inputs_for_begin(
     - ``input_hashes``: ``{slot_name: None}`` placeholder, reserved
       for future content-hash freshness checks.
 
-    Optional slots that have no available instance are silently
-    skipped.  Required slots that have no instance raise
-    ``ValueError``.
+    Slots with ``derive_from`` set are *always* rebuilt before
+    binding by rolling up their declared source artifact (e.g.,
+    ``game_history`` rolled up from ``game_step`` via
+    :meth:`Workspace.materialize_sequence`).  This guarantees the
+    block's input pins exactly the rollup version it saw, at the
+    cost of one new artifact instance per begin.  When the source
+    has zero registered instances the rollup is skipped (treated
+    as an absent optional input) rather than raising, since the
+    rollup is genuinely empty rather than missing.
+
+    Non-derived optional slots that have no available instance are
+    silently skipped.  Non-derived required slots that have no
+    instance raise ``ValueError``.
     """
     bindings: dict[str, str] = {}
     paths: dict[str, str] = {}
     hashes: dict[str, str | None] = {}
 
     for slot in block_def.inputs:
-        instances = workspace.instances_for(slot.name)
-        if not instances:
-            if slot.optional:
+        if slot.derive_from is not None:
+            instance = _materialize_derived_input(slot, workspace)
+            if instance is None:
                 continue
-            raise ValueError(
-                f"Block {block_def.name!r} input slot "
-                f"{slot.name!r} has no registered instances "
-                f"in workspace"
-            )
-        latest = instances[-1]
-        bindings[slot.name] = latest.id
-        if latest.copy_path:
+        else:
+            instances = workspace.instances_for(slot.name)
+            if not instances:
+                if slot.optional:
+                    continue
+                raise ValueError(
+                    f"Block {block_def.name!r} input slot "
+                    f"{slot.name!r} has no registered instances "
+                    f"in workspace"
+                )
+            instance = instances[-1]
+        bindings[slot.name] = instance.id
+        if instance.copy_path:
             paths[slot.name] = str(
-                workspace.path / "artifacts" / latest.copy_path
+                workspace.path / "artifacts" / instance.copy_path
             )
         else:
             paths[slot.name] = ""
         hashes[slot.name] = None
 
     return bindings, paths, hashes
+
+
+def _materialize_derived_input(slot, workspace: Workspace):
+    """Rebuild a derived input's rollup and return the new instance.
+
+    Returns ``None`` if the source has no instances yet, in which
+    case the caller treats the slot as absent.  Raises ``ValueError``
+    on unsupported derive_kind (the parser also catches this; this
+    is defense in depth in case a slot is constructed in code).
+    """
+    if slot.derive_kind == "jsonl_concat":
+        if not workspace.instances_for(slot.derive_from):
+            return None
+        return workspace.materialize_sequence(
+            source_name=slot.derive_from,
+            target_name=slot.name,
+        )
+    raise ValueError(
+        f"Input slot {slot.name!r}: unsupported derive_kind "
+        f"{slot.derive_kind!r}"
+    )
 
 
 class _ChannelRequestHandler(BaseHTTPRequestHandler):

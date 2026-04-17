@@ -38,11 +38,39 @@ class ArtifactDeclaration:
 
 @dataclass(frozen=True)
 class InputSlot:
-    """A declared input to a block — artifact name, container mount path, and optionality."""
+    """A declared input to a block.
+
+    Attributes:
+        name: Artifact declaration name this slot consumes.  At
+            ``/execution/begin`` the channel resolves this to the
+            latest registered instance of that name.
+        container_path: Where the artifact is mounted inside a
+            container block.  For ``inprocess`` blocks it is just
+            documentation; the resolver returns the host path
+            either way.
+        optional: If ``True``, missing instances skip the slot
+            silently rather than raising.
+        derive_from: When set, declares this input as a *rollup*
+            of another artifact.  At begin time the channel always
+            rebuilds a fresh instance of ``name`` from all
+            instances of ``derive_from`` before binding, using
+            ``derive_kind`` to choose the rollup function.  This
+            is the freshness mechanism for things like
+            ``game_history`` rolled up from ``game_step``.  When
+            ``derive_from`` is set, ``optional`` is ignored — the
+            rollup is always materializable as long as at least
+            one source instance exists.
+        derive_kind: Which rollup function to apply.  Currently
+            only ``"jsonl_concat"`` is supported (delegates to
+            :meth:`Workspace.materialize_sequence`).  Required
+            when ``derive_from`` is set.
+    """
 
     name: str
     container_path: str
     optional: bool = False
+    derive_from: str | None = None
+    derive_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +317,9 @@ def _parse_artifacts(
     return artifacts, artifact_names, artifact_kinds
 
 
+_SUPPORTED_DERIVE_KINDS = {"jsonl_concat"}
+
+
 def _parse_input_slots(raw: list) -> list[InputSlot]:
     """Parse a list of raw input entries into InputSlot objects."""
     slots: list[InputSlot] = []
@@ -298,14 +329,37 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
                 name=inp,
                 container_path=f"/input/{inp}",
             ))
-        else:
-            ref = inp["name"]
-            slots.append(InputSlot(
-                name=ref,
-                container_path=inp.get(
-                    "container_path", f"/input/{ref}"),
-                optional=inp.get("optional", False),
-            ))
+            continue
+
+        ref = inp["name"]
+        derive_from = inp.get("derive_from")
+        derive_kind = inp.get("derive_kind")
+        if derive_from is not None and derive_kind is None:
+            raise ValueError(
+                f"Input slot {ref!r}: 'derive_from' requires "
+                f"'derive_kind' to also be set"
+            )
+        if derive_kind is not None and derive_from is None:
+            raise ValueError(
+                f"Input slot {ref!r}: 'derive_kind' requires "
+                f"'derive_from' to also be set"
+            )
+        if (derive_kind is not None
+                and derive_kind not in _SUPPORTED_DERIVE_KINDS):
+            raise ValueError(
+                f"Input slot {ref!r}: unsupported derive_kind "
+                f"{derive_kind!r}; supported: "
+                f"{sorted(_SUPPORTED_DERIVE_KINDS)}"
+            )
+
+        slots.append(InputSlot(
+            name=ref,
+            container_path=inp.get(
+                "container_path", f"/input/{ref}"),
+            optional=inp.get("optional", False),
+            derive_from=derive_from,
+            derive_kind=derive_kind,
+        ))
     return slots
 
 
