@@ -450,6 +450,13 @@ class TestBlockChannelClient:
         }
         assert execution.runner == "inprocess"
 
+        # The client must echo the channel's output_bindings back
+        # onto the context so callers can chain artifact IDs from
+        # one block execution into the next without a separate
+        # workspace lookup.
+        assert ctx.output_bindings == execution.output_bindings
+        assert "prediction" in ctx.output_bindings
+
     def test_body_exception_records_failure_and_propagates(
             self, channel):
         _, ws, _, port = channel
@@ -468,6 +475,8 @@ class TestBlockChannelClient:
         execution = ws.executions[eid]
         assert execution.status == "failed"
         assert "body fail" in execution.error
+        # Failed body → no output_bindings populated on ctx.
+        assert ctx.output_bindings == {}
 
     def test_set_output_duplicate_raises(self, channel):
         _, ws, _, port = channel

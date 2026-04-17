@@ -110,6 +110,14 @@ class ExecutionContext:
         outputs: Buffer of name → JSON-serializable data to send
             on end.  Use ``set_output`` to populate.
         started_at: Monotonic wall-clock at begin (for elapsed_s).
+        output_bindings: Populated by the client *after* the
+            ``with`` block exits successfully, with the
+            ``{slot_name: artifact_id}`` map returned by the
+            channel's end endpoint.  Empty if the body raised or
+            no outputs were registered.  Useful for callers that
+            need to chain across multiple block executions
+            (e.g., the next call wants the artifact ID this one
+            just produced).
     """
 
     execution_id: str
@@ -122,6 +130,7 @@ class ExecutionContext:
     parent_execution_id: str | None
     started_at: float
     outputs: dict[str, Any] = field(default_factory=dict)
+    output_bindings: dict[str, str] = field(default_factory=dict)
 
     def set_output(self, name: str, data: Any) -> None:
         """Record a JSON-serializable artifact for later registration.
@@ -291,7 +300,7 @@ class BlockChannelClient:
                     "elapsed_s": elapsed,
                 }
             try:
-                self._post_json(
+                end_response = self._post_json(
                     f"/execution/end/{ctx.execution_id}", end_body)
             except Exception:
                 # Don't mask the original exception; swallow the
@@ -300,6 +309,12 @@ class BlockChannelClient:
                 # ledger anomaly.
                 if body_failed is None:
                     raise
+            else:
+                if (body_failed is None
+                        and isinstance(end_response, dict)):
+                    bindings = end_response.get("output_bindings")
+                    if isinstance(bindings, dict):
+                        ctx.output_bindings = bindings
 
     def _post_json(
         self, path: str, body: dict[str, Any],
