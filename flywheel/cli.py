@@ -6,7 +6,9 @@ Supports:
         [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
     flywheel run agent --workspace PATH --template TEMPLATE
         --prompt-file FILE [--model MODEL] [--max-invocations N]
-        [--allowed-block BLOCK ...] [-- container override args...]
+        [--allowed-block BLOCK ...]
+        [--input-artifact NAME=ARTIFACT_ID ...]
+        [-- container override args...]
     flywheel run loop --workspace PATH --template TEMPLATE
         [--hooks MODULE:CLASS] [--model MODEL] [--max-rounds N]
         [-- project-specific args...]
@@ -111,6 +113,11 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument(
         "--mount", action="append", default=[], dest="extra_mounts",
         help="Extra mount as HOST:CONTAINER:MODE (repeatable).")
+    agent_parser.add_argument(
+        "--input-artifact", action="append", default=[],
+        dest="input_artifacts",
+        help="Mount a workspace artifact at /input/NAME inside "
+        "the agent container, as NAME=ARTIFACT_ID (repeatable).")
 
     # flywheel run loop
     loop_parser = run_sub.add_parser("loop")
@@ -378,6 +385,20 @@ def run_agent_command(args, extra_args: list[str]) -> None:
             host_path = ":".join(parts[:-2])
             extra_mounts.append((host_path, container_path, mode))
 
+    # Parse --input-artifact NAME=ARTIFACT_ID arguments into a dict.
+    # Mirrors --bind on `flywheel run block`, but expressed as
+    # --input-artifact since these become /input/NAME mounts inside
+    # the agent container rather than slot-bound block inputs.
+    input_artifacts: dict[str, str] = {}
+    for entry in args.input_artifacts:
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid --input-artifact format {entry!r}, "
+                f"expected NAME=ARTIFACT_ID"
+            )
+        name, artifact_id = entry.split("=", 1)
+        input_artifacts[name] = artifact_id
+
     result = run_agent_block(
         workspace=ws,
         template=template,
@@ -391,6 +412,7 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         total_timeout=args.total_timeout,
         allowed_blocks=args.allowed_block or None,
         source_dirs=args.source_dir or None,
+        input_artifacts=input_artifacts or None,
         output_names=args.output or None,
         overrides=overrides or None,
         mcp_servers=args.mcp_servers,
