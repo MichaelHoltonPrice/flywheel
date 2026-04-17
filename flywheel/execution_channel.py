@@ -3,11 +3,28 @@
 Replaces the former ``BlockBridgeService``.  Routes requests to
 the appropriate executor based on the request mode:
 
-- ``mode=record`` → ``RecordExecutor``
+- ``mode=record`` → ``RecordExecutor``  (legacy sugar)
 - Default (invoke) → ``ContainerExecutor``
 
-Preserves the exact HTTP protocol so that MCP servers inside
-containers need zero changes.
+Also exposes the **block-execution lifecycle API**:
+
+- ``POST /execution/begin`` opens a logical block execution.
+  Resolves declared inputs to their latest registered instances,
+  opens a ledger row with ``status="running"``, and returns the
+  execution_id and resolved input bindings.
+- ``POST /execution/end/{id}`` closes a previously-opened
+  execution.  On success, registers output artifacts atomically
+  and updates the ledger row to ``"succeeded"``.  On failure,
+  records the error and registers nothing.
+
+This API is the runtime surface for tool-triggered logical block
+executions (e.g., an MCP tool inside an agent container that
+invokes a block via the ``flywheel.tool_block`` decorator).  See
+``plans/flywheel-block-execution-refactor.md`` for the full design.
+
+Preserves the exact HTTP protocol of the legacy modes so that
+existing MCP servers inside containers need zero changes during
+the migration.
 
 Fires ``ExecutionEvent`` callbacks after each execution, replacing
 the former ``on_record`` callback with a typed, executor-agnostic
@@ -19,19 +36,79 @@ from __future__ import annotations
 import contextlib
 import json
 import secrets
+import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
+from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.executor import (
     ContainerExecutor,
     ExecutionEvent,
     RecordExecutor,
 )
-from flywheel.template import Template
+from flywheel.template import BlockDefinition, Template
 from flywheel.workspace import Workspace
+
+
+def _find_block(
+    template: Template, block_name: str,
+) -> BlockDefinition | None:
+    """Look up a block definition by name in the template."""
+    for block in template.blocks:
+        if block.name == block_name:
+            return block
+    return None
+
+
+def _resolve_inputs_for_begin(
+    block_def: BlockDefinition,
+    workspace: Workspace,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str | None]]:
+    """Resolve declared block inputs to latest registered instances.
+
+    For each input slot of the block, picks the most recently
+    registered ``ArtifactInstance`` of that name and returns:
+
+    - ``input_bindings``: ``{slot_name: artifact_id}``.
+    - ``input_paths``: ``{slot_name: workspace-relative path}`` for
+      the artifact directory (callers can resolve to absolute).
+    - ``input_hashes``: ``{slot_name: None}`` placeholder, reserved
+      for future content-hash freshness checks.
+
+    Optional slots that have no available instance are silently
+    skipped.  Required slots that have no instance raise
+    ``ValueError``.
+    """
+    bindings: dict[str, str] = {}
+    paths: dict[str, str] = {}
+    hashes: dict[str, str | None] = {}
+
+    for slot in block_def.inputs:
+        instances = workspace.instances_for(slot.name)
+        if not instances:
+            if slot.optional:
+                continue
+            raise ValueError(
+                f"Block {block_def.name!r} input slot "
+                f"{slot.name!r} has no registered instances "
+                f"in workspace"
+            )
+        latest = instances[-1]
+        bindings[slot.name] = latest.id
+        if latest.copy_path:
+            paths[slot.name] = str(
+                workspace.path / "artifacts" / latest.copy_path
+            )
+        else:
+            paths[slot.name] = ""
+        hashes[slot.name] = None
+
+    return bindings, paths, hashes
 
 
 class _ChannelRequestHandler(BaseHTTPRequestHandler):
@@ -39,6 +116,7 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
 
     # Assigned by ExecutionChannel before the server starts.
     workspace: Workspace
+    _template: Template
     _record_executor: RecordExecutor
     _container_executor: ContainerExecutor
     _allowed_blocks: list[str] | None
@@ -62,6 +140,17 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # Lifecycle API endpoints — separate from the legacy
+        # block_name/mode payloads.
+        path = self.path.rstrip("/")
+        if path == "/execution/begin":
+            self._handle_lifecycle_begin()
+            return
+        if path.startswith("/execution/end/"):
+            execution_id = path[len("/execution/end/"):]
+            self._handle_lifecycle_end(execution_id)
+            return
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
@@ -82,6 +171,375 @@ class _ChannelRequestHandler(BaseHTTPRequestHandler):
             self._handle_record(payload, block_name)
         else:
             self._handle_invoke(payload, block_name)
+
+    def _read_json_body(self) -> tuple[dict | None, str | None]:
+        """Read and JSON-parse the request body.
+
+        Returns a (payload, error) tuple where exactly one is set.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+        except Exception as e:
+            return None, f"read failed: {e}"
+        if not body:
+            return {}, None
+        try:
+            return json.loads(body), None
+        except (json.JSONDecodeError, ValueError) as e:
+            return None, str(e)
+
+    def _handle_lifecycle_begin(self) -> None:
+        """Handle ``POST /execution/begin``.
+
+        Opens a logical block execution: resolves declared input
+        artifacts to their latest registered instances, allocates a
+        per-execution scratch directory, opens a ledger row with
+        ``status="running"``, and returns the execution_id and
+        resolved input bindings.
+        """
+        payload, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {
+                "ok": False,
+                "error_type": "invalid_json",
+                "message": err,
+            })
+            return
+        assert payload is not None
+
+        block_name = payload.get("block", "")
+        if not block_name:
+            self._send_json(400, {
+                "ok": False,
+                "error_type": "missing_field",
+                "message": "begin request requires 'block'",
+            })
+            return
+
+        if (self._allowed_blocks
+                and block_name not in self._allowed_blocks):
+            self._send_json(200, {
+                "ok": False,
+                "retryable": False,
+                "error_type": "block_not_allowed",
+                "message": (
+                    f"Block {block_name!r} not in allowed list: "
+                    f"{self._allowed_blocks}"),
+            })
+            return
+
+        block_def = _find_block(self._template, block_name)
+        if block_def is None:
+            self._send_json(200, {
+                "ok": False,
+                "retryable": False,
+                "error_type": "unknown_block",
+                "message": (
+                    f"Block {block_name!r} not found in template"),
+            })
+            return
+
+        params = payload.get("params") or {}
+        caller = payload.get("caller")
+        parent_execution_id = payload.get("parent_execution_id")
+        runner = payload.get("runner")  # caller-declared, optional
+
+        # Resolve input artifact bindings.  Latest-instance for each
+        # declared input slot.  Missing required slots are an error.
+        try:
+            input_bindings, input_paths, input_hashes = (
+                _resolve_inputs_for_begin(
+                    block_def, self.workspace,
+                ))
+        except ValueError as e:
+            self._send_json(200, {
+                "ok": False,
+                "retryable": False,
+                "error_type": "missing_input",
+                "message": str(e),
+            })
+            return
+
+        # Open the ledger row.  Allocate a scratch dir for this
+        # execution under the workspace.
+        with self._lock:
+            self._counter[0] += 1
+            request_id = (
+                f"{self._service_id}_{self._counter[0]:04d}")
+
+        execution_id = self.workspace.generate_execution_id()
+        scratch_dir = (
+            self.workspace.path / "execution_scratch" / execution_id
+        )
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+
+        execution = BlockExecution(
+            id=execution_id,
+            block_name=block_name,
+            started_at=datetime.now(UTC),
+            status="running",
+            input_bindings=input_bindings,
+            output_bindings={},
+            image=block_def.image,
+            parent_execution_id=parent_execution_id,
+            runner=runner,
+            caller=caller,
+            params=params or None,
+        )
+        try:
+            self.workspace.add_execution(execution)
+            self.workspace.save()
+        except Exception as e:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            self._send_json(500, {
+                "ok": False,
+                "error_type": "internal_error",
+                "message": f"failed to record execution: {e}",
+            })
+            return
+
+        self._send_json(200, {
+            "request_id": request_id,
+            "ok": True,
+            "execution_id": execution_id,
+            "input_bindings": input_bindings,
+            "input_paths": input_paths,
+            "input_hashes": input_hashes,
+            "scratch_dir": str(scratch_dir),
+            "parent_execution_id": parent_execution_id,
+        })
+
+    def _handle_lifecycle_end(self, execution_id: str) -> None:
+        """Handle ``POST /execution/end/{id}``.
+
+        Closes a previously-opened execution.  On ``status="ok"``,
+        registers any supplied output artifacts atomically and marks
+        the ledger row succeeded.  On ``status="failed"``, records
+        the error and registers nothing (atomicity).
+        """
+        if not execution_id:
+            self._send_json(400, {
+                "ok": False,
+                "error_type": "missing_field",
+                "message": "end request requires execution_id in path",
+            })
+            return
+
+        payload, err = self._read_json_body()
+        if err is not None:
+            self._send_json(400, {
+                "ok": False,
+                "error_type": "invalid_json",
+                "message": err,
+            })
+            return
+        assert payload is not None
+
+        status_in = payload.get("status", "ok")
+        outputs_data = payload.get("outputs") or {}
+        elapsed_s = payload.get("elapsed_s")
+        error = payload.get("error")
+
+        # Look up the existing execution row.  Must be in "running".
+        if execution_id not in self.workspace.executions:
+            self._send_json(404, {
+                "ok": False,
+                "error_type": "unknown_execution",
+                "message": (
+                    f"Execution {execution_id!r} not found "
+                    f"(begin may have failed)"),
+            })
+            return
+
+        existing = self.workspace.executions[execution_id]
+        if existing.status != "running":
+            self._send_json(400, {
+                "ok": False,
+                "error_type": "not_running",
+                "message": (
+                    f"Execution {execution_id!r} has status "
+                    f"{existing.status!r}, expected 'running'"),
+            })
+            return
+
+        block_def = _find_block(
+            self._template, existing.block_name)
+        if block_def is None:
+            # Should be impossible — begin already validated.
+            self._send_json(500, {
+                "ok": False,
+                "error_type": "internal_error",
+                "message": (
+                    f"Block {existing.block_name!r} disappeared "
+                    f"between begin and end"),
+            })
+            return
+
+        finished_at = datetime.now(UTC)
+
+        # Failure path: record error, no outputs registered.
+        if status_in not in ("ok", "succeeded"):
+            failed = BlockExecution(
+                id=existing.id,
+                block_name=existing.block_name,
+                started_at=existing.started_at,
+                finished_at=finished_at,
+                status="failed",
+                input_bindings=existing.input_bindings,
+                output_bindings={},
+                exit_code=existing.exit_code,
+                elapsed_s=elapsed_s,
+                image=existing.image,
+                stop_reason=existing.stop_reason,
+                predecessor_id=existing.predecessor_id,
+                parent_execution_id=existing.parent_execution_id,
+                runner=existing.runner,
+                caller=existing.caller,
+                params=existing.params,
+                error=error or "execution failed",
+            )
+            self._replace_execution(failed)
+            self.workspace.save()
+            self._cleanup_scratch(execution_id)
+
+            self._send_json(200, {
+                "ok": True,
+                "execution_id": execution_id,
+                "status": "failed",
+                "error": failed.error,
+            })
+
+            if self._on_execution is not None:
+                with contextlib.suppress(Exception):
+                    self._on_execution(ExecutionEvent(
+                        executor_type=existing.runner or "lifecycle",
+                        block_name=existing.block_name,
+                        execution_id=execution_id,
+                        status="failed",
+                        output_bindings={},
+                    ))
+            return
+
+        # Success path: atomically register all declared outputs
+        # supplied in the payload.  Buffered until we have written
+        # everything; on any error, roll back partial writes.
+        registered: list[tuple[str, str]] = []  # (slot_name, aid)
+        try:
+            for slot in block_def.outputs:
+                data = outputs_data.get(slot.name)
+                if data is None:
+                    continue
+
+                aid = self.workspace.generate_artifact_id(slot.name)
+                output_dir = (
+                    self.workspace.path / "artifacts" / aid)
+                output_dir.mkdir(parents=True)
+
+                output_file = output_dir / f"{slot.name}.json"
+                output_file.write_text(
+                    json.dumps(data, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+
+                instance = ArtifactInstance(
+                    id=aid,
+                    name=slot.name,
+                    kind="copy",
+                    created_at=finished_at,
+                    produced_by=execution_id,
+                    copy_path=aid,
+                )
+                self.workspace.add_artifact(instance)
+                registered.append((slot.name, aid))
+        except Exception as e:
+            # Roll back: remove any artifacts written this attempt.
+            for _, aid in registered:
+                aid_dir = self.workspace.path / "artifacts" / aid
+                shutil.rmtree(aid_dir, ignore_errors=True)
+                self.workspace.artifacts.pop(aid, None)
+            self._send_json(500, {
+                "ok": False,
+                "error_type": "output_write_failed",
+                "message": str(e),
+            })
+            return
+
+        output_bindings = {name: aid for name, aid in registered}
+
+        succeeded = BlockExecution(
+            id=existing.id,
+            block_name=existing.block_name,
+            started_at=existing.started_at,
+            finished_at=finished_at,
+            status="succeeded",
+            input_bindings=existing.input_bindings,
+            output_bindings=output_bindings,
+            exit_code=existing.exit_code,
+            elapsed_s=elapsed_s,
+            image=existing.image,
+            stop_reason=existing.stop_reason,
+            predecessor_id=existing.predecessor_id,
+            parent_execution_id=existing.parent_execution_id,
+            runner=existing.runner,
+            caller=existing.caller,
+            params=existing.params,
+        )
+        self._replace_execution(succeeded)
+        self.workspace.save()
+        self._cleanup_scratch(execution_id)
+
+        # Build response with name → artifact_id mapping for
+        # convenience, plus instance counts (per-name) so callers
+        # can derive sequence position without a separate query.
+        instance_counts = {
+            f"{name}_instance_count": len(
+                self.workspace.instances_for(name))
+            for name in output_bindings
+        }
+        artifact_id_map = {
+            f"{name}_artifact_id": aid
+            for name, aid in output_bindings.items()
+        }
+        self._send_json(200, {
+            "ok": True,
+            "execution_id": execution_id,
+            "status": "succeeded",
+            "output_bindings": output_bindings,
+            **artifact_id_map,
+            **instance_counts,
+        })
+
+        if self._on_execution is not None:
+            with contextlib.suppress(Exception):
+                self._on_execution(ExecutionEvent(
+                    executor_type=existing.runner or "lifecycle",
+                    block_name=existing.block_name,
+                    execution_id=execution_id,
+                    status="succeeded",
+                    output_bindings=output_bindings,
+                    outputs_data=outputs_data,
+                ))
+
+    def _replace_execution(
+        self, execution: BlockExecution,
+    ) -> None:
+        """Replace an existing execution row in the workspace.
+
+        BlockExecution is frozen, so transitions from ``"running"``
+        to terminal states require constructing a new record and
+        swapping it in.  Bypasses ``add_execution`` since the ID
+        already exists by design.
+        """
+        with self.workspace._lock:  # noqa: SLF001
+            self.workspace.executions[execution.id] = execution
+
+    def _cleanup_scratch(self, execution_id: str) -> None:
+        """Remove the scratch directory for a finished execution."""
+        scratch_dir = (
+            self.workspace.path / "execution_scratch" / execution_id
+        )
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     def _handle_record(
         self, payload: dict, block_name: str,
@@ -489,6 +947,7 @@ class ExecutionChannel:
 
         class Handler(_ChannelRequestHandler):
             workspace = self.workspace
+            _template = self.template
             _record_executor = record_executor
             _container_executor = container_executor
             _allowed_blocks = self.allowed_blocks
