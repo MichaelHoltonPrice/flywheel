@@ -60,13 +60,24 @@ class BlockExecution:
     Captures the full provenance: which artifact instances were consumed,
     which were produced, and the outcome.
 
+    Two distinct linkage fields exist:
+
+    - ``predecessor_id`` is the *resume chain*: this execution
+      continues a previous one (same logical agent step, fresh
+      container).
+    - ``parent_execution_id`` is the *control-flow tree*: this
+      execution was launched from inside another one (e.g., a tool
+      call inside an agent container that triggers a logical block).
+
     Attributes:
         id: Unique identifier within the workspace (e.g., ``exec_a3f7b2e1``).
         block_name: The name of the block that was executed.
         started_at: When execution began.
         finished_at: When execution ended, or None if not yet finished.
-        status: The outcome: ``"succeeded"``, ``"failed"``, or
-            ``"interrupted"``.
+        status: The outcome: ``"succeeded"``, ``"failed"``,
+            ``"interrupted"``, or ``"running"`` for executions that
+            have begun but not yet ended (used by the lifecycle API
+            between begin and end).
         input_bindings: Maps each input artifact name to the artifact
             instance ID that was consumed.
         output_bindings: Maps each output artifact name to the artifact
@@ -80,13 +91,38 @@ class BlockExecution:
             normal completion.
         predecessor_id: Execution ID that this block resumes from,
             enabling resume chains. None if this is a fresh start.
+        parent_execution_id: Execution ID of the execution that
+            launched this one (e.g., the agent container hosting a
+            tool-triggered logical block execution). None for
+            top-level executions. Distinct from ``predecessor_id``:
+            parent is "who launched me," predecessor is "who am I
+            resuming."
+        runner: How this execution was physically performed:
+            ``"container"`` (Docker), ``"inprocess"`` (function call
+            in the calling container), ``"subprocess"`` (local
+            process), ``"record"`` (legacy record-mode, no work
+            performed), or ``"agent"`` (long-lived agent container).
+            None for legacy rows that predate the runner concept.
+        caller: For tool-triggered logical executions, identifies
+            which MCP server and tool invoked this block. Shape is
+            ``{"mcp_server": str, "tool": str}``. None for executions
+            not triggered by a tool call.
+        params: Function-argument parameters supplied by the caller
+            (e.g., ``{"action_id": 6, "x": 15, "y": 20}``).  These
+            are not artifacts but are recorded for lineage so the
+            full call can be reconstructed.  None if the block has
+            no params or for legacy rows.
+        error: Error message if status is ``"failed"`` and the
+            failure produced a string description. None otherwise.
     """
 
     id: str
     block_name: str
     started_at: datetime
     finished_at: datetime | None = None
-    status: Literal["succeeded", "failed", "interrupted"] = "failed"
+    status: Literal[
+        "succeeded", "failed", "interrupted", "running"
+    ] = "failed"
     input_bindings: dict[str, str] = field(default_factory=dict)
     output_bindings: dict[str, str] = field(default_factory=dict)
     exit_code: int | None = None
@@ -94,6 +130,11 @@ class BlockExecution:
     image: str | None = None
     stop_reason: str | None = None
     predecessor_id: str | None = None
+    parent_execution_id: str | None = None
+    runner: str | None = None
+    caller: dict[str, Any] | None = None
+    params: dict[str, Any] | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)

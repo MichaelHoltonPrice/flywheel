@@ -512,6 +512,11 @@ class Workspace:
                 image=entry.get("image"),
                 stop_reason=entry.get("stop_reason"),
                 predecessor_id=entry.get("predecessor_id"),
+                parent_execution_id=entry.get("parent_execution_id"),
+                runner=entry.get("runner"),
+                caller=entry.get("caller"),
+                params=entry.get("params"),
+                error=entry.get("error"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -583,6 +588,16 @@ class Workspace:
                     entry["stop_reason"] = ex.stop_reason
                 if ex.predecessor_id is not None:
                     entry["predecessor_id"] = ex.predecessor_id
+                if ex.parent_execution_id is not None:
+                    entry["parent_execution_id"] = ex.parent_execution_id
+                if ex.runner is not None:
+                    entry["runner"] = ex.runner
+                if ex.caller is not None:
+                    entry["caller"] = ex.caller
+                if ex.params is not None:
+                    entry["params"] = ex.params
+                if ex.error is not None:
+                    entry["error"] = ex.error
                 serialized_executions[eid] = entry
 
             serialized_events = {}
