@@ -12,6 +12,10 @@ Supports:
     flywheel run loop --workspace PATH --template TEMPLATE
         [--hooks MODULE:CLASS] [--model MODEL] [--max-rounds N]
         [-- project-specific args...]
+    flywheel run pattern PATTERN_NAME --workspace PATH
+        --template TEMPLATE [--project-hooks MODULE:CLASS]
+        [--model MODEL] [--max-runtime SECONDS]
+        [-- project-specific args...]
     flywheel import artifact --workspace PATH --name NAME
         --from SOURCE [--source TEXT]
 """
@@ -27,6 +31,9 @@ from flywheel.agent import AgentBlockConfig, run_agent_block
 from flywheel.agent_loop import AgentLoop, load_hooks_class
 from flywheel.config import load_project_config
 from flywheel.execution import run_block
+from flywheel.pattern import Pattern, discover_patterns
+from flywheel.pattern_runner import PatternRunner
+from flywheel.project_hooks import load_project_hooks_class
 from flywheel.template import Template, check_service_dependencies
 from flywheel.workspace import Workspace
 
@@ -140,6 +147,41 @@ def main(argv: list[str] | None = None) -> None:
         "--max-consecutive-failures", type=int, default=3,
         help="Circuit breaker threshold (default: 3).")
 
+    # flywheel run pattern
+    pattern_parser = run_sub.add_parser("pattern")
+    pattern_parser.add_argument(
+        "pattern_name",
+        help="Pattern name (file stem under <project>/patterns/).")
+    pattern_parser.add_argument("--workspace", required=True)
+    pattern_parser.add_argument("--template", required=True)
+    pattern_parser.add_argument(
+        "--project-hooks", default=None,
+        dest="project_hooks",
+        help="Project hooks class as module.path:ClassName. "
+        "Overrides 'project_hooks' in flywheel.yaml.")
+    pattern_parser.add_argument("--model", default=None)
+    pattern_parser.add_argument(
+        "--max-runtime", type=int, default=None,
+        dest="max_runtime",
+        help="Hard wall-clock cap on the whole pattern run, in "
+        "seconds.  Default: wait until all continuous-role "
+        "agents finish naturally.")
+    pattern_parser.add_argument(
+        "--poll-interval", type=float, default=1.0,
+        dest="poll_interval",
+        help="Seconds between ledger scans for trigger "
+        "evaluation (default: 1.0).")
+    pattern_parser.add_argument(
+        "--total-timeout", type=int, default=14400,
+        help="Per-agent wall-clock cap (default: 14400 = 4h). "
+        "Roles can override this in their YAML.")
+    pattern_parser.add_argument(
+        "--max-turns", type=int, default=200)
+    pattern_parser.add_argument(
+        "--auth-volume", default="claude-auth")
+    pattern_parser.add_argument(
+        "--agent-image", default="flywheel-claude:latest")
+
     # flywheel materialize
     mat_parser = subparsers.add_parser("materialize")
     mat_parser.add_argument("--workspace", required=True)
@@ -181,6 +223,8 @@ def main(argv: list[str] | None = None) -> None:
         run_agent_command(args, extra_container_args)
     elif args.command == "run" and getattr(args, "target", None) == "loop":
         run_loop_command(args, extra_container_args)
+    elif args.command == "run" and getattr(args, "target", None) == "pattern":
+        run_pattern_command(args, extra_container_args)
     elif args.command == "materialize":
         materialize_command(
             args.workspace, args.source_name, args.target_name,
@@ -516,6 +560,119 @@ def run_loop_command(args, extra_args: list[str]) -> None:
         print("  Game finished!")
     if result.get("stop_reason"):
         print(f"  Stop reason: {result['stop_reason']}")
+
+
+def run_pattern_command(args, extra_args: list[str]) -> None:
+    """Run a declarative pattern with optional project hooks.
+
+    Discovers ``<project_root>/patterns/<name>.yaml`` (mirrors
+    template discovery), loads project hooks if configured,
+    builds an :class:`AgentBlockConfig` from CLI flags + hook
+    overrides, and hands off to :class:`PatternRunner`.
+
+    Args:
+        args: Parsed argparse namespace with pattern-specific
+            fields.
+        extra_args: Project-specific arguments passed after
+            ``--``; forwarded verbatim to the project hooks'
+            ``init``.
+    """
+    config = load_project_config(Path.cwd())
+
+    template_path = config.templates_dir / f"{args.template}.yaml"
+    block_registry = config.load_block_registry()
+    template = Template.from_yaml(
+        template_path, block_registry=block_registry)
+
+    ws = Workspace.load(Path(args.workspace))
+
+    warnings = check_service_dependencies(template)
+    for w in warnings:
+        print(f"  [flywheel] WARNING: {w}")
+
+    patterns = discover_patterns(config.patterns_dir)
+    if args.pattern_name not in patterns:
+        known = sorted(patterns) or ["<none>"]
+        print(
+            f"ERROR: no pattern named {args.pattern_name!r} in "
+            f"{config.patterns_dir}.  Known patterns: "
+            f"{', '.join(known)}"
+        )
+        sys.exit(1)
+
+    pattern = Pattern.from_yaml(
+        patterns[args.pattern_name],
+        block_registry=block_registry,
+    )
+    print(
+        f"  [flywheel] running pattern {pattern.name!r} "
+        f"({len(pattern.roles)} role(s))"
+    )
+
+    hooks_path = args.project_hooks or config.project_hooks
+    hooks = None
+    overrides: dict[str, Any] = {}
+    if hooks_path:
+        hooks_cls = load_project_hooks_class(hooks_path)
+        hooks = hooks_cls()
+        if hasattr(hooks, "init"):
+            overrides = hooks.init(
+                ws, template, config.project_root, extra_args,
+            ) or {}
+    elif extra_args:
+        # Loud failure: project args were passed but nothing
+        # is wired up to receive them.  Better to fail than to
+        # let a typo silently drop a flag.
+        print(
+            f"ERROR: extra args {extra_args!r} were passed "
+            f"after `--` but no project_hooks are configured "
+            f"to consume them.  Set 'project_hooks' in "
+            f"flywheel.yaml or pass --project-hooks."
+        )
+        sys.exit(1)
+
+    agent_config = AgentBlockConfig(
+        workspace=ws,
+        template=template,
+        project_root=config.project_root,
+        prompt="",  # Set by the pattern runner per-role.
+        agent_image=overrides.get(
+            "agent_image", args.agent_image),
+        auth_volume=overrides.get(
+            "auth_volume", args.auth_volume),
+        model=overrides.get("model", args.model),
+        max_turns=overrides.get("max_turns", args.max_turns),
+        total_timeout=overrides.get(
+            "total_timeout", args.total_timeout),
+        output_names=overrides.get("output_names"),
+        mcp_servers=overrides.get("mcp_servers"),
+        allowed_tools=overrides.get("allowed_tools"),
+        extra_env=overrides.get("extra_env"),
+        extra_mounts=overrides.get("extra_mounts"),
+        pre_launch_hook=overrides.get("pre_launch_hook"),
+        isolated_network=overrides.get(
+            "isolated_network", True),
+        post_checks=block_registry.post_checks or None,
+    )
+
+    try:
+        runner = PatternRunner(
+            pattern,
+            base_config=agent_config,
+            poll_interval_s=args.poll_interval,
+            max_total_runtime_s=args.max_runtime,
+        )
+        result = runner.run()
+    finally:
+        if hooks is not None and hasattr(hooks, "teardown"):
+            hooks.teardown()
+
+    print(
+        f"\nPattern {pattern.name!r} complete: "
+        f"{result.agents_launched} agent(s) launched"
+    )
+    for role_name, count in result.cohorts_by_role.items():
+        print(f"  {role_name}: {count} cohort(s)")
 
 
 def _parse_overrides(args: list[str]) -> dict[str, str]:

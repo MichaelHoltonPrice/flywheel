@@ -22,18 +22,38 @@ class ProjectConfig:
     Attributes:
         project_root: The project root directory containing flywheel.yaml.
         foundry_dir: Path to the foundry directory.
-        hooks: Optional Python import path for loop hooks, in the form
-            ``module.path:ClassName`` (e.g., ``myproject.hooks:MyHooks``).
+        hooks: Optional Python import path for *legacy* agent-loop
+            hooks (consumed by ``flywheel run loop``), in the form
+            ``module.path:ClassName``.  Patterns use
+            ``project_hooks`` instead.
+        project_hooks: Optional Python import path for the
+            shrunken project-side hooks consumed by ``flywheel
+            run pattern``.  Same syntax as ``hooks``.  The two
+            keys coexist intentionally during the patterns
+            campaign so projects can migrate one pattern at a
+            time without breaking the legacy ``run loop`` path.
     """
 
     project_root: Path
     foundry_dir: Path
     hooks: str | None = None
+    project_hooks: str | None = None
 
     @property
     def templates_dir(self) -> Path:
         """Path to the templates directory."""
         return self.foundry_dir / "templates"
+
+    @property
+    def patterns_dir(self) -> Path:
+        """Path to the patterns directory.
+
+        Convention: ``<project_root>/patterns/``.  Used by
+        ``flywheel run pattern`` to discover declarative patterns
+        by file stem.  The directory is optional; projects that
+        only use the legacy ``run loop`` flow do not need it.
+        """
+        return self.project_root / "patterns"
 
     @property
     def blocks_dir(self) -> Path:
@@ -125,8 +145,18 @@ def load_project_config(project_root: Path) -> ProjectConfig:
             f"'module.path:ClassName', got {type(hooks).__name__}"
         )
 
+    project_hooks = data.get("project_hooks")
+    if project_hooks is not None and not isinstance(
+            project_hooks, str):
+        raise ValueError(
+            f"'project_hooks' in {config_path} must be a string "
+            f"in the form 'module.path:ClassName', got "
+            f"{type(project_hooks).__name__}"
+        )
+
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
         hooks=hooks,
+        project_hooks=project_hooks,
     )

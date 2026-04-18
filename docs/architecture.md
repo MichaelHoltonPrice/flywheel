@@ -624,6 +624,79 @@ The loop handles:
 - **Lifecycle events**: records ``loop_completed`` events in
   the workspace.
 
+## Patterns (declarative agent topology)
+
+``Pattern`` (in ``flywheel.pattern``) and ``PatternRunner``
+(in ``flywheel.pattern_runner``) are the second-generation
+sibling of ``AgentLoop``.  Where the loop asks project hooks to
+make decisions every round, a pattern *declares* its topology
+and timing in YAML and the runner translates that declaration
+into agent launches:
+
+```yaml
+# patterns/play-brainstorm.yaml
+description: One play agent + a brainstorm cohort every 20 actions.
+roles:
+  play:
+    prompt: workforce/prompts/arc_predict_play.md
+    model: claude-sonnet-4-6
+    cardinality: 1
+    trigger: { kind: continuous }
+    inputs: [predictor, mechanics_summary]
+    outputs: [game_log]
+  brainstorm:
+    prompt: workforce/prompts/arc_brainstorm.md
+    cardinality: 6
+    trigger: { kind: every_n_executions, of_block: take_action, n: 20 }
+    outputs: [brainstorm_result]
+```
+
+### Trigger vocabulary
+
+- ``continuous`` — fire at run start; lifetime equals the run.
+- ``every_n_executions`` — fire every N successful, non-synthetic
+  executions of a referenced block.
+- ``on_request`` (parsed, runner not yet implemented) — fire when
+  an agent invokes a named tool.
+- ``on_event`` (parsed, runner not yet implemented) — fire when
+  a workspace event of the named kind is recorded.
+
+The vocabulary is intentionally narrow.  Add a kind only when an
+existing pattern can't be expressed without it; every kind grows
+the runner's responsibility.
+
+### Project hooks
+
+Patterns shrink the project-side surface to the things only the
+project can know — starting external resources and parsing
+project-specific CLI args.  ``ProjectHooks`` (in
+``flywheel.project_hooks``) declares:
+
+- ``init(workspace, template, project_root, args) -> dict``:
+  one-time setup; returns ``AgentBlockConfig`` overrides.
+- ``teardown()`` (optional): release resources after the run.
+
+Wired up in ``flywheel.yaml``:
+
+```yaml
+foundry_dir: foundry
+hooks: myproject.hooks:LegacyLoopHooks      # for `run loop`
+project_hooks: myproject.project:ProjectHooks   # for `run pattern`
+```
+
+### CLI
+
+```bash
+flywheel run pattern <pattern-name> \
+  --workspace PATH --template TEMPLATE \
+  [--project-hooks MODULE:CLASS] [--model MODEL] \
+  [--max-runtime SECONDS] [-- project-specific args...]
+```
+
+Patterns are discovered as ``<project_root>/patterns/<name>.yaml``.
+The ``run loop`` verb still works; both can target the same
+project simultaneously while individual patterns migrate.
+
 ## Future work
 
 ### Default binding policy

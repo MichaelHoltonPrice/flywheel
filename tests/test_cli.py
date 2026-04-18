@@ -406,3 +406,192 @@ class TestMainMaterialize:
         with pytest.raises(ValueError, match="No instances"):
             main(["materialize", "--workspace", str(ws_path),
                   "--from", "game_step", "--to", "game_history"])
+
+
+# ── flywheel run pattern ────────────────────────────────────────
+
+
+def _write_pattern(project_root: Path, name: str, body: str) -> Path:
+    patterns_dir = project_root / "patterns"
+    patterns_dir.mkdir(exist_ok=True)
+    path = patterns_dir / f"{name}.yaml"
+    path.write_text(body)
+    return path
+
+
+class TestRunPattern:
+    def test_unknown_pattern_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+
+        with pytest.raises(SystemExit):
+            main([
+                "run", "pattern", "nope",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+            ])
+        out = capsys.readouterr().out
+        assert "no pattern named 'nope'" in out
+
+    def test_extra_args_without_hooks_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+        _write_pattern(project_root, "p", """\
+roles:
+  play:
+    prompt: prompts/play.md
+    trigger:
+      kind: continuous
+""")
+
+        with pytest.raises(SystemExit):
+            main([
+                "run", "pattern", "p",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+                "--", "--game-id", "abc",
+            ])
+        out = capsys.readouterr().out
+        assert "no project_hooks are configured" in out
+
+    def test_runs_with_fake_runner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+        _write_pattern(project_root, "tiny", """\
+roles:
+  play:
+    prompt: prompts/play.md
+    trigger:
+      kind: continuous
+""")
+
+        captured: dict = {}
+
+        class _FakeResult:
+            agents_launched = 1
+            cohorts_by_role = {"play": 1}
+
+        class _FakeRunner:
+            def __init__(self, pattern, **kwargs):
+                captured["pattern"] = pattern
+                captured["kwargs"] = kwargs
+
+            def run(self):
+                return _FakeResult()
+
+        with patch("flywheel.cli.PatternRunner", _FakeRunner):
+            main([
+                "run", "pattern", "tiny",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+                "--max-runtime", "5",
+                "--poll-interval", "0.5",
+            ])
+
+        assert captured["pattern"].name == "tiny"
+        assert captured["kwargs"]["poll_interval_s"] == 0.5
+        assert captured["kwargs"]["max_total_runtime_s"] == 5
+
+    def test_calls_project_hooks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+        _write_pattern(project_root, "tiny", """\
+roles:
+  play:
+    prompt: prompts/play.md
+    trigger:
+      kind: continuous
+""")
+
+        teardown_called = []
+        init_called = []
+
+        class _FakeHooks:
+            def init(self, ws, template, pr, args):
+                init_called.append((ws, args))
+                return {"mcp_servers": "arc"}
+
+            def teardown(self):
+                teardown_called.append(True)
+
+        class _FakeRunner:
+            def __init__(self, pattern, **kwargs):
+                self.cfg = kwargs["base_config"]
+
+            def run(self):
+                class R:
+                    agents_launched = 0
+                    cohorts_by_role = {"play": 0}
+                return R()
+
+        with patch(
+            "flywheel.cli.PatternRunner", _FakeRunner,
+        ), patch(
+            "flywheel.cli.load_project_hooks_class",
+            return_value=_FakeHooks,
+        ):
+            main([
+                "run", "pattern", "tiny",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+                "--project-hooks", "x:Y",
+                "--", "--game-id", "abc",
+            ])
+
+        assert init_called
+        # Project args were forwarded.
+        assert init_called[0][1] == ["--game-id", "abc"]
+        # teardown ran.
+        assert teardown_called == [True]
+
+
+class TestProjectConfigFields:
+    def test_project_hooks_parsed(
+        self, tmp_path: Path,
+    ):
+        from flywheel.config import load_project_config
+        (tmp_path / "flywheel.yaml").write_text(
+            "foundry_dir: foundry\n"
+            "project_hooks: my.module:Hooks\n"
+        )
+        cfg = load_project_config(tmp_path)
+        assert cfg.project_hooks == "my.module:Hooks"
+        assert cfg.patterns_dir == tmp_path / "patterns"
+
+    def test_project_hooks_wrong_type_raises(
+        self, tmp_path: Path,
+    ):
+        from flywheel.config import load_project_config
+        (tmp_path / "flywheel.yaml").write_text(
+            "foundry_dir: foundry\n"
+            "project_hooks: 42\n"
+        )
+        with pytest.raises(
+                ValueError, match="project_hooks"):
+            load_project_config(tmp_path)
