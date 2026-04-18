@@ -697,6 +697,47 @@ Patterns are discovered as ``<project_root>/patterns/<name>.yaml``.
 ``run pattern`` is the only multi-agent orchestration verb;
 the legacy ``run loop`` was removed in P7 of the campaign.
 
+## Nested block executions from agents
+
+Some agent tool calls trigger nested block executions (``predict``,
+``game_step``, ``brainstorm_request``); others do not (workspace
+state queries, schema lookups).  For the calls that *are* block
+executions, we have considered two designs.
+
+**Bridge (current implementation).**  The agent container stays
+running for the duration of the nested execution.  An MCP tool
+inside the container holds open an HTTP rendezvous with the host:
+``begin`` opens a ledger row with ``status="running"`` and
+resolves inputs, the tool body executes, ``end`` writes outputs
+and transitions the row.  This is convenient — the agent's tool
+call returns synchronously like a normal function call — but it
+leaks state across the boundary.  The agent process keeps its
+in-memory context, the workspace can shift underneath between
+calls, a crash mid-body leaves an orphaned ``running`` row, and
+the agent and its MCP server share fate so a hang in one wedges
+the other.
+
+**Full stop (chosen direction).**  A nested block execution is a
+real operational boundary: the agent's session is checkpointed,
+the container exits cleanly, the nested block runs as an
+independent execution, and the agent restarts with the nested
+block's output delivered as the resolution of the pending tool
+call (via the Claude Agent SDK's ``PreToolUse`` hook so the agent
+perceives a normal tool-call/result cycle).  This pays container-
+restart latency on every nested invocation, which matters most
+for high-frequency calls like ``take_action`` — but the cost is
+small relative to agent turn runtimes and RL training time, and
+the gains are categorical.  Each block execution becomes the
+atomic unit it has always been advertised as: state is on disk
+at every boundary, no row can be orphaned, the agent cannot
+observe a workspace mid-mutation by another execution, and
+patterns that *would* let two executions impinge on the same
+artifact slot can be rejected at validation time rather than
+papered over with runtime locks.  We accept that this trades
+bridge brittleness for state-save brittleness; the latter is
+local, testable by killing the agent at every interesting point,
+and fails loudly rather than silently.
+
 ## Future work
 
 ### Default binding policy
