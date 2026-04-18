@@ -27,6 +27,8 @@ Three things are co-equal in flywheel's design:
 These three reinforce each other. Visibility without artifact
 tracking is anecdotal. Artifact tracking without visibility is a
 data lake. Improvement loops without either are blind iteration.
+While improvement loops are a first-order concern for flywheel,
+it is not a requirement for every workflow.
 
 ## The foundry
 
@@ -85,7 +87,8 @@ Success criteria may be an automated metric, a human judgment, an
 LLM evaluation, or something built up over time from initially
 human-mediated feedback. Not every block starts with an automated
 success criterion — the criterion itself can be improved as
-understanding deepens.
+understanding deepens. Not all blocks have a metric; some just do
+work.
 
 ### Implementations vs approaches
 
