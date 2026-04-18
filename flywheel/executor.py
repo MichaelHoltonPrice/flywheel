@@ -11,9 +11,8 @@ with output artifacts.
 
 Phase 5 of the block-execution refactor removed ``RecordExecutor``
 and the ``__record__`` sentinel.  Blocks that previously rode the
-record path are now ``runner: lifecycle`` blocks invoked through
-the ``ExecutionChannel`` lifecycle API (see
-:mod:`flywheel.tool_block`).
+record path are now ``runner: lifecycle`` blocks recorded by
+:class:`flywheel.local_block.LocalBlockRecorder`.
 
 All executors satisfy the ``BlockExecutor`` protocol and return
 an ``ExecutionHandle`` from ``launch()``.
@@ -245,7 +244,8 @@ class ContainerExecutor:
             overrides: CLI flag overrides (merged with defaults).
             allowed_blocks: If set, only these block names allowed.
             artifact_path: Path to input artifact relative to the
-                agent workspace (for bridge-style invocations).
+                agent workspace (legacy invocation shape kept for
+                callers that pass an explicit input directory).
             stopping: Threading event for cancellation.
             active_container: Single-element list tracking the
                 running container name.
@@ -270,7 +270,6 @@ class ContainerExecutor:
             raise ValueError(
                 f"Block {block_name!r} not found in template")
 
-        # Resolve artifact path if provided (bridge-style).
         if artifact_path is not None:
             agent_ws_name = agent_workspace_dir or "agent_workspace"
             agent_ws = workspace.path / agent_ws_name

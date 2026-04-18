@@ -1,7 +1,7 @@
 """Post-execution callback protocol.
 
 A *post-execution callback* is a project-side quality gate that
-runs after :class:`flywheel.execution_channel.ExecutionChannel`
+runs after :class:`flywheel.local_block.LocalBlockRecorder`
 finalizes a block-execution row.  It can ask the runner that
 invoked the block to stop; it cannot emit artifacts, mutate the
 workspace, or change what was recorded.
@@ -19,10 +19,10 @@ The dotted path is resolved at registry-load time
 typo fails the run at startup, not in the middle of a long
 training session.
 
-The callable is invoked synchronously in the channel's HTTP
-handler thread after ``end_execution`` (or after the channel
-synthesises a failed row for a request that never made it past
-``begin``).  See ``plans/post-execution-callback.md`` for the full
+The callable is invoked synchronously by the recorder after
+``end_execution`` (or after the recorder synthesises a failed
+row for a body that raised before ``end``).  See
+``plans/post-execution-callback.md`` for the full
 spec, including the channel/runner flows and what's explicitly
 out of scope.
 """

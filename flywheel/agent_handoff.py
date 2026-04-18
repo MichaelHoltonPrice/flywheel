@@ -35,10 +35,9 @@ and is observationally identical to :func:`run_agent_block`.
 
 Production wiring is intentionally minimal:
 
-* The execution channel (the bridge for non-handoff tool calls)
-  is still spun up per launch by :func:`launch_agent_block`.  The
-  full-stop nested-block plan retires the bridge in B7; until
-  then, this loop coexists with it.
+* No host-side HTTP bridge runs.  Block executions invoked
+  during a handoff are recorded directly by the host runner
+  via :class:`flywheel.local_block.LocalBlockRecorder`.
 * Each cycle's :class:`flywheel.artifact.BlockExecution` row is
   recorded by the underlying :class:`flywheel.agent.AgentHandle`
   with its own ``execution_id``; this loop chains them via

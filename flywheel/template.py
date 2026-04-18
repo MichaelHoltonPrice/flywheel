@@ -135,12 +135,12 @@ class BlockDefinition:
             Required for ``inprocess`` and ``subprocess``.
             Forbidden for ``container`` and ``lifecycle``.
         post_check: Optional dotted Python path to a callable
-            invoked by :class:`flywheel.execution_channel.ExecutionChannel`
-            after the row is finalized.  See
-            :mod:`flywheel.post_check`.  ``None`` means no
-            post-execution check is configured for this block.
-            Resolved eagerly at registry-load time (a typo fails
-            startup, not the run).
+            invoked by
+            :class:`flywheel.local_block.LocalBlockRecorder` after
+            the row is finalized.  See :mod:`flywheel.post_check`.
+            ``None`` means no post-execution check is configured
+            for this block.  Resolved eagerly at registry-load
+            time (a typo fails startup, not the run).
     """
 
     name: str

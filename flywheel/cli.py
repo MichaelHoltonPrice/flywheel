@@ -5,7 +5,7 @@ Supports:
     flywheel run block --workspace PATH --block BLOCK --template TEMPLATE
         [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
     flywheel run agent --workspace PATH --template TEMPLATE
-        --prompt-file FILE [--model MODEL] [--max-invocations N]
+        --prompt-file FILE [--model MODEL]
         [--allowed-block BLOCK ...]
         [--input-artifact NAME=ARTIFACT_ID ...]
         [-- container override args...]
@@ -94,8 +94,6 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--prompt-file", required=True,
                               help="Path to the agent system prompt file.")
     agent_parser.add_argument("--model", default=None)
-    agent_parser.add_argument("--max-invocations", type=int, default=None,
-                              help="Max nested block invocations.")
     agent_parser.add_argument("--max-turns", type=int, default=None)
     agent_parser.add_argument("--total-timeout", type=int, default=14400,
                               help="Max wall-clock seconds (default: 14400 = 4h).")
@@ -362,8 +360,7 @@ def run_block_command(
 def run_agent_command(args, extra_args: list[str]) -> None:
     """Run an agent block within an existing workspace.
 
-    Reads the prompt file, starts the block bridge, and launches
-    the agent container.
+    Reads the prompt file and launches the agent container.
 
     Args:
         args: Parsed argparse namespace with agent-specific fields.
@@ -431,7 +428,6 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         agent_image=args.agent_image,
         auth_volume=args.auth_volume,
         model=args.model,
-        max_invocations=args.max_invocations,
         max_turns=args.max_turns,
         total_timeout=args.total_timeout,
         allowed_blocks=args.allowed_block or None,

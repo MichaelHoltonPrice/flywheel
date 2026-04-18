@@ -34,7 +34,7 @@ if [ "${NETWORK_ISOLATION}" = "1" ]; then
         iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT
     done
 
-    # Allow host machine (game server + block bridge).
+    # Allow host machine (game server + project MCP servers).
     if [ -n "$HOST_IP" ]; then
         iptables -A OUTPUT -d "$HOST_IP" -j ACCEPT
     fi

@@ -1,15 +1,15 @@
 """Agent block execution orchestration.
 
-Runs an AI agent (Claude Code) inside a Docker container with access
-to a block bridge service that lets it trigger nested block executions.
-The agent reads source code, writes artifacts, and iteratively
-invokes other blocks (e.g., evaluations) through an MCP tool.
+Runs an AI agent (Claude Code) inside a Docker container.  The
+agent reads source code, writes artifacts, and may trigger nested
+block executions via the host-side full-stop handoff path
+(:mod:`flywheel.agent_handoff`); see
+:mod:`flywheel.local_block` for the recorder side.
 
 The agent container receives:
 - A workspace directory (read-write) for writing artifacts
 - Source code directories (read-only)
 - Previous artifacts as optional inputs (read-only)
-- A block bridge endpoint for triggering nested block executions
 
 Each block the agent invokes becomes a tracked block execution
 with full artifact provenance in the workspace.
@@ -18,8 +18,8 @@ Two APIs are provided:
 
 - ``launch_agent_block()`` returns an ``AgentHandle`` immediately
   for non-blocking control.  The handle supports ``stop()`` to
-  request a graceful shutdown (e.g., from a bridge callback) and
-  ``wait()`` to block until completion and collect artifacts.
+  request a graceful shutdown and ``wait()`` to block until
+  completion and collect artifacts.
 - ``run_agent_block()`` is a blocking convenience wrapper that
   calls ``launch_agent_block()`` then ``handle.wait()``.
 """
@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.artifact import BlockExecution, LifecycleEvent
-from flywheel.execution_channel import ExecutionChannel
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -193,16 +192,14 @@ class AgentHandle:
     control over the container lifecycle.
 
     The caller **must** call ``wait()`` exactly once to clean up
-    resources (join threads, stop bridge, collect artifacts).
-    Call ``stop()`` to request a graceful shutdown — the agent
-    runner detects the stop file, exports its session, and exits
-    on its own.
+    resources (join threads, collect artifacts).  Call ``stop()``
+    to request a graceful shutdown — the agent runner detects the
+    stop file, exports its session, and exits on its own.
     """
 
     def __init__(
         self,
         process: subprocess.Popen,
-        bridge: ExecutionChannel,
         workspace: Workspace,
         agent_ws: Path,
         output_names: list[str] | None,
@@ -218,7 +215,6 @@ class AgentHandle:
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
-        self._bridge = bridge
         self._workspace = workspace
         self._agent_ws = agent_ws
         self._output_names = output_names
@@ -238,28 +234,6 @@ class AgentHandle:
         """Check if the container process is still running."""
         return self._process.poll() is None
 
-    @property
-    def bridge_endpoint(self) -> str:
-        """Host-process URL of this agent's execution channel.
-
-        Returns the ``http://host:port`` the local
-        :class:`flywheel.execution_channel.ExecutionChannel` is
-        listening on.  Differs from the ``EVAL_ENDPOINT`` the
-        agent container sees, which substitutes
-        ``host.docker.internal`` for the host so the in-container
-        MCP processes can reach back across the Docker NAT.
-
-        Use this from the host side when a block runner (e.g. the
-        full-stop handoff path's
-        :class:`cyberarc.game_step_block.GameStepRunner`) needs
-        to record executions against the same channel the agent
-        is using.  The endpoint is stable from the moment
-        :func:`launch_agent_block` returns until
-        :meth:`wait` stops the bridge, so callers may capture it
-        once per cycle.
-        """
-        return self._bridge.url
-
     def stop(self, reason: str = "requested") -> None:
         """Request a graceful shutdown of the agent.
 
@@ -273,7 +247,7 @@ class AgentHandle:
         reliably propagate host writes to the container.
 
         The caller **must** still call ``wait()`` afterward to join
-        threads, stop the bridge, and collect artifacts.
+        threads and collect artifacts.
 
         Args:
             reason: Why the agent is being stopped (e.g.,
@@ -291,9 +265,9 @@ class AgentHandle:
     def wait(self) -> AgentResult:
         """Block until the container exits and return results.
 
-        Joins background threads, stops the bridge, collects output
-        artifacts, records the agent execution in the workspace, and
-        returns ``AgentResult``.  Must be called exactly once.
+        Joins background threads, collects output artifacts,
+        records the agent execution in the workspace, and returns
+        ``AgentResult``.  Must be called exactly once.
 
         Raises:
             RuntimeError: If ``wait()`` has already been called.
@@ -313,7 +287,6 @@ class AgentHandle:
             self._process.wait()
         finally:
             self._stderr_thread.join(timeout=5)
-            self._bridge.stop()
 
         elapsed = time.monotonic() - self._start_time
         finished_at = datetime.now(UTC)
@@ -412,7 +385,6 @@ class AgentBlockConfig:
         agent_image: Docker image for the agent container.
         auth_volume: Docker named volume with API credentials.
         model: Model name (e.g., ``"claude-sonnet-4-6"``).
-        max_invocations: Maximum nested block invocations.
         max_turns: Maximum agent conversation turns.
         total_timeout: Maximum wall-clock seconds.
         allowed_blocks: Block names the agent may invoke.
@@ -425,8 +397,6 @@ class AgentBlockConfig:
         extra_env: Additional environment variables.
         extra_mounts: Additional volume mounts.
         pre_launch_hook: Callback before container launch.
-        on_record: Callback fired after each successful record-mode
-            bridge invocation.
         isolated_network: Enable iptables-based network isolation.
         agent_workspace_dir: Subdirectory name for the agent workspace.
         predecessor_id: Execution ID of a previous agent run that
@@ -440,7 +410,6 @@ class AgentBlockConfig:
     agent_image: str = "flywheel-claude:latest"
     auth_volume: str = "claude-auth"
     model: str | None = None
-    max_invocations: int | None = None
     max_turns: int | None = None
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT
     allowed_blocks: list[str] | None = None
@@ -453,13 +422,14 @@ class AgentBlockConfig:
     extra_env: dict[str, str] | None = None
     extra_mounts: list[tuple[str, str, str]] | None = None
     pre_launch_hook: Callable[[Path], None] | None = None
-    on_record: Callable[[str, dict], None] | None = None
     isolated_network: bool = False
     agent_workspace_dir: str | None = None
     predecessor_id: str | None = None
     # Pre-resolved post-execution callbacks keyed by block name.
-    # See :mod:`flywheel.post_check`.  Optional; ``None`` means
-    # the channel runs no project-side checks.
+    # See :mod:`flywheel.post_check`.  Reserved for future use:
+    # the agent path itself does not run post-checks today; the
+    # full-stop handoff loop registers them on its own
+    # :class:`flywheel.local_block.LocalBlockRecorder` instead.
     post_checks: dict[str, Any] | None = None
     # Optional ``{{KEY}} -> value`` substitutions applied by
     # :class:`flywheel.pattern_runner.PatternRunner` to each
@@ -636,7 +606,6 @@ def launch_agent_block(
     agent_image: str = "flywheel-claude:latest",
     auth_volume: str = "claude-auth",
     model: str | None = None,
-    max_invocations: int | None = None,
     max_turns: int | None = None,
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
     allowed_blocks: list[str] | None = None,
@@ -649,7 +618,6 @@ def launch_agent_block(
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str, str]] | None = None,
     pre_launch_hook: Callable[[Path], None] | None = None,
-    on_record: Callable[[str, dict], None] | None = None,
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
@@ -658,14 +626,13 @@ def launch_agent_block(
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
-    Sets up the workspace, starts the block bridge, launches the
-    Docker container, and returns an ``AgentHandle`` immediately.
-    The container runs in the background.
+    Sets up the workspace, launches the Docker container, and
+    returns an ``AgentHandle`` immediately.  The container runs
+    in the background.
 
     The caller must call ``handle.wait()`` to clean up and get
     the result.  Call ``handle.stop()`` to request a graceful
-    shutdown (e.g., from a bridge callback), then ``wait()`` to
-    finalize.
+    shutdown, then ``wait()`` to finalize.
 
     Args:
         workspace: The flywheel workspace for artifact tracking.
@@ -675,7 +642,6 @@ def launch_agent_block(
         agent_image: Docker image for the agent container.
         auth_volume: Docker named volume with API credentials.
         model: Model name (e.g., "claude-sonnet-4-6").
-        max_invocations: Maximum nested block invocations.
         max_turns: Maximum agent conversation turns.
         total_timeout: Maximum wall-clock seconds.
         allowed_blocks: Block names the agent may invoke.
@@ -688,9 +654,6 @@ def launch_agent_block(
         extra_env: Additional environment variables.
         extra_mounts: Additional volume mounts.
         pre_launch_hook: Callback before container launch.
-        on_record: Callback fired after each successful record-mode
-            bridge invocation.  Receives ``(block_name, outputs)``.
-            Runs in the bridge HTTP handler thread.
         isolated_network: Enable iptables-based network isolation
             inside the container.
         agent_workspace_dir: Subdirectory name for the agent workspace.
@@ -700,10 +663,10 @@ def launch_agent_block(
         predecessor_id: Execution ID of a previous agent run that
             this launch resumes from.  Recorded in the workspace
             execution for resume chain tracking.
-        post_checks: Pre-resolved post-execution callbacks keyed
-            by block name (see :mod:`flywheel.post_check`).
-            ``None`` means the execution channel runs no
-            project-side checks for nested blocks.
+        post_checks: Reserved.  The agent path itself runs no
+            post-checks; nested-block post-checks live on the
+            host-side :class:`flywheel.local_block.LocalBlockRecorder`
+            owned by the handoff loop.
         reuse_workspace: When ``True``, the launcher skips the
             "fresh workspace" check and the prior-artifact
             seeding pass.  Used by the host-side handoff loop
@@ -716,34 +679,17 @@ def launch_agent_block(
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
     """
+    del overrides, post_checks  # accepted for API compatibility
     mount = prepare_agent_workspace(
         workspace, output_names, agent_workspace_dir,
         reuse_workspace=reuse_workspace,
     )
     agent_ws = mount.host_path
-    # Bind the resolved name back into the variable the rest of
-    # this function passes through to ExecutionChannel and
-    # AgentHandle: nested executions see the same auto-named
-    # path the agent does, and the recorded BlockExecution row
-    # records the directory it ran in.
+    # Bind the resolved name back so AgentHandle records the
+    # directory the run actually used.
     agent_workspace_dir = mount.relative_dir
 
-    # Snapshot execution count to compute invocations later.
     executions_before = len(workspace.executions)
-
-    # Start execution channel (HTTP service for nested executions).
-    bridge = ExecutionChannel(
-        template=template,
-        workspace=workspace,
-        overrides=overrides,
-        allowed_blocks=allowed_blocks,
-        max_invocations=max_invocations,
-        on_record=on_record,
-        agent_workspace_dir=agent_workspace_dir,
-        post_checks=post_checks,
-    )
-    port = bridge.start()
-    bridge_endpoint = f"http://host.docker.internal:{port}"
 
     # Build Docker command with a named container for reliable stop.
     container_name = f"flywheel-{uuid.uuid4().hex[:12]}"
@@ -791,7 +737,6 @@ def launch_agent_block(
         allowed_blocks[0] if allowed_blocks else "eval_bot"
     )
     env_vars = {
-        "EVAL_ENDPOINT": bridge_endpoint,
         "EVAL_BLOCK": default_block,
         "MCP_SERVERS": mcp_servers or "eval",
         "ALLOWED_TOOLS": (
@@ -829,22 +774,18 @@ def launch_agent_block(
     event_log = workspace.path / "agent_events.jsonl"
     stderr_log = workspace.path / "agent_stderr.log"
 
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=env,
-        )
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
 
-        process.stdin.write(prompt)
-        process.stdin.close()
-    except Exception:
-        bridge.stop()
-        raise
+    process.stdin.write(prompt)
+    process.stdin.close()
 
     # Background threads for stdout and stderr.
     def _drain_stderr():
@@ -866,7 +807,6 @@ def launch_agent_block(
 
     return AgentHandle(
         process=process,
-        bridge=bridge,
         workspace=workspace,
         agent_ws=agent_ws,
         output_names=output_names,
@@ -889,7 +829,6 @@ def run_agent_block(
     agent_image: str = "flywheel-claude:latest",
     auth_volume: str = "claude-auth",
     model: str | None = None,
-    max_invocations: int | None = None,
     max_turns: int | None = None,
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
     allowed_blocks: list[str] | None = None,
@@ -924,7 +863,6 @@ def run_agent_block(
         agent_image=agent_image,
         auth_volume=auth_volume,
         model=model,
-        max_invocations=max_invocations,
         max_turns=max_turns,
         total_timeout=total_timeout,
         allowed_blocks=allowed_blocks,

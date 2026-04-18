@@ -1,9 +1,8 @@
 """Deterministic unit tests for :mod:`flywheel.local_block`.
 
-The recorder replaces the loopback ``BlockChannelClient`` →
-``ExecutionChannel`` round-trip used by host-side block runners
-in B5/B6.  These tests pin the contract every cyberarc runner
-relies on:
+The recorder is the host-side write surface for nested-block
+executions invoked during a full-stop handoff.  These tests pin
+the contract every cyberarc runner relies on:
 
 - ``begin`` resolves declared inputs against the workspace's
   latest instances; missing required inputs raise a typed error
@@ -170,7 +169,7 @@ def recorder_factory(tmp_path: Path):
 
 
 class TestBeginInputResolution:
-    """``begin`` must resolve inputs the same way the bridge did."""
+    """``begin`` resolves declared inputs to latest instances."""
 
     def test_unknown_block_raises_typed_error(
             self, recorder_factory):

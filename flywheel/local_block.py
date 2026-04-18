@@ -7,24 +7,18 @@ boundary.  The agent stops, the host runs the block synchronously
 in its own Python process, then the agent restarts with the
 block's output spliced into its session.
 
-This module is the recorder side of that handoff.  It plays the
-role :class:`flywheel.tool_block.BlockChannelClient` used to play
-when the bridge was alive, but with two structural differences
-that the campaign was built around:
+This module is the recorder side of that handoff.  Its two
+defining structural properties:
 
 1. **No HTTP round-trip.**  The host-side block runner shares a
    Python process with the workspace, so it writes artifacts and
-   ledger rows directly instead of POSTing into a loopback
-   :class:`flywheel.execution_channel.ExecutionChannel`.  The
-   loopback was the last consumer of the lifecycle API; deleting
-   it lets B7 also delete the API.
-2. **No ``"running"`` row.**  ``BlockChannelClient.begin`` opened
-   a row with ``status="running"`` so the channel could remember
-   what was in flight across the HTTP boundary.  Nothing needs
-   to remember anything across an in-process boundary, so
-   recorded executions go straight from non-existent →
-   ``"succeeded"`` or ``"failed"`` and the orphaned-``running``
-   class of bug becomes structurally impossible.
+   ledger rows directly under the workspace's own lock.  No
+   loopback HTTP service runs.
+2. **No ``"running"`` row.**  Nothing needs to remember anything
+   across an in-process boundary, so recorded executions go
+   straight from non-existent → ``"succeeded"`` or ``"failed"``
+   and the orphaned-``running`` class of bug becomes structurally
+   impossible.
 
 Halt directives produced by post-execution checks are queued on
 the recorder rather than served over ``GET /halt``; the
@@ -64,13 +58,9 @@ from flywheel.workspace import Workspace
 class LocalBlockError(RuntimeError):
     """Raised when the recorder rejects a ``begin`` request.
 
-    Mirrors the
-    :class:`flywheel.tool_block.BlockChannelError` shape callers
-    used to handle: an ``error_type`` string identifying the
-    rejection class plus a human-readable message.  Used for
-    pre-body failures (unknown block, missing required input)
-    that the legacy bridge would have surfaced as
-    ``ok=false`` HTTP responses.
+    Carries an ``error_type`` string identifying the rejection
+    class plus a human-readable message.  Used for pre-body
+    failures (unknown block, missing required input).
 
     Body failures (exceptions raised by the wrapped block code)
     propagate out of the ``begin`` context manager unchanged —
@@ -78,11 +68,9 @@ class LocalBlockError(RuntimeError):
 
     Attributes:
         error_type: One of ``"unknown_block"``, ``"missing_input"``.
-        execution_id: ``None`` because no row was written for
-            rejected requests under the post-bridge model
-            (synthetic rows died with the bridge).  Kept on the
-            exception only so callers that want to log a stable
-            shape can do so.
+        execution_id: ``None`` because no row is written for
+            rejected requests.  Present on the exception only so
+            callers that want to log a stable shape can do so.
     """
 
     def __init__(
@@ -102,13 +90,10 @@ class LocalBlockError(RuntimeError):
 class LocalExecutionContext:
     """Per-execution context yielded by :meth:`LocalBlockRecorder.begin`.
 
-    Mirrors the public surface of the old
-    :class:`flywheel.tool_block.ExecutionContext` so host-side
-    block runners can treat the two interchangeably during the
-    migration window — but with the HTTP-specific fields
-    (``input_hashes``, the wire-shape ``output_bindings``)
-    removed because the recorder writes outputs directly and
-    nobody needs the intermediate forms.
+    Carries everything a block body needs to read its inputs,
+    write its outputs, and stage scratch state.  The recorder
+    writes the resulting artifacts and ledger row directly under
+    the workspace's lock when the body returns.
 
     Attributes:
         execution_id: Workspace-allocated ledger ID for this
@@ -279,9 +264,7 @@ class LocalBlockRecorder:
             LocalBlockError: When the block is not in the
                 template (``"unknown_block"``) or a required
                 input slot has no registered instances
-                (``"missing_input"``).  Callers that want
-                bridge-compatible error handling can catch this
-                in place of the old ``BlockChannelError``.
+                (``"missing_input"``).
             Exception: Any exception raised by the body propagates
                 out of the context manager after the recorder
                 writes a ``"failed"`` row and runs the post-check.
@@ -378,14 +361,12 @@ class LocalBlockRecorder:
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Resolve declared block inputs to latest registered instances.
 
-        Same semantics as the legacy
-        ``execution_channel._resolve_inputs_for_begin``: derived
-        slots are rebuilt every begin, non-derived optional slots
-        with no instance are silently skipped, non-derived
-        required slots with no instance raise ``ValueError``.
-        Returns ``(input_bindings, input_paths)`` as absolute
-        host paths (the in-process caller can read them
-        directly).
+        Derived slots are rebuilt on every ``begin``, non-derived
+        optional slots with no instance are silently skipped, and
+        non-derived required slots with no instance raise
+        ``ValueError``.  Returns ``(input_bindings, input_paths)``
+        as absolute host paths (the in-process caller can read
+        them directly).
         """
         bindings: dict[str, str] = {}
         paths: dict[str, str] = {}
@@ -605,10 +586,6 @@ class LocalBlockRecorder:
         ``post_check_error`` populated.  Halt directives are
         also appended to :attr:`halt_queue` so the host-side
         handoff loop can find them.
-
-        Mirrors the channel's behaviour exactly so projects that
-        ship post-checks against the bridge keep working without
-        modification.
         """
         callable_ = self.post_checks.get(execution.block_name)
         if callable_ is None:

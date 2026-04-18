@@ -27,12 +27,11 @@ Pause/resume
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
-    EVAL_ENDPOINT   — URL of the host-side eval HTTP service
     ALLOWED_TOOLS   — Comma-separated tool whitelist
     MAX_TURNS       — Total turn budget for the agent (optional)
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
-                      Built-in: eval. Projects can mount additional
-                      servers at /workspace/.mcp_servers/.
+                      Projects mount servers at
+                      /workspace/.mcp_servers/.
     HANDOFF_TOOLS   — Comma-separated MCP tool names to intercept
                       via a PreToolUse hook.  When the agent calls
                       one or more in a single assistant turn, the
@@ -273,24 +272,11 @@ def _persist_handoff(session_id: str) -> None:
 # MCP server registry
 # ------------------------------------------------------------------
 
-def _eval_server():
-    """Block invocation proxy — requires EVAL_ENDPOINT to be set."""
-    endpoint = os.environ.get("EVAL_ENDPOINT", "")
-    if not endpoint:
-        return None
-    eval_block = os.environ.get("EVAL_BLOCK", "eval_bot")
-    config = {
-        "command": "python3",
-        "args": ["/app/eval_mcp_server.py"],
-        "env": {"EVAL_ENDPOINT": endpoint, "EVAL_BLOCK": eval_block},
-    }
-    tools = ["mcp__run_eval__evaluate"]
-    return config, tools
-
-
-_MCP_REGISTRY = {
-    "eval": ("run_eval", _eval_server),
-}
+# Built-in MCP servers used to ship the in-container ``eval`` proxy
+# that round-tripped to the host bridge.  The bridge is gone; the
+# only servers the runner now exposes are the project-provided ones
+# scanned from ``MCP_SERVER_MOUNT_DIR``.
+_MCP_REGISTRY: dict[str, tuple[str, Any]] = {}
 
 # Default directory where project-provided MCP servers are mounted.
 MCP_SERVER_MOUNT_DIR = "/workspace/.mcp_servers"

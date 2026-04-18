@@ -231,9 +231,10 @@ class PatternRunner:
 
         Counts only ``status=="succeeded"`` rows that are not
         synthetic.  Synthetic-failed rows already trigger
-        post-check halts via :class:`flywheel.execution_channel.ExecutionChannel`;
-        counting them here would double-count infrastructure
-        failures as "real" progress.
+        post-check halts via
+        :class:`flywheel.local_block.LocalBlockRecorder`; counting
+        them here would double-count infrastructure failures as
+        "real" progress.
         """
         for state in self._state.values():
             trigger = state.role.trigger
@@ -306,7 +307,6 @@ class PatternRunner:
             "agent_image": self._base.agent_image,
             "auth_volume": self._base.auth_volume,
             "model": role.model or self._base.model,
-            "max_invocations": self._base.max_invocations,
             "max_turns": (
                 role.max_turns
                 if role.max_turns is not None

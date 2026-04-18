@@ -22,10 +22,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # let agents inspect game mechanics directly.
 RUN pip install claude-agent-sdk httpx mcp Pillow numpy
 
-# Copy the agent runner and built-in MCP server scripts.
-# Project-specific MCP servers are mounted at runtime.
+# Copy the agent runner.  Project-specific MCP servers are
+# mounted at runtime.
 COPY agent_runner.py /app/agent_runner.py
-COPY eval_mcp_server.py /app/eval_mcp_server.py
 COPY entrypoint.sh /app/entrypoint.sh
 
 # Claude Code refuses --dangerously-skip-permissions as root.
