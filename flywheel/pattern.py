@@ -177,6 +177,24 @@ class Role:
             launcher default.
         total_timeout: Per-agent wall-clock cap in seconds;
             ``None`` defers to the launcher default.
+        extra_env: Per-role environment variables merged on top
+            of the project-wide ``extra_env`` from
+            :class:`AgentBlockConfig`.  Use sparingly — most env
+            vars belong in the project hooks since they apply to
+            every role; this is for cases like
+            ``PREDICTOR_PATH`` that only the escalator and play
+            roles in a predict pattern care about.
+        materialize: Sequences to assemble before each firing,
+            mapping target artifact name to source block name
+            (e.g., ``{"game_history": "take_action"}`` rolls all
+            ``take_action`` rows into a single ``game_history``
+            JSONL artifact via
+            :meth:`flywheel.workspace.Workspace.materialize_sequence`).
+            The materialized artifact is then automatically
+            available to :attr:`inputs` resolution because the
+            runner re-reads ``instances_for`` after materializing.
+            Empty by default; only roles that read assembled
+            history (brainstormers, escalators) need it.
     """
 
     name: str
@@ -190,6 +208,8 @@ class Role:
     allowed_tools: str | None = None
     max_turns: int | None = None
     total_timeout: int | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
+    materialize: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -392,6 +412,51 @@ def _parse_role(
             f"omitted"
         )
 
+    extra_env_raw = spec.get("extra_env", {})
+    if not isinstance(extra_env_raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} role {role_name!r}: "
+            f"'extra_env' must be a mapping of name to string "
+            f"value, got {type(extra_env_raw).__name__}"
+        )
+    extra_env: dict[str, str] = {}
+    for env_name, env_value in extra_env_raw.items():
+        if not isinstance(env_name, str) or not env_name:
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"'extra_env' keys must be non-empty strings"
+            )
+        if not isinstance(env_value, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"'extra_env.{env_name}' must be a string, got "
+                f"{type(env_value).__name__}"
+            )
+        extra_env[env_name] = env_value
+
+    materialize_raw = spec.get("materialize", {})
+    if not isinstance(materialize_raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} role {role_name!r}: "
+            f"'materialize' must be a mapping of target-artifact "
+            f"to source-block, got "
+            f"{type(materialize_raw).__name__}"
+        )
+    materialize: dict[str, str] = {}
+    for target, source in materialize_raw.items():
+        if not isinstance(target, str) or not target:
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"'materialize' keys must be non-empty strings"
+            )
+        if not isinstance(source, str) or not source:
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"'materialize.{target}' must be a non-empty "
+                f"source block-name string"
+            )
+        materialize[target] = source
+
     return Role(
         name=role_name,
         prompt=prompt,
@@ -404,6 +469,8 @@ def _parse_role(
         allowed_tools=allowed_tools,
         max_turns=max_turns,
         total_timeout=total_timeout,
+        extra_env=extra_env,
+        materialize=materialize,
     )
 
 

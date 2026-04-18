@@ -321,6 +321,94 @@ class TestEveryNExecutions:
         assert bs_count[0] == 0
 
 
+class TestMaterialize:
+    """Roles can declare sequences to roll up before each firing.
+
+    The runner consults ``Workspace.materialize_sequence`` (which
+    we stub here) so brainstormers and escalators see a single
+    ``game_history`` artifact rather than N raw rows.
+    """
+
+    def test_materialize_called_when_source_present(
+            self, tmp_path: Path):
+        ws = _FakeWorkspace(tmp_path)
+        materialize_calls: list[tuple[str, str]] = []
+
+        def materialize_sequence(src, dst):
+            materialize_calls.append((src, dst))
+
+        ws.materialize_sequence = materialize_sequence  # type: ignore[attr-defined]
+
+        # Has source instances? Yes, after we register them.
+        original_instances = ws.instances_for
+
+        def instances_for(name: str):
+            if name == "take_action":
+                return [object()]
+            return original_instances(name)
+        ws.instances_for = instances_for  # type: ignore[assignment]
+
+        prompt = _write_prompt(tmp_path, "p.md")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=ContinuousTrigger(),
+                materialize={"game_history": "take_action"},
+            )],
+        )
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            handle.finish()
+            return handle
+
+        PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+        ).run()
+
+        assert materialize_calls == [("take_action", "game_history")]
+
+    def test_materialize_skipped_when_source_empty(
+            self, tmp_path: Path):
+        ws = _FakeWorkspace(tmp_path)
+        materialize_calls: list[tuple[str, str]] = []
+
+        def materialize_sequence(src, dst):
+            materialize_calls.append((src, dst))
+
+        ws.materialize_sequence = materialize_sequence  # type: ignore[attr-defined]
+
+        prompt = _write_prompt(tmp_path, "p.md")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=ContinuousTrigger(),
+                materialize={"game_history": "take_action"},
+            )],
+        )
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            handle.finish()
+            return handle
+
+        PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+        ).run()
+
+        assert materialize_calls == []
+
+
 class TestRejectsBadPatterns:
     def test_no_continuous_role_raises(self, tmp_path: Path):
         prompt = _write_prompt(tmp_path, "p.md")

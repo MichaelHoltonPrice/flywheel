@@ -648,8 +648,29 @@ roles:
     prompt: workforce/prompts/arc_brainstorm.md
     cardinality: 6
     trigger: { kind: every_n_executions, of_block: take_action, n: 20 }
+    inputs: [game_history]
     outputs: [brainstorm_result]
+    materialize: { game_history: take_action }
+    extra_env: { BRAINSTORM_FOCUS: "general" }
 ```
+
+### Role fields
+
+- ``inputs`` — artifact names; the runner binds the latest
+  registered instance of each before launch.
+- ``outputs`` — artifact names the role registers.  Falls back
+  to ``base_config.output_names`` when omitted.
+- ``materialize`` — sequences to roll up before each firing
+  (mapping target artifact name → source block name).  Drives
+  ``Workspace.materialize_sequence`` so brainstormers and
+  escalators see one ``game_history.jsonl`` instead of N rows.
+  Skipped when the source has no instances yet.
+- ``extra_env`` — per-role env vars merged on top of the
+  project's ``extra_env``.  Use sparingly; most env vars belong
+  in project hooks.
+- ``model`` / ``max_turns`` / ``total_timeout`` /
+  ``mcp_servers`` / ``allowed_tools`` — per-role overrides of
+  the launcher defaults.
 
 ### Trigger vocabulary
 

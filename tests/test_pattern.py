@@ -295,6 +295,76 @@ roles:
             Pattern.from_yaml(path)
 
 
+class TestMaterialize:
+    """Patterns that need a sequence rolled up before firing.
+
+    The brainstorm / escalate roles read assembled
+    ``game_history.jsonl`` rather than the individual ``game_step``
+    rows, so the role declares a ``materialize:`` map.  The
+    runner consumes it; the loader's job is just to parse and
+    surface bad shapes.
+    """
+
+    def test_materialize_round_trips(self, tmp_path: Path):
+        path = _write(tmp_path, "p", """\
+roles:
+  brainstorm:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    materialize:
+      game_history: take_action
+      mechanics_summary: escalate
+""")
+        pattern = Pattern.from_yaml(path)
+        role = pattern.roles[0]
+        assert role.materialize == {
+            "game_history": "take_action",
+            "mechanics_summary": "escalate",
+        }
+
+    def test_materialize_default_is_empty(self, tmp_path: Path):
+        path = _write(tmp_path, "p", """\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+""")
+        pattern = Pattern.from_yaml(path)
+        assert pattern.roles[0].materialize == {}
+
+    def test_materialize_must_be_mapping(self, tmp_path: Path):
+        path = _write(tmp_path, "bad", """\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    materialize:
+      - game_history
+""")
+        with pytest.raises(
+                ValueError, match="'materialize' must be a mapping"):
+            Pattern.from_yaml(path)
+
+    def test_materialize_empty_source_raises(self, tmp_path: Path):
+        path = _write(tmp_path, "bad", """\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    materialize:
+      game_history: ""
+""")
+        with pytest.raises(
+                ValueError,
+                match="'materialize.game_history' must be a "
+                      "non-empty"):
+            Pattern.from_yaml(path)
+
+
 class TestDiscoverPatterns:
     def test_indexes_yaml_files(self, tmp_path: Path):
         (tmp_path / "a.yaml").write_text("roles: {}")

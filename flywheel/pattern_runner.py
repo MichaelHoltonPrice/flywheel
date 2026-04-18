@@ -260,6 +260,8 @@ class PatternRunner:
         state = self._state[role.name]
         cohort_index = state.cohorts_fired
 
+        self._materialize_for(role)
+
         for member_index in range(role.cardinality):
             kwargs = self._kwargs_for(
                 role, cohort_index=cohort_index,
@@ -325,7 +327,7 @@ class PatternRunner:
                 role.mcp_servers or self._base.mcp_servers),
             "allowed_tools": (
                 role.allowed_tools or self._base.allowed_tools),
-            "extra_env": self._base.extra_env,
+            "extra_env": self._merge_env(role),
             "extra_mounts": self._base.extra_mounts,
             "pre_launch_hook": self._base.pre_launch_hook,
             "isolated_network": self._base.isolated_network,
@@ -337,6 +339,43 @@ class PatternRunner:
             "post_checks": self._base.post_checks,
         }
         return kwargs
+
+    def _merge_env(self, role: Role) -> dict[str, str] | None:
+        """Layer ``role.extra_env`` on top of ``base_config.extra_env``.
+
+        Role wins on key collision — that's the whole point of
+        per-role overrides; otherwise the role couldn't, e.g.,
+        scope ``PREDICTOR_PATH`` to itself.  Returning ``None``
+        when both are empty matches the launcher's "no extra
+        env" sentinel.
+        """
+        base = dict(self._base.extra_env or {})
+        if role.extra_env:
+            base.update(role.extra_env)
+        return base or None
+
+    def _materialize_for(self, role: Role) -> None:
+        """Roll declared sequences into a single artifact pre-firing.
+
+        Empty for roles that do not declare ``materialize``.  When
+        the source block has no rows yet (e.g., the first cohort
+        fires before any ``take_action`` rows exist), the call is
+        skipped: ``materialize_sequence`` would otherwise create
+        an empty artifact and confuse downstream readers expecting
+        at least one record.
+        """
+        if not role.materialize:
+            return
+        ws = self._base.workspace
+        for target, source in role.materialize.items():
+            if not ws.instances_for(source):
+                print(
+                    f"  [pattern-runner] role {role.name!r}: "
+                    f"skipping materialize {target!r}<-{source!r}"
+                    f" (no source instances yet)"
+                )
+                continue
+            ws.materialize_sequence(source, target)
 
     def _collect_inputs(self, role: Role) -> dict[str, str] | None:
         """Resolve role.inputs to the latest registered instance IDs.
