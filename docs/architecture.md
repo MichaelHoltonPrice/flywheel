@@ -595,77 +595,23 @@ automation.
 any declared service whose ``url_env`` is not set in the current
 environment.
 
-## Agent loop
-
-``AgentLoop`` (in ``flywheel.agent_loop``) is flywheel's
-orchestration loop for multi-round agent workflows. Projects
-provide hooks; flywheel manages the run-decide-repeat lifecycle.
-
-### Hooks discovery
-
-Projects declare their hooks class in ``flywheel.yaml``:
-
-```yaml
-foundry_dir: foundry
-hooks: myproject.hooks:MyHooks
-```
-
-``flywheel run loop`` loads this class, instantiates it, and calls
-``init()`` for project-specific setup before starting the loop.
-The ``--hooks`` CLI flag overrides the config file.
-
-### Hooks protocol
-
-Projects implement ``AgentLoopHooks``:
-
-- ``init(workspace, template, project_root, args) -> dict``:
-  One-time setup.  Parse project-specific CLI args (passed after
-  ``--``), initialize external services, register initial
-  artifacts.  Returns a dict of ``AgentBlockConfig`` field
-  overrides (``extra_env``, ``extra_mounts``, ``output_names``,
-  ``mcp_servers``, ``pre_launch_hook``, etc.).
-- ``decide(state: LoopState) -> Action``: Given what just
-  happened (round number, last result, exit reason), decide
-  what to do next.
-- ``build_prompt(action, state) -> str``: Build the prompt for
-  the next agent round.
-
-Optional hooks (detected via ``hasattr``):
-``on_execution(event, handle)`` receives ``ExecutionEvent``
-callbacks during agent execution.
-``auto_mount_artifacts()`` and ``make_pre_launch_hook()`` provide
-per-launch artifact mounting and workspace setup.
-
-### Actions
-
-``decide()`` returns one of four actions:
-
-- ``Continue`` — launch a new agent round.
-- ``SpawnGroup`` — launch parallel sub-agents via
-  ``AgentGroup``, then resume deciding.
-- ``Stop`` — stop the loop (with a reason string).
-- ``Finished`` — the task is complete (with optional summary).
-
-### Lifecycle management
-
-The loop handles:
-
-- **Round counting** with a configurable ``max_rounds`` budget.
-- **Session resume**: detects prior agent executions in the
-  workspace and links them via ``predecessor_id``.
-- **Circuit breaker**: consecutive auth or rate-limit failures
-  trigger an automatic stop (default threshold: 3).
-- **Lifecycle events**: records ``loop_completed`` events in
-  the workspace.
-
 ## Patterns (declarative agent topology)
 
 ``Pattern`` (in ``flywheel.pattern``) and ``PatternRunner``
-(in ``flywheel.pattern_runner``) are the second-generation
-sibling of ``AgentLoop``.  Where the loop asks project hooks to
-make decisions every round, a pattern *declares* its topology
-and timing in YAML and the runner translates that declaration
-into agent launches:
+(in ``flywheel.pattern_runner``) are flywheel's orchestration
+primitive for multi-agent workflows.  A pattern *declares* its
+topology and timing in YAML and the runner translates that
+declaration into agent launches:
+
+(P7 of the patterns campaign retired the previous generation —
+``AgentLoop`` and the ``AgentLoopHooks`` protocol with its
+``decide`` / ``build_prompt`` / ``on_execution`` callbacks.
+Decision logic that used to live in ``decide()`` is now expressed
+as a role's trigger; ``build_prompt()`` collapses into the
+role's prompt file; ``on_execution`` callbacks are now block-
+level ``post_check`` functions.  ``flywheel run loop`` and the
+``hooks:`` key in ``flywheel.yaml`` were removed at the same
+time; setting ``hooks:`` raises a directional error.)
 
 ```yaml
 # patterns/play-brainstorm.yaml
@@ -735,8 +681,7 @@ Wired up in ``flywheel.yaml``:
 
 ```yaml
 foundry_dir: foundry
-hooks: myproject.hooks:LegacyLoopHooks      # for `run loop`
-project_hooks: myproject.project:ProjectHooks   # for `run pattern`
+project_hooks: myproject.project:ProjectHooks
 ```
 
 ### CLI
@@ -749,8 +694,8 @@ flywheel run pattern <pattern-name> \
 ```
 
 Patterns are discovered as ``<project_root>/patterns/<name>.yaml``.
-The ``run loop`` verb still works; both can target the same
-project simultaneously while individual patterns migrate.
+``run pattern`` is the only multi-agent orchestration verb;
+the legacy ``run loop`` was removed in P7 of the campaign.
 
 ## Future work
 

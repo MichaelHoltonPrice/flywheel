@@ -11,12 +11,12 @@ documents them as a known gap so the failure mode is loud rather
 than silent.
 
 The runner is intentionally narrow.  It does not own session
-resume, prompt construction, or circuit-breaking — those concerns
-belonged to the legacy :class:`flywheel.agent_loop.AgentLoop`
-because that loop also did the hooks-driven *decide* step.
-Patterns make decisions declaratively, so the runner only needs
-to translate that declaration into ``launch_agent_block`` /
-``BlockGroup`` calls.
+resume, prompt construction, or circuit-breaking; patterns make
+decisions declaratively, so the runner only needs to translate
+that declaration into ``launch_agent_block`` / ``BlockGroup``
+calls.  (Pre-P7, those concerns lived on the now-retired
+``AgentLoop`` because that loop also did the hooks-driven
+*decide* step.)
 
 Termination
 -----------

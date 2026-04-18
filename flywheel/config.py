@@ -22,21 +22,17 @@ class ProjectConfig:
     Attributes:
         project_root: The project root directory containing flywheel.yaml.
         foundry_dir: Path to the foundry directory.
-        hooks: Optional Python import path for *legacy* agent-loop
-            hooks (consumed by ``flywheel run loop``), in the form
-            ``module.path:ClassName``.  Patterns use
-            ``project_hooks`` instead.
         project_hooks: Optional Python import path for the
-            shrunken project-side hooks consumed by ``flywheel
-            run pattern``.  Same syntax as ``hooks``.  The two
-            keys coexist intentionally during the patterns
-            campaign so projects can migrate one pattern at a
-            time without breaking the legacy ``run loop`` path.
+            project-side hooks consumed by ``flywheel run
+            pattern``, in the form ``module.path:ClassName``.
+            Resolved by
+            :func:`flywheel.project_hooks.load_project_hooks_class`.
+            Optional: a pure-pattern project that needs no
+            project-side resource setup may omit it.
     """
 
     project_root: Path
     foundry_dir: Path
-    hooks: str | None = None
     project_hooks: str | None = None
 
     @property
@@ -51,7 +47,7 @@ class ProjectConfig:
         Convention: ``<project_root>/patterns/``.  Used by
         ``flywheel run pattern`` to discover declarative patterns
         by file stem.  The directory is optional; projects that
-        only use the legacy ``run loop`` flow do not need it.
+        ship no patterns yet have an implicit empty registry.
         """
         return self.project_root / "patterns"
 
@@ -138,11 +134,13 @@ def load_project_config(project_root: Path) -> ProjectConfig:
 
     foundry_dir = project_root / raw_foundry
 
-    hooks = data.get("hooks")
-    if hooks is not None and not isinstance(hooks, str):
+    if "hooks" in data:
         raise ValueError(
-            f"'hooks' in {config_path} must be a string in the form "
-            f"'module.path:ClassName', got {type(hooks).__name__}"
+            f"'hooks' in {config_path} is no longer supported. "
+            f"The legacy AgentLoop / AgentLoopHooks path was "
+            f"retired in P7 of the patterns campaign; declare "
+            f"workflows under '<project>/patterns/' and wire "
+            f"resource setup via 'project_hooks' instead."
         )
 
     project_hooks = data.get("project_hooks")
@@ -157,6 +155,5 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
-        hooks=hooks,
         project_hooks=project_hooks,
     )

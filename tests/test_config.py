@@ -64,24 +64,26 @@ class TestLoadProjectConfig:
         assert config.templates_dir == tmp_path / "some" / "nested" / "dir" / "templates"
 
 
-class TestHooksConfig:
-    def test_hooks_none_by_default(self, tmp_path: Path):
+class TestLegacyHooksKeyRejected:
+    """The legacy ``hooks:`` key was retired in P7 of the
+    patterns campaign.  It now raises a directional error instead
+    of silently being ignored, so workspaces created before the
+    migration produce a loud failure instead of running the
+    project with the wrong orchestration verb.
+    """
+
+    def test_hooks_key_present_raises(self, tmp_path: Path):
+        (tmp_path / CONFIG_FILENAME).write_text(
+            "foundry_dir: foundry\nhooks: mymod:MyClass\n")
+        with pytest.raises(
+                ValueError, match="no longer supported"):
+            load_project_config(tmp_path)
+
+    def test_hooks_key_absent_is_fine(self, tmp_path: Path):
         (tmp_path / CONFIG_FILENAME).write_text(
             "foundry_dir: foundry\n")
         config = load_project_config(tmp_path)
-        assert config.hooks is None
-
-    def test_hooks_loaded(self, tmp_path: Path):
-        (tmp_path / CONFIG_FILENAME).write_text(
-            "foundry_dir: foundry\nhooks: mymod:MyClass\n")
-        config = load_project_config(tmp_path)
-        assert config.hooks == "mymod:MyClass"
-
-    def test_hooks_non_string_raises(self, tmp_path: Path):
-        (tmp_path / CONFIG_FILENAME).write_text(
-            "foundry_dir: foundry\nhooks: 42\n")
-        with pytest.raises(ValueError, match="module.path:ClassName"):
-            load_project_config(tmp_path)
+        assert config.project_hooks is None
 
 
 class TestProjectConfigFrozen:

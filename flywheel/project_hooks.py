@@ -8,16 +8,14 @@ project), parsing project-specific CLI arguments, and supplying
 the launcher overrides those arguments produce (extra env vars,
 extra mounts, a pre-launch hook, etc.).
 
-This is deliberately *much* smaller than
-:class:`flywheel.agent_loop.AgentLoopHooks`.  There is no
-``decide``, no ``build_prompt``, no ``on_execution`` — those
-concerns either move to the pattern (``decide`` becomes the
-trigger vocabulary), to the role's prompt file
-(``build_prompt``), or to the runner's post-execution callbacks
-(``on_execution`` becomes a block-level ``post_check``).
-
-Implementors are free to add helper methods on the same class,
-but only the two declared below are called by the runner.
+The legacy ``AgentLoopHooks`` protocol (``decide``,
+``build_prompt``, ``on_execution``) was retired in P7 of the
+patterns campaign.  Decision logic now lives in the pattern's
+trigger vocabulary, prompts live in role prompt files, and
+mid-execution callbacks live in block-level ``post_check``
+functions.  Implementors are free to add helper methods on the
+same class, but only the two declared below are called by the
+runner.
 """
 
 from __future__ import annotations
@@ -84,11 +82,10 @@ class ProjectHooks(Protocol):
 def load_project_hooks_class(import_path: str) -> type:
     """Resolve ``module.path:ClassName`` into a hooks class.
 
-    Mirrors :func:`flywheel.agent_loop.load_hooks_class` so
-    project authors only have to learn one import-path syntax.
-    Kept as a separate function (rather than re-exported) so
-    that retiring ``AgentLoop`` in P7 of the campaign does not
-    silently break ``flywheel run pattern`` callers.
+    The CLI calls this once with the value of ``project_hooks``
+    from ``flywheel.yaml`` (or the ``--project-hooks`` flag) and
+    instantiates the result with no arguments before invoking
+    :meth:`ProjectHooks.init`.
     """
     if ":" not in import_path:
         raise ValueError(
