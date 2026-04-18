@@ -60,7 +60,12 @@ class AgentResult:
         exit_reason: Semantic classification of why the agent
             exited.  One of: ``"completed"``, ``"auth_failure"``,
             ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
-            ``"crashed"``.
+            ``"crashed"``, ``"tool_handoff"``.  ``"tool_handoff"``
+            indicates the agent runner intercepted one or more
+            handoff tool calls and exited cleanly to let the host
+            run the corresponding blocks; the host-side handoff
+            loop (``flywheel.agent_handoff``) is responsible for
+            splicing results back and re-launching.
         agent_workspace_dir: Workspace-relative path of the
             directory the agent was bind-mounted at (e.g.,
             ``"agent_workspaces/abc12345"``).  Callers that need
@@ -97,7 +102,7 @@ def _classify_exit(
     Returns:
         One of: ``"completed"``, ``"auth_failure"``,
         ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
-        ``"crashed"``.
+        ``"crashed"``, ``"tool_handoff"``.
     """
     if stop_reason:
         return "stopped"
@@ -110,6 +115,8 @@ def _classify_exit(
             status = state.get("status", "")
             reason = state.get("reason", "")
 
+            if status == "tool_handoff":
+                return "tool_handoff"
             if "auth" in reason:
                 return "auth_failure"
             if "rate_limit" in reason:
@@ -486,6 +493,8 @@ def prepare_agent_workspace(
     workspace: Workspace,
     output_names: list[str] | None = None,
     agent_workspace_dir: str | None = None,
+    *,
+    reuse_workspace: bool = False,
 ) -> AgentMount:
     """Prepare a fresh agent workspace directory.
 
@@ -513,14 +522,33 @@ def prepare_agent_workspace(
             auto-named mount; pass a string when the caller has
             its own naming convention and is willing to take
             responsibility for collision avoidance.
+        reuse_workspace: When ``True``, treat an existing
+            non-empty ``agent_workspace_dir`` as intentional reuse
+            (no ``FileExistsError``), and skip artifact seeding.
+            Used by the host-side handoff loop
+            (``flywheel.agent_handoff``) to relaunch into a
+            workspace that already contains the spliced
+            ``agent_session.jsonl`` from a prior cycle.  Requires
+            an explicit ``agent_workspace_dir``; passing both
+            ``agent_workspace_dir=None`` and
+            ``reuse_workspace=True`` raises ``ValueError`` because
+            there is nothing to reuse.
 
     Returns:
         :class:`AgentMount` describing the prepared directory.
 
     Raises:
-        FileExistsError: if ``agent_workspace_dir`` is explicit
-            and the target directory exists with content.
+        FileExistsError: if ``agent_workspace_dir`` is explicit,
+            the target directory exists with content, and
+            ``reuse_workspace`` is ``False``.
+        ValueError: if ``reuse_workspace`` is ``True`` but
+            ``agent_workspace_dir`` is ``None``.
     """
+    if reuse_workspace and agent_workspace_dir is None:
+        raise ValueError(
+            "reuse_workspace=True requires an explicit "
+            "agent_workspace_dir; nothing to reuse otherwise."
+        )
     if agent_workspace_dir is None:
         ws_dir_name = (
             f"{AGENT_WORKSPACES_DIR}/{uuid.uuid4().hex[:8]}")
@@ -536,7 +564,8 @@ def prepare_agent_workspace(
     else:
         ws_dir_name = agent_workspace_dir
         agent_ws = workspace.path / ws_dir_name
-        if agent_ws.exists() and any(agent_ws.iterdir()):
+        if (agent_ws.exists() and any(agent_ws.iterdir())
+                and not reuse_workspace):
             raise FileExistsError(
                 f"agent_workspace_dir={agent_workspace_dir!r} "
                 f"already exists at {agent_ws} with content. "
@@ -547,6 +576,15 @@ def prepare_agent_workspace(
             )
 
     agent_ws.mkdir(parents=True, exist_ok=True)
+
+    # Skip artifact seeding on reuse: the workspace already
+    # carries the prior cycle's state (spliced session JSONL,
+    # any intermediate files), and re-seeding could clobber it.
+    if reuse_workspace:
+        return AgentMount(
+            relative_dir=ws_dir_name,
+            host_path=agent_ws,
+        )
 
     if output_names:
         for name in output_names:
@@ -594,6 +632,7 @@ def launch_agent_block(
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
     post_checks: dict[str, Any] | None = None,
+    reuse_workspace: bool = False,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -639,13 +678,26 @@ def launch_agent_block(
         predecessor_id: Execution ID of a previous agent run that
             this launch resumes from.  Recorded in the workspace
             execution for resume chain tracking.
+        post_checks: Pre-resolved post-execution callbacks keyed
+            by block name (see :mod:`flywheel.post_check`).
+            ``None`` means the execution channel runs no
+            project-side checks for nested blocks.
+        reuse_workspace: When ``True``, the launcher skips the
+            "fresh workspace" check and the prior-artifact
+            seeding pass.  Used by the host-side handoff loop
+            (``flywheel.agent_handoff``) to relaunch an agent
+            into the same workspace its prior cycle wrote to,
+            so the spliced ``agent_session.jsonl`` is on disk
+            ready for ``RESUME_SESSION_FILE``.  Requires an
+            explicit ``agent_workspace_dir``.
 
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
     """
-    # Prepare agent workspace (create dir, seed prior artifacts).
     mount = prepare_agent_workspace(
-        workspace, output_names, agent_workspace_dir)
+        workspace, output_names, agent_workspace_dir,
+        reuse_workspace=reuse_workspace,
+    )
     agent_ws = mount.host_path
     # Bind the resolved name back into the variable the rest of
     # this function passes through to ExecutionChannel and
