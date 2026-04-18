@@ -206,48 +206,67 @@ and passed directly to `docker run` before the image name.
 ### Agent block execution
 
 An agent block is a special execution variant where an AI agent
-runs inside a Docker container with the ability to trigger nested
-block executions. The agent reads source code, writes artifacts,
-and iteratively invokes other blocks (e.g., evaluation) via an
-MCP tool.
+runs inside a Docker container, reads source code, writes
+artifacts, and may trigger nested block executions on the host.
+The container itself runs no host-facing services; nested blocks
+are produced by stopping the agent, running the block in the
+host's Python process, splicing the result into the agent's
+session history, and relaunching the agent against that spliced
+session (see "Nested block executions from agents" below).
 
-The lifecycle:
+The single-launch lifecycle inside ``launch_agent_block``:
 
-1. Create a fresh agent workspace directory. Seed it with the
-   latest artifacts from prior steps so the agent can continue
-   where the previous step left off.
-2. Start an execution channel service (HTTP, background thread).
-3. Run the optional ``pre_launch_hook`` callback. Projects use
+1. Create or reuse the agent workspace directory.  Fresh
+   launches seed it with the latest artifacts from prior
+   executions; relaunches into an existing handoff workspace
+   skip the seed and reuse the directory the previous cycle
+   wrote to.
+2. Run the optional ``pre_launch_hook`` callback.  Projects use
    this for game-specific init, artifact creation, or writing
-   files to the workspace before the container starts. The
-   bridge is already running, so the hook can create artifacts.
-4. Launch the agent container with the workspace, source mounts,
-   auth volume, and the bridge endpoint as an environment variable.
-   Stderr is drained in a background thread to prevent pipe
-   deadlocks.
-5. Stream JSON events from the agent's stdout and log them.
-6. On completion (or timeout), collect output artifacts from the
-   agent workspace by matching filenames to declared output names.
-7. Stop the bridge service.
+   files to the workspace before the container starts.
+3. Launch the agent container with the workspace, source mounts,
+   the auth volume, and the configured environment variables
+   (model, ``MAX_TURNS``, ``HANDOFF_TOOLS``, ``MCP_SERVERS``,
+   ``RESUME_SESSION_FILE`` for relaunches, etc.).  Stderr is
+   drained in a background thread to prevent pipe deadlocks.
+4. Stream JSON events from the agent's stdout and log them.
+5. On exit (clean, timeout, ``.agent_stop``, or handoff), record
+   the agent itself as a ``BlockExecution`` with
+   ``block_name="__agent__"``, collect output artifacts by
+   matching filenames in the workspace to declared output names,
+   and return an ``AgentResult``.
 
-A total timeout (default 4 hours) kills the agent container if
-exceeded, ensuring hung agents do not block indefinitely.
+A total timeout (default 4 hours) kills the container if
+exceeded.
+
+For agents that need to invoke nested blocks, callers wrap
+``launch_agent_block`` in :func:`flywheel.agent_handoff.run_agent_with_handoffs`.
+The handoff loop owns the launch → exit → splice → relaunch
+cycle; each cycle is its own ``BlockExecution`` row chained via
+``predecessor_id`` so an operator inspecting the workspace sees
+the cycle structure explicitly.
 
 ### Non-blocking agent handle
 
 ``launch_agent_block()`` returns an ``AgentHandle`` immediately,
 allowing the caller to control the container while it runs:
 
-- ``handle.stop(reason)`` — terminate the container (e.g., from
-  an execution callback when an artifact triggers a policy
-  decision). The optional ``reason`` is recorded in the execution.
-- ``handle.wait()`` — block until exit, stop the bridge, collect
-  output artifacts, and return ``AgentResult``.  Must be called
-  exactly once, even after ``stop()``.
-- ``handle.is_alive()`` — check if the container is still running.
+- ``handle.stop(reason)`` — terminate the container by writing
+  ``/workspace/.agent_stop`` via ``docker exec`` (Docker
+  Desktop's bind mounts on Windows do not reliably propagate
+  host writes into the container).  The optional ``reason`` is
+  recorded on the resulting execution row.
+- ``handle.wait()`` — block until exit, join the stdout/stderr
+  drain threads, collect output artifacts, and return
+  ``AgentResult``.  Must be called exactly once, even after
+  ``stop()``.
+- ``handle.is_alive()`` — check if the container process is
+  still running.
 
 The blocking ``run_agent_block()`` is a convenience wrapper that
-calls ``launch_agent_block()`` then ``handle.wait()``.
+calls ``launch_agent_block()`` then ``handle.wait()``.  Code
+that needs nested-block support uses
+``run_agent_with_handoffs()`` instead.
 
 ### Agent session artifacts
 
@@ -268,131 +287,130 @@ volumes — the session round-trips through the artifact system.
 
 ### Agent pause and resume
 
-Long-running agents can hit API rate limits or consume excessive
-budget in a single session. The agent runner
-(`batteries/claude/agent_runner.py`) supports pausing and resuming
-to handle both cases.
+Long-running agents need to handle three independent classes of
+interruption: API rate limits, exhausted turn budgets, and
+nested block invocations.  All three converge on the same
+mechanism — the agent's session is checkpointed to a session
+JSONL artifact and the host relaunches a new container against
+that artifact — but they differ in *who* drives the resume and
+*what* (if anything) is appended to the session before
+relaunch.
 
-**Pause triggers:**
+**In-container pauses (rate limit, max turns).**  The agent
+runner (``batteries/claude/agent_runner.py``) detects these
+two conditions from the SDK event stream:
 
-- **Max turns** (`MAX_TURNS` env var). The SDK stops the query
-  and emits a `ResultMessage` with `subtype == "error_max_turns"`.
-  The runner detects this and pauses. This is opt-in — omit
-  `MAX_TURNS` to let the agent run to natural completion.
-- **Rate limit rejection**. The SDK yields a `RateLimitEvent`
-  with `rate_limit_info.status == "rejected"`. The runner breaks
-  out of the query loop and pauses. Rate limit exceptions raised
-  outside the event stream are also caught.
+- **Rate limit rejection.**  The SDK yields a ``RateLimitEvent``
+  with ``rate_limit_info.status == "rejected"``.  The runner
+  exponentially backs off (60s, 120s, 300s, 300s, 300s).
+- **Max turns.**  The SDK emits a ``ResultMessage`` with
+  ``subtype == "error_max_turns"`` (opt-in via the
+  ``MAX_TURNS`` env var).
 
-**Pause behavior:**
-
-On pause, the runner:
-1. Writes `.agent_state.json` to the workspace with the session
-   ID, status (`"paused"`), and reason (`"max_turns"` or
-   `"rate_limit"`).
-2. Emits an `agent_state` JSON event to stdout.
-3. Polls every 5 seconds for a `.agent_resume` file in the
-   workspace.
-
-**Resume:**
-
-The host (or user) writes a `.agent_resume` file to the shared
-workspace mount. The file content is used as the resume prompt
-(an empty file defaults to "Continue from where you left off.").
-The runner reads and deletes the file, then calls `query()` with
-`options.resume = session_id` to continue the conversation with
-full history.
-
-On startup, the runner also checks for:
-- `RESUME_SESSION` env var — resume a specific session immediately.
-- A saved `.agent_state.json` with `status == "paused"` — resume
-  the interrupted session automatically.
-
-**Assumptions:** The Docker container remains running between
-pause and resume. The Claude Agent SDK stores session history
-as local JSONL files at
+When backoff is exhausted (or for max turns directly), the
+runner writes ``.agent_state.json`` with ``status="paused"`` and
+the reason, emits an ``agent_state`` event to stdout, and polls
+``.agent_resume`` in the workspace.  Writing any content (or an
+empty file) to ``.agent_resume`` lets the runner consume it as
+the next prompt and call ``query()`` with ``options.resume =
+session_id`` to continue in the same container.  This in-place
+resume only works while the container is still alive — the SDK
+stores session JSONLs at
 ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` inside
-the container. These files are lost when the container dies.
-The ``session_id`` alone is not enough to resume — the SDK
-needs the local session file.
+the container, and those files die with the container.
 
-To support cross-container resume, mount a persistent volume
-at ``/home/claude/.claude/projects/`` (in addition to the
-existing auth volume at ``/home/claude/.claude/``), and ensure
-the working directory matches across containers. This is not
-yet implemented.
+**Cross-container resume via session artifacts.**  When the
+container has to die — total-timeout, a graceful
+``.agent_stop``, or a nested-block handoff — the runner exports
+the SDK session JSONL to the workspace as
+``agent_session.jsonl`` before exiting.  If ``output_names``
+includes ``agent_session``, flywheel registers that file as a
+regular copy artifact with full provenance.  A subsequent
+launch can resume from it by passing the artifact as an input
+mount and setting ``RESUME_SESSION_FILE`` in ``extra_env`` to
+the mounted path; the agent runner copies the file into the
+SDK's expected location and passes ``resume=session_id`` to the
+SDK client on startup.  This makes the session round-trip
+through the artifact system rather than through a persistent
+volume.
 
-Alternatively, avoid session resume entirely: capture results
-as artifacts and pass them into a fresh session's prompt. This
-is the approach the artifact-based architecture naturally
-supports.
+**Handoff resume (nested blocks).**  The host-side handoff loop
+(:func:`flywheel.agent_handoff.run_agent_with_handoffs`) drives
+its own pause/resume cycle on top of cross-container resume.
+When the agent calls a tool listed in ``HANDOFF_TOOLS``, the
+runner's ``PreToolUse`` hook denies the call, captures the
+intended ``tool_use`` blocks into ``pending_tool_calls.json``,
+sets ``.agent_state.json`` to ``status="tool_handoff"``, and
+exits cleanly so the host can run the blocks out-of-band and
+splice the real ``tool_result`` back into ``agent_session.jsonl``
+before relaunching.  This is the same session-artifact resume
+path as above, with the extra splice step in between.  See
+"Nested block executions from agents" for the full mechanism.
 
-### Execution channel
+### Recording nested block executions
 
-The execution channel (``ExecutionChannel``) is a generic HTTP
-service that lets containers trigger nested block executions
-within the same workspace. It is not specific to evaluation —
-the invoked block and what it does are defined by the project's
-template, not by flywheel.
+Nested block executions invoked by an agent — ``predict``,
+``game_step``, ``exploration_request``, ``brainstorm_request``,
+and the like — are recorded in-process by
+:class:`flywheel.local_block.LocalBlockRecorder`.  No host-side
+HTTP service runs.  The recorder owns one workspace and exposes a
+single ``begin`` context manager:
 
-The channel exposes two surfaces:
+1. ``begin(block, params=..., caller=...)`` resolves the block's
+   declared inputs to the latest registered instance of each slot.
+   Slots with ``derive_from``/``derive_kind`` (e.g.,
+   ``derive_kind: jsonl_concat``) are rebuilt at this moment so
+   the body always sees fresh derived inputs.  Missing required
+   inputs raise ``LocalBlockError`` *before* a row is opened.
+2. The body runs.  It receives a ``LocalExecutionContext``
+   carrying the allocated ``execution_id``, the resolved input
+   bindings, host paths to each input artifact, and a per-execution
+   scratch directory.  It writes outputs by calling
+   ``ctx.set_output(name, payload)``.
+3. On clean exit the recorder registers each declared output as a
+   ``copy`` artifact under the workspace, writes a single
+   ``BlockExecution`` row with ``status="succeeded"``, and runs
+   the block's configured post-check.  On body exceptions or
+   output-write failures it rolls back any partial artifacts and
+   writes a single ``"failed"`` row carrying the error message.
+   There is no ``"running"`` row; nothing crosses an asynchronous
+   boundary, so the orphaned-``running`` failure mode is
+   structurally impossible.
 
-**Lifecycle API** (``POST /execution/begin`` and ``POST
-/execution/end/{id}``): the surface for *logical* block
-executions whose body is an MCP tool inside an agent container.
-The tool calls ``BlockChannelClient.begin(...)`` (see
-:mod:`flywheel.tool_block`) which:
+Post-execution callbacks (see :mod:`flywheel.post_check`) fire
+synchronously after the row is durable.  When a callback returns
+a ``HaltDirective``, the recorder appends it to an internal halt
+queue.  The host-side handoff loop drains that queue between
+cycles via :meth:`LocalBlockRecorder.drain_halts` and refuses to
+relaunch the agent if a relevant directive is present, which is
+how a project signals "stop this run, the work it produced
+crossed a policy threshold."
 
-1. Resolves declared inputs to the latest registered instances
-   for each slot. Slots with ``derive_from``/``derive_kind``
-   (e.g., ``derive_kind: jsonl_concat``) are rebuilt at this
-   moment so the execution always sees fresh derived inputs.
-2. Opens a ``BlockExecution`` row with status ``"running"``,
-   recording the caller (MCP server + tool name) and any
-   parameters.
-3. Returns the execution ID and resolved input bindings.
-
-The tool body then runs (predicting an action, recording a game
-step, queueing an exploration request, etc.).
-``BlockChannelClient.end(...)`` writes the declared outputs as
-artifacts, sets the execution status to ``"succeeded"`` (or
-``"failed"`` with an error message), and fires an
-``ExecutionEvent`` callback. This is the only path for
-tool-triggered logical block executions and is how cyberarc's
-``predict``, ``game_step``, ``exploration_request``, and
-``brainstorm_request`` blocks operate; their block definitions
-declare ``runner: lifecycle``.
-
-**Invoke endpoint** (``POST /``): launches a ``runner:
-container`` block in a Docker container.
-
-1. Validates the block name against the template and an optional
-   allowed-blocks list.
-2. Imports the provided artifact into the workspace via
-   ``register_artifact()``.
-3. Looks up the block definition to determine the image, docker
-   args, input slots, and output slots.
-4. Runs the container with proper mounts.
-5. Records the output artifacts and block execution in the
-   workspace with full provenance.
-6. Returns the results (including any scores) to the caller.
-
-An invocation budget (``max_invocations``) limits how many
-container blocks the agent can trigger per step.
-
-**Execution events**: ``ExecutionChannel`` accepts an optional
-``on_execution`` callback that fires after each successful
-execution with an ``ExecutionEvent``. The callback runs in the
-channel's HTTP handler thread. This enables the host to react in
-real-time to artifacts created by the agent — for example,
-stopping the agent container via ``AgentHandle.stop()`` when a
-recorded step indicates a policy-relevant condition.
+Host-side block runners (``cyberarc.game_step_block.GameStepRunner``,
+``PredictActionRunner``, ``BrainstormRequestRunner``,
+``ExplorationRequestRunner``) all use the recorder this way:
+they are plain ``BlockRunner`` callables registered with the
+handoff loop, invoked when the agent's ``PreToolUse`` hook
+intercepts the corresponding tool, and they wrap their work in
+``recorder.begin(...)`` so the resulting row, artifacts, and
+post-check are recorded under the same workspace lock as every
+other execution.  The same pattern applies outside the agent
+loop: ``cyberarc/tools/play_server.py`` uses a
+``LocalBlockRecorder`` to record human play sessions against
+the same ``game_step`` block schema.
 
 Phase 5 of the block-execution refactor removed the legacy
 ``mode=record`` HTTP path, the ``RecordExecutor`` class, the
-``__record__`` sentinel image, the ``BlockBridgeService`` alias,
-and the inline-block-in-template parser branch. All artifact-
-recording flows now ride the lifecycle API.
+``__record__`` sentinel image, and the inline-block-in-template
+parser branch.  B7 of the full-stop nested-block plan removed
+the host-side HTTP bridge that hosted the lifecycle API
+(``ExecutionChannel``), the in-container ``BlockChannelClient``
+that called it, the ``mcp__run_eval__evaluate`` proxy that wrapped
+it, and the tool-block manifest validation path that policed it.
+All artifact-recording flows now ride either ``LocalBlockRecorder``
+(``runner: lifecycle`` blocks) or ``ContainerExecutor`` /
+``ProcessExecutor`` (``runner: container`` and
+``runner: process`` blocks).
 
 ### Project-provided MCP servers
 
@@ -702,41 +720,80 @@ the legacy ``run loop`` was removed in P7 of the campaign.
 Some agent tool calls trigger nested block executions (``predict``,
 ``game_step``, ``brainstorm_request``); others do not (workspace
 state queries, schema lookups).  For the calls that *are* block
-executions, we have considered two designs.
+executions, flywheel uses a "full stop" model: each nested
+invocation is a real operational boundary, not a mid-session RPC.
 
-**Bridge (current implementation).**  The agent container stays
-running for the duration of the nested execution.  An MCP tool
-inside the container holds open an HTTP rendezvous with the host:
-``begin`` opens a ledger row with ``status="running"`` and
-resolves inputs, the tool body executes, ``end`` writes outputs
-and transitions the row.  This is convenient — the agent's tool
-call returns synchronously like a normal function call — but it
-leaks state across the boundary.  The agent process keeps its
-in-memory context, the workspace can shift underneath between
-calls, a crash mid-body leaves an orphaned ``running`` row, and
-the agent and its MCP server share fate so a hang in one wedges
-the other.
+**Why not a bridge.**  An earlier design kept the agent container
+alive while a host-side HTTP bridge ran the nested block in
+parallel and returned the result over an open MCP tool call.
+That worked, but it leaked state across the boundary: the agent
+process kept its in-memory context, the workspace could shift
+underneath between calls, a crash mid-body left an orphaned
+``running`` row, and the agent and its MCP server shared fate so
+a hang in one wedged the other.  We accepted some container-
+restart latency to make these failure modes structurally
+impossible.
 
-**Full stop (chosen direction).**  A nested block execution is a
-real operational boundary: the agent's session is checkpointed,
-the container exits cleanly, the nested block runs as an
-independent execution, and the agent restarts with the nested
-block's output delivered as the resolution of the pending tool
-call (via the Claude Agent SDK's ``PreToolUse`` hook so the agent
-perceives a normal tool-call/result cycle).  This pays container-
-restart latency on every nested invocation, which matters most
-for high-frequency calls like ``take_action`` — but the cost is
-small relative to agent turn runtimes and RL training time, and
-the gains are categorical.  Each block execution becomes the
-atomic unit it has always been advertised as: state is on disk
-at every boundary, no row can be orphaned, the agent cannot
-observe a workspace mid-mutation by another execution, and
-patterns that *would* let two executions impinge on the same
-artifact slot can be rejected at validation time rather than
-papered over with runtime locks.  We accept that this trades
-bridge brittleness for state-save brittleness; the latter is
-local, testable by killing the agent at every interesting point,
-and fails loudly rather than silently.
+**Mechanism.**  The host-side handoff loop
+(:func:`flywheel.agent_handoff.run_agent_with_handoffs`) drives
+each cycle as follows:
+
+1. **Launch.**  ``launch_agent_block`` starts the agent container
+   with ``HANDOFF_TOOLS`` set to the MCP tool names that should
+   produce nested block executions (e.g.,
+   ``mcp__arc__take_action``).  On a relaunch this also sets
+   ``RESUME_SESSION_FILE`` to the spliced session JSONL produced
+   by the previous cycle.
+2. **Intercept.**  When the agent emits a ``tool_use`` for one of
+   the listed tools, the agent runner's Claude Agent SDK
+   ``PreToolUse`` hook denies it with a marker reason
+   (``"handoff_to_flywheel"``).  This causes the SDK to write a
+   synthetic ``deny`` ``tool_result`` into the session JSONL,
+   which is exactly what the splice step needs as a target.  The
+   hook also records every intercepted call (one per ``tool_use``
+   in the same assistant turn) into ``pending_tool_calls.json``
+   in the workspace, sets ``.agent_state.json`` to
+   ``status="tool_handoff"``, and signals the runner to exit
+   cleanly.
+3. **Exit.**  The runner exports the SDK session JSONL to
+   ``agent_session.jsonl`` and exits 0.  The container goes away;
+   ``AgentHandle.wait`` records a ``BlockExecution`` row for the
+   agent itself with ``stop_reason="tool_handoff"``.
+4. **Run blocks.**  For each pending tool call, the handoff loop
+   invokes the registered ``BlockRunner`` (one per handoff tool;
+   composed via ``make_tool_router`` when more than one exists).
+   The runner does its work through ``LocalBlockRecorder.begin``,
+   so each call produces its own ``BlockExecution`` row,
+   artifacts, and post-check.  Multiple parallel tool_uses in a
+   single assistant turn are handled serially: N tool_uses → N
+   independent rows.
+5. **Splice.**  The loop rewrites the session JSONL in place,
+   replacing each synthetic ``deny`` ``tool_result`` (located by
+   tool_use_id and the ``"handoff_to_flywheel"`` marker) with the
+   real result returned by the corresponding ``BlockRunner``.
+   This is the step that lets the agent perceive the handoff as a
+   normal tool-call/result cycle.
+6. **Halt check.**  The loop drains
+   :meth:`LocalBlockRecorder.drain_halts`.  If any post-check
+   produced a ``HaltDirective`` for a block this loop cares about,
+   the loop terminates without relaunching and returns the
+   collected halts on its result.
+7. **Relaunch.**  Otherwise the loop calls ``launch_agent_block``
+   again with ``reuse_workspace=True`` and ``RESUME_SESSION_FILE``
+   pointing at the spliced JSONL.  ``predecessor_id`` chains the
+   new agent execution to the previous one.  Repeat until the
+   agent exits without a handoff, ``max_iterations`` is hit, or
+   a halt fires.
+
+**Why this is right.**  Each block execution is the atomic unit
+it has always been advertised as: state is on disk at every
+boundary, no row can be orphaned, the agent cannot observe a
+workspace mid-mutation by another execution, and host-side
+runners get all the host's tooling (debuggers, real exception
+traces, the workspace's own lock).  The tradeoff is that we move
+brittleness from the bridge surface to the state-save surface;
+the latter is local, testable by killing the agent at every
+interesting point, and fails loudly rather than silently.
 
 ## Future work
 
