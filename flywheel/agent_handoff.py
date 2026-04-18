@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -453,4 +454,204 @@ def run_agent_with_handoffs(
         f"hit max_iterations={max_iterations} without a "
         f"non-handoff exit; last cycle exit_reason="
         f"{cycles[-1].agent_result.exit_reason!r}"
+    )
+
+
+# --------------------------------------------------------------------
+# Threaded handle wrapper for ``PatternRunner`` compatibility.
+# --------------------------------------------------------------------
+
+
+class HandoffAgentHandle:
+    """``PatternRunner``-compatible handle around the handoff loop.
+
+    :class:`flywheel.pattern_runner.PatternRunner` polls handles
+    via the minimal ``is_alive()`` / ``wait()`` protocol — it does
+    not care whether one launch or several happen behind that
+    interface.  This wrapper runs :func:`run_agent_with_handoffs`
+    on a background thread so the pattern runner sees a single
+    long-lived "agent" the whole time, even when the underlying
+    loop is cycling through stop/restart iterations.
+
+    The handle's ``wait()`` returns the *terminal*
+    :class:`flywheel.agent.AgentResult` (the same ``AgentResult``
+    a non-handoff ``AgentHandle.wait()`` would have returned for a
+    one-shot run), so existing pattern-runner consumers see no
+    schema change.  The full per-cycle :class:`HandoffLoopResult`
+    is also exposed on the handle as ``loop_result`` for callers
+    that want to inspect the chain.
+
+    The wrapper does not implement ``stop()``: the pattern runner
+    does not call it today, and a clean stop semantics across an
+    in-flight handoff cycle (mid-``block_runner`` invocation,
+    mid-splice) is its own design.  When that need arises it
+    becomes its own piece of work.
+
+    Attributes:
+        loop_result: Populated once the loop terminates (whether
+            by completion or exception).  ``None`` while the
+            background thread is still running.
+        loop_error: Populated if ``run_agent_with_handoffs``
+            raised; ``None`` otherwise.  Re-raised by ``wait()``
+            so the caller learns about the failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_runner: BlockRunner | None,
+        launch_kwargs: dict[str, Any],
+        resume_prompt: str = DEFAULT_RESUME_PROMPT,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        launch_fn: Callable[..., Any] = launch_agent_block,
+    ) -> None:
+        """Spawn a background thread that runs the handoff loop.
+
+        Args:
+            block_runner: Forwarded to
+                :func:`run_agent_with_handoffs`.  ``None`` is the
+                no-handoff backward-compat path; passing a real
+                callable enables handoff resolution.
+            launch_kwargs: Forwarded as the ``**launch_kwargs`` to
+                :func:`run_agent_with_handoffs`.  Must include the
+                same arguments :func:`launch_agent_block`
+                requires.  Stored unmodified — the loop makes its
+                own copies for relaunches.
+            resume_prompt: Same as
+                :func:`run_agent_with_handoffs`.
+            max_iterations: Same as
+                :func:`run_agent_with_handoffs`.
+            launch_fn: Same as
+                :func:`run_agent_with_handoffs`; default is the
+                production :func:`launch_agent_block`.  Tests
+                inject a fake.
+        """
+        self._block_runner = block_runner
+        self._launch_kwargs = launch_kwargs
+        self._resume_prompt = resume_prompt
+        self._max_iterations = max_iterations
+        self._launch_fn = launch_fn
+
+        self.loop_result: HandoffLoopResult | None = None
+        self.loop_error: BaseException | None = None
+        self._waited = False
+
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="flywheel-handoff-loop",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        """Body of the background thread.
+
+        Captures success into ``loop_result`` and any exception
+        into ``loop_error`` so ``wait()`` can re-raise on the
+        caller's thread.  Catching ``BaseException`` is
+        intentional: a ``KeyboardInterrupt`` raised inside the
+        loop should still surface to the caller rather than
+        leaking out of the daemon thread.
+        """
+        try:
+            self.loop_result = run_agent_with_handoffs(
+                block_runner=self._block_runner,
+                resume_prompt=self._resume_prompt,
+                max_iterations=self._max_iterations,
+                launch_fn=self._launch_fn,
+                **self._launch_kwargs,
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-raised in wait()
+            self.loop_error = exc
+
+    def is_alive(self) -> bool:
+        """Return whether the loop's background thread is running."""
+        return self._thread.is_alive()
+
+    def wait(self) -> AgentResult:
+        """Block until the loop terminates and return the terminal result.
+
+        Idempotent: calling more than once is safe and returns
+        (or re-raises) the same outcome as the first call.  This
+        matches the spirit of the existing one-shot
+        :class:`flywheel.agent.AgentHandle.wait` while being
+        gentler about repeat calls — pattern runner code that
+        defensively waits twice should not blow up here.
+
+        Raises:
+            HandoffLoopError: anything the loop raised.
+            Exception: any other exception raised inside the
+                loop's thread (re-raised on the caller's thread).
+        """
+        self._thread.join()
+        self._waited = True
+        if self.loop_error is not None:
+            raise self.loop_error
+        # The loop returns a HandoffLoopResult only when the
+        # terminating cycle has at least one entry; if we get
+        # here without an error the result must be present.
+        assert self.loop_result is not None
+        return self.loop_result.final_result
+
+
+def launch_agent_with_handoffs(
+    *,
+    block_runner: BlockRunner | None = None,
+    resume_prompt: str = DEFAULT_RESUME_PROMPT,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    launch_fn: Callable[..., Any] = launch_agent_block,
+    **launch_kwargs: Any,
+) -> HandoffAgentHandle:
+    """Pattern-runner-compatible non-blocking launcher.
+
+    Constructs a :class:`HandoffAgentHandle` so the same kwargs
+    that drive :func:`flywheel.agent.launch_agent_block` (which
+    :class:`flywheel.pattern_runner.PatternRunner` builds via
+    ``_kwargs_for``) flow through this launcher unchanged.  The
+    handoff parameters (``block_runner``, ``resume_prompt``,
+    ``max_iterations``) are keyword-only and *not* in
+    ``launch_kwargs``, so callers wire them up via
+    :func:`functools.partial` before passing the result as
+    ``PatternRunner(launch_fn=...)``.
+
+    Typical wiring:
+
+    .. code-block:: python
+
+        from functools import partial
+        from flywheel.agent_handoff import launch_agent_with_handoffs
+
+        my_launch = partial(
+            launch_agent_with_handoffs,
+            block_runner=my_block_runner,
+        )
+        runner = PatternRunner(
+            pattern, base_config=cfg, launch_fn=my_launch,
+        )
+        runner.run()
+
+    With ``block_runner=None`` the handle wraps a one-cycle no-op
+    loop that is observationally identical to a direct
+    :func:`launch_agent_block` (no thread overhead worth caring
+    about on the cadence pattern runner polls at).
+
+    Args:
+        block_runner: Forwarded to :class:`HandoffAgentHandle`.
+        resume_prompt: Same.
+        max_iterations: Same.
+        launch_fn: Same.
+        **launch_kwargs: Forwarded as the loop's
+            ``**launch_kwargs``.  Must include the same
+            arguments :func:`launch_agent_block` requires.
+
+    Returns:
+        A :class:`HandoffAgentHandle` with its background thread
+        already started.
+    """
+    return HandoffAgentHandle(
+        block_runner=block_runner,
+        launch_kwargs=launch_kwargs,
+        resume_prompt=resume_prompt,
+        max_iterations=max_iterations,
+        launch_fn=launch_fn,
     )
