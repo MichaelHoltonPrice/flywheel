@@ -104,6 +104,17 @@ class TestAgentHandleBasics:
             handle.wait()
         bridge.stop.assert_called_once()
 
+    def test_bridge_endpoint_proxies_to_channel(self):
+        # Host-side block runners (cyberarc's GameStepRunner) need
+        # the local URL to record executions during a handoff
+        # cycle.  AgentHandle exposes it via ``bridge_endpoint``;
+        # the value must be the channel's ``url``, NOT the
+        # ``host.docker.internal`` form passed to the agent.
+        bridge = MagicMock(spec=ExecutionChannel)
+        bridge.url = "http://127.0.0.1:54321"
+        handle = _make_handle(bridge=bridge)
+        assert handle.bridge_endpoint == "http://127.0.0.1:54321"
+
 
 class TestAgentHandleStop:
     @mock_patch("flywheel.agent.subprocess.run")

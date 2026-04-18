@@ -570,6 +570,119 @@ roles:
         # teardown ran.
         assert teardown_called == [True]
 
+    def test_project_hooks_can_override_launch_fn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Projects that need the host-side full-stop handoff loop
+        # (cyberarc) put a partial-bound
+        # ``launch_agent_with_handoffs`` in the overrides dict.
+        # The CLI must thread it through to ``PatternRunner``;
+        # otherwise the default ``launch_agent_block`` runs and
+        # the handoff path never fires.
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+        _write_pattern(project_root, "tiny", """\
+roles:
+  play:
+    prompt: prompts/play.md
+    trigger:
+      kind: continuous
+""")
+
+        sentinel = object()
+
+        class _Hooks:
+            def init(self, ws, template, pr, args):
+                return {"launch_fn": sentinel}
+
+            def teardown(self):
+                pass
+
+        captured: dict = {}
+
+        class _FakeRunner:
+            def __init__(self, pattern, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def run(self):
+                class R:
+                    agents_launched = 0
+                    cohorts_by_role = {"play": 0}
+                return R()
+
+        with patch(
+            "flywheel.cli.PatternRunner", _FakeRunner,
+        ), patch(
+            "flywheel.cli.load_project_hooks_class",
+            return_value=_Hooks,
+        ):
+            main([
+                "run", "pattern", "tiny",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+                "--project-hooks", "x:Y",
+            ])
+
+        assert captured["kwargs"]["launch_fn"] is sentinel
+
+    def test_project_hooks_without_launch_fn_uses_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # When hooks don't supply ``launch_fn`` the CLI must
+        # leave the kwarg out so PatternRunner falls back to its
+        # default (``launch_agent_block``).
+        project_root = make_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "ws",
+              "--template", "my_template"])
+        _write_pattern(project_root, "tiny", """\
+roles:
+  play:
+    prompt: prompts/play.md
+    trigger:
+      kind: continuous
+""")
+
+        class _Hooks:
+            def init(self, ws, template, pr, args):
+                return {}
+
+            def teardown(self):
+                pass
+
+        captured: dict = {}
+
+        class _FakeRunner:
+            def __init__(self, pattern, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def run(self):
+                class R:
+                    agents_launched = 0
+                    cohorts_by_role = {"play": 0}
+                return R()
+
+        with patch(
+            "flywheel.cli.PatternRunner", _FakeRunner,
+        ), patch(
+            "flywheel.cli.load_project_hooks_class",
+            return_value=_Hooks,
+        ):
+            main([
+                "run", "pattern", "tiny",
+                "--workspace",
+                str(project_root / "foundry"
+                    / "workspaces" / "ws"),
+                "--template", "my_template",
+                "--project-hooks", "x:Y",
+            ])
+
+        assert "launch_fn" not in captured["kwargs"]
+
 
 class TestProjectConfigFields:
     def test_project_hooks_parsed(

@@ -547,12 +547,20 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             "prompt_substitutions"),
     )
 
+    runner_kwargs: dict[str, Any] = {}
+    if "launch_fn" in overrides:
+        # Projects that need the host-side full-stop handoff
+        # loop (e.g. cyberarc) inject ``launch_agent_with_handoffs``
+        # here.  Default is ``launch_agent_block``.
+        runner_kwargs["launch_fn"] = overrides["launch_fn"]
+
     try:
         runner = PatternRunner(
             pattern,
             base_config=agent_config,
             poll_interval_s=args.poll_interval,
             max_total_runtime_s=args.max_runtime,
+            **runner_kwargs,
         )
         result = runner.run()
     finally:

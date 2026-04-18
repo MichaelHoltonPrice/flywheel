@@ -238,6 +238,28 @@ class AgentHandle:
         """Check if the container process is still running."""
         return self._process.poll() is None
 
+    @property
+    def bridge_endpoint(self) -> str:
+        """Host-process URL of this agent's execution channel.
+
+        Returns the ``http://host:port`` the local
+        :class:`flywheel.execution_channel.ExecutionChannel` is
+        listening on.  Differs from the ``EVAL_ENDPOINT`` the
+        agent container sees, which substitutes
+        ``host.docker.internal`` for the host so the in-container
+        MCP processes can reach back across the Docker NAT.
+
+        Use this from the host side when a block runner (e.g. the
+        full-stop handoff path's
+        :class:`cyberarc.game_step_block.GameStepRunner`) needs
+        to record executions against the same channel the agent
+        is using.  The endpoint is stable from the moment
+        :func:`launch_agent_block` returns until
+        :meth:`wait` stops the bridge, so callers may capture it
+        once per cycle.
+        """
+        return self._bridge.url
+
     def stop(self, reason: str = "requested") -> None:
         """Request a graceful shutdown of the agent.
 

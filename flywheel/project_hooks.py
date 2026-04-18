@@ -65,6 +65,17 @@ class ProjectHooks(Protocol):
             CLI flags before launching agents.  Common keys:
             ``extra_env``, ``extra_mounts``, ``pre_launch_hook``,
             ``isolated_network``, ``mcp_servers``, ``allowed_tools``.
+
+            One non-config key is also recognised:
+            ``launch_fn`` — a callable with the
+            :func:`flywheel.agent.launch_agent_block` signature
+            that the pattern runner uses in place of the default
+            launcher.  Projects that want the host-side full-stop
+            handoff loop (see
+            :mod:`flywheel.agent_handoff`) inject
+            :func:`flywheel.agent_handoff.launch_agent_with_handoffs`
+            here, partially bound with the project's
+            :class:`~flywheel.agent_handoff.BlockRunner`.
             Returning ``None`` is equivalent to ``{}``.
         """
         ...
