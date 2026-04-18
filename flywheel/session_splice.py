@@ -16,10 +16,11 @@ tool-result cycle, and the model's view of the conversation is
 indistinguishable from a tool that simply took a long time to
 return.
 
-The full design contract lives at
-``plans/full-stop-state-contract.md``.  The invariants this
-module depends on are documented there and validated by the B1
-unit tests + the live-API integration test.
+The invariants this module depends on (sessionId line shape,
+unique tool_use_id, deny-marker tool_result location) are
+exercised by the unit tests in :mod:`tests.test_session_splice`
+and validated against the real Claude SDK by the live-API
+integration test under ``tests/integration/``.
 """
 
 from __future__ import annotations

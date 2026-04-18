@@ -68,9 +68,9 @@ class ProjectConfig:
 
         Convenience wrapper around
         ``BlockRegistry.from_directory(self.blocks_dir)``.
-        Returns an empty registry if the directory does not exist,
-        which is the supported state during the Phase 2 migration
-        for projects whose blocks are still inline in templates.
+        Returns an empty registry if the directory does not
+        exist, which is the supported state for projects whose
+        blocks are still inline in templates.
         """
         # Local import to avoid a config → blocks → template cycle.
         from flywheel.blocks.registry import BlockRegistry
@@ -136,11 +136,10 @@ def load_project_config(project_root: Path) -> ProjectConfig:
 
     if "hooks" in data:
         raise ValueError(
-            f"'hooks' in {config_path} is no longer supported. "
-            f"The legacy AgentLoop / AgentLoopHooks path was "
-            f"retired in P7 of the patterns campaign; declare "
-            f"workflows under '<project>/patterns/' and wire "
-            f"resource setup via 'project_hooks' instead."
+            f"'hooks' in {config_path} is not supported. "
+            f"Declare workflows under '<project>/patterns/' "
+            f"and wire resource setup via 'project_hooks' "
+            f"instead."
         )
 
     project_hooks = data.get("project_hooks")

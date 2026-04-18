@@ -9,9 +9,8 @@ with output artifacts.
 - **ProcessExecutor**: Runs a block as a local subprocess.
   For trusted, host-local processes like game servers.
 
-Phase 5 of the block-execution refactor removed ``RecordExecutor``
-and the ``__record__`` sentinel.  Blocks that previously rode the
-record path are now ``runner: lifecycle`` blocks recorded by
+``runner: lifecycle`` blocks have no executor — they are
+recorded directly by
 :class:`flywheel.local_block.LocalBlockRecorder`.
 
 All executors satisfy the ``BlockExecutor`` protocol and return
@@ -243,9 +242,9 @@ class ContainerExecutor:
             execution_id: Pre-assigned execution ID.
             overrides: CLI flag overrides (merged with defaults).
             allowed_blocks: If set, only these block names allowed.
-            artifact_path: Path to input artifact relative to the
-                agent workspace (legacy invocation shape kept for
-                callers that pass an explicit input directory).
+            artifact_path: Optional path to input artifact relative
+                to the agent workspace, for callers that pass an
+                explicit input directory.
             stopping: Threading event for cancellation.
             active_container: Single-element list tracking the
                 running container name.

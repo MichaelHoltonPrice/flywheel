@@ -346,7 +346,7 @@ class TestPrepareAgentWorkspace:
             self, tmp_path: Path):
         """Two back-to-back launches get distinct directories.
 
-        This is the whole point of P6 — parallel launches must
+        Auto-naming is the whole point — parallel launches must
         not be able to clobber each other by sharing a path.
         """
         ws = MagicMock()
@@ -372,7 +372,7 @@ class TestPrepareAgentWorkspace:
 
     def test_explicit_dir_with_content_raises(
             self, tmp_path: Path):
-        """Pre-P6 behavior was to silently rmtree; now we raise.
+        """A non-empty hand-stamped agent_workspace_dir raises.
 
         If a caller hand-stamps an ``agent_workspace_dir`` and
         the target already has files, refusing the launch is the
@@ -407,28 +407,30 @@ class TestPrepareAgentWorkspace:
         assert mount.host_path == existing
         assert mount.relative_dir == "explore_0"
 
-    def test_seeds_latest_artifacts(self, tmp_path: Path):
+    def test_workspace_starts_empty(self, tmp_path: Path):
+        """Agent workspace is scratch only.
+
+        The workspace must never carry seeded artifact contents.
+        The agent sees artifact data only through its mounted
+        ``/input/<slot>`` directories (staged copies of canonical
+        artifacts; see :mod:`flywheel.input_staging`).  This
+        test pins the invariant: a fresh workspace is empty.
+        """
         ws = MagicMock()
         ws.path = tmp_path
 
-        # Create a mock artifact instance.
+        # Even with prior copy-kind instances on the workspace,
+        # ``prepare_agent_workspace`` must not seed them in.
         art_dir = tmp_path / "artifacts" / "game_log@abc"
         art_dir.mkdir(parents=True)
         (art_dir / "game_log.txt").write_text("log data")
-
         inst = MagicMock()
         inst.kind = "copy"
         inst.copy_path = "game_log@abc"
         ws.instances_for = MagicMock(return_value=[inst])
 
-        mount = prepare_agent_workspace(
-            ws, output_names=["game_log"])
-        assert (mount.host_path / "game_log.txt").read_text() == (
-            "log data")
-
-    def test_no_output_names_skips_seeding(self, tmp_path: Path):
-        ws = MagicMock()
-        ws.path = tmp_path
-
-        mount = prepare_agent_workspace(ws, output_names=None)
+        mount = prepare_agent_workspace(ws)
         assert list(mount.host_path.iterdir()) == []
+        # And ``instances_for`` is never even consulted: we
+        # removed the seeding loop entirely.
+        ws.instances_for.assert_not_called()

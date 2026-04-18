@@ -1,10 +1,9 @@
 """Unit tests for ``flywheel.session_splice``.
 
 Covers the algorithm against synthetic JSONL fixtures shaped like
-the Claude Agent SDK's saved sessions.  The shapes are documented
-in ``plans/full-stop-state-contract.md``; the live-API integration
-test under ``tests/integration/`` validates that the assumed shapes
-match what the SDK actually writes.
+the Claude Agent SDK's saved sessions.  The live-API integration
+test under ``tests/integration/`` validates that these synthetic
+shapes match what the SDK actually writes.
 """
 
 from __future__ import annotations

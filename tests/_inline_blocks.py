@@ -1,16 +1,15 @@
-"""Test helpers for templates that still use inline-block syntax.
+"""Test helpers for templates that use inline-block syntax.
 
-Phase 5 of the block-execution refactor removed inline-dict block
-definitions from templates: ``Template.from_yaml`` now only accepts
-string references to a :class:`BlockRegistry`.
+Production templates only accept string block references resolved
+against a :class:`BlockRegistry`; ``Template.from_yaml`` rejects
+inline-dict blocks.
 
-A large number of legacy test fixtures still write inline-dict
-blocks for convenience.  Rather than splitting every fixture into
-per-block YAML files, this module provides a parser shim that
-detects inline blocks, builds an ad-hoc registry, rewrites the
-template to use string references, and parses it normally.
-
-Production code never goes through this path.
+Many test fixtures find it convenient to declare blocks inline
+rather than splitting them into per-block YAML files.  This
+helper detects inline blocks in a fixture, builds an ad-hoc
+registry, rewrites the template to use string references, and
+parses it normally.  Production code never goes through this
+path.
 """
 
 from __future__ import annotations
@@ -31,9 +30,7 @@ from flywheel.template import (
 def from_yaml_with_inline_blocks(path: Path) -> Template:
     """Parse a template fixture that may use inline-dict blocks.
 
-    Inline-block test fixtures pre-date the Phase 5 cleanup and
-    were inherited by many test files; rewriting every fixture is
-    out of scope for that cleanup.  This helper:
+    The helper:
 
     1. Reads the YAML.
     2. If ``blocks:`` contains only string references, delegates

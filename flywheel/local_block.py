@@ -7,7 +7,7 @@ boundary.  The agent stops, the host runs the block synchronously
 in its own Python process, then the agent restarts with the
 block's output spliced into its session.
 
-This module is the recorder side of that handoff.  Its two
+This module is the recorder side of that handoff.  Its three
 defining structural properties:
 
 1. **No HTTP round-trip.**  The host-side block runner shares a
@@ -19,6 +19,14 @@ defining structural properties:
    straight from non-existent → ``"succeeded"`` or ``"failed"``
    and the orphaned-``running`` class of bug becomes structurally
    impossible.
+3. **Blocks write files; the recorder registers artifacts.**
+   Block bodies write files under
+   :meth:`LocalExecutionContext.output_dir` (a per-execution
+   ephemeral system tempdir).  After the body exits, the
+   recorder walks each declared output directory and registers
+   artifacts from what's on disk.  Blocks never call an
+   "emit-artifact" API, and they never write directly into the
+   workspace's canonical artifact store.
 
 Halt directives produced by post-execution checks are queued on
 the recorder rather than served over ``GET /halt``; the
@@ -37,15 +45,22 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.input_staging import (
+    cleanup_staged_inputs,
+    stage_artifact_instances,
+)
 from flywheel.post_check import (
     HaltDirective,
     PostCheckCallable,
@@ -92,8 +107,8 @@ class LocalExecutionContext:
 
     Carries everything a block body needs to read its inputs,
     write its outputs, and stage scratch state.  The recorder
-    writes the resulting artifacts and ledger row directly under
-    the workspace's lock when the body returns.
+    walks the per-output directories on the way out and registers
+    one artifact per declared output that has any contents.
 
     Attributes:
         execution_id: Workspace-allocated ledger ID for this
@@ -103,9 +118,12 @@ class LocalExecutionContext:
         input_bindings: ``{slot_name: artifact_id}`` resolved at
             ``begin`` time from the workspace's latest instances.
         input_paths: ``{slot_name: absolute path on host}`` to the
-            artifact directory.  Valid for read-only use during
-            the body; the recorder writes outputs to a different
-            location.
+            artifact directory.  These paths point at fresh
+            per-execution staging tempdirs populated by
+            :func:`flywheel.input_staging.stage_artifact_instances`,
+            *not* at the workspace's canonical artifact store.
+            Valid for read-only use during the body; the
+            recorder cleans them up after the body exits.
         scratch_dir: Per-execution scratch directory under
             ``<workspace>/execution_scratch/<execution_id>``.
             Cleaned up by the recorder on exit (success or
@@ -114,9 +132,14 @@ class LocalExecutionContext:
             echoed back verbatim.
         parent_execution_id: ID of the runner that invoked this
             execution, when supplied to ``begin``.
-        outputs: Buffer of slot_name → JSON-serializable data for
-            registration on successful exit.  Populated via
-            :meth:`set_output`.
+        output_root: Per-execution ephemeral system tempdir.
+            Each declared output slot has a pre-created
+            subdirectory at ``<output_root>/<slot_name>/`` that
+            the body writes files into.  Use
+            :meth:`output_dir` rather than constructing the path
+            by hand.  Cleaned up after successful registration;
+            preserved on failure for debugging (the path is
+            stamped into the ``BlockExecution.error`` text).
         output_bindings: Populated by the recorder *after* the
             ``with`` block exits successfully, with the
             ``{slot_name: artifact_id}`` map of newly-registered
@@ -131,30 +154,39 @@ class LocalExecutionContext:
     scratch_dir: str
     params: dict[str, Any]
     parent_execution_id: str | None
-    outputs: dict[str, Any] = field(default_factory=dict)
+    output_root: Path | None = None
+    _output_dirs: dict[str, Path] = field(default_factory=dict)
     output_bindings: dict[str, str] = field(default_factory=dict)
 
-    def set_output(self, name: str, data: Any) -> None:
-        """Buffer an output for atomic registration on exit.
+    def output_dir(self, name: str) -> Path:
+        """Return the per-output directory for slot *name*.
+
+        The directory is created by the recorder before the body
+        runs, so callers can write into it freely.  For copy
+        artifacts, the body writes one or more files; on
+        successful exit, the recorder copies the directory's
+        contents into ``<workspace>/artifacts/<artifact_id>/``
+        and registers a copy artifact.  For incremental
+        artifacts, the body writes a file named ``entries.jsonl``
+        with one JSON value per line; the recorder appends those
+        entries to the workspace's canonical incremental
+        artifact instance for *name* (creating the instance if
+        none exists yet).
 
         Args:
             name: The output slot name as declared by the block.
-            data: The artifact contents.  JSON-encoded by the
-                recorder when the body exits successfully.
 
         Raises:
-            ValueError: If an output was already buffered for
-                this slot name on this context.  The block's
-                output slots are single-shot by design — a
-                second ``set_output("game_step", ...)`` is
-                always a programming error in the runner.
+            KeyError: If *name* is not a declared output of this
+                block.
         """
-        if name in self.outputs:
-            raise ValueError(
-                f"Output {name!r} already set on execution "
-                f"{self.execution_id}"
+        if name not in self._output_dirs:
+            raise KeyError(
+                f"{name!r} is not a declared output of block "
+                f"{self.block_name!r}; declared: "
+                f"{sorted(self._output_dirs)}"
             )
-        self.outputs[name] = data
+        return self._output_dirs[name]
 
 
 @dataclass
@@ -183,17 +215,23 @@ class LocalBlockRecorder:
     state machine:
 
     1. :meth:`begin` resolves the block's inputs against the
-       workspace's latest instances, allocates a scratch
-       directory, and yields a context.
+       workspace's latest instances, stages each one into a
+       per-mount tempdir (see
+       :func:`flywheel.input_staging.stage_artifact_instances`),
+       allocates an ephemeral output root with one
+       sub-directory per declared output, and yields a context.
     2. The block runner runs the side-effecting work inside the
-       ``with`` block, populating outputs via
-       :meth:`LocalExecutionContext.set_output`.
-    3. On clean exit the recorder writes each buffered output as
-       a copy artifact, registers the resulting
-       :class:`flywheel.artifact.ArtifactInstance` on the
-       workspace, builds a ``"succeeded"``
-       :class:`flywheel.artifact.BlockExecution`, and runs the
-       block's post-execution check (if configured).
+       ``with`` block, writing files into
+       :meth:`LocalExecutionContext.output_dir`.  For
+       ``incremental`` outputs the runner appends one or more
+       JSON entries to ``<output_dir>/entries.jsonl``.
+    3. On clean exit the recorder registers a fresh ``copy``
+       artifact for each non-empty copy output directory and
+       appends each ``incremental`` output's entries to the
+       canonical incremental instance, then builds a
+       ``"succeeded"`` :class:`flywheel.artifact.BlockExecution`
+       and runs the block's post-execution check (if
+       configured).
     4. On exception the recorder writes no artifacts, builds a
        ``"failed"`` row, runs the post-check with that row as
        context, and re-raises.
@@ -277,8 +315,7 @@ class LocalBlockRecorder:
             )
 
         try:
-            input_bindings, input_paths = (
-                self._resolve_inputs(block_def))
+            input_bindings = self._resolve_input_bindings(block_def)
         except ValueError as exc:
             raise LocalBlockError(
                 str(exc), error_type="missing_input") from exc
@@ -289,6 +326,25 @@ class LocalBlockRecorder:
         )
         scratch_dir.mkdir(parents=True, exist_ok=True)
 
+        output_root = Path(tempfile.mkdtemp(
+            prefix=f"flywheel-exec-{execution_id}-",
+        ))
+        output_dirs: dict[str, Path] = {}
+        for slot in block_def.outputs:
+            slot_dir = output_root / slot.name
+            slot_dir.mkdir(parents=True)
+            output_dirs[slot.name] = slot_dir
+
+        # Per-mount staging: copy each input artifact's canonical
+        # directory contents into a fresh tempdir so the body
+        # never reads from <workspace>/artifacts/ directly.  See
+        # :mod:`flywheel.input_staging` for the invariant.
+        staged_inputs = stage_artifact_instances(
+            self.workspace, input_bindings)
+        input_paths = {
+            slot: str(path) for slot, path in staged_inputs.items()
+        }
+
         ctx = LocalExecutionContext(
             execution_id=execution_id,
             block_name=block,
@@ -297,11 +353,14 @@ class LocalBlockRecorder:
             scratch_dir=str(scratch_dir),
             params=params or {},
             parent_execution_id=parent_execution_id,
+            output_root=output_root,
+            _output_dirs=output_dirs,
         )
         started_at = datetime.now(UTC)
         t0 = time.monotonic()
 
         body_failed: BaseException | None = None
+        preserved_output_root: Path | None = None
         try:
             yield ctx
         except BaseException as exc:
@@ -332,8 +391,13 @@ class LocalBlockRecorder:
                     runner=runner,
                     error=body_failed,
                 )
+                if _retain_failed_output_dirs():
+                    preserved_output_root = output_root
 
+            cleanup_staged_inputs(staged_inputs)
             self._cleanup_scratch(execution_id)
+            if preserved_output_root is None:
+                shutil.rmtree(output_root, ignore_errors=True)
 
     def drain_halts(self) -> list[_QueuedHalt]:
         """Pop and return all queued halt directives.
@@ -356,67 +420,35 @@ class LocalBlockRecorder:
                 return block
         return None
 
-    def _resolve_inputs(
+    def _resolve_input_bindings(
         self, block_def: BlockDefinition,
-    ) -> tuple[dict[str, str], dict[str, str]]:
+    ) -> dict[str, str]:
         """Resolve declared block inputs to latest registered instances.
 
-        Derived slots are rebuilt on every ``begin``, non-derived
-        optional slots with no instance are silently skipped, and
-        non-derived required slots with no instance raise
-        ``ValueError``.  Returns ``(input_bindings, input_paths)``
-        as absolute host paths (the in-process caller can read
-        them directly).
+        Optional slots with no instance are silently skipped;
+        required slots with no instance raise ``ValueError``.
+        Returns ``{slot_name: artifact_id}``; host paths come
+        later from
+        :func:`flywheel.input_staging.stage_artifact_instances`,
+        which knows how to copy ``copy`` and ``incremental``
+        artifacts into per-mount staging tempdirs.
         """
         bindings: dict[str, str] = {}
-        paths: dict[str, str] = {}
 
         for slot in block_def.inputs:
-            if slot.derive_from is not None:
-                instance = self._materialize_derived_input(slot)
-                if instance is None:
+            instances = self.workspace.instances_for(slot.name)
+            if not instances:
+                if slot.optional:
                     continue
-            else:
-                instances = self.workspace.instances_for(slot.name)
-                if not instances:
-                    if slot.optional:
-                        continue
-                    raise ValueError(
-                        f"Block {block_def.name!r} input slot "
-                        f"{slot.name!r} has no registered "
-                        f"instances in workspace"
-                    )
-                instance = instances[-1]
-            bindings[slot.name] = instance.id
-            if instance.copy_path:
-                paths[slot.name] = str(
-                    self.workspace.path / "artifacts"
-                    / instance.copy_path
+                raise ValueError(
+                    f"Block {block_def.name!r} input slot "
+                    f"{slot.name!r} has no registered "
+                    f"instances in workspace"
                 )
-            else:
-                paths[slot.name] = ""
+            instance = instances[-1]
+            bindings[slot.name] = instance.id
 
-        return bindings, paths
-
-    def _materialize_derived_input(self, slot):
-        """Rebuild a derived input's rollup; return the new instance.
-
-        Returns ``None`` when the source has no instances yet so
-        the caller treats the slot as absent.  Raises
-        ``ValueError`` on unsupported ``derive_kind`` (defense in
-        depth — the parser also catches this).
-        """
-        if slot.derive_kind == "jsonl_concat":
-            if not self.workspace.instances_for(slot.derive_from):
-                return None
-            return self.workspace.materialize_sequence(
-                source_name=slot.derive_from,
-                target_name=slot.name,
-            )
-        raise ValueError(
-            f"Input slot {slot.name!r}: unsupported derive_kind "
-            f"{slot.derive_kind!r}"
-        )
+        return bindings
 
     def _finalize_succeeded(
         self,
@@ -429,50 +461,86 @@ class LocalBlockRecorder:
         caller: dict[str, Any] | None,
         runner: str | None,
     ) -> None:
-        """Write outputs as artifacts and record a succeeded row.
+        """Register artifacts from per-output dirs and record a succeeded row.
+
+        For each declared output slot, looks up the artifact's
+        declared kind, then either:
+
+        * **copy** — if the per-output directory is non-empty,
+          allocates a fresh artifact ID, copies the directory's
+          contents into ``<workspace>/artifacts/<aid>/``, and
+          registers a copy :class:`ArtifactInstance`.  Empty
+          directories are skipped silently (the block chose not
+          to emit this output this time).
+        * **incremental** — if the per-output directory contains a
+          file named ``entries.jsonl``, parses one JSON value per
+          non-blank line and appends them to the workspace's
+          canonical incremental instance for this name.  Creates
+          the canonical instance on first append.  An empty
+          directory or missing/empty ``entries.jsonl`` is a
+          silent no-op.
 
         Atomic with respect to artifact writes: if any output
-        registration fails, partial writes are rolled back and a
-        ``"failed"`` row is written instead.  The row's ``error``
-        field carries the underlying message so operators can
-        diagnose without grepping logs.
+        registration fails partway through, partial *new* copy
+        artifacts are rolled back; previously-completed copy
+        artifacts in this same call are kept (each completes
+        atomically once it lands in the ledger).  Incremental
+        appends are not rolled back — they are append-only by
+        design and partial appends remain visible to subsequent
+        readers.  A ``"failed"`` row is written with the
+        underlying error message so operators can diagnose
+        without grepping logs.
         """
         registered: list[tuple[str, str]] = []
+        output_payloads: dict[str, Path] = {}
         try:
             for slot in block_def.outputs:
-                data = ctx.outputs.get(slot.name)
-                if data is None:
-                    continue
+                slot_dir = ctx.output_dir(slot.name)
+                output_payloads[slot.name] = slot_dir
 
-                aid = self.workspace.generate_artifact_id(
+                kind = self.workspace.artifact_declarations.get(
                     slot.name)
-                output_dir = (
-                    self.workspace.path / "artifacts" / aid)
-                output_dir.mkdir(parents=True)
+                if kind is None:
+                    raise ValueError(
+                        f"Block {block_def.name!r} declares output "
+                        f"{slot.name!r} but the workspace has no "
+                        f"such artifact declaration"
+                    )
 
-                output_file = output_dir / f"{slot.name}.json"
-                output_file.write_text(
-                    json.dumps(data, separators=(",", ":")),
-                    encoding="utf-8",
-                )
-
-                instance = ArtifactInstance(
-                    id=aid,
-                    name=slot.name,
-                    kind="copy",
-                    created_at=finished_at,
-                    produced_by=ctx.execution_id,
-                    copy_path=aid,
-                )
-                self.workspace.add_artifact(instance)
-                registered.append((slot.name, aid))
+                if kind == "copy":
+                    aid = self._register_copy_output(
+                        slot_name=slot.name,
+                        slot_dir=slot_dir,
+                        execution_id=ctx.execution_id,
+                        finished_at=finished_at,
+                    )
+                    if aid is not None:
+                        registered.append((slot.name, aid))
+                elif kind == "incremental":
+                    aid = self._append_incremental_output(
+                        slot_name=slot.name,
+                        slot_dir=slot_dir,
+                        execution_id=ctx.execution_id,
+                        finished_at=finished_at,
+                    )
+                    if aid is not None:
+                        registered.append((slot.name, aid))
+                else:
+                    raise ValueError(
+                        f"Block {block_def.name!r} output "
+                        f"{slot.name!r} declared as kind "
+                        f"{kind!r}; only 'copy' and 'incremental' "
+                        f"are valid block-output kinds"
+                    )
         except Exception as exc:
             for _, aid in registered:
+                inst = self.workspace.artifacts.get(aid)
+                if inst is None or inst.kind != "copy":
+                    continue
                 aid_dir = self.workspace.path / "artifacts" / aid
                 shutil.rmtree(aid_dir, ignore_errors=True)
                 self.workspace.artifacts.pop(aid, None)
-            failed_error = (
-                f"output_write_failed: {exc}")
+            failed_error = f"output_write_failed: {exc}"
             self._write_row(BlockExecution(
                 id=ctx.execution_id,
                 block_name=ctx.block_name,
@@ -508,7 +576,81 @@ class LocalBlockRecorder:
             runner=runner,
             caller=caller,
             params=ctx.params or None,
-        ), outputs=ctx.outputs, error=None)
+        ), outputs=output_payloads, error=None)
+
+    def _register_copy_output(
+        self,
+        *,
+        slot_name: str,
+        slot_dir: Path,
+        execution_id: str,
+        finished_at: datetime,
+    ) -> str | None:
+        """Copy the per-output directory into the canonical artifact store.
+
+        Returns the new artifact ID, or ``None`` if the per-output
+        directory is empty (treated as "block chose not to emit
+        this output").
+        """
+        if not slot_dir.exists() or not any(slot_dir.iterdir()):
+            return None
+        aid = self.workspace.generate_artifact_id(slot_name)
+        target_dir = self.workspace.path / "artifacts" / aid
+        try:
+            shutil.copytree(slot_dir, target_dir)
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+        instance = ArtifactInstance(
+            id=aid,
+            name=slot_name,
+            kind="copy",
+            created_at=finished_at,
+            produced_by=execution_id,
+            copy_path=aid,
+        )
+        self.workspace.add_artifact(instance)
+        return aid
+
+    def _append_incremental_output(
+        self,
+        *,
+        slot_name: str,
+        slot_dir: Path,
+        execution_id: str,
+        finished_at: datetime,
+    ) -> str | None:
+        """Append entries from ``<slot_dir>/entries.jsonl`` to the canonical instance.
+
+        Returns the (possibly newly-created) canonical incremental
+        artifact ID for *slot_name*, or ``None`` if the slot
+        directory had nothing to contribute (no ``entries.jsonl``
+        or the file was empty).
+        """
+        entries_file = slot_dir / "entries.jsonl"
+        if not entries_file.exists():
+            return None
+        raw = entries_file.read_text(encoding="utf-8")
+        entries: list[Any] = []
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            entries.append(json.loads(stripped))
+        if not entries:
+            return None
+
+        instance = self.workspace.latest_incremental_instance(
+            slot_name)
+        if instance is None:
+            instance = self.workspace.register_incremental_artifact(
+                slot_name,
+                produced_by=execution_id,
+                source=(
+                    f"first appended by execution {execution_id}"),
+            )
+        self.workspace.append_to_incremental(instance.id, entries)
+        return instance.id
 
     def _finalize_failed(
         self,
@@ -545,7 +687,7 @@ class LocalBlockRecorder:
         self,
         execution: BlockExecution,
         *,
-        outputs: dict[str, Any],
+        outputs: dict[str, Path],
         error: str | None,
     ) -> None:
         """Persist a finalized execution row, then run post-check.
@@ -574,7 +716,7 @@ class LocalBlockRecorder:
         self,
         *,
         execution: BlockExecution,
-        outputs: dict[str, Any],
+        outputs: dict[str, Path],
         error: str | None,
     ) -> BlockExecution:
         """Invoke the configured post-check; return updated row.
@@ -648,3 +790,16 @@ class LocalBlockRecorder:
         )
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _retain_failed_output_dirs() -> bool:
+    """Whether to keep per-execution output dirs after a body failure.
+
+    Reads the ``FLYWHEEL_RETAIN_FAILED_OUTPUT_DIRS`` environment
+    variable.  Default: retain.  Tests that want deterministic
+    cleanup set this to ``"0"`` (or ``"false"`` / ``"no"``).
+    """
+    raw = os.environ.get("FLYWHEEL_RETAIN_FAILED_OUTPUT_DIRS")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", ""}

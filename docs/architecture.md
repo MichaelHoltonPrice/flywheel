@@ -28,18 +28,44 @@ of those types as blocks execute.
 
 ### Storage kinds
 
-There are two storage kinds:
+There are three storage kinds:
 
 - **Copy artifacts** are files or directories stored directly in
   the workspace. Block executions produce them — checkpoints,
-  scores, and logs are typical examples.
+  scores, and logs are typical examples.  Each instance is
+  immutable.
 - **Git artifacts** are references to version-controlled code,
   recorded as repo, commit SHA, and path. They are used to
   inject source code, configurations, or prompts into a
   workspace.
+- **Incremental artifacts** are append-only sequences of
+  immutable JSON entries, stored as a directory containing one
+  ``entries.jsonl`` file (one opaque JSON value per line).
+  Unlike copy artifacts, an incremental artifact has *one*
+  growing instance per name per workspace; new entries are
+  appended to that instance rather than producing a new
+  instance per write.  ``game_history`` is the canonical
+  example: every successful ``take_action`` block appends one
+  entry recording the resulting frame.  Existing entries are
+  never rewritten.
 
-From a block's perspective both kinds behave the same way: each
-is something injectable with a name.
+From a block's perspective copy and git inputs are read-only
+directories.  An incremental input is a read-only snapshot of
+the file as of mount time (see "Per-mount input staging" below).
+Blocks emit copy and incremental output through the per-execution
+output directory; no dedicated emit-artifact API exists.
+
+### Artifact-only data channel
+
+The data produced by a block execution flows out of the block
+exclusively via its output artifacts.  Tool calls that trigger
+nested block executions return only acknowledgment — ``"OK"`` on
+success or ``"ERROR: <reason>"`` on failure.  Agents that need
+the resulting data read it from the corresponding artifact (in
+particular the incremental artifact for sequence-shaped data),
+not from the spliced ``tool_result``.  This invariant is what
+keeps the artifact store the single source of truth for what a
+run produced.
 
 ### Artifact IDs
 
@@ -164,18 +190,60 @@ Flywheel mounts artifact instance directories at the declared
 container paths. What files exist inside is the container's
 concern, not flywheel's.
 
-### Convention-based output recording
+### Per-execution output directories
 
-Flywheel creates a fresh directory per declared output and
-mounts it at the block's declared container path. The container
-writes files there. After the container exits, flywheel records
-whatever appeared as a new artifact instance.
+Each block execution gets a fresh, ephemeral output directory
+created via ``tempfile.mkdtemp(prefix="flywheel-exec-")``.
+Inside that directory flywheel pre-creates one
+``output/<output_name>/`` per declared output and either bind-
+mounts it into the container at the block's declared
+``container_path`` (for container blocks) or exposes it via
+``ctx.output_dir(name)`` to in-process block bodies.  The block
+writes files into those directories; no API is provided to
+emit artifacts directly.
+
+After the container or in-process body exits, flywheel walks
+each declared output:
+
+- For ``copy`` outputs: the directory's contents become a new
+  copy artifact instance under the workspace.
+- For ``incremental`` outputs: each line of
+  ``output/<name>/entries.jsonl`` (and any other ``*.jsonl``
+  files written there) is appended to the canonical incremental
+  instance under a file lock, preserving registration order.
+
+The ephemeral output directory is removed after registration
+on success.  On failure it is retained for debugging.
 
 This avoids requiring containers to write a manifest or be
-flywheel-aware. The template already declares the contract
-(what a block produces), so a manifest would be redundant.
-If we later need richer signaling (metadata, partial results,
-error details), manifests can be layered on top.
+flywheel-aware: the template's output declarations are the
+contract.  It also keeps the canonical artifact store untouched
+by the block body — only flywheel writes to it, and only after
+observing the final on-disk state of the output directory.
+
+### Per-mount input staging
+
+Canonical artifact directories under
+``<workspace>/artifacts/<id>/`` are never directly mounted into
+a block.  For every input slot, flywheel copies the canonical
+contents into a fresh per-mount staging directory created with
+``tempfile.mkdtemp(prefix="flywheel-mount-")`` and mounts the
+staging directory instead.  Always a full copy; never a
+hardlink, never a shared inode.  The staging directory is
+cleaned up after the container or in-process body exits.
+
+This buys two things.  First, mutation isolation: a misbehaving
+block that writes into a "read-only" input mount can corrupt
+its private copy at worst, never the canonical instance.
+Second, snapshot semantics for incremental artifacts: each
+relaunch of the agent-handoff loop gets a fresh staging copy
+that reflects all entries appended so far, including those
+written by handoff blocks during the previous cycle.
+
+The cost is sequential file I/O proportional to total input
+size on every launch.  Today's largest inputs in cyberarc
+(``game_history``) reach a few MB after a long run; we accept
+the cost for the safety it buys.
 
 ### Docker configuration
 
@@ -216,14 +284,20 @@ session (see "Nested block executions from agents" below).
 
 The single-launch lifecycle inside ``launch_agent_block``:
 
-1. Create or reuse the agent workspace directory.  Fresh
-   launches seed it with the latest artifacts from prior
-   executions; relaunches into an existing handoff workspace
-   skip the seed and reuse the directory the previous cycle
-   wrote to.
+1. Create or reuse the agent workspace directory.  The
+   workspace is **scratch only** — flywheel never seeds it
+   with artifact data.  Fresh launches start with an empty
+   workspace; relaunches reuse whatever the agent itself wrote
+   to it during the previous cycle (notes, intermediate
+   scripts, the SDK's own session state).  Artifact data
+   reaches the agent exclusively through input mounts (see
+   "Per-mount input staging").
 2. Run the optional ``pre_launch_hook`` callback.  Projects use
-   this for game-specific init, artifact creation, or writing
-   files to the workspace before the container starts.
+   this for non-data setup that must run on every relaunch
+   (typically nothing in current projects).  It must not stage
+   artifact data into the workspace; that path is reserved
+   for cold-start seeding into the appropriate incremental
+   artifact via :meth:`Workspace.append_to_incremental`.
 3. Launch the agent container with the workspace, source mounts,
    the auth volume, and the configured environment variables
    (model, ``MAX_TURNS``, ``HANDOFF_TOOLS``, ``MCP_SERVERS``,
@@ -357,25 +431,36 @@ HTTP service runs.  The recorder owns one workspace and exposes a
 single ``begin`` context manager:
 
 1. ``begin(block, params=..., caller=...)`` resolves the block's
-   declared inputs to the latest registered instance of each slot.
-   Slots with ``derive_from``/``derive_kind`` (e.g.,
-   ``derive_kind: jsonl_concat``) are rebuilt at this moment so
-   the body always sees fresh derived inputs.  Missing required
-   inputs raise ``LocalBlockError`` *before* a row is opened.
+   declared inputs to the latest registered instance of each
+   slot, copies each into a per-mount staging tempdir (the same
+   isolation rule that container blocks observe), and exposes
+   the staging paths to the body.  Missing required inputs raise
+   ``LocalBlockError`` *before* a row is opened.  Incremental
+   inputs are snapshotted into the staging dir at this moment,
+   so the body sees a frozen view of the sequence regardless of
+   appends that happen during execution.
 2. The body runs.  It receives a ``LocalExecutionContext``
    carrying the allocated ``execution_id``, the resolved input
-   bindings, host paths to each input artifact, and a per-execution
-   scratch directory.  It writes outputs by calling
-   ``ctx.set_output(name, payload)``.
-3. On clean exit the recorder registers each declared output as a
-   ``copy`` artifact under the workspace, writes a single
-   ``BlockExecution`` row with ``status="succeeded"``, and runs
+   bindings, host paths to each staged input, a per-execution
+   scratch directory, and ``ctx.output_dir(name)`` returning a
+   pre-created ``output/<name>/`` under the execution's
+   ephemeral output tempdir.  The body writes files there;
+   no ``set_output`` callback exists.
+3. On clean exit the recorder walks each declared output:
+   ``copy`` outputs are registered as a new instance from the
+   directory contents; ``incremental`` outputs append the lines
+   in ``output/<name>/entries.jsonl`` (and any other ``*.jsonl``
+   files in that directory) to the canonical incremental
+   instance under a file lock.  It then writes a single
+   ``BlockExecution`` row with ``status="succeeded"`` and runs
    the block's configured post-check.  On body exceptions or
-   output-write failures it rolls back any partial artifacts and
-   writes a single ``"failed"`` row carrying the error message.
-   There is no ``"running"`` row; nothing crosses an asynchronous
-   boundary, so the orphaned-``running`` failure mode is
-   structurally impossible.
+   output-registration failures it rolls back any partial
+   artifacts and writes a single ``"failed"`` row carrying the
+   error message.  Per-mount staging dirs and the per-execution
+   output tempdir are cleaned up at the end (retained on
+   failure for debugging).  There is no ``"running"`` row;
+   nothing crosses an asynchronous boundary, so the orphaned-
+   ``running`` failure mode is structurally impossible.
 
 Post-execution callbacks (see :mod:`flywheel.post_check`) fire
 synchronously after the row is durable.  When a callback returns
@@ -399,18 +484,13 @@ loop: ``cyberarc/tools/play_server.py`` uses a
 ``LocalBlockRecorder`` to record human play sessions against
 the same ``game_step`` block schema.
 
-Phase 5 of the block-execution refactor removed the legacy
-``mode=record`` HTTP path, the ``RecordExecutor`` class, the
-``__record__`` sentinel image, and the inline-block-in-template
-parser branch.  B7 of the full-stop nested-block plan removed
-the host-side HTTP bridge that hosted the lifecycle API
-(``ExecutionChannel``), the in-container ``BlockChannelClient``
-that called it, the ``mcp__run_eval__evaluate`` proxy that wrapped
-it, and the tool-block manifest validation path that policed it.
-All artifact-recording flows now ride either ``LocalBlockRecorder``
-(``runner: lifecycle`` blocks) or ``ContainerExecutor`` /
-``ProcessExecutor`` (``runner: container`` and
-``runner: process`` blocks).
+All artifact-recording flows ride either
+``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or
+``ContainerExecutor`` / ``ProcessExecutor`` (``runner:
+container`` and ``runner: process`` blocks).  There is no HTTP
+lifecycle API and no in-container recording proxy — agents
+trigger recordings exclusively through the host-side handoff
+loop (see "Nested block executions from agents" below).
 
 ### Project-provided MCP servers
 
@@ -461,8 +541,8 @@ configured. Templates live in `foundry/templates/`.
 
 A template declares:
 - **Artifact declarations**, which specify names and storage
-  kinds (copy or git), along with repo and path for git
-  artifacts.
+  kinds (``copy``, ``git``, or ``incremental``), along with
+  repo and path for git artifacts.
 - **Block definitions**, which specify names, container images,
   Docker configuration, and input/output artifact mappings
   with container paths.
@@ -561,9 +641,14 @@ overrides.
 
 ``prepare_agent_workspace()`` (in ``flywheel.agent``) creates the
 host-side directory that gets bind-mounted into the agent
-container at ``/workspace`` and seeds it with the latest
-artifacts from prior steps.  It returns an :class:`AgentMount`
-that records:
+container at ``/workspace``.  The directory is **scratch only**:
+flywheel never copies artifact data into it.  Whatever the agent
+itself writes — notes, intermediate scripts, ``.agent_state.json``,
+the SDK's session state for in-place resume — lives there for the
+duration of the run.  Artifact data reaches the agent through
+input mounts (per-mount staged copies of canonical instances),
+never through the workspace.  The function returns an
+:class:`AgentMount` that records:
 
 - ``relative_dir``: the workspace-relative path of the mount
   (e.g., ``"agent_workspaces/abc12345"``).
@@ -621,16 +706,6 @@ primitive for multi-agent workflows.  A pattern *declares* its
 topology and timing in YAML and the runner translates that
 declaration into agent launches:
 
-(P7 of the patterns campaign retired the previous generation —
-``AgentLoop`` and the ``AgentLoopHooks`` protocol with its
-``decide`` / ``build_prompt`` / ``on_execution`` callbacks.
-Decision logic that used to live in ``decide()`` is now expressed
-as a role's trigger; ``build_prompt()`` collapses into the
-role's prompt file; ``on_execution`` callbacks are now block-
-level ``post_check`` functions.  ``flywheel run loop`` and the
-``hooks:`` key in ``flywheel.yaml`` were removed at the same
-time; setting ``hooks:`` raises a directional error.)
-
 ```yaml
 # patterns/play-brainstorm.yaml
 description: One play agent + a brainstorm cohort every 20 actions.
@@ -648,21 +723,18 @@ roles:
     trigger: { kind: every_n_executions, of_block: take_action, n: 20 }
     inputs: [game_history]
     outputs: [brainstorm_result]
-    materialize: { game_history: take_action }
     extra_env: { BRAINSTORM_FOCUS: "general" }
 ```
 
 ### Role fields
 
 - ``inputs`` — artifact names; the runner binds the latest
-  registered instance of each before launch.
+  registered instance of each before launch.  Incremental
+  artifacts (e.g., ``game_history``) are bound the same way and
+  re-staged per launch, so each cycle of a handoff loop sees
+  every entry appended through the previous cycle.
 - ``outputs`` — artifact names the role registers.  Falls back
   to ``base_config.output_names`` when omitted.
-- ``materialize`` — sequences to roll up before each firing
-  (mapping target artifact name → source block name).  Drives
-  ``Workspace.materialize_sequence`` so brainstormers and
-  escalators see one ``game_history.jsonl`` instead of N rows.
-  Skipped when the source has no instances yet.
 - ``extra_env`` — per-role env vars merged on top of the
   project's ``extra_env``.  Use sparingly; most env vars belong
   in project hooks.
@@ -712,8 +784,7 @@ flywheel run pattern <pattern-name> \
 ```
 
 Patterns are discovered as ``<project_root>/patterns/<name>.yaml``.
-``run pattern`` is the only multi-agent orchestration verb;
-the legacy ``run loop`` was removed in P7 of the campaign.
+``run pattern`` is the only multi-agent orchestration verb.
 
 ## Nested block executions from agents
 

@@ -64,19 +64,20 @@ class TestLoadProjectConfig:
         assert config.templates_dir == tmp_path / "some" / "nested" / "dir" / "templates"
 
 
-class TestLegacyHooksKeyRejected:
-    """The legacy ``hooks:`` key was retired in P7 of the
-    patterns campaign.  It now raises a directional error instead
-    of silently being ignored, so workspaces created before the
-    migration produce a loud failure instead of running the
-    project with the wrong orchestration verb.
+class TestHooksKeyRejected:
+    """A ``hooks:`` key in ``flywheel.yaml`` must be rejected.
+
+    The supported key is ``project_hooks``; accepting ``hooks``
+    would silently route the project through the wrong
+    configuration path, so the loader raises a directional
+    error pointing at the correct key.
     """
 
     def test_hooks_key_present_raises(self, tmp_path: Path):
         (tmp_path / CONFIG_FILENAME).write_text(
             "foundry_dir: foundry\nhooks: mymod:MyClass\n")
         with pytest.raises(
-                ValueError, match="no longer supported"):
+                ValueError, match="not supported"):
             load_project_config(tmp_path)
 
     def test_hooks_key_absent_is_fine(self, tmp_path: Path):

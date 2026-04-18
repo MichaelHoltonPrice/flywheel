@@ -55,10 +55,9 @@ error rather than a long timeout.
 - `test_full_stop_b1_two_container_roundtrip.py` — agent and
   block runner each in their own Docker container.
 
-## Crash-resume coverage (B8)
+## Crash-resume coverage
 
-Every host-side failure mode listed in
-`plans/full-stop-state-contract.md → Failure modes` has a
+Every host-side failure mode of the handoff loop has a
 deterministic regression test in
 `flywheel/tests/test_handoff_resume.py` (no live API, no
 Docker, runs in <1s).  That file is the source of truth for

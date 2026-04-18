@@ -21,10 +21,10 @@ training session.
 
 The callable is invoked synchronously by the recorder after
 ``end_execution`` (or after the recorder synthesises a failed
-row for a body that raised before ``end``).  See
-``plans/post-execution-callback.md`` for the full
-spec, including the channel/runner flows and what's explicitly
-out of scope.
+row for a body that raised before ``end``).  Callbacks may
+return a :class:`HaltDirective` to ask the host loop to stop;
+they may not mutate the row, the workspace ledger, or the
+artifacts.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -82,10 +82,7 @@ class PostCheckContext:
     """Read-only view of a finalized execution, passed to a check.
 
     The check must not mutate any field reachable through this
-    object.  ``outputs`` is a plain ``dict`` for ergonomic access
-    but should be treated as read-only; mutating it is a
-    programming error and may corrupt subsequent post-checks
-    invoked on the same row.
+    object.
 
     Attributes:
         block: Block name.
@@ -96,8 +93,16 @@ class PostCheckContext:
         params: Caller-supplied params (e.g. ``{"action_id": 6}``).
         error: Body-failure error string when ``status="failed"``.
             ``None`` when ``status="succeeded"``.
-        outputs: Output payloads keyed by slot name.  Empty mapping
-            when the row is failed.
+        outputs: Mapping from output slot name to the per-output
+            directory the block wrote into, on the host filesystem.
+            Post-checks may read from these directories but must
+            not modify them.  Empty mapping when the row is failed
+            or when the block declared no outputs.  Note: this is
+            *not* the canonical artifact directory — it's the
+            ephemeral per-execution staging dir, valid for the
+            duration of the post-check call.  For canonical
+            access, use ``execution.output_bindings`` plus
+            :meth:`flywheel.workspace.Workspace.instance_path`.
         parent_execution_id: ID of the runner that invoked this
             block, when known.
         synthetic: ``True`` if this row was synthesised by the
@@ -115,7 +120,7 @@ class PostCheckContext:
     caller: dict | None
     params: dict | None
     error: str | None
-    outputs: Mapping[str, Any]
+    outputs: Mapping[str, Path]
     parent_execution_id: str | None
     synthetic: bool
     workspace_path: Path

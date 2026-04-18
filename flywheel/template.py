@@ -6,9 +6,7 @@ are parsed from YAML files and validated at load time.
 
 Block declarations live in ``workforce/blocks/<name>.yaml`` files
 and are loaded into a :class:`BlockRegistry`.  The template's
-``blocks:`` list contains string references to those blocks.  The
-inline-block-definition syntax was removed in Phase 5 of the
-block-execution refactor.
+``blocks:`` list contains string references to those blocks.
 """
 
 from __future__ import annotations
@@ -63,27 +61,15 @@ class InputSlot:
             either way.
         optional: If ``True``, missing instances skip the slot
             silently rather than raising.
-        derive_from: When set, declares this input as a *rollup*
-            of another artifact.  At begin time the channel always
-            rebuilds a fresh instance of ``name`` from all
-            instances of ``derive_from`` before binding, using
-            ``derive_kind`` to choose the rollup function.  This
-            is the freshness mechanism for things like
-            ``game_history`` rolled up from ``game_step``.  When
-            ``derive_from`` is set, ``optional`` is ignored — the
-            rollup is always materializable as long as at least
-            one source instance exists.
-        derive_kind: Which rollup function to apply.  Currently
-            only ``"jsonl_concat"`` is supported (delegates to
-            :meth:`Workspace.materialize_sequence`).  Required
-            when ``derive_from`` is set.
+
+    Live step-by-step history is expressed as a first-class
+    :attr:`incremental` artifact whose contents are per-mount
+    staged on every relaunch.
     """
 
     name: str
     container_path: str
     optional: bool = False
-    derive_from: str | None = None
-    derive_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,8 +105,7 @@ class BlockDefinition:
     Attributes:
         name: Block identifier, unique per template.
         image: Docker image.  Required for ``runner == "container"``;
-            forbidden for every other runner (Phase 5 retired the
-            ``__record__`` sentinel and the empty-image fallback).
+            forbidden for every other runner.
         inputs: Declared input artifact slots.
         outputs: Declared output artifact slots.
         docker_args: Extra docker run args for container blocks.
@@ -243,8 +228,7 @@ class Template:
                     f"unsupported type {type(entry).__name__!r}; "
                     f"templates must reference blocks by name "
                     f"(string).  Define each block in its own "
-                    f"workforce/blocks/<name>.yaml file.  Inline "
-                    f"block definitions were removed in Phase 5."
+                    f"workforce/blocks/<name>.yaml file."
                 )
             if block_registry is None:
                 raise ValueError(
@@ -333,9 +317,6 @@ def _parse_artifacts(
     return artifacts, artifact_names, artifact_kinds
 
 
-_SUPPORTED_DERIVE_KINDS = {"jsonl_concat"}
-
-
 def _parse_input_slots(raw: list) -> list[InputSlot]:
     """Parse a list of raw input entries into InputSlot objects."""
     slots: list[InputSlot] = []
@@ -348,24 +329,12 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
             continue
 
         ref = inp["name"]
-        derive_from = inp.get("derive_from")
-        derive_kind = inp.get("derive_kind")
-        if derive_from is not None and derive_kind is None:
+        if "derive_from" in inp or "derive_kind" in inp:
             raise ValueError(
-                f"Input slot {ref!r}: 'derive_from' requires "
-                f"'derive_kind' to also be set"
-            )
-        if derive_kind is not None and derive_from is None:
-            raise ValueError(
-                f"Input slot {ref!r}: 'derive_kind' requires "
-                f"'derive_from' to also be set"
-            )
-        if (derive_kind is not None
-                and derive_kind not in _SUPPORTED_DERIVE_KINDS):
-            raise ValueError(
-                f"Input slot {ref!r}: unsupported derive_kind "
-                f"{derive_kind!r}; supported: "
-                f"{sorted(_SUPPORTED_DERIVE_KINDS)}"
+                f"Input slot {ref!r}: 'derive_from' / "
+                f"'derive_kind' are not supported.  Declare "
+                f"the source artifact as 'kind: incremental' "
+                f"instead and reference it directly here."
             )
 
         slots.append(InputSlot(
@@ -373,8 +342,6 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
             container_path=inp.get(
                 "container_path", f"/input/{ref}"),
             optional=inp.get("optional", False),
-            derive_from=derive_from,
-            derive_kind=derive_kind,
         ))
     return slots
 

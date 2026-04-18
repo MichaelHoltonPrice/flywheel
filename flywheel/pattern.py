@@ -4,8 +4,7 @@ A *pattern* describes the network topology and timing of an agent
 run: which roles exist, how many of each fire on a given trigger,
 and what artifacts they consume / produce.  Patterns are authored
 in YAML alongside templates and block definitions, and consumed
-by :mod:`flywheel.pattern_runner` (added in P2 of the patterns
-campaign).
+by :mod:`flywheel.pattern_runner`.
 
 This module covers parsing and validation only — there is no
 runner here.  Validation happens at load time so a malformed
@@ -36,7 +35,7 @@ Conceptual shape::
         outputs: [brainstorm_result]
 
 Triggers are a small declarative vocabulary intentionally kept
-narrow at the start of the campaign:
+narrow:
 
 - ``continuous`` — fire once at run start; the role's lifetime is
   the lifetime of the run.  Used for the persistent play agent.
@@ -184,17 +183,12 @@ class Role:
             every role; this is for cases like
             ``PREDICTOR_PATH`` that only the escalator and play
             roles in a predict pattern care about.
-        materialize: Sequences to assemble before each firing,
-            mapping target artifact name to source block name
-            (e.g., ``{"game_history": "take_action"}`` rolls all
-            ``take_action`` rows into a single ``game_history``
-            JSONL artifact via
-            :meth:`flywheel.workspace.Workspace.materialize_sequence`).
-            The materialized artifact is then automatically
-            available to :attr:`inputs` resolution because the
-            runner re-reads ``instances_for`` after materializing.
-            Empty by default; only roles that read assembled
-            history (brainstormers, escalators) need it.
+
+    Roles that need step-by-step history list the canonical
+    incremental artifact (e.g., ``game_history``) in their
+    :attr:`inputs`; the in-process recorder appends to it in
+    real time and per-mount input staging re-reads the latest
+    snapshot at every relaunch.
     """
 
     name: str
@@ -209,7 +203,6 @@ class Role:
     max_turns: int | None = None
     total_timeout: int | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
-    materialize: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -434,28 +427,15 @@ def _parse_role(
             )
         extra_env[env_name] = env_value
 
-    materialize_raw = spec.get("materialize", {})
-    if not isinstance(materialize_raw, dict):
+    if "materialize" in spec:
         raise ValueError(
             f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'materialize' must be a mapping of target-artifact "
-            f"to source-block, got "
-            f"{type(materialize_raw).__name__}"
+            f"'materialize' is not supported.  Add the canonical "
+            f"incremental artifact name (e.g., 'game_history') "
+            f"to 'inputs' instead — the in-process recorder "
+            f"appends to it live and the per-mount input stager "
+            f"re-reads the latest snapshot every relaunch."
         )
-    materialize: dict[str, str] = {}
-    for target, source in materialize_raw.items():
-        if not isinstance(target, str) or not target:
-            raise ValueError(
-                f"Pattern {pattern_name!r} role {role_name!r}: "
-                f"'materialize' keys must be non-empty strings"
-            )
-        if not isinstance(source, str) or not source:
-            raise ValueError(
-                f"Pattern {pattern_name!r} role {role_name!r}: "
-                f"'materialize.{target}' must be a non-empty "
-                f"source block-name string"
-            )
-        materialize[target] = source
 
     return Role(
         name=role_name,
@@ -470,7 +450,6 @@ def _parse_role(
         max_turns=max_turns,
         total_timeout=total_timeout,
         extra_env=extra_env,
-        materialize=materialize,
     )
 
 

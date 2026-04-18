@@ -13,8 +13,7 @@ debugging template) without copy-pasting its full definition.
 
 Per-block YAML schema mirrors what
 :func:`flywheel.template.parse_block_definition` accepts when given
-a single block-entry mapping.  See
-``plans/flywheel-block-execution-refactor.md`` for the full schema.
+a single block-entry mapping.
 
 Example:
 

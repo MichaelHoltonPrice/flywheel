@@ -113,8 +113,8 @@ SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # assistant turn.  Plural because a single turn can contain
 # multiple parallel tool_use blocks; we capture every one and let
 # the host-side driver run, splice, and resume them all in a
-# single stop/restart cycle.  See plans/full-stop-state-contract.md
-# for the canonical schema (schema_version 2).
+# single stop/restart cycle.  Schema is versioned via
+# ``PENDING_TOOL_CALLS_SCHEMA_VERSION`` below.
 PENDING_TOOL_CALLS_FILE = WORKSPACE / "pending_tool_calls.json"
 PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
@@ -247,7 +247,6 @@ def _persist_handoff(session_id: str) -> None:
     and the SDK has flushed the deny tool_results to the session
     JSONL.  The pending file is the canonical handoff payload; the
     state file mirrors the count + first tool name for quick visibility.
-    Schema is documented in plans/full-stop-state-contract.md.
     """
     pending = list(_HANDOFF_STATE["pending"])
     if not pending:

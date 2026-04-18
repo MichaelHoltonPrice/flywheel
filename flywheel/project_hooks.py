@@ -1,21 +1,15 @@
 """Minimal project-hooks protocol consumed by ``flywheel run pattern``.
 
 Patterns own decision logic (which roles fire, when), so the
-project-side surface shrinks to the things only the project can
-know: starting / stopping external resources (the ARC game
+project-side surface covers only what the pattern cannot know on
+its own: starting / stopping external resources (the ARC game
 server in cyberarc, a SQL fixture in a hypothetical query-eval
 project), parsing project-specific CLI arguments, and supplying
 the launcher overrides those arguments produce (extra env vars,
 extra mounts, a pre-launch hook, etc.).
 
-The legacy ``AgentLoopHooks`` protocol (``decide``,
-``build_prompt``, ``on_execution``) was retired in P7 of the
-patterns campaign.  Decision logic now lives in the pattern's
-trigger vocabulary, prompts live in role prompt files, and
-mid-execution callbacks live in block-level ``post_check``
-functions.  Implementors are free to add helper methods on the
-same class, but only the two declared below are called by the
-runner.
+Implementors are free to add helper methods on the same class,
+but only the two declared below are called by the runner.
 """
 
 from __future__ import annotations

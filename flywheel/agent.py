@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -41,6 +40,10 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.artifact import BlockExecution, LifecycleEvent
+from flywheel.input_staging import (
+    cleanup_staged_inputs,
+    stage_artifact_instances,
+)
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -212,6 +215,7 @@ class AgentHandle:
         predecessor_id: str | None = None,
         block_name: str = "__agent__",
         agent_workspace_dir: str | None = None,
+        staged_inputs: dict[str, Path] | None = None,
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
@@ -227,6 +231,7 @@ class AgentHandle:
         self._predecessor_id = predecessor_id
         self._block_name = block_name
         self._agent_workspace_dir = agent_workspace_dir
+        self._staged_inputs = staged_inputs or {}
         self._stop_reason: str | None = None
         self._waited = False
 
@@ -287,6 +292,13 @@ class AgentHandle:
             self._process.wait()
         finally:
             self._stderr_thread.join(timeout=5)
+            # Per-mount staging tempdirs are scoped to the
+            # container's lifetime: the container has now exited
+            # so any further read against the mount is the host's
+            # bug, not ours.  Cleanup is best-effort; a leaked
+            # tempdir is preferable to crashing on the way out.
+            cleanup_staged_inputs(self._staged_inputs)
+            self._staged_inputs = {}
 
         elapsed = time.monotonic() - self._start_time
         finished_at = datetime.now(UTC)
@@ -483,7 +495,6 @@ class AgentMount:
 
 def prepare_agent_workspace(
     workspace: Workspace,
-    output_names: list[str] | None = None,
     agent_workspace_dir: str | None = None,
     *,
     reuse_workspace: bool = False,
@@ -495,11 +506,17 @@ def prepare_agent_workspace(
     launches can never collide.  When the caller passes an
     explicit name and the target directory already exists with
     content, this function raises ``FileExistsError`` instead of
-    silently rmtree-ing — the legacy footgun the patterns
-    campaign set out to fix.  Empty / non-existent explicit
+    silently rmtree-ing — refusing to clobber existing content
+    is the only way to keep parallel launches from racing each
+    other into a hand-set workspace dir.  Empty / non-existent explicit
     targets are still accepted (so tests that pre-create an
     empty dir keep working) and existing-but-empty dirs are
     reused in place.
+
+    The agent workspace is **scratch only** — the agent obtains
+    all artifact data through its mounted ``/input/<slot>``
+    directories (staged copies of canonical artifacts; see
+    :func:`flywheel.input_staging.stage_artifact_instances`).
 
     The returned :class:`AgentMount` records the relative dir
     name so :class:`AgentHandle` can stamp it onto the
@@ -507,8 +524,6 @@ def prepare_agent_workspace(
 
     Args:
         workspace: The flywheel workspace.
-        output_names: Artifact names whose latest instances should
-            be seeded into the workspace before the agent starts.
         agent_workspace_dir: Optional explicit subdirectory name.
             Pass ``None`` (the default) to get a unique
             auto-named mount; pass a string when the caller has
@@ -516,10 +531,9 @@ def prepare_agent_workspace(
             responsibility for collision avoidance.
         reuse_workspace: When ``True``, treat an existing
             non-empty ``agent_workspace_dir`` as intentional reuse
-            (no ``FileExistsError``), and skip artifact seeding.
-            Used by the host-side handoff loop
-            (``flywheel.agent_handoff``) to relaunch into a
-            workspace that already contains the spliced
+            (no ``FileExistsError``).  Used by the host-side
+            handoff loop (``flywheel.agent_handoff``) to relaunch
+            into a workspace that already contains the spliced
             ``agent_session.jsonl`` from a prior cycle.  Requires
             an explicit ``agent_workspace_dir``; passing both
             ``agent_workspace_dir=None`` and
@@ -568,29 +582,6 @@ def prepare_agent_workspace(
             )
 
     agent_ws.mkdir(parents=True, exist_ok=True)
-
-    # Skip artifact seeding on reuse: the workspace already
-    # carries the prior cycle's state (spliced session JSONL,
-    # any intermediate files), and re-seeding could clobber it.
-    if reuse_workspace:
-        return AgentMount(
-            relative_dir=ws_dir_name,
-            host_path=agent_ws,
-        )
-
-    if output_names:
-        for name in output_names:
-            instances = workspace.instances_for(name)
-            if instances:
-                latest = instances[-1]
-                if latest.kind == "copy" and latest.copy_path:
-                    src_dir = (
-                        workspace.path / "artifacts" / latest.copy_path
-                    )
-                    if src_dir.exists():
-                        for f in src_dir.iterdir():
-                            if f.is_file():
-                                shutil.copy2(f, agent_ws / f.name)
 
     return AgentMount(
         relative_dir=ws_dir_name,
@@ -681,7 +672,7 @@ def launch_agent_block(
     """
     del overrides, post_checks  # accepted for API compatibility
     mount = prepare_agent_workspace(
-        workspace, output_names, agent_workspace_dir,
+        workspace, agent_workspace_dir,
         reuse_workspace=reuse_workspace,
     )
     agent_ws = mount.host_path
@@ -709,22 +700,84 @@ def launch_agent_block(
                 "-v", f"{_resolve_path(src_path)}:{mount_point}:ro",
             ])
 
+    # Per-mount input staging: the canonical artifact directory
+    # is never bind-mounted directly.  Each input slot gets a
+    # fresh ephemeral copy (see :mod:`flywheel.input_staging`).
+    # AgentHandle cleans up the tempdirs after the container
+    # exits.
+    staged_inputs: dict[str, Path] = {}
     if input_artifacts:
-        for mount_name, artifact_id in input_artifacts.items():
-            if artifact_id not in workspace.artifacts:
-                continue
-            inst = workspace.artifacts[artifact_id]
-            if inst.kind == "copy" and inst.copy_path:
-                host_path = (
-                    workspace.path / "artifacts" / inst.copy_path
-                )
-                if host_path.exists():
-                    cmd.extend([
-                        "-v",
-                        f"{_resolve_path(host_path)}"
-                        f":/input/{mount_name}:ro",
-                    ])
+        staged_inputs = stage_artifact_instances(
+            workspace, dict(input_artifacts))
+    # Any failure between here and AgentHandle construction must
+    # release the staging tempdirs; AgentHandle.wait() handles
+    # them once the handle is built.
+    try:
+        for mount_name, host_path in staged_inputs.items():
+            cmd.extend([
+                "-v",
+                f"{_resolve_path(host_path)}"
+                f":/input/{mount_name}:ro",
+            ])
 
+        return _continue_launch(
+            workspace=workspace,
+            agent_ws=agent_ws,
+            agent_workspace_dir=agent_workspace_dir,
+            agent_image=agent_image,
+            output_names=output_names,
+            executions_before=executions_before,
+            container_name=container_name,
+            cmd=cmd,
+            staged_inputs=staged_inputs,
+            extra_mounts=extra_mounts,
+            allowed_blocks=allowed_blocks,
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
+            model=model,
+            max_turns=max_turns,
+            isolated_network=isolated_network,
+            extra_env=extra_env,
+            pre_launch_hook=pre_launch_hook,
+            total_timeout=total_timeout,
+            predecessor_id=predecessor_id,
+            prompt=prompt,
+        )
+    except BaseException:
+        cleanup_staged_inputs(staged_inputs)
+        raise
+
+
+def _continue_launch(
+    *,
+    workspace: Workspace,
+    agent_ws: Path,
+    agent_workspace_dir: str,
+    agent_image: str,
+    output_names: list[str] | None,
+    executions_before: int,
+    container_name: str,
+    cmd: list[str],
+    staged_inputs: dict[str, Path],
+    extra_mounts: list[tuple[str, str, str]] | None,
+    allowed_blocks: list[str] | None,
+    mcp_servers: str | None,
+    allowed_tools: str | None,
+    model: str | None,
+    max_turns: int | None,
+    isolated_network: bool,
+    extra_env: dict[str, str] | None,
+    pre_launch_hook: Callable[[Path], None] | None,
+    total_timeout: int,
+    predecessor_id: str | None,
+    prompt: str,
+) -> AgentHandle:
+    """Tail half of :func:`launch_agent_block`.
+
+    Split out so the staging-cleanup ``try/except`` in the
+    parent wraps a single call rather than the entire body.
+    Behaviour is unchanged from the inline version this replaced.
+    """
     if extra_mounts:
         for host_path, container_path, mode in extra_mounts:
             cmd.extend([
@@ -818,6 +871,7 @@ def launch_agent_block(
         container_name=container_name,
         predecessor_id=predecessor_id,
         agent_workspace_dir=agent_workspace_dir,
+        staged_inputs=dict(staged_inputs),
     )
 
 

@@ -18,7 +18,7 @@ Files using these helpers:
 - ``tests/test_agent_handoff.py`` exercises the happy paths,
   contract violations, and result-accessor surface.
 - ``tests/test_handoff_resume.py`` exercises crash-resume
-  semantics across the boundary's failure modes (B8).
+  semantics across the boundary's failure modes.
 
 The leading underscore on the module name keeps pytest from
 collecting it as a test file even though it lives under

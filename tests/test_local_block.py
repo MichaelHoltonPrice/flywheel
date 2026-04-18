@@ -8,14 +8,17 @@ the contract every cyberarc runner relies on:
   latest instances; missing required inputs raise a typed error
   *before* any row is written; missing optional inputs are
   silently skipped.
-- ``set_output`` buffers payloads; on clean exit the recorder
-  registers each as a ``copy`` artifact and writes a single
-  ``"succeeded"`` row.  No intermediate ``"running"`` row exists.
+- The body writes files into ``ctx.output_dir(name)``; on clean
+  exit the recorder registers a ``copy`` artifact from each
+  per-output directory that has contents (and appends to the
+  workspace's canonical ``incremental`` instance for incremental
+  outputs), then writes a single ``"succeeded"`` row.  No
+  intermediate ``"running"`` row exists.
 - Body exceptions propagate after the recorder writes a single
   ``"failed"`` row with the expected ``error`` string and zero
   output bindings.
-- Output write failures roll back partial artifacts and surface
-  as a failed row carrying the underlying error message.
+- Output write failures roll back partial copy artifacts and
+  surface as a failed row carrying the underlying error message.
 - Post-execution checks run after the row is durable; halt
   directives queue on the recorder and drain through
   ``drain_halts``.
@@ -29,8 +32,10 @@ Tests use a real :class:`flywheel.workspace.Workspace` against
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -51,7 +56,7 @@ artifacts:
   - name: predictor
     kind: copy
   - name: game_history
-    kind: copy
+    kind: incremental
   - name: prediction
     kind: copy
   - name: game_step
@@ -63,6 +68,7 @@ blocks:
   - predict
   - noop
   - emits_two
+  - emits_incremental
 """
 
 PREDICT_BLOCK_YAML = """\
@@ -100,6 +106,16 @@ outputs:
     container_path: /output/game_step
 """
 
+EMITS_INCREMENTAL_BLOCK_YAML = """\
+name: emits_incremental
+runner: lifecycle
+runner_justification: "Test-only block that appends to an incremental output."
+inputs: []
+outputs:
+  - name: game_history
+    container_path: /output/game_history
+"""
+
 
 def _make_workspace(tmp_path: Path) -> tuple[Template, Workspace]:
     """Build a template and empty workspace under ``tmp_path``."""
@@ -110,6 +126,8 @@ def _make_workspace(tmp_path: Path) -> tuple[Template, Workspace]:
             yaml.safe_load(NOOP_BLOCK_YAML)),
         "emits_two": parse_block_definition(
             yaml.safe_load(EMITS_TWO_BLOCK_YAML)),
+        "emits_incremental": parse_block_definition(
+            yaml.safe_load(EMITS_INCREMENTAL_BLOCK_YAML)),
     })
     tmpl_path = tmp_path / "test.yaml"
     tmpl_path.write_text(TEMPLATE_YAML)
@@ -153,10 +171,37 @@ def _seed_artifact(
     return aid
 
 
+def _emit_copy_output(
+    ctx: LocalExecutionContext, name: str, data: dict[str, Any],
+) -> None:
+    """Write a JSON file into the per-output dir for *name*.
+
+    Helper that mirrors what cyberarc runners do: the body's
+    contribution to a copy output is one file per execution.
+    """
+    out_dir = ctx.output_dir(name)
+    (out_dir / f"{name}.json").write_text(
+        json.dumps(data), encoding="utf-8")
+
+
+def _emit_incremental_entries(
+    ctx: LocalExecutionContext,
+    name: str,
+    entries: list[Any],
+) -> None:
+    """Append entries to the per-output ``entries.jsonl`` file."""
+    out_dir = ctx.output_dir(name)
+    entries_file = out_dir / "entries.jsonl"
+    with entries_file.open("a", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
 @pytest.fixture()
-def recorder_factory(tmp_path: Path):
+def recorder_factory(tmp_path: Path, monkeypatch):
     """Yield ``(make_recorder, workspace)`` for tests."""
     template, ws = _make_workspace(tmp_path)
+    monkeypatch.setenv("FLYWHEEL_RETAIN_FAILED_OUTPUT_DIRS", "0")
 
     def _make(post_checks=None) -> LocalBlockRecorder:
         return LocalBlockRecorder(
@@ -219,7 +264,41 @@ class TestBeginInputResolution:
             path = Path(ctx.input_paths["predictor"])
             assert path.is_absolute()
             assert path.exists()
-            assert path == ws.path / "artifacts" / aid
+            # Paths point at per-mount staging tempdirs, not
+            # the canonical artifact directory.
+            assert path != ws.path / "artifacts" / aid
+
+    def test_input_paths_are_staging_copies_not_canonical(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        aid = _seed_artifact(ws, "predictor", {"v": 1})
+        canonical = ws.path / "artifacts" / aid
+        rec = make()
+        observed: dict[str, Path] = {}
+        with rec.begin(block="predict") as ctx:
+            staged = Path(ctx.input_paths["predictor"])
+            observed["staged"] = staged
+            # A modification of the staging copy must not
+            # mutate canonical state.
+            (staged / "tampered.txt").write_text("scratch")
+            assert not (canonical / "tampered.txt").exists()
+            # Each input file is present in the staging copy.
+            assert (staged / "predictor.json").is_file()
+        # Tempdir is cleaned up after the block exits.
+        assert not observed["staged"].exists()
+        assert canonical.exists()
+        assert not (canonical / "tampered.txt").exists()
+
+    def test_input_staging_runs_per_begin(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        _seed_artifact(ws, "predictor", {"v": 1})
+        rec = make()
+        with rec.begin(block="predict") as ctx:
+            first = Path(ctx.input_paths["predictor"])
+        with rec.begin(block="predict") as ctx:
+            second = Path(ctx.input_paths["predictor"])
+        assert first != second
 
 
 class TestSucceededRow:
@@ -236,7 +315,7 @@ class TestSucceededRow:
             caller={"mcp_server": "arc",
                     "tool": "predict_action"},
         ) as ctx:
-            ctx.set_output("prediction", {
+            _emit_copy_output(ctx, "prediction", {
                 "predicted_state": [[0, 1]],
                 "rationale": "deterministic",
             })
@@ -259,7 +338,7 @@ class TestSucceededRow:
         _seed_artifact(ws, "predictor", {"v": 1})
         rec = make()
         with rec.begin(block="predict") as ctx:
-            ctx.set_output("prediction", {
+            _emit_copy_output(ctx, "prediction", {
                 "predicted_state": [[0, 1], [2, 3]]})
 
         row = next(iter(ws.executions.values()))
@@ -276,7 +355,7 @@ class TestSucceededRow:
         rec = make()
         captured: dict[str, str] = {}
         with rec.begin(block="predict") as ctx:
-            ctx.set_output("prediction", {"v": 1})
+            _emit_copy_output(ctx, "prediction", {"v": 1})
         captured.update(ctx.output_bindings)
         row = next(iter(ws.executions.values()))
         assert captured == row.output_bindings
@@ -286,22 +365,19 @@ class TestSucceededRow:
         make, ws = recorder_factory
         rec = make()
         with rec.begin(block="emits_two") as ctx:
-            ctx.set_output("prediction", {"only": "this one"})
+            _emit_copy_output(ctx, "prediction", {"only": "this one"})
 
         row = next(iter(ws.executions.values()))
         assert row.status == "succeeded"
         assert "prediction" in row.output_bindings
         assert "game_step" not in row.output_bindings
 
-    def test_set_output_twice_raises(self, recorder_factory):
+    def test_output_dir_for_unknown_slot_raises(
+            self, recorder_factory):
         make, _ = recorder_factory
         rec = make()
-        with (
-            pytest.raises(ValueError, match="already set"),
-            rec.begin(block="emits_two") as ctx,
-        ):
-            ctx.set_output("prediction", {"v": 1})
-            ctx.set_output("prediction", {"v": 2})
+        with rec.begin(block="emits_two") as ctx, pytest.raises(KeyError):
+            ctx.output_dir("not_a_slot")
 
     def test_parent_execution_id_recorded(self, recorder_factory):
         make, ws = recorder_factory
@@ -311,6 +387,96 @@ class TestSucceededRow:
             pass
         row = next(iter(ws.executions.values()))
         assert row.parent_execution_id == "exec_parent01"
+
+    def test_copy_output_directory_with_multiple_files(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        _seed_artifact(ws, "predictor", {"v": 1})
+        rec = make()
+        with rec.begin(block="predict") as ctx:
+            out = ctx.output_dir("prediction")
+            (out / "first.json").write_text('{"a": 1}')
+            (out / "second.txt").write_text("hello")
+
+        row = next(iter(ws.executions.values()))
+        aid = row.output_bindings["prediction"]
+        out_dir = ws.path / "artifacts" / aid
+        assert (out_dir / "first.json").exists()
+        assert (out_dir / "second.txt").read_text() == "hello"
+
+
+class TestIncrementalOutputs:
+    """Incremental outputs append to a workspace-canonical instance."""
+
+    def test_first_append_creates_canonical_instance(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        rec = make()
+        with rec.begin(block="emits_incremental") as ctx:
+            _emit_incremental_entries(
+                ctx, "game_history",
+                [{"step": 0, "action": "noop"}],
+            )
+
+        latest = ws.latest_incremental_instance("game_history")
+        assert latest is not None
+        row = next(iter(ws.executions.values()))
+        assert row.output_bindings["game_history"] == latest.id
+        assert ws.read_incremental_entries(latest.id) == [
+            {"step": 0, "action": "noop"},
+        ]
+
+    def test_subsequent_appends_reuse_canonical_instance(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        rec = make()
+
+        with rec.begin(block="emits_incremental") as ctx:
+            _emit_incremental_entries(
+                ctx, "game_history", [{"step": 0}])
+        with rec.begin(block="emits_incremental") as ctx:
+            _emit_incremental_entries(
+                ctx, "game_history", [{"step": 1}, {"step": 2}])
+
+        latest = ws.latest_incremental_instance("game_history")
+        rows = sorted(
+            ws.executions.values(), key=lambda r: r.started_at)
+        assert all(
+            r.output_bindings["game_history"] == latest.id
+            for r in rows
+        )
+        assert ws.read_incremental_entries(latest.id) == [
+            {"step": 0}, {"step": 1}, {"step": 2},
+        ]
+        # Only one canonical instance should ever exist for v1.
+        assert len([
+            a for a in ws.artifacts.values()
+            if a.name == "game_history" and a.kind == "incremental"
+        ]) == 1
+
+    def test_empty_entries_file_skips_binding(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        rec = make()
+        with rec.begin(block="emits_incremental") as ctx:
+            (ctx.output_dir("game_history")
+             / "entries.jsonl").write_text("")
+
+        row = next(iter(ws.executions.values()))
+        assert row.status == "succeeded"
+        assert "game_history" not in row.output_bindings
+        assert ws.latest_incremental_instance(
+            "game_history") is None
+
+    def test_no_entries_file_skips_binding(
+            self, recorder_factory):
+        make, ws = recorder_factory
+        rec = make()
+        with rec.begin(block="emits_incremental"):
+            pass
+
+        row = next(iter(ws.executions.values()))
+        assert "game_history" not in row.output_bindings
 
 
 class TestFailedRow:
@@ -339,7 +505,7 @@ class TestFailedRow:
         rec = make()
         artifacts_before = dict(ws.artifacts)
         with pytest.raises(RuntimeError), rec.begin(block="emits_two") as ctx:
-            ctx.set_output("prediction", {"v": 1})
+            _emit_copy_output(ctx, "prediction", {"v": 1})
             raise RuntimeError("boom")
         assert ws.artifacts == artifacts_before
 
@@ -352,9 +518,16 @@ class TestPostCheck:
         make, ws = recorder_factory
         _seed_artifact(ws, "predictor", {"v": 1})
         seen: list[PostCheckContext] = []
+        # Captured during the check, before output-dir cleanup
+        # runs in the recorder's finally block.
+        observed_payload: dict = {}
 
         def check(ctx: PostCheckContext) -> None:
             seen.append(ctx)
+            out_path = ctx.outputs["prediction"]
+            payload_file = out_path / "prediction.json"
+            observed_payload["exists"] = payload_file.exists()
+            observed_payload["text"] = payload_file.read_text()
             return None
 
         rec = make(post_checks={"predict": check})
@@ -363,7 +536,7 @@ class TestPostCheck:
             caller={"mcp_server": "arc",
                     "tool": "predict_action"},
         ) as ctx:
-            ctx.set_output("prediction", {"v": 1})
+            _emit_copy_output(ctx, "prediction", {"v": 1})
 
         assert len(seen) == 1
         seen_ctx = seen[0]
@@ -371,7 +544,10 @@ class TestPostCheck:
         assert seen_ctx.status == "succeeded"
         assert seen_ctx.caller == {
             "mcp_server": "arc", "tool": "predict_action"}
-        assert seen_ctx.outputs == {"prediction": {"v": 1}}
+        assert "prediction" in seen_ctx.outputs
+        assert isinstance(seen_ctx.outputs["prediction"], Path)
+        assert observed_payload["exists"] is True
+        assert json.loads(observed_payload["text"]) == {"v": 1}
 
     def test_halt_directive_queues_and_persists(
             self, recorder_factory):
@@ -462,6 +638,55 @@ class TestScratchAndCleanup:
             raise RuntimeError("boom")
         assert not scratch_path[0].exists()
 
+    def test_output_root_created_during_body(
+            self, recorder_factory):
+        make, _ = recorder_factory
+        rec = make()
+        seen: list[Path] = []
+        with rec.begin(block="emits_two") as ctx:
+            assert ctx.output_root is not None
+            seen.append(ctx.output_root)
+            assert ctx.output_root.is_dir()
+            for slot in ("prediction", "game_step"):
+                assert ctx.output_dir(slot).is_dir()
+        assert not seen[0].exists()
+
+    def test_output_root_removed_on_success(
+            self, recorder_factory):
+        make, _ = recorder_factory
+        rec = make()
+        seen: list[Path] = []
+        with rec.begin(block="emits_two") as ctx:
+            seen.append(ctx.output_root)
+            _emit_copy_output(ctx, "prediction", {"v": 1})
+        assert not seen[0].exists()
+
+    def test_output_root_removed_on_failure_when_disabled(
+            self, recorder_factory):
+        make, _ = recorder_factory
+        rec = make()
+        seen: list[Path] = []
+        with pytest.raises(RuntimeError), rec.begin(block="emits_two") as ctx:
+            seen.append(ctx.output_root)
+            raise RuntimeError("boom")
+        assert not seen[0].exists()
+
+    def test_output_root_retained_on_failure_by_default(
+            self, tmp_path: Path, monkeypatch):
+        template, ws = _make_workspace(tmp_path)
+        monkeypatch.delenv(
+            "FLYWHEEL_RETAIN_FAILED_OUTPUT_DIRS", raising=False)
+        rec = LocalBlockRecorder(
+            workspace=ws, template=template)
+        seen: list[Path] = []
+        with pytest.raises(RuntimeError), rec.begin(block="emits_two") as ctx:
+            seen.append(ctx.output_root)
+            raise RuntimeError("boom")
+        assert seen[0].exists(), (
+            "default behaviour retains output dir on failure")
+        # Cleanup so tmp_path teardown doesn't trip on stale state.
+        shutil.rmtree(seen[0], ignore_errors=True)
+
 
 class TestNoIntermediateRunningRow:
     """Critical contract: no row exists with status=='running'."""
@@ -487,19 +712,36 @@ class TestNoIntermediateRunningRow:
 class TestLocalExecutionContext:
     """Independent unit coverage of the dataclass surface."""
 
-    def test_set_output_buffers_data(self):
+    def test_output_dir_returns_expected_path(self, tmp_path: Path):
+        out_dir = tmp_path / "outputs" / "a"
+        out_dir.mkdir(parents=True)
         ctx = LocalExecutionContext(
             execution_id="exec_test01",
             block_name="noop",
             input_bindings={},
             input_paths={},
-            scratch_dir="/tmp/x",
+            scratch_dir=str(tmp_path / "scratch"),
             params={},
             parent_execution_id=None,
+            output_root=tmp_path / "outputs",
+            _output_dirs={"a": out_dir},
         )
-        ctx.set_output("a", {"v": 1})
-        ctx.set_output("b", [1, 2, 3])
-        assert ctx.outputs == {"a": {"v": 1}, "b": [1, 2, 3]}
+        assert ctx.output_dir("a") == out_dir
+
+    def test_output_dir_unknown_raises(self, tmp_path: Path):
+        ctx = LocalExecutionContext(
+            execution_id="exec_test01",
+            block_name="noop",
+            input_bindings={},
+            input_paths={},
+            scratch_dir=str(tmp_path),
+            params={},
+            parent_execution_id=None,
+            output_root=tmp_path,
+            _output_dirs={},
+        )
+        with pytest.raises(KeyError):
+            ctx.output_dir("missing")
 
 
 class TestRowIsolation:

@@ -1,8 +1,8 @@
 """Pattern runner — drives a :class:`flywheel.pattern.Pattern` end-to-end.
 
-The runner is the second half of the patterns campaign.  Where
-:mod:`flywheel.pattern` defines what a pattern *is*, this module
-defines how one is *executed*: continuous roles fire at run start
+Where :mod:`flywheel.pattern` defines what a pattern *is*, this
+module defines how one is *executed*: continuous roles fire at
+run start
 and persist for the run's lifetime; ledger-driven triggers
 (``every_n_executions``) fire as the workspace accumulates
 matching block executions; reactive triggers (``on_request``,
@@ -14,9 +14,7 @@ The runner is intentionally narrow.  It does not own session
 resume, prompt construction, or circuit-breaking; patterns make
 decisions declaratively, so the runner only needs to translate
 that declaration into ``launch_agent_block`` / ``BlockGroup``
-calls.  (Pre-P7, those concerns lived on the now-retired
-``AgentLoop`` because that loop also did the hooks-driven
-*decide* step.)
+calls.
 
 Termination
 -----------
@@ -261,8 +259,6 @@ class PatternRunner:
         state = self._state[role.name]
         cohort_index = state.cohorts_fired
 
-        self._materialize_for(role)
-
         for member_index in range(role.cardinality):
             kwargs = self._kwargs_for(
                 role, cohort_index=cohort_index,
@@ -289,8 +285,7 @@ class PatternRunner:
 
         Layers role overrides on top of ``base_config`` and reads
         the role's prompt file from ``project_root``.  Per-member
-        differentiation lives in the ``agent_workspace_dir`` name
-        for now; P6 of the campaign replaces this with auto-named
+        differentiation comes from the launcher's auto-named
         ``agent_workspaces/<execution_id>/`` mounts.
         """
         prompt_path = self._base.project_root / role.prompt
@@ -354,29 +349,6 @@ class PatternRunner:
             base.update(role.extra_env)
         return base or None
 
-    def _materialize_for(self, role: Role) -> None:
-        """Roll declared sequences into a single artifact pre-firing.
-
-        Empty for roles that do not declare ``materialize``.  When
-        the source block has no rows yet (e.g., the first cohort
-        fires before any ``take_action`` rows exist), the call is
-        skipped: ``materialize_sequence`` would otherwise create
-        an empty artifact and confuse downstream readers expecting
-        at least one record.
-        """
-        if not role.materialize:
-            return
-        ws = self._base.workspace
-        for target, source in role.materialize.items():
-            if not ws.instances_for(source):
-                print(
-                    f"  [pattern-runner] role {role.name!r}: "
-                    f"skipping materialize {target!r}<-{source!r}"
-                    f" (no source instances yet)"
-                )
-                continue
-            ws.materialize_sequence(source, target)
-
     def _collect_inputs(self, role: Role) -> dict[str, str] | None:
         """Resolve role.inputs to the latest registered instance IDs.
 
@@ -407,11 +379,11 @@ class PatternRunner:
     ) -> str | None:
         """Always defer to the launcher's auto-naming.
 
-        P6 made auto-naming the default: every launch lands in
+        Auto-naming is the default: every launch lands in
         ``agent_workspaces/<short-uuid>/`` so two parallel
         agents in the same workspace can never clobber each
-        other.  Roles can no longer share a workspace dir by
-        accident — which used to happen when a project hand-set
+        other.  Roles cannot share a workspace dir by accident —
+        which used to happen when a project hand-set
         ``agent_workspace_dir`` to a fixed name and reused it
         for sibling agents.
 

@@ -1,13 +1,12 @@
 """Tests for the per-block YAML registry and template integration.
 
-Covers Phase 2 of the block-execution refactor:
+Covers:
 
 - ``BlockRegistry.from_directory`` loads ``workforce/blocks/*.yaml``.
 - Block YAML schema validation (runner, image, implementation,
   runner_justification rules).
 - Template integration: string entries in ``blocks:`` resolve to
-  registry blocks; inline-dict entries still work; mixed lists
-  load.
+  registry blocks; inline-dict entries are rejected.
 - ``ProjectConfig.load_block_registry`` auto-discovers from
   ``<project_root>/workforce/blocks``.
 """
@@ -305,11 +304,10 @@ class TestTemplateRegistryIntegration:
                 ValueError, match="unknown block 'bogus'"):
             Template.from_yaml(tmpl_path, block_registry=registry)
 
-    def test_mixed_inline_and_registry_no_longer_supported(
+    def test_mixed_inline_and_registry_rejected(
             self, tmp_path: Path, blocks_dir: Path):
-        # Phase 5 of the block-execution refactor removed inline
-        # block definitions; templates may only reference blocks
-        # by name from the registry.
+        # Templates may only reference blocks by name from the
+        # registry; inline-dict block definitions are rejected.
         tmpl_path = tmp_path / "t.yaml"
         tmpl_path.write_text(
             "artifacts:\n"
@@ -371,8 +369,8 @@ class TestTemplateRegistryIntegration:
 class TestInlineBlockRemoved:
     def test_inline_block_definition_is_now_an_error(
             self, tmp_path: Path):
-        # Phase 5 of the block-execution refactor removed support
-        # for inline-dict block definitions in templates.
+        # Inline-dict block definitions in templates are no
+        # longer supported.
         tmpl = tmp_path / "t.yaml"
         tmpl.write_text(
             "artifacts:\n"

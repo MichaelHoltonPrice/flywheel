@@ -1,22 +1,18 @@
-"""Live-API B1 demonstration: PreToolUse → splice → resume cycle.
+"""Live-API demonstration: PreToolUse → splice → resume cycle.
 
-This is the experiment that makes or breaks the full-stop nested
-block design.  It runs a real Haiku-backed Claude Agent SDK
-session, intercepts a custom MCP tool call with ``PreToolUse``,
-captures the tool's intent, denies the call so the SDK records a
-synthetic deny ``tool_result``, then splices in a real result and
-resumes a fresh SDK session from the modified JSONL.  We assert
-that the model perceives the spliced result as the genuine
-outcome of its original tool call.
+Validates the full-stop nested-block design end to end.  Runs a
+real Haiku-backed Claude Agent SDK session, intercepts a custom
+MCP tool call with ``PreToolUse``, captures the tool's intent,
+denies the call so the SDK records a synthetic deny
+``tool_result``, then splices in a real result and resumes a
+fresh SDK session from the modified JSONL.  Asserts that the
+model perceives the spliced result as the genuine outcome of
+its original tool call.
 
-If this test passes, the B1 go/no-go is "go" and the rest of the
-campaign (B2–B8) proceeds.  If it fails, the failure mode tells
-us which of the assumed JSONL invariants is wrong; we update
-``plans/full-stop-state-contract.md`` and the splice module
-before any other phase starts.
-
-The full design contract this test validates:
-``plans/full-stop-state-contract.md``.
+If this test fails, the failure mode tells us which of the
+assumed JSONL invariants is wrong (sessionId line shape, unique
+tool_use_id, deny-marker tool_result location); update the
+splice module accordingly before other handoff work proceeds.
 """
 
 from __future__ import annotations
@@ -308,8 +304,7 @@ def test_splice_roundtrip_with_haiku(
     assert tool_use_id in pending, (
         f"splice module did not see the deny marker for "
         f"tool_use_id={tool_use_id} in {sdk_jsonl}; the JSONL "
-        f"shape may differ from "
-        f"plans/full-stop-state-contract.md.  Pending IDs found: "
+        f"shape may have changed.  Pending IDs found: "
         f"{pending}"
     )
 
@@ -357,8 +352,8 @@ def test_session_jsonl_invariants(
     """Validate the shape assumptions that the splice depends on.
 
     Pure observation: runs Haiku with a denied tool call, then
-    inspects the resulting JSONL and asserts every invariant
-    listed in ``plans/full-stop-state-contract.md``:
+    inspects the resulting JSONL and asserts every invariant the
+    splice module assumes:
 
     - First non-empty line carries a top-level ``sessionId``.
     - Every tool_use block has an ``id``; every tool_result

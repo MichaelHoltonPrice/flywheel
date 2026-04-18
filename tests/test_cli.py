@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import json
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from flywheel.artifact import ArtifactInstance
 from flywheel.cli import _parse_bindings, create_workspace, main
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -335,77 +332,6 @@ class TestMainRunBlock:
             mock_rb.assert_called_once()
             call_args = mock_rb.call_args
             assert call_args[0][1] == "train"
-
-
-def _make_materialize_project(tmp_path: Path) -> Path:
-    """Create a project with game_step and game_history artifacts."""
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-
-    flywheel_yaml = project_root / "flywheel.yaml"
-    flywheel_yaml.write_text("foundry_dir: foundry\n")
-
-    templates_dir = project_root / "foundry" / "templates"
-    templates_dir.mkdir(parents=True)
-
-    template_yaml = templates_dir / "step_test.yaml"
-    template_yaml.write_text("""\
-artifacts:
-  - name: game_step
-    kind: copy
-  - name: game_history
-    kind: copy
-
-blocks: []
-""")
-    return project_root
-
-
-class TestMainMaterialize:
-    def test_materialize_via_cli(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        project_root = _make_materialize_project(tmp_path)
-        monkeypatch.chdir(project_root)
-
-        main(["create", "workspace", "--name", "mat_ws",
-              "--template", "step_test"])
-
-        ws_path = project_root / "foundry" / "workspaces" / "mat_ws"
-        ws = Workspace.load(ws_path)
-
-        # Add a step artifact.
-        aid = ws.generate_artifact_id("game_step")
-        artifact_dir = ws.path / "artifacts" / aid
-        artifact_dir.mkdir(parents=True)
-        (artifact_dir / "game_step.json").write_text(
-            json.dumps({"step_index": 1, "action": "A"}))
-        ws.add_artifact(ArtifactInstance(
-            id=aid, name="game_step", kind="copy",
-            created_at=datetime.now(UTC), copy_path=aid,
-        ))
-        ws.save()
-
-        main(["materialize", "--workspace", str(ws_path),
-              "--from", "game_step", "--to", "game_history"])
-
-        reloaded = Workspace.load(ws_path)
-        history = reloaded.instances_for("game_history")
-        assert len(history) == 1
-
-    def test_materialize_no_instances_raises(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        project_root = _make_materialize_project(tmp_path)
-        monkeypatch.chdir(project_root)
-
-        main(["create", "workspace", "--name", "empty_ws",
-              "--template", "step_test"])
-
-        ws_path = project_root / "foundry" / "workspaces" / "empty_ws"
-        with pytest.raises(ValueError, match="No instances"):
-            main(["materialize", "--workspace", str(ws_path),
-                  "--from", "game_step", "--to", "game_history"])
 
 
 # ── flywheel run pattern ────────────────────────────────────────

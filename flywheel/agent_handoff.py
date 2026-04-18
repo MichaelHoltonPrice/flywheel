@@ -44,9 +44,9 @@ Production wiring is intentionally minimal:
   ``predecessor_id`` so an operator inspecting the workspace
   sees the cycle structure explicitly.
 
-See ``plans/full-stop-nested-blocks.md`` for the campaign and
-``plans/full-stop-state-contract.md`` for the on-disk contract
-this module assumes.
+The on-disk handoff state (the pending tool-call file the
+agent runner writes when it intercepts a mapped tool) is
+documented inline in :mod:`flywheel.batteries.claude.agent_runner`.
 """
 
 from __future__ import annotations

@@ -16,10 +16,8 @@ Supports:
     flywheel import artifact --workspace PATH --name NAME
         --from SOURCE [--source TEXT]
 
-The legacy ``flywheel run loop`` verb (driven by
-``AgentLoopHooks``) was retired in P7 of the patterns campaign.
-Every multi-round / multi-agent workflow is now expressed as a
-pattern under ``<project>/patterns/`` and run via
+Multi-round / multi-agent workflows are expressed as patterns
+under ``<project>/patterns/`` and run via
 ``flywheel run pattern``.
 """
 
@@ -161,18 +159,6 @@ def main(argv: list[str] | None = None) -> None:
     pattern_parser.add_argument(
         "--agent-image", default="flywheel-claude:latest")
 
-    # flywheel materialize
-    mat_parser = subparsers.add_parser("materialize")
-    mat_parser.add_argument("--workspace", required=True)
-    mat_parser.add_argument(
-        "--from", dest="source_name", required=True,
-        help="Source artifact declaration name.",
-    )
-    mat_parser.add_argument(
-        "--to", dest="target_name", required=True,
-        help="Target artifact declaration name.",
-    )
-
     # Split on '--' to separate flywheel args from container args
     if argv is None:
         argv = sys.argv[1:]
@@ -202,10 +188,6 @@ def main(argv: list[str] | None = None) -> None:
         run_agent_command(args, extra_container_args)
     elif args.command == "run" and getattr(args, "target", None) == "pattern":
         run_pattern_command(args, extra_container_args)
-    elif args.command == "materialize":
-        materialize_command(
-            args.workspace, args.source_name, args.target_name,
-        )
     else:
         parser.print_help()
         sys.exit(1)
@@ -287,29 +269,6 @@ def import_artifact(
         name, Path(source_path), source=source,
     )
     print(f"Imported {name!r} as {instance.id!r}")
-
-
-def materialize_command(
-    workspace_path: str,
-    source_name: str,
-    target_name: str,
-) -> None:
-    """Assemble incremental artifacts into a single JSONL artifact.
-
-    Args:
-        workspace_path: Path to the workspace directory.
-        source_name: Artifact declaration name to read from.
-        target_name: Artifact declaration name to write to.
-
-    Raises:
-        ValueError: If the workspace YAML is malformed, artifact names
-            are not declared, or no source instances exist.
-    """
-    ws = Workspace.load(Path(workspace_path))
-    count = len(ws.instances_for(source_name))
-    instance = ws.materialize_sequence(source_name, target_name)
-    print(f"Materialized {count} {source_name!r} instances "
-          f"into {instance.id!r}")
 
 
 def run_block_command(

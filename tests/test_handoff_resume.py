@@ -1,10 +1,9 @@
-"""Crash-resume contract tests for the handoff loop (B8).
+"""Crash-resume contract tests for the handoff loop.
 
 Drives :func:`flywheel.agent_handoff.run_agent_with_handoffs`
-through every host-side failure mode listed in
-``plans/full-stop-state-contract.md → Failure modes`` so the
-recovery story for each row of that table has at least one
-deterministic test pinning current behavior:
+through every host-side failure mode in the run_agent_with_handoffs
+state diagram so the recovery story for each kill point has at
+least one deterministic test pinning current behavior:
 
 ==========================  =================================
 Where it dies               Coverage in this file
@@ -139,7 +138,7 @@ def _multi_pending_script(
 
 
 # --------------------------------------------------------------------
-# B8 row: During step 12 (block runner raises mid-batch)
+# Block runner raises mid-batch
 # --------------------------------------------------------------------
 
 
@@ -290,7 +289,7 @@ class TestBlockRunnerFailure:
 
 
 # --------------------------------------------------------------------
-# B8 row: Step 13 partial (splice mid-batch failure)
+# Splice mid-batch failure
 # --------------------------------------------------------------------
 
 
@@ -380,7 +379,7 @@ class TestSpliceFailureMidBatch:
 
 
 # --------------------------------------------------------------------
-# B8 row: Step 3 partial write (malformed pending file)
+# Malformed pending-tool-calls file (partial write)
 # --------------------------------------------------------------------
 
 
@@ -510,7 +509,7 @@ class TestPendingFileShape:
 
 
 # --------------------------------------------------------------------
-# B8 rows: Before step 3, between 5 and 8, etc. (stale workspace)
+# Stale workspace artifacts from a prior crashed run
 # --------------------------------------------------------------------
 
 
@@ -682,7 +681,7 @@ class TestStaleArtifactsTolerated:
 
 
 # --------------------------------------------------------------------
-# B8 row: Step 13 partial — splice atomic-write under stale tmp
+# Splice atomic-write under a stale .tmp file from a prior crash
 # --------------------------------------------------------------------
 
 
