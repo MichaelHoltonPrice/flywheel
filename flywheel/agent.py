@@ -61,6 +61,12 @@ class AgentResult:
             exited.  One of: ``"completed"``, ``"auth_failure"``,
             ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
             ``"crashed"``.
+        agent_workspace_dir: Workspace-relative path of the
+            directory the agent was bind-mounted at (e.g.,
+            ``"agent_workspaces/abc12345"``).  Callers that need
+            to read post-run files (output collection,
+            log scraping) read this rather than guessing the
+            path.  ``None`` only when recording was skipped.
     """
 
     exit_code: int
@@ -69,6 +75,7 @@ class AgentResult:
     execution_id: str | None = None
     stop_reason: str | None = None
     exit_reason: str | None = None
+    agent_workspace_dir: str | None = None
 
 
 def _classify_exit(
@@ -200,6 +207,7 @@ class AgentHandle:
         container_name: str = "",
         predecessor_id: str | None = None,
         block_name: str = "__agent__",
+        agent_workspace_dir: str | None = None,
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
@@ -215,6 +223,7 @@ class AgentHandle:
         self._container_name = container_name
         self._predecessor_id = predecessor_id
         self._block_name = block_name
+        self._agent_workspace_dir = agent_workspace_dir
         self._stop_reason: str | None = None
         self._waited = False
 
@@ -322,6 +331,7 @@ class AgentHandle:
             image=self._agent_image,
             stop_reason=self._stop_reason,
             predecessor_id=self._predecessor_id,
+            agent_workspace_dir=self._agent_workspace_dir,
         )
         self._workspace.add_execution(execution)
 
@@ -353,6 +363,7 @@ class AgentHandle:
             execution_id=execution_id,
             stop_reason=self._stop_reason,
             exit_reason=exit_reason,
+            agent_workspace_dir=self._agent_workspace_dir,
         )
 
 
@@ -432,32 +443,110 @@ class AgentBlockConfig:
     prompt_substitutions: dict[str, str] | None = None
 
 
+# Subdirectory under the workspace where auto-named agent
+# workspaces live; one ``<short-uuid>`` directory per agent
+# launch.  Pulled out as a module constant so cyberarc tooling
+# (``play_server``, replay scripts) can refer to it without
+# duplicating the literal.
+AGENT_WORKSPACES_DIR = "agent_workspaces"
+
+
+@dataclass(frozen=True)
+class AgentMount:
+    """A bind-mount target prepared for one agent launch.
+
+    Bundles the host directory (rooted under the workspace), the
+    container path it'll be mounted at, and whether it's
+    writable, so callers don't have to recompute these from the
+    name string.  Returned by :func:`prepare_agent_workspace` and
+    recorded into :class:`flywheel.artifact.BlockExecution` so an
+    operator looking at a ``foundry/workspaces/<ws>/agent_workspaces/<id>``
+    directory can find the row that produced it.
+
+    Attributes:
+        relative_dir: Path of the mount relative to the workspace
+            root (e.g., ``"agent_workspaces/abc12345"``).  This
+            is what gets recorded into ``BlockExecution`` for
+            traceability.
+        host_path: Absolute host path to the prepared directory.
+        container_path: Where the directory is mounted inside the
+            container.  Always ``/workspace`` today; field exists
+            so future patterns can mount auxiliary workspaces.
+        mode: ``"rw"`` (the agent writes here) or ``"ro"``.
+            Always ``"rw"`` for the primary agent workspace.
+    """
+
+    relative_dir: str
+    host_path: Path
+    container_path: str = "/workspace"
+    mode: str = "rw"
+
+
 def prepare_agent_workspace(
     workspace: Workspace,
     output_names: list[str] | None = None,
     agent_workspace_dir: str | None = None,
-) -> Path:
+) -> AgentMount:
     """Prepare a fresh agent workspace directory.
 
-    Creates the directory (removing any existing one) and seeds it
-    with the latest artifacts from prior steps so the agent can
-    continue where the previous step left off.
+    When ``agent_workspace_dir`` is ``None`` the directory is
+    auto-named ``agent_workspaces/<short-uuid>`` so parallel
+    launches can never collide.  When the caller passes an
+    explicit name and the target directory already exists with
+    content, this function raises ``FileExistsError`` instead of
+    silently rmtree-ing — the legacy footgun the patterns
+    campaign set out to fix.  Empty / non-existent explicit
+    targets are still accepted (so tests that pre-create an
+    empty dir keep working) and existing-but-empty dirs are
+    reused in place.
+
+    The returned :class:`AgentMount` records the relative dir
+    name so :class:`AgentHandle` can stamp it onto the
+    :class:`BlockExecution` row.
 
     Args:
         workspace: The flywheel workspace.
         output_names: Artifact names whose latest instances should
-            be seeded into the workspace.
-        agent_workspace_dir: Subdirectory name under the workspace.
-            Defaults to ``"agent_workspace"``.
+            be seeded into the workspace before the agent starts.
+        agent_workspace_dir: Optional explicit subdirectory name.
+            Pass ``None`` (the default) to get a unique
+            auto-named mount; pass a string when the caller has
+            its own naming convention and is willing to take
+            responsibility for collision avoidance.
 
     Returns:
-        Path to the prepared agent workspace directory.
+        :class:`AgentMount` describing the prepared directory.
+
+    Raises:
+        FileExistsError: if ``agent_workspace_dir`` is explicit
+            and the target directory exists with content.
     """
-    ws_dir_name = agent_workspace_dir or "agent_workspace"
-    agent_ws = workspace.path / ws_dir_name
-    if agent_ws.exists():
-        shutil.rmtree(agent_ws)
-    agent_ws.mkdir(parents=True)
+    if agent_workspace_dir is None:
+        ws_dir_name = (
+            f"{AGENT_WORKSPACES_DIR}/{uuid.uuid4().hex[:8]}")
+        agent_ws = workspace.path / ws_dir_name
+        # In the (cosmically unlikely) event of a uuid collision
+        # against an existing dir, redraw rather than rmtree —
+        # the whole point of auto-naming is "never blow away
+        # someone else's workspace".
+        while agent_ws.exists():
+            ws_dir_name = (
+                f"{AGENT_WORKSPACES_DIR}/{uuid.uuid4().hex[:8]}")
+            agent_ws = workspace.path / ws_dir_name
+    else:
+        ws_dir_name = agent_workspace_dir
+        agent_ws = workspace.path / ws_dir_name
+        if agent_ws.exists() and any(agent_ws.iterdir()):
+            raise FileExistsError(
+                f"agent_workspace_dir={agent_workspace_dir!r} "
+                f"already exists at {agent_ws} with content. "
+                f"Pass agent_workspace_dir=None to auto-name "
+                f"this launch under {AGENT_WORKSPACES_DIR}/, or "
+                f"choose a unique name to avoid clobbering "
+                f"another launch's working directory."
+            )
+
+    agent_ws.mkdir(parents=True, exist_ok=True)
 
     if output_names:
         for name in output_names:
@@ -473,7 +562,10 @@ def prepare_agent_workspace(
                             if f.is_file():
                                 shutil.copy2(f, agent_ws / f.name)
 
-    return agent_ws
+    return AgentMount(
+        relative_dir=ws_dir_name,
+        host_path=agent_ws,
+    )
 
 
 def launch_agent_block(
@@ -552,8 +644,15 @@ def launch_agent_block(
         An ``AgentHandle`` for monitoring and controlling the agent.
     """
     # Prepare agent workspace (create dir, seed prior artifacts).
-    agent_ws = prepare_agent_workspace(
+    mount = prepare_agent_workspace(
         workspace, output_names, agent_workspace_dir)
+    agent_ws = mount.host_path
+    # Bind the resolved name back into the variable the rest of
+    # this function passes through to ExecutionChannel and
+    # AgentHandle: nested executions see the same auto-named
+    # path the agent does, and the recorded BlockExecution row
+    # records the directory it ran in.
+    agent_workspace_dir = mount.relative_dir
 
     # Snapshot execution count to compute invocations later.
     executions_before = len(workspace.executions)
@@ -704,6 +803,7 @@ def launch_agent_block(
         stderr_thread=stderr_thread,
         container_name=container_name,
         predecessor_id=predecessor_id,
+        agent_workspace_dir=agent_workspace_dir,
     )
 
 

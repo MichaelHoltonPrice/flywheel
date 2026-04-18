@@ -520,6 +520,8 @@ class Workspace:
                 synthetic=entry.get("synthetic", False),
                 halt_directive=entry.get("halt_directive"),
                 post_check_error=entry.get("post_check_error"),
+                agent_workspace_dir=entry.get(
+                    "agent_workspace_dir"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -607,6 +609,9 @@ class Workspace:
                     entry["halt_directive"] = ex.halt_directive
                 if ex.post_check_error is not None:
                     entry["post_check_error"] = ex.post_check_error
+                if ex.agent_workspace_dir is not None:
+                    entry["agent_workspace_dir"] = (
+                        ex.agent_workspace_dir)
                 serialized_executions[eid] = entry
 
             serialized_events = {}

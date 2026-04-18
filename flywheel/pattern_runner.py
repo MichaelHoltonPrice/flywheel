@@ -405,23 +405,29 @@ class PatternRunner:
         cohort_index: int,
         member_index: int,
     ) -> str | None:
-        """Pick a deterministic agent_workspace subdir name.
+        """Always defer to the launcher's auto-naming.
 
-        For continuous roles with cardinality 1 we pass ``None``
-        and let the launcher use its default — that matches
-        today's just-play behavior, so a workspace recorded with
-        a pattern is byte-equivalent to one recorded with the
-        legacy loop.
+        P6 made auto-naming the default: every launch lands in
+        ``agent_workspaces/<short-uuid>/`` so two parallel
+        agents in the same workspace can never clobber each
+        other.  Roles can no longer share a workspace dir by
+        accident — which used to happen when a project hand-set
+        ``agent_workspace_dir`` to a fixed name and reused it
+        for sibling agents.
 
-        Cohort roles (or continuous roles with cardinality > 1)
-        get ``<role>_<cohort>_<member>``.  P6 of the campaign
-        replaces this hand-rolled naming with the auto
-        ``agent_workspaces/<execution_id>/`` scheme.
+        We honor an explicit ``base_config.agent_workspace_dir``
+        only when a single-cardinality continuous role asks for
+        it, because a few callers still want a stable path.
+        Even then, the launcher refuses to clobber an existing
+        directory with content (raising :class:`FileExistsError`),
+        so the worst case is a loud failure rather than silent
+        cross-contamination.
         """
-        if (isinstance(role.trigger, ContinuousTrigger)
+        if (self._base.agent_workspace_dir is not None
+                and isinstance(role.trigger, ContinuousTrigger)
                 and role.cardinality == 1):
             return self._base.agent_workspace_dir
-        return f"{role.name}_{cohort_index}_{member_index}"
+        return None
 
     def _drain_all_handles(self) -> None:
         """Wait on every launched handle, recording results.

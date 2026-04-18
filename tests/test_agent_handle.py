@@ -349,39 +349,87 @@ class TestExecutionRecording:
 
 
 class TestPrepareAgentWorkspace:
-    def test_creates_fresh_directory(self, tmp_path: Path):
+    def test_auto_names_under_agent_workspaces(self, tmp_path: Path):
+        """No explicit dir → auto-named under agent_workspaces/."""
         ws = MagicMock()
         ws.path = tmp_path
         ws.instances_for = MagicMock(return_value=[])
 
-        agent_ws = prepare_agent_workspace(ws)
-        assert agent_ws.exists()
-        assert agent_ws.is_dir()
-        assert agent_ws.name == "agent_workspace"
+        mount = prepare_agent_workspace(ws)
+        assert mount.host_path.exists()
+        assert mount.host_path.is_dir()
+        # Auto-named directory lives under
+        # ``agent_workspaces/`` (the parent dir).
+        assert mount.host_path.parent.name == "agent_workspaces"
+        assert mount.relative_dir.startswith(
+            "agent_workspaces/")
+        assert mount.container_path == "/workspace"
+        assert mount.mode == "rw"
+
+    def test_auto_naming_yields_unique_dirs(
+            self, tmp_path: Path):
+        """Two back-to-back launches get distinct directories.
+
+        This is the whole point of P6 — parallel launches must
+        not be able to clobber each other by sharing a path.
+        """
+        ws = MagicMock()
+        ws.path = tmp_path
+        ws.instances_for = MagicMock(return_value=[])
+
+        a = prepare_agent_workspace(ws)
+        b = prepare_agent_workspace(ws)
+        assert a.host_path != b.host_path
+        assert a.relative_dir != b.relative_dir
 
     def test_custom_dir_name(self, tmp_path: Path):
+        """Explicit name is honored when the target is empty."""
         ws = MagicMock()
         ws.path = tmp_path
         ws.instances_for = MagicMock(return_value=[])
 
-        agent_ws = prepare_agent_workspace(
+        mount = prepare_agent_workspace(
             ws, agent_workspace_dir="explore_0")
-        assert agent_ws.name == "explore_0"
-        assert agent_ws.exists()
+        assert mount.host_path.name == "explore_0"
+        assert mount.host_path.exists()
+        assert mount.relative_dir == "explore_0"
 
-    def test_removes_existing_directory(self, tmp_path: Path):
+    def test_explicit_dir_with_content_raises(
+            self, tmp_path: Path):
+        """Pre-P6 behavior was to silently rmtree; now we raise.
+
+        If a caller hand-stamps an ``agent_workspace_dir`` and
+        the target already has files, refusing the launch is the
+        only way to guarantee we don't blow away data the
+        previous launch (or another concurrent launch) wrote.
+        """
         ws = MagicMock()
         ws.path = tmp_path
         ws.instances_for = MagicMock(return_value=[])
 
-        # Pre-create with a file.
-        existing = tmp_path / "agent_workspace"
+        existing = tmp_path / "explore_0"
         existing.mkdir()
         (existing / "old_file.txt").write_text("old")
 
-        agent_ws = prepare_agent_workspace(ws)
-        assert agent_ws.exists()
-        assert not (agent_ws / "old_file.txt").exists()
+        with pytest.raises(FileExistsError):
+            prepare_agent_workspace(
+                ws, agent_workspace_dir="explore_0")
+        # The old file was left intact — proof we didn't rmtree.
+        assert (existing / "old_file.txt").read_text() == "old"
+
+    def test_explicit_empty_dir_is_reused(self, tmp_path: Path):
+        """Pre-existing-but-empty dirs are accepted as targets."""
+        ws = MagicMock()
+        ws.path = tmp_path
+        ws.instances_for = MagicMock(return_value=[])
+
+        existing = tmp_path / "explore_0"
+        existing.mkdir()
+
+        mount = prepare_agent_workspace(
+            ws, agent_workspace_dir="explore_0")
+        assert mount.host_path == existing
+        assert mount.relative_dir == "explore_0"
 
     def test_seeds_latest_artifacts(self, tmp_path: Path):
         ws = MagicMock()
@@ -397,13 +445,14 @@ class TestPrepareAgentWorkspace:
         inst.copy_path = "game_log@abc"
         ws.instances_for = MagicMock(return_value=[inst])
 
-        agent_ws = prepare_agent_workspace(
+        mount = prepare_agent_workspace(
             ws, output_names=["game_log"])
-        assert (agent_ws / "game_log.txt").read_text() == "log data"
+        assert (mount.host_path / "game_log.txt").read_text() == (
+            "log data")
 
     def test_no_output_names_skips_seeding(self, tmp_path: Path):
         ws = MagicMock()
         ws.path = tmp_path
 
-        agent_ws = prepare_agent_workspace(ws, output_names=None)
-        assert list(agent_ws.iterdir()) == []
+        mount = prepare_agent_workspace(ws, output_names=None)
+        assert list(mount.host_path.iterdir()) == []

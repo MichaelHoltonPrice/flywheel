@@ -185,13 +185,25 @@ class BlockGroup:
                 f" exit={exit_code}"
             )
 
+            # If the caller didn't pre-stamp an output_dir
+            # (the new auto-naming default for agent groups), use
+            # whatever directory the launcher actually mounted.
+            # AgentResult exposes ``agent_workspace_dir`` for
+            # exactly this purpose; older launch_fns that don't
+            # surface it leave member.output_dir as the source of
+            # truth.
+            output_dir = (
+                member.output_dir
+                or getattr(result, "agent_workspace_dir", None)
+            )
+
             collected = self._collect(
-                i, member, collect_artifacts)
+                i, member, output_dir, collect_artifacts)
 
             results.append(BlockGroupResult(
                 index=i,
                 result=result,
-                output_dir=member.output_dir,
+                output_dir=output_dir,
                 artifacts_collected=collected,
             ))
 
@@ -220,13 +232,22 @@ class BlockGroup:
         self,
         index: int,
         member: BlockGroupMember,
+        output_dir: str | None,
         collect_artifacts: list[tuple[str, str]] | None,
     ) -> list[str]:
-        """Collect output files from a member's output directory."""
-        if not collect_artifacts or not member.output_dir:
+        """Collect output files from a member's output directory.
+
+        ``output_dir`` is what the caller actually wrote into —
+        either the explicit ``member.output_dir`` or the
+        auto-named directory the launcher reports back through
+        ``AgentResult.agent_workspace_dir``.  Either way, it's
+        resolved by :meth:`run` before we get here so this method
+        doesn't have to re-derive it.
+        """
+        if not collect_artifacts or not output_dir:
             return []
 
-        output_path = self._workspace.path / member.output_dir
+        output_path = self._workspace.path / output_dir
         collected: list[str] = []
 
         for file_stem, artifact_name in collect_artifacts:

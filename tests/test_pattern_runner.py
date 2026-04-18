@@ -211,8 +211,8 @@ class TestContinuous:
 class TestEveryNExecutions:
     def test_fires_at_correct_cadence(self, tmp_path: Path):
         ws = _FakeWorkspace(tmp_path)
-        play_prompt = _write_prompt(tmp_path, "play.md")
-        bs_prompt = _write_prompt(tmp_path, "bs.md")
+        play_prompt = _write_prompt(tmp_path, "play.md", "play body")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "brainstorm body")
         pattern = Pattern(
             name="play-bs",
             roles=[
@@ -237,8 +237,12 @@ class TestEveryNExecutions:
 
         def launch_fn(**kwargs):
             handle = _FakeHandle(kwargs)
-            ws_dir = kwargs.get("agent_workspace_dir") or "play"
-            role = "brainstorm" if "brainstorm" in ws_dir else "play"
+            # P6 dropped per-role agent_workspace_dir naming, so
+            # identify the role via the prompt path each role
+            # carries (the runner reads the prompt from disk and
+            # passes it through verbatim).
+            prompt = kwargs.get("prompt") or ""
+            role = "brainstorm" if "brainstorm" in prompt else "play"
             launches_by_role[role] += 1
             if role == "play":
                 play_handle.append(handle)
@@ -272,18 +276,19 @@ class TestEveryNExecutions:
     def test_synthetic_failed_rows_do_not_count(
             self, tmp_path: Path):
         ws = _FakeWorkspace(tmp_path)
-        prompt = _write_prompt(tmp_path, "p.md")
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "bs")
         pattern = Pattern(
             name="p",
             roles=[
                 Role(
                     name="play",
-                    prompt=prompt,
+                    prompt=play_prompt,
                     trigger=ContinuousTrigger(),
                 ),
                 Role(
                     name="bs",
-                    prompt=prompt,
+                    prompt=bs_prompt,
                     trigger=EveryNExecutionsTrigger(
                         of_block="take_action", n=2),
                 ),
@@ -295,7 +300,9 @@ class TestEveryNExecutions:
 
         def launch_fn(**kwargs):
             handle = _FakeHandle(kwargs)
-            if "bs" in (kwargs.get("agent_workspace_dir") or ""):
+            # P6 dropped per-role agent_workspace_dir naming;
+            # roles are now distinguished by their prompt body.
+            if (kwargs.get("prompt") or "").startswith("bs"):
                 bs_count[0] += 1
                 handle.finish()
             else:

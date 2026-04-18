@@ -519,15 +519,19 @@ executions. They are serialized to workspace.yaml under an
 primitive for launching multiple agents in parallel and collecting
 their results:
 
-1. Each member gets a distinct ``agent_workspace_dir`` to avoid
-   file conflicts.
+1. Each member's bind mount is auto-named under
+   ``agent_workspaces/<short-uuid>/`` so two parallel launches
+   in the same workspace can never clobber each other's files
+   (see "Agent workspace mounts" below).
 2. All agents are launched simultaneously via
    ``launch_agent_block()``.
 3. Results are collected sequentially (serializes workspace writes
    to avoid races on ``workspace.yaml``).
-4. After each wait, the group scans for output files and registers
-   them as artifacts. A ``fallback_fn`` can generate default output
-   for agents that produce nothing.
+4. After each wait, the group scans for output files in the
+   directory the launcher reports back through
+   ``AgentResult.agent_workspace_dir`` and registers them as
+   artifacts.  A ``fallback_fn`` can generate default output for
+   agents that produce nothing.
 5. A ``group_completed`` lifecycle event is recorded on completion.
 
 The ``AgentBlockConfig`` dataclass groups the 26+ parameters of
@@ -535,10 +539,40 @@ The ``AgentBlockConfig`` dataclass groups the 26+ parameters of
 practical to define a base configuration and merge per-member
 overrides.
 
-``prepare_agent_workspace()`` is a standalone function that
-creates a fresh agent workspace directory and seeds it with the
-latest artifacts from prior steps. It is used internally by
-``launch_agent_block()`` and can be called independently.
+### Agent workspace mounts
+
+``prepare_agent_workspace()`` (in ``flywheel.agent``) creates the
+host-side directory that gets bind-mounted into the agent
+container at ``/workspace`` and seeds it with the latest
+artifacts from prior steps.  It returns an :class:`AgentMount`
+that records:
+
+- ``relative_dir``: the workspace-relative path of the mount
+  (e.g., ``"agent_workspaces/abc12345"``).
+- ``host_path``: the absolute host directory.
+- ``container_path``: where the dir is mounted inside the
+  container (always ``/workspace`` today).
+- ``mode``: ``"rw"`` for the primary agent workspace.
+
+When the caller does **not** pass ``agent_workspace_dir``, the
+function mints a unique name under ``agent_workspaces/`` using a
+short UUID; collisions trigger a redraw.  This is the default for
+``PatternRunner``, ``BlockGroup``, and the cyberarc explorer /
+brainstorm helpers — making cross-agent workspace contamination
+structurally impossible during parallel runs.
+
+When the caller *does* pass an explicit name and the target
+directory already exists with content, ``prepare_agent_workspace``
+raises ``FileExistsError`` rather than silently rmtree-ing.  The
+old "delete and re-create" behavior was a footgun that could blow
+away another agent's working state; explicit names are still
+honored when the target is empty (e.g., a test pre-creates the
+dir) or absent.
+
+``BlockExecution`` records carry an ``agent_workspace_dir`` field
+populated from the ``AgentMount`` so an operator inspecting an
+``agent_workspaces/<id>/`` directory can find the row that
+produced it via ``workspace.yaml``.
 
 ## Service dependencies
 

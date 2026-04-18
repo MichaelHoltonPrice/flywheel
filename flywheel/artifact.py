@@ -134,6 +134,14 @@ class BlockExecution:
             the check is broken without it taking the run down.
             ``None`` when no callback was configured or it
             completed normally.
+        agent_workspace_dir: Workspace-relative path to the
+            ``/workspace`` bind mount used by this agent (e.g.,
+            ``"agent_workspaces/abc12345"``).  Recorded so an
+            operator looking at a workspace directory can find
+            the row that produced it (and vice versa) without
+            having to grep timestamps.  ``None`` for non-agent
+            executions and for agent rows that predate this
+            field.
     """
 
     id: str
@@ -158,6 +166,7 @@ class BlockExecution:
     synthetic: bool = False
     halt_directive: dict[str, Any] | None = None
     post_check_error: str | None = None
+    agent_workspace_dir: str | None = None
 
 
 @dataclass(frozen=True)
