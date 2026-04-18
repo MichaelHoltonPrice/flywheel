@@ -421,6 +421,15 @@ class AgentBlockConfig:
     # See :mod:`flywheel.post_check`.  Optional; ``None`` means
     # the channel runs no project-side checks.
     post_checks: dict[str, Any] | None = None
+    # Optional ``{{KEY}} -> value`` substitutions applied by
+    # :class:`flywheel.pattern_runner.PatternRunner` to each
+    # role's prompt text before launch.  The :mod:`launch_agent_block`
+    # path does not consult this (the loop already substitutes
+    # via ``--key value`` overrides parsed from the CLI tail);
+    # patterns surface it as an explicit hook return so the
+    # equivalent of ``{{GAME_ID}}`` keeps working without
+    # leaking ``--key value`` plumbing into the runner.
+    prompt_substitutions: dict[str, str] | None = None
 
 
 def prepare_agent_workspace(

@@ -292,6 +292,9 @@ class PatternRunner:
         """
         prompt_path = self._base.project_root / role.prompt
         prompt = prompt_path.read_text(encoding="utf-8")
+        for key, value in (
+                self._base.prompt_substitutions or {}).items():
+            prompt = prompt.replace("{{" + key + "}}", value)
 
         kwargs: dict[str, Any] = {
             "workspace": self._base.workspace,

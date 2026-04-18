@@ -653,6 +653,8 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         isolated_network=overrides.get(
             "isolated_network", True),
         post_checks=block_registry.post_checks or None,
+        prompt_substitutions=overrides.get(
+            "prompt_substitutions"),
     )
 
     try:
