@@ -245,9 +245,9 @@ async def _resume_and_collect(
     final_text = ""
     async with ClaudeSDKClient(options=options) as client:
         await client.query(
-            "Based on the tool result you just received, what is "
-            "the doubled value?  Reply with a single short "
-            "sentence."
+            "Based on the tool result you just received, repeat "
+            "the verification token from that tool result verbatim "
+            "in your reply, then state the doubled value."
         )
         async for message in client.receive_response():
             cls = type(message).__name__
@@ -257,6 +257,9 @@ async def _resume_and_collect(
                     if isinstance(text, str):
                         final_text += text + "\n"
     return final_text.strip()
+
+
+VERIFICATION_TOKEN = "FLYWHEEL-SPLICE-3X8Q-7P2W"
 
 
 def test_splice_roundtrip_with_haiku(
@@ -275,10 +278,15 @@ def test_splice_roundtrip_with_haiku(
         ``tool_use_id`` is reachable via
         ``find_pending_deny_tool_use_ids`` (the splice module's
         only schema-level assumption being live-checked here),
-        and splice in a real result of ``"42"``.
-    4.  We resume from the spliced JSONL and ask Haiku what the
-        doubled value is.  Haiku must answer "42" — proving the
-        model received the spliced result, not the deny stub.
+        and splice in a real result that includes a unique
+        verification token.
+    4.  We resume from the spliced JSONL and ask Haiku to echo
+        the verification token verbatim.  The token has no source
+        other than the splice, so the model emitting it is
+        unambiguous evidence the spliced content reached the
+        resumed model (a numeric canary like ``"42"`` flakes
+        because Haiku will "correct" obviously-wrong arithmetic
+        with its own answer).
     """
     captured: dict[str, Any] = {}
 
@@ -311,11 +319,15 @@ def test_splice_roundtrip_with_haiku(
     splice_tool_result(
         spliced_path,
         tool_use_id=tool_use_id,
-        tool_result_content="The doubled value is 42.",
+        tool_result_content=(
+            f"The tool ran successfully.  "
+            f"Verification token: {VERIFICATION_TOKEN}.  "
+            f"Doubled value: 14."
+        ),
     )
 
     spliced_text = spliced_path.read_text(encoding="utf-8")
-    assert "The doubled value is 42." in spliced_text
+    assert VERIFICATION_TOKEN in spliced_text
     assert (
         find_pending_deny_tool_use_ids(
             spliced_path, deny_marker=DENY_MARKER)
@@ -329,8 +341,10 @@ def test_splice_roundtrip_with_haiku(
         session_id=session_id,
     ))
 
-    assert "42" in final_text, (
-        f"Resumed model did not see the spliced result.  "
+    assert VERIFICATION_TOKEN in final_text, (
+        f"Resumed model did not echo the verification token.  "
+        f"Spliced JSONL contains token? "
+        f"{VERIFICATION_TOKEN in spliced_text}.  "
         f"Final assistant text: {final_text!r}"
     )
 
