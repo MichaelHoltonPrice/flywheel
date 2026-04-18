@@ -12,7 +12,7 @@ Compared to the in-process round-trip, this test additionally
 validates:
 
 - The PreToolUse hook works inside a containerized SDK and
-  writes ``pending_tool_call.json`` to the bind-mounted workspace.
+  writes ``pending_tool_calls.json`` to the bind-mounted workspace.
 - The agent runner exits cleanly on handoff with status
   ``tool_handoff`` and the session JSONL is exported as the
   ``agent_session.jsonl`` workspace artifact.
@@ -200,7 +200,7 @@ def test_container_handoff_roundtrip_with_haiku(
     2.  ``run_with_handoffs`` launches the agent container.
     3.  Haiku, prompted to call double_it on a number, invokes the tool.
     4.  Container's PreToolUse hook denies + writes
-        ``pending_tool_call.json``, status -> ``tool_handoff``,
+        ``pending_tool_calls.json``, status -> ``tool_handoff``,
         container exits.
     5.  Block runner returns a payload containing a unique
         verification token the model has no other way to know.
@@ -268,8 +268,12 @@ def test_container_handoff_roundtrip_with_haiku(
 
     handoff_iter = result.iterations[0]
     assert handoff_iter.state.get("status") == "tool_handoff"
-    assert handoff_iter.handoff is not None
-    assert handoff_iter.splice_line is not None
+    assert len(handoff_iter.handoffs) == 1
+    record = handoff_iter.handoffs[0]
+    assert record["splice_line"] is not None
+    assert record["siblings"] == 1
+    assert record["index_in_iteration"] == 0
+    assert result.iterations[-1].handoffs == []
 
     final_iter = result.iterations[-1]
     assert final_iter.state.get("status") in {

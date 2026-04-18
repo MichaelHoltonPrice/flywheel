@@ -1,16 +1,19 @@
 """Drive an agent container through tool-call handoff cycles.
 
 The flywheel-claude agent runner exposes a ``HANDOFF_TOOLS`` env
-var.  When the agent invokes a matched MCP tool, a ``PreToolUse``
-hook denies the call (recording a deny ``tool_result`` in the SDK
-session JSONL), writes the tool's intent to
-``pending_tool_call.json``, sets ``.agent_state.json`` status to
-``tool_handoff``, and exits cleanly.  This module is the host-side
-counterpart: it launches the agent container, waits for exit, and
-on a handoff exit runs a caller-provided block, splices the real
-result into the saved session JSONL, and restarts the container
-with ``RESUME_SESSION_FILE`` pointing at the spliced JSONL.  The
-loop continues until the agent exits without a pending handoff.
+var.  When the agent invokes one or more matched MCP tools in a
+single assistant turn, a ``PreToolUse`` hook denies each call
+(recording a deny ``tool_result`` per ``tool_use_id`` in the SDK
+session JSONL), captures every intercepted call into
+``pending_tool_calls.json`` (``schema_version`` 2), sets
+``.agent_state.json`` status to ``tool_handoff``, and exits
+cleanly.  This module is the host-side counterpart: it launches
+the agent container, waits for exit, and on a handoff exit runs a
+caller-provided block once per pending entry (in order), splices
+each real result into the saved session JSONL, and restarts the
+container with ``RESUME_SESSION_FILE`` pointing at the spliced
+JSONL.  The loop continues until the agent exits without any
+pending handoffs.
 
 The driver intentionally avoids the heavier ``launch_agent_block``
 machinery (workspace recording, execution-channel HTTP service,
@@ -35,14 +38,20 @@ from typing import Any
 
 from flywheel.session_splice import SpliceError, splice_tool_result
 
-PENDING_FILE_NAME = "pending_tool_call.json"
+PENDING_FILE_NAME = "pending_tool_calls.json"
 STATE_FILE_NAME = ".agent_state.json"
 SESSION_ARTIFACT_NAME = "agent_session.jsonl"
+PENDING_SCHEMA_VERSION = 2
 
 
 @dataclass
 class HandoffContext:
     """What the block runner sees for a single handoff invocation.
+
+    The driver calls ``block_runner`` once per pending tool call,
+    even when the agent emitted multiple parallel tool_use blocks
+    in one assistant turn (chosen design: one block execution per
+    tool_use, run sequentially within a single stop/restart cycle).
 
     Attributes:
         tool_name: Fully qualified MCP tool name the agent invoked
@@ -55,9 +64,14 @@ class HandoffContext:
         workspace: Host-side path to the agent workspace directory
             (the same directory bind-mounted into the container at
             its workspace path).
-        iteration: 0-based index of which handoff in this loop run
-            we're on; useful for diagnostics and per-iteration
-            artifact paths.
+        iteration: 0-based index of which container launch this is;
+            shared across all handoffs surfaced by that launch.
+        index_in_iteration: 0-based position within this iteration's
+            pending list (preserves the SDK's tool_use emission
+            order within the assistant turn).
+        siblings: Total number of pending tool calls in this
+            iteration; ``index_in_iteration < siblings`` always.
+            ``siblings == 1`` is the single-tool-use case.
     """
 
     tool_name: str
@@ -66,6 +80,8 @@ class HandoffContext:
     tool_use_id: str
     workspace: Path
     iteration: int
+    index_in_iteration: int = 0
+    siblings: int = 1
 
 
 @dataclass
@@ -89,12 +105,21 @@ BlockRunner = Callable[[HandoffContext], HandoffResult]
 
 @dataclass
 class LoopIteration:
-    """Per-iteration record returned in ``LoopResult.iterations``."""
+    """Per-iteration record returned in ``LoopResult.iterations``.
+
+    Attributes:
+        container_exit_code: Docker exit code for this launch.
+        state: ``.agent_state.json`` snapshot captured after exit.
+        handoffs: List of handoff records (one per intercepted
+            tool_use surfaced by this iteration).  Empty on the
+            terminating iteration.  Each entry mirrors the
+            corresponding ``HandoffContext`` plus the splice line
+            number so failures can be located precisely.
+    """
 
     container_exit_code: int
     state: dict[str, Any]
-    handoff: dict[str, Any] | None = None
-    splice_line: int | None = None
+    handoffs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -103,8 +128,9 @@ class LoopResult:
 
     Attributes:
         iterations: One record per container launch, in order.
-            The last one's ``handoff`` is ``None`` (the loop exits
-            when an iteration completes without a handoff).
+            The last one's ``handoffs`` is empty (the loop exits
+            when an iteration completes without any pending
+            handoffs).
         final_state: The final ``.agent_state.json`` contents.
         final_session_path: Path to the final session JSONL on
             disk (the workspace artifact, after all splices).
@@ -132,6 +158,29 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _resolve_path(p: Path) -> str:
     """Format a host path for docker -v mounts (POSIX-style)."""
     return str(p).replace("\\", "/")
+
+
+def _normalize_pending(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the list of pending tool calls from the on-disk doc.
+
+    The canonical schema (``schema_version`` 2) wraps the list in
+    a ``pending`` key.  We accept a handful of alternative shapes
+    defensively so a future runner change or hand-edited fixture
+    doesn't blow up the loop:
+
+    * ``{"schema_version": 2, "pending": [...]}`` — canonical.
+    * A bare ``list`` of pending dicts.
+    * A bare single pending dict with ``tool_use_id`` (legacy
+      schema_version 1; wrapped into a one-element list).
+    """
+    if isinstance(doc, list):
+        return [p for p in doc if isinstance(p, dict)]
+    pending = doc.get("pending")
+    if isinstance(pending, list):
+        return [p for p in pending if isinstance(p, dict)]
+    if "tool_use_id" in doc and "tool_name" in doc:
+        return [doc]
+    return []
 
 
 def _drain(stream, sink: Path) -> threading.Thread:
@@ -177,14 +226,23 @@ def run_with_handoffs(
       2. Wait for the container to exit.
       3. Read ``.agent_state.json`` from the workspace.
       4. If status is not ``tool_handoff``: return.
-      5. Read ``pending_tool_call.json``; call ``block_runner``;
-         splice the real result into the workspace's session
-         JSONL artifact; remove the pending file; loop.
+      5. Read ``pending_tool_calls.json``; for each pending entry
+         (preserving the SDK's tool_use emission order) call
+         ``block_runner`` and splice the real result into the
+         workspace's session JSONL artifact; remove the pending
+         file; loop.
+
+    A single agent turn can contain multiple parallel tool_use
+    blocks; the design choice is one block execution per tool_use
+    (Option α), run sequentially within one stop/restart cycle.
+    The ``HandoffContext.siblings`` field exposes the batch size
+    so callers can decide whether to specialise behaviour for
+    multi-tool-use turns.
 
     Args:
         workspace: Host directory bind-mounted as the agent's
             workspace.  All state (``.agent_state.json``,
-            ``pending_tool_call.json``, ``agent_session.jsonl``)
+            ``pending_tool_calls.json``, ``agent_session.jsonl``)
             lives here.
         docker_command: Full ``docker run`` command including image
             name and any -v / -e flags the caller wants.  The
@@ -313,31 +371,13 @@ def run_with_handoffs(
             ))
             break
 
-        pending = _read_json(pending_path)
-        tool_use_id = pending.get("tool_use_id")
-        tool_name = pending.get("tool_name")
-        if not isinstance(tool_use_id, str) or not tool_use_id:
+        pending_doc = _read_json(pending_path)
+        pending_list = _normalize_pending(pending_doc)
+        if not pending_list:
             raise HandoffLoopError(
-                f"pending_tool_call.json malformed (no tool_use_id): "
-                f"{pending}"
+                f"agent exited with tool_handoff but pending file "
+                f"{pending_path.name} has no tool calls: {pending_doc}"
             )
-        if not isinstance(tool_name, str) or not tool_name:
-            raise HandoffLoopError(
-                f"pending_tool_call.json malformed (no tool_name): "
-                f"{pending}"
-            )
-
-        ctx = HandoffContext(
-            tool_name=tool_name,
-            tool_input=pending.get("tool_input", {}) or {},
-            session_id=pending.get(
-                "session_id", last_state.get("session_id", "")),
-            tool_use_id=tool_use_id,
-            workspace=workspace,
-            iteration=iteration,
-        )
-
-        block_result = block_runner(ctx)
 
         if not session_path.is_file():
             raise HandoffLoopError(
@@ -345,28 +385,65 @@ def run_with_handoffs(
                 f"artifact at {session_path}; cannot splice"
             )
 
-        try:
-            splice_line = splice_tool_result(
-                session_path,
-                tool_use_id=tool_use_id,
-                tool_result_content=block_result.content,
-                is_error=block_result.is_error,
-            )
-        except SpliceError as exc:
-            raise HandoffLoopError(
-                f"splice failed for tool_use_id={tool_use_id}: {exc}"
-            ) from exc
+        siblings = len(pending_list)
+        session_id_fallback = pending_doc.get(
+            "session_id", last_state.get("session_id", ""))
+        handoff_records: list[dict[str, Any]] = []
+        for idx, pending in enumerate(pending_list):
+            tool_use_id = pending.get("tool_use_id")
+            tool_name = pending.get("tool_name")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                raise HandoffLoopError(
+                    f"{pending_path.name} entry {idx} malformed "
+                    f"(no tool_use_id): {pending}"
+                )
+            if not isinstance(tool_name, str) or not tool_name:
+                raise HandoffLoopError(
+                    f"{pending_path.name} entry {idx} malformed "
+                    f"(no tool_name): {pending}"
+                )
 
-        result.iterations.append(LoopIteration(
-            container_exit_code=exit_code,
-            state=last_state,
-            handoff={
+            ctx = HandoffContext(
+                tool_name=tool_name,
+                tool_input=pending.get("tool_input", {}) or {},
+                session_id=pending.get(
+                    "session_id", session_id_fallback),
+                tool_use_id=tool_use_id,
+                workspace=workspace,
+                iteration=iteration,
+                index_in_iteration=idx,
+                siblings=siblings,
+            )
+
+            block_result = block_runner(ctx)
+
+            try:
+                splice_line = splice_tool_result(
+                    session_path,
+                    tool_use_id=tool_use_id,
+                    tool_result_content=block_result.content,
+                    is_error=block_result.is_error,
+                )
+            except SpliceError as exc:
+                raise HandoffLoopError(
+                    f"splice failed for tool_use_id={tool_use_id} "
+                    f"(iteration={iteration}, index={idx}): {exc}"
+                ) from exc
+
+            handoff_records.append({
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "tool_input": ctx.tool_input,
                 "is_error": block_result.is_error,
-            },
-            splice_line=splice_line,
+                "index_in_iteration": idx,
+                "siblings": siblings,
+                "splice_line": splice_line,
+            })
+
+        result.iterations.append(LoopIteration(
+            container_exit_code=exit_code,
+            state=last_state,
+            handoffs=handoff_records,
         ))
 
         # Clear the pending file so a leftover doesn't trick the

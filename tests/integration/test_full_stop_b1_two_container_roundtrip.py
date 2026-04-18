@@ -277,8 +277,12 @@ def test_handoff_with_block_in_separate_container(
     assert VERIFICATION_TOKEN in block_invocations[0]["stdout"]
 
     assert len(result.iterations) == 2
-    assert result.iterations[0].state.get("status") == "tool_handoff"
-    assert result.iterations[0].splice_line is not None
+    handoff_iter = result.iterations[0]
+    assert handoff_iter.state.get("status") == "tool_handoff"
+    assert len(handoff_iter.handoffs) == 1
+    assert handoff_iter.handoffs[0]["splice_line"] is not None
+    assert handoff_iter.handoffs[0]["siblings"] == 1
+    assert result.iterations[-1].handoffs == []
     assert result.iterations[-1].state.get("status") in {
         "complete", "stopped", "paused"}
 

@@ -35,15 +35,17 @@ Environment variables:
                       servers at /workspace/.mcp_servers/.
     HANDOFF_TOOLS   — Comma-separated MCP tool names to intercept
                       via a PreToolUse hook.  When the agent calls
-                      one, the hook denies it (recording a deny
-                      tool_result in the session), writes the
-                      tool's intent to ``pending_tool_call.json``
-                      in the workspace, sets ``.agent_state.json``
-                      status to ``tool_handoff``, and signals the
-                      runner to exit cleanly so a host-side driver
-                      can run the tool out-of-band, splice the real
-                      result into the session JSONL, and restart
-                      the container with RESUME_SESSION_FILE set.
+                      one or more in a single assistant turn, the
+                      hook denies each (recording deny tool_results
+                      in the session), captures every intercepted
+                      call into ``pending_tool_calls.json`` in the
+                      workspace, sets ``.agent_state.json`` status
+                      to ``tool_handoff``, and signals the runner
+                      to exit cleanly so a host-side driver can
+                      run the blocks out-of-band, splice every
+                      real result into the session JSONL, and
+                      restart the container with
+                      RESUME_SESSION_FILE set.
     HANDOFF_DENY_MARKER — Substring that the splice helper uses to
                       locate the deny tool_result on disk.  Defaults
                       to ``handoff_to_flywheel``.
@@ -112,18 +114,23 @@ SESSION_OUTPUT_FILE = WORKSPACE / "agent_session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Pending tool-call handoff: artifact-shaped file the PreToolUse
-# handoff hook writes when it intercepts a mapped tool.  Read by
-# the host-side driver to learn which block to run between
-# container restarts.
-PENDING_TOOL_CALL_FILE = WORKSPACE / "pending_tool_call.json"
+# handoff hook writes when it intercepts mapped tools in an
+# assistant turn.  Plural because a single turn can contain
+# multiple parallel tool_use blocks; we capture every one and let
+# the host-side driver run, splice, and resume them all in a
+# single stop/restart cycle.  See plans/full-stop-state-contract.md
+# for the canonical schema (schema_version 2).
+PENDING_TOOL_CALLS_FILE = WORKSPACE / "pending_tool_calls.json"
+PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
 
-# Module-level handoff state.  The PreToolUse hook captures the
-# intercepted tool's intent here; the main message loop reads it
-# after each message to know whether to exit cleanly with status
-# ``tool_handoff``.  A dict so the hook (a free function passed to
-# the SDK) can mutate the same object the loop reads.
-_HANDOFF_STATE: dict[str, Any] = {"pending": None}
+# Module-level handoff state.  The PreToolUse hook appends each
+# intercepted tool_use to ``pending`` (preserving emission order);
+# the main message loop reads the list after each message to know
+# whether to exit cleanly with status ``tool_handoff``.  A dict so
+# the hook (a free function passed to the SDK) can mutate the same
+# object the loop reads.
+_HANDOFF_STATE: dict[str, Any] = {"pending": []}
 
 
 
@@ -227,11 +234,17 @@ def _build_handoff_hook(
 ):
     """Return a PreToolUse hook that intercepts handoff-mapped tools.
 
-    The returned hook captures the intercepted tool's intent into
-    ``_HANDOFF_STATE``, returns a deny decision so the SDK records a
-    deny tool_result keyed to the SDK-assigned ``tool_use_id``, and
-    leaves the actual exit signaling to the main message loop (which
-    polls ``_HANDOFF_STATE`` after each message).
+    The returned hook appends every intercepted tool_use into
+    ``_HANDOFF_STATE["pending"]`` (preserving the SDK's emission
+    order within an assistant turn) and returns a deny decision so
+    the SDK records a deny tool_result for each ``tool_use_id``.
+    The actual exit signaling is left to the main message loop
+    (which polls ``_HANDOFF_STATE`` after each message).
+
+    Multi-tool-use turns: the SDK fires PreToolUse for each
+    tool_use in a single assistant message in order; we capture
+    every match and the host-side driver runs / splices all of
+    them in one stop/restart cycle.
 
     Args:
         handoff_tools: Set of fully qualified MCP tool names whose
@@ -240,7 +253,7 @@ def _build_handoff_hook(
             SDK treats as "no opinion, proceed normally").
         deny_marker: Substring embedded in the deny reason; the
             host-side splice helper uses this to locate the deny
-            tool_result on disk.
+            tool_results on disk.
 
     Returns:
         An async hook callable matching the SDK's hook signature.
@@ -255,27 +268,12 @@ def _build_handoff_hook(
             return {}
         if tool_use_id is None:
             return {}
-        if _HANDOFF_STATE["pending"] is not None:
-            # A handoff is already pending; deny without overwriting
-            # so the first one wins (we exit on the first handoff,
-            # the host re-runs us once it's resolved).
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"permission denied: {deny_marker} "
-                        f"(another handoff already pending)"
-                    ),
-                },
-            }
-        _HANDOFF_STATE["pending"] = {
-            "schema_version": 1,
+        _HANDOFF_STATE["pending"].append({
             "tool_use_id": tool_use_id,
             "tool_name": tool_name,
             "tool_input": input_data.get("tool_input", {}),
             "captured_at": datetime.now(UTC).isoformat(),
-        }
+        })
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -289,25 +287,30 @@ def _build_handoff_hook(
 
 
 def _persist_handoff(session_id: str) -> None:
-    """Write the pending tool call + state file for host pickup.
+    """Write the pending tool calls + state file for host pickup.
 
     Called by the main loop after it observes the handoff signal
-    and the SDK has flushed the deny tool_result to the session
+    and the SDK has flushed the deny tool_results to the session
     JSONL.  The pending file is the canonical handoff payload; the
-    state file mirrors the tool_use_id for fast lookup.
+    state file mirrors the count + first tool name for quick visibility.
+    Schema is documented in plans/full-stop-state-contract.md.
     """
-    pending = _HANDOFF_STATE["pending"]
-    if pending is None:
+    pending = list(_HANDOFF_STATE["pending"])
+    if not pending:
         return
-    payload = dict(pending)
-    payload["session_id"] = session_id
-    PENDING_TOOL_CALL_FILE.write_text(
+    payload = {
+        "schema_version": PENDING_TOOL_CALLS_SCHEMA_VERSION,
+        "session_id": session_id,
+        "pending": pending,
+    }
+    PENDING_TOOL_CALLS_FILE.write_text(
         json.dumps(payload, indent=2), encoding="utf-8")
     _emit({
         "type": "handoff_pending",
-        "tool_use_id": pending["tool_use_id"],
-        "tool_name": pending["tool_name"],
-        "path": str(PENDING_TOOL_CALL_FILE),
+        "count": len(pending),
+        "tool_use_ids": [p["tool_use_id"] for p in pending],
+        "tool_names": [p["tool_name"] for p in pending],
+        "path": str(PENDING_TOOL_CALLS_FILE),
     })
 
 
@@ -739,11 +742,12 @@ async def main() -> None:
                             break
 
                         # Tool-call handoff: PreToolUse hook captured
-                        # a mapped tool.  The deny tool_result is now
-                        # in the live session; exit cleanly so the
-                        # finally block exports the JSONL and the
-                        # host driver can splice + restart.
-                        if _HANDOFF_STATE["pending"] is not None:
+                        # one or more mapped tools in this turn.
+                        # All deny tool_results are now in the live
+                        # session; exit cleanly so the finally block
+                        # exports the JSONL and the host driver can
+                        # splice + restart.
+                        if _HANDOFF_STATE["pending"]:
                             pause_reason = "tool_handoff"
                             break
 
@@ -768,11 +772,18 @@ async def main() -> None:
 
                 # Tool-call handoff.
                 if pause_reason == "tool_handoff":
-                    pending = _HANDOFF_STATE["pending"] or {}
+                    pending = list(_HANDOFF_STATE["pending"])
                     _persist_handoff(session_id)
+                    if pending:
+                        first = pending[0]["tool_name"]
+                        reason = (
+                            first if len(pending) == 1
+                            else f"{first} (+{len(pending) - 1} more)"
+                        )
+                    else:
+                        reason = ""
                     _save_state(
-                        session_id, "tool_handoff",
-                        pending.get("tool_name", ""))
+                        session_id, "tool_handoff", reason)
                     return
 
                 # Channel-side halt directive.
