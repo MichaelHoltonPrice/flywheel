@@ -33,6 +33,20 @@ Environment variables:
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
                       Built-in: eval. Projects can mount additional
                       servers at /workspace/.mcp_servers/.
+    HANDOFF_TOOLS   — Comma-separated MCP tool names to intercept
+                      via a PreToolUse hook.  When the agent calls
+                      one, the hook denies it (recording a deny
+                      tool_result in the session), writes the
+                      tool's intent to ``pending_tool_call.json``
+                      in the workspace, sets ``.agent_state.json``
+                      status to ``tool_handoff``, and signals the
+                      runner to exit cleanly so a host-side driver
+                      can run the tool out-of-band, splice the real
+                      result into the session JSONL, and restart
+                      the container with RESUME_SESSION_FILE set.
+    HANDOFF_DENY_MARKER — Substring that the splice helper uses to
+                      locate the deny tool_result on disk.  Defaults
+                      to ``handoff_to_flywheel``.
     RESUME_SESSION_FILE — Path to a .jsonl session file to resume
                       on startup. The filename stem is the session ID.
     COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
@@ -54,10 +68,16 @@ import os
 import shutil
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import anyio
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+)
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -90,6 +110,20 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # can collect it as an artifact for cross-container resume.
 SESSION_OUTPUT_FILE = WORKSPACE / "agent_session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# Pending tool-call handoff: artifact-shaped file the PreToolUse
+# handoff hook writes when it intercepts a mapped tool.  Read by
+# the host-side driver to learn which block to run between
+# container restarts.
+PENDING_TOOL_CALL_FILE = WORKSPACE / "pending_tool_call.json"
+DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
+
+# Module-level handoff state.  The PreToolUse hook captures the
+# intercepted tool's intent here; the main message loop reads it
+# after each message to know whether to exit cleanly with status
+# ``tool_handoff``.  A dict so the hook (a free function passed to
+# the SDK) can mutate the same object the loop reads.
+_HANDOFF_STATE: dict[str, Any] = {"pending": None}
 
 
 
@@ -181,6 +215,100 @@ def _check_for_halt() -> dict | None:
     if not halts:
         return None
     return halts[0]
+
+
+# ------------------------------------------------------------------
+# Tool-call handoff hook
+# ------------------------------------------------------------------
+
+def _build_handoff_hook(
+    handoff_tools: set[str],
+    deny_marker: str,
+):
+    """Return a PreToolUse hook that intercepts handoff-mapped tools.
+
+    The returned hook captures the intercepted tool's intent into
+    ``_HANDOFF_STATE``, returns a deny decision so the SDK records a
+    deny tool_result keyed to the SDK-assigned ``tool_use_id``, and
+    leaves the actual exit signaling to the main message loop (which
+    polls ``_HANDOFF_STATE`` after each message).
+
+    Args:
+        handoff_tools: Set of fully qualified MCP tool names whose
+            invocations should be intercepted.  Other tool names
+            pass through (the hook returns an empty dict, which the
+            SDK treats as "no opinion, proceed normally").
+        deny_marker: Substring embedded in the deny reason; the
+            host-side splice helper uses this to locate the deny
+            tool_result on disk.
+
+    Returns:
+        An async hook callable matching the SDK's hook signature.
+    """
+    async def _hook(
+        input_data: dict,
+        tool_use_id: str | None,
+        context,
+    ) -> dict:
+        tool_name = input_data.get("tool_name", "")
+        if tool_name not in handoff_tools:
+            return {}
+        if tool_use_id is None:
+            return {}
+        if _HANDOFF_STATE["pending"] is not None:
+            # A handoff is already pending; deny without overwriting
+            # so the first one wins (we exit on the first handoff,
+            # the host re-runs us once it's resolved).
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"permission denied: {deny_marker} "
+                        f"(another handoff already pending)"
+                    ),
+                },
+            }
+        _HANDOFF_STATE["pending"] = {
+            "schema_version": 1,
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "tool_input": input_data.get("tool_input", {}),
+            "captured_at": datetime.now(UTC).isoformat(),
+        }
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"permission denied: {deny_marker}"
+                ),
+            },
+        }
+    return _hook
+
+
+def _persist_handoff(session_id: str) -> None:
+    """Write the pending tool call + state file for host pickup.
+
+    Called by the main loop after it observes the handoff signal
+    and the SDK has flushed the deny tool_result to the session
+    JSONL.  The pending file is the canonical handoff payload; the
+    state file mirrors the tool_use_id for fast lookup.
+    """
+    pending = _HANDOFF_STATE["pending"]
+    if pending is None:
+        return
+    payload = dict(pending)
+    payload["session_id"] = session_id
+    PENDING_TOOL_CALL_FILE.write_text(
+        json.dumps(payload, indent=2), encoding="utf-8")
+    _emit({
+        "type": "handoff_pending",
+        "tool_use_id": pending["tool_use_id"],
+        "tool_name": pending["tool_name"],
+        "path": str(PENDING_TOOL_CALL_FILE),
+    })
 
 
 # ------------------------------------------------------------------
@@ -436,6 +564,29 @@ async def main() -> None:
         t.strip() for t in tools_str.split(",") if t.strip()
     ] if tools_str else None
 
+    # --- Tool-call handoff hook ---
+    handoff_tools_str = os.environ.get("HANDOFF_TOOLS", "")
+    handoff_tools = {
+        t.strip() for t in handoff_tools_str.split(",") if t.strip()
+    }
+    handoff_deny_marker = os.environ.get(
+        "HANDOFF_DENY_MARKER", DEFAULT_HANDOFF_DENY_MARKER)
+    handoff_hooks_config = None
+    if handoff_tools:
+        hook_callable = _build_handoff_hook(
+            handoff_tools, handoff_deny_marker)
+        handoff_hooks_config = {
+            "PreToolUse": [
+                HookMatcher(matcher=t, hooks=[hook_callable])
+                for t in sorted(handoff_tools)
+            ],
+        }
+        _emit({
+            "type": "handoff_hook_registered",
+            "tools": sorted(handoff_tools),
+            "deny_marker": handoff_deny_marker,
+        })
+
     # --- Build options ---
     options = ClaudeAgentOptions(
         cwd="/workspace",
@@ -446,6 +597,8 @@ async def main() -> None:
         options.tools = tools_whitelist
     if model:
         options.model = model
+    if handoff_hooks_config is not None:
+        options.hooks = handoff_hooks_config
     if mcp_servers:
         options.mcp_servers = mcp_servers
     if max_turns:
@@ -585,6 +738,15 @@ async def main() -> None:
                             })
                             break
 
+                        # Tool-call handoff: PreToolUse hook captured
+                        # a mapped tool.  The deny tool_result is now
+                        # in the live session; exit cleanly so the
+                        # finally block exports the JSONL and the
+                        # host driver can splice + restart.
+                        if _HANDOFF_STATE["pending"] is not None:
+                            pause_reason = "tool_handoff"
+                            break
+
                     except Exception as e:
                         _emit({
                             "type": "error",
@@ -602,6 +764,15 @@ async def main() -> None:
                     })
                     STOP_FILE.unlink(missing_ok=True)
                     _save_state(session_id, "stopped", "stop_requested")
+                    return
+
+                # Tool-call handoff.
+                if pause_reason == "tool_handoff":
+                    pending = _HANDOFF_STATE["pending"] or {}
+                    _persist_handoff(session_id)
+                    _save_state(
+                        session_id, "tool_handoff",
+                        pending.get("tool_name", ""))
                     return
 
                 # Channel-side halt directive.
