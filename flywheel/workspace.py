@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -117,6 +118,12 @@ class Workspace:
                 raise ValueError(
                     f"Copy artifact {instance.id!r} is missing "
                     f"copy_path"
+                )
+            if (instance.kind == "incremental"
+                    and instance.copy_path is None):
+                raise ValueError(
+                    f"Incremental artifact {instance.id!r} is "
+                    f"missing copy_path"
                 )
             if instance.kind == "git":
                 missing = [
@@ -278,6 +285,226 @@ class Workspace:
         except Exception:
             shutil.rmtree(target_dir, ignore_errors=True)
             raise
+
+    def instance_path(self, instance_id: str) -> Path:
+        """Return the on-disk directory for a copy or incremental artifact.
+
+        For ``copy`` and ``incremental`` artifacts the returned path is
+        ``<workspace>/artifacts/<copy_path>/``.  For ``git`` artifacts
+        this raises — git artifacts are not directory-stored within
+        the workspace.
+
+        Args:
+            instance_id: The artifact instance ID.
+
+        Raises:
+            KeyError: If no instance exists with that ID.
+            ValueError: If the instance is a git artifact.
+        """
+        if instance_id not in self.artifacts:
+            raise KeyError(instance_id)
+        inst = self.artifacts[instance_id]
+        if inst.kind == "git":
+            raise ValueError(
+                f"Artifact {instance_id!r} is a git artifact and "
+                f"has no workspace-local directory"
+            )
+        if inst.copy_path is None:
+            raise ValueError(
+                f"Artifact {instance_id!r} is missing copy_path"
+            )
+        return self.path / "artifacts" / inst.copy_path
+
+    def register_incremental_artifact(
+        self,
+        name: str,
+        *,
+        produced_by: str | None = None,
+        source: str | None = None,
+    ) -> ArtifactInstance:
+        """Allocate a new incremental artifact instance.
+
+        Creates the artifact directory, an empty ``entries.jsonl``
+        file, and a registered :class:`ArtifactInstance` of kind
+        ``incremental``.  Subsequent appenders should use
+        :meth:`append_to_incremental` to add entries.
+
+        Args:
+            name: The artifact declaration name (must be declared
+                with ``kind: incremental``).
+            produced_by: Execution ID of the first appender, if
+                known.  May be ``None`` if the instance is created
+                ahead of any appends (e.g., during workspace
+                bootstrap).
+            source: Free-text provenance description.
+
+        Returns:
+            The created :class:`ArtifactInstance`.
+
+        Raises:
+            ValueError: If the name is not declared as an
+                incremental artifact.
+        """
+        if name not in self.artifact_declarations:
+            raise ValueError(
+                f"Artifact {name!r} not declared in this workspace"
+            )
+        if self.artifact_declarations[name] != "incremental":
+            raise ValueError(
+                f"Artifact {name!r} is declared as "
+                f"{self.artifact_declarations[name]!r}; "
+                f"register_incremental_artifact requires "
+                f"'incremental'"
+            )
+
+        artifact_id = self.generate_artifact_id(name)
+        target_dir = self.path / "artifacts" / artifact_id
+        target_dir.mkdir(parents=True)
+        try:
+            (target_dir / "entries.jsonl").touch()
+            instance = ArtifactInstance(
+                id=artifact_id,
+                name=name,
+                kind="incremental",
+                created_at=datetime.now(UTC),
+                produced_by=produced_by,
+                source=source,
+                copy_path=artifact_id,
+            )
+            self.add_artifact(instance)
+            self.save()
+            return instance
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+
+    def latest_incremental_instance(
+        self, name: str,
+    ) -> ArtifactInstance | None:
+        """Return the most recent incremental instance of *name*, or None.
+
+        v1 expects at most one incremental instance per declaration
+        per workspace; this helper exists so callers don't have to
+        enforce that themselves and so a future v2 with multiple
+        instances can change the resolution policy here.
+
+        Args:
+            name: The artifact declaration name.
+
+        Returns:
+            The newest incremental instance, or ``None`` if no
+            incremental instances exist for this name.
+        """
+        if name not in self.artifact_declarations:
+            raise ValueError(
+                f"Artifact {name!r} not declared in this workspace"
+            )
+        if self.artifact_declarations[name] != "incremental":
+            raise ValueError(
+                f"Artifact {name!r} is declared as "
+                f"{self.artifact_declarations[name]!r}; "
+                f"latest_incremental_instance requires 'incremental'"
+            )
+        candidates = [
+            a for a in self.artifacts.values()
+            if a.name == name and a.kind == "incremental"
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda a: a.created_at)
+
+    def append_to_incremental(
+        self,
+        instance_id: str,
+        entries: list[Any],
+    ) -> None:
+        """Append one or more entries to an incremental artifact.
+
+        Each entry is JSON-encoded and written as one line to
+        ``entries.jsonl``.  Holds the workspace lock for the
+        duration of the append; concurrent appenders within the
+        same process serialize against each other.  v1 assumes
+        cross-process appenders will not collide (block executions
+        producing an incremental are expected to be serialized by
+        the workspace owner).
+
+        Args:
+            instance_id: The incremental artifact instance ID.
+            entries: List of JSON-encodable values to append.
+                Empty list is a no-op.
+
+        Raises:
+            KeyError: If no instance exists with that ID.
+            ValueError: If the instance is not an incremental
+                artifact.
+        """
+        if not entries:
+            return
+        if instance_id not in self.artifacts:
+            raise KeyError(instance_id)
+        inst = self.artifacts[instance_id]
+        if inst.kind != "incremental":
+            raise ValueError(
+                f"Artifact {instance_id!r} has kind {inst.kind!r}; "
+                f"append_to_incremental requires 'incremental'"
+            )
+        if inst.copy_path is None:
+            raise ValueError(
+                f"Incremental artifact {instance_id!r} is missing "
+                f"copy_path"
+            )
+        entries_path = (
+            self.path / "artifacts" / inst.copy_path / "entries.jsonl"
+        )
+        with self._lock, open(entries_path, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(
+                    json.dumps(entry, separators=(",", ":")) + "\n"
+                )
+
+    def read_incremental_entries(
+        self, instance_id: str,
+    ) -> list[Any]:
+        """Read all entries from an incremental artifact in append order.
+
+        Convenience reader for in-process callers; container blocks
+        read ``/input/<name>/entries.jsonl`` directly.
+
+        Args:
+            instance_id: The incremental artifact instance ID.
+
+        Returns:
+            List of JSON values in append order.
+
+        Raises:
+            KeyError: If no instance exists with that ID.
+            ValueError: If the instance is not an incremental
+                artifact.
+        """
+        if instance_id not in self.artifacts:
+            raise KeyError(instance_id)
+        inst = self.artifacts[instance_id]
+        if inst.kind != "incremental":
+            raise ValueError(
+                f"Artifact {instance_id!r} has kind {inst.kind!r}; "
+                f"read_incremental_entries requires 'incremental'"
+            )
+        if inst.copy_path is None:
+            raise ValueError(
+                f"Incremental artifact {instance_id!r} is missing "
+                f"copy_path"
+            )
+        entries_path = (
+            self.path / "artifacts" / inst.copy_path / "entries.jsonl"
+        )
+        if not entries_path.exists():
+            return []
+        with open(entries_path, encoding="utf-8") as f:
+            return [
+                json.loads(line)
+                for line in f
+                if line.strip()
+            ]
 
     def register_artifact(
         self,
@@ -564,7 +791,8 @@ class Workspace:
                     entry["produced_by"] = inst.produced_by
                 if inst.source is not None:
                     entry["source"] = inst.source
-                if inst.kind == "copy" and inst.copy_path is not None:
+                if (inst.kind in ("copy", "incremental")
+                        and inst.copy_path is not None):
                     entry["copy_path"] = inst.copy_path
                 if inst.kind == "git":
                     entry["repo"] = inst.repo

@@ -747,3 +747,244 @@ class TestLifecycleEvents:
         with open(ws.path / "workspace.yaml") as f:
             raw = yaml.safe_load(f)
         assert "events" not in raw
+
+
+INCREMENTAL_TEMPLATE_YAML = """\
+artifacts:
+  - name: engine
+    kind: git
+    repo: "."
+    path: src
+  - name: history
+    kind: incremental
+  - name: notes
+    kind: copy
+
+blocks:
+  - name: train
+    image: train:latest
+    inputs: [engine]
+    outputs: [history]
+"""
+
+
+def _setup_incremental_project(
+    tmp_path: Path,
+) -> tuple[Path, Path, Template]:
+    """Variant of _setup_project that declares an incremental artifact."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _init_git_repo(project_root)
+    (project_root / "src").mkdir()
+    (project_root / "src" / "main.rs").write_text("// engine")
+    subprocess.run(
+        ["git", "-C", str(project_root), "add", "."],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_root), "commit", "-m", "add src"],
+        check=True, capture_output=True,
+    )
+    foundry_dir = project_root / "foundry"
+    foundry_dir.mkdir()
+    templates_dir = foundry_dir / "templates"
+    templates_dir.mkdir()
+    template_path = templates_dir / "test.yaml"
+    template_path.write_text(INCREMENTAL_TEMPLATE_YAML)
+    subprocess.run(
+        ["git", "-C", str(project_root), "add", "."],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
+        check=True, capture_output=True,
+    )
+    template = from_yaml_with_inline_blocks(template_path)
+    return project_root, foundry_dir, template
+
+
+class TestIncrementalArtifacts:
+    """Tests for the incremental artifact kind."""
+
+    def test_declaration_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        assert ws.artifact_declarations["history"] == "incremental"
+        loaded = Workspace.load(ws.path)
+        assert loaded.artifact_declarations["history"] == "incremental"
+
+    def test_no_baseline_at_create(self, tmp_path: Path):
+        """Workspace.create does not auto-create incremental instances."""
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        incremental = [
+            a for a in ws.artifacts.values() if a.kind == "incremental"
+        ]
+        assert incremental == []
+
+    def test_register_incremental_artifact(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        assert inst.kind == "incremental"
+        assert inst.name == "history"
+        assert inst.copy_path == inst.id
+        artifact_dir = ws.path / "artifacts" / inst.id
+        assert artifact_dir.exists()
+        entries_path = artifact_dir / "entries.jsonl"
+        assert entries_path.exists()
+        assert entries_path.read_text() == ""
+
+    def test_register_incremental_with_provenance(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact(
+            "history",
+            produced_by="exec_first",
+            source="bootstrapped from initial frame",
+        )
+        assert inst.produced_by == "exec_first"
+        assert inst.source == "bootstrapped from initial frame"
+
+    def test_register_rejects_non_incremental(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        with pytest.raises(ValueError, match="incremental"):
+            ws.register_incremental_artifact("notes")
+
+    def test_register_rejects_undeclared(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        with pytest.raises(ValueError, match="not declared"):
+            ws.register_incremental_artifact("unknown")
+
+    def test_append_to_incremental(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        ws.append_to_incremental(inst.id, [{"step": 0, "action": "noop"}])
+        ws.append_to_incremental(
+            inst.id,
+            [{"step": 1, "action": "left"}, {"step": 2, "action": "right"}],
+        )
+        entries = ws.read_incremental_entries(inst.id)
+        assert entries == [
+            {"step": 0, "action": "noop"},
+            {"step": 1, "action": "left"},
+            {"step": 2, "action": "right"},
+        ]
+
+    def test_append_empty_list_noop(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        ws.append_to_incremental(inst.id, [])
+        assert ws.read_incremental_entries(inst.id) == []
+
+    def test_append_to_unknown_id(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        with pytest.raises(KeyError):
+            ws.append_to_incremental("history@nonexistent", [{"x": 1}])
+
+    def test_append_rejects_copy_artifact(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        copy_inst = ArtifactInstance(
+            id="notes@1", name="notes", kind="copy",
+            created_at=datetime.now(UTC), copy_path="notes@1",
+        )
+        ws.add_artifact(copy_inst)
+        with pytest.raises(ValueError, match="incremental"):
+            ws.append_to_incremental("notes@1", [{"x": 1}])
+
+    def test_round_trip_with_appends(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        ws.append_to_incremental(inst.id, [{"a": 1}, {"b": 2}])
+
+        loaded = Workspace.load(ws.path)
+        assert inst.id in loaded.artifacts
+        loaded_inst = loaded.artifacts[inst.id]
+        assert loaded_inst.kind == "incremental"
+        assert loaded_inst.copy_path == inst.id
+        assert loaded.read_incremental_entries(inst.id) == [
+            {"a": 1}, {"b": 2},
+        ]
+
+    def test_latest_incremental_instance(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        assert ws.latest_incremental_instance("history") is None
+        first = ws.register_incremental_artifact("history")
+        latest = ws.latest_incremental_instance("history")
+        assert latest is not None
+        assert latest.id == first.id
+
+    def test_instance_path_for_incremental(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        path = ws.instance_path(inst.id)
+        assert path == ws.path / "artifacts" / inst.id
+        assert (path / "entries.jsonl").exists()
+
+    def test_instance_path_rejects_git(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        with pytest.raises(ValueError, match="git"):
+            ws.instance_path("engine@baseline")
+
+    def test_add_artifact_validates_incremental_copy_path(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        bad = ArtifactInstance(
+            id="history@bad", name="history", kind="incremental",
+            created_at=datetime.now(UTC), copy_path=None,
+        )
+        with pytest.raises(ValueError, match="copy_path"):
+            ws.add_artifact(bad)
+
+    def test_template_rejects_unknown_kind(self, tmp_path: Path):
+        bad_yaml = """\
+artifacts:
+  - name: history
+    kind: bogus
+
+blocks: []
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(bad_yaml)
+        with pytest.raises(ValueError, match="unknown kind"):
+            Template.from_yaml(path)
+
+    def test_template_accepts_incremental_kind(self, tmp_path: Path):
+        good_yaml = """\
+artifacts:
+  - name: history
+    kind: incremental
+
+blocks: []
+"""
+        path = tmp_path / "good.yaml"
+        path.write_text(good_yaml)
+        tpl = Template.from_yaml(path)
+        assert tpl.artifacts[0].kind == "incremental"
+
+    def test_entries_jsonl_format_is_one_per_line(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_incremental_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        inst = ws.register_incremental_artifact("history")
+        ws.append_to_incremental(
+            inst.id,
+            [{"x": 1, "y": 2}, "scalar", [1, 2, 3]],
+        )
+        raw = (ws.path / "artifacts" / inst.id / "entries.jsonl").read_text()
+        lines = [line for line in raw.split("\n") if line]
+        assert len(lines) == 3
+        assert json.loads(lines[0]) == {"x": 1, "y": 2}
+        assert json.loads(lines[1]) == "scalar"
+        assert json.loads(lines[2]) == [1, 2, 3]

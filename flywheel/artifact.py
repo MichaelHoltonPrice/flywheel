@@ -16,26 +16,40 @@ from typing import Any, Literal
 
 @dataclass(frozen=True)
 class ArtifactInstance:
-    """A concrete, immutable artifact record within a workspace.
+    """A concrete artifact record within a workspace.
 
     Each instance has a unique ID in the form ``name@uuid``
-    (e.g., ``checkpoint@a3f7b2``, ``engine@baseline``). Copy artifacts
-    store files in the workspace; git artifacts reference
-    version-controlled code.
+    (e.g., ``checkpoint@a3f7b2``, ``engine@baseline``). Three storage
+    kinds:
+
+    * ``copy`` — directory of files written once; immutable after
+      registration.
+    * ``git`` — reference to a commit in a git repo.
+    * ``incremental`` — directory containing exactly one
+      ``entries.jsonl`` file, append-only.  Each appended entry is
+      itself immutable (no rewrites of earlier entries); the file as
+      a whole grows over time as block executions add new entries.
+      The "logical instance" is a sequence of immutable entries
+      stored in one growing file.
 
     Attributes:
         id: Unique identifier within the workspace (e.g., ``checkpoint@a3f7b2``).
         name: The artifact declaration name this instance belongs to.
-        kind: Storage kind, either ``"copy"`` or ``"git"``.
+        kind: Storage kind, ``"copy"``, ``"git"``, or ``"incremental"``.
         created_at: When this instance was created.
         produced_by: The execution ID that produced this instance,
             or None for artifacts not produced by a block execution
             (e.g., baseline git snapshots or imported artifacts).
+            For incremental artifacts, this is the *first* execution
+            that appended an entry; subsequent appenders are recorded
+            in their own ``BlockExecution.output_bindings``.
         source: For imported artifacts, a description of where the
             artifact came from (e.g., a file path). None for
             block-produced and baseline artifacts.
-        copy_path: For copy artifacts, the directory name under
-            ``workspace/artifacts/`` where files are stored.
+        copy_path: For copy and incremental artifacts, the directory
+            name under ``workspace/artifacts/`` where files are
+            stored.  Copy artifacts hold arbitrary files; incremental
+            artifacts hold exactly one ``entries.jsonl``.
         repo: For git artifacts, the absolute path to the repo root.
         commit: For git artifacts, the full commit SHA.
         git_path: For git artifacts, the path within the repo.
@@ -43,7 +57,7 @@ class ArtifactInstance:
 
     id: str
     name: str
-    kind: Literal["copy", "git"]
+    kind: Literal["copy", "git", "incremental"]
     created_at: datetime
     produced_by: str | None = None
     source: str | None = None

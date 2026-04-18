@@ -28,9 +28,23 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ArtifactDeclaration:
-    """A declared artifact in a template — name, storage kind, and git fields if applicable."""
+    """A declared artifact in a template — name, storage kind, and git fields if applicable.
+
+    Three kinds:
+
+    * ``copy`` — directory of arbitrary files, written once per
+      instance.  Each block execution that emits one creates a fresh
+      instance.
+    * ``git`` — reference to a path within a git repo at a specific
+      commit.  Resolved at workspace creation time.
+    * ``incremental`` — append-only sequence of opaque JSON entries.
+      A workspace holds at most one current instance per declaration;
+      block executions append to it rather than producing fresh
+      instances.  See :class:`flywheel.artifact.ArtifactInstance` for
+      the on-disk shape.
+    """
     name: str
-    kind: Literal["copy", "git"]
+    kind: Literal["copy", "git", "incremental"]
     repo: str | None = None  # git only, relative to project root
     path: str | None = None  # git only
 
@@ -292,7 +306,7 @@ def _parse_artifacts(
         repo = entry.get("repo")
         path_field = entry.get("path")
 
-        if kind not in ("copy", "git"):
+        if kind not in ("copy", "git", "incremental"):
             raise ValueError(
                 f"Artifact {name!r} has unknown kind {kind!r}")
 
