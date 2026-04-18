@@ -43,9 +43,11 @@ from flywheel.agent_handoff import (
     PENDING_FILE_NAME,
     RESUME_ENV_VAR,
     SESSION_ARTIFACT_NAME,
+    BlockRunner,
     HandoffContext,
     HandoffLoopError,
     HandoffResult,
+    make_tool_router,
     run_agent_with_handoffs,
 )
 
@@ -923,3 +925,117 @@ class TestHandoffLoopResult:
         assert out.final_result.execution_id == "exec-final"
         assert out.final_result.exit_reason == "completed"
         assert out.cycles[-1].handoffs == []
+
+
+def _ctx(tool_name: str, **overrides: Any) -> HandoffContext:
+    """Build a HandoffContext with sensible defaults for router tests."""
+    fields = dict(
+        tool_name=tool_name,
+        tool_input={},
+        session_id="sess-1",
+        tool_use_id="toolu_x",
+        agent_workspace=Path("/tmp/ws"),
+        iteration=0,
+        index_in_iteration=0,
+        siblings=1,
+    )
+    fields.update(overrides)
+    return HandoffContext(**fields)
+
+
+class TestMakeToolRouter:
+    """Pin the dispatch contract of ``make_tool_router``.
+
+    The router is the seam every multi-tool handoff project (e.g.
+    cyberarc, once ``predict_action`` migrates) hangs runners off
+    of, so its behavior is exercised directly rather than only
+    through ``run_agent_with_handoffs``.
+    """
+
+    def test_dispatches_to_matching_runner(self) -> None:
+        seen: list[str] = []
+
+        def runner_a(ctx: HandoffContext) -> HandoffResult:
+            seen.append(f"a:{ctx.tool_name}")
+            return HandoffResult(content="from-a")
+
+        def runner_b(ctx: HandoffContext) -> HandoffResult:
+            seen.append(f"b:{ctx.tool_name}")
+            return HandoffResult(content="from-b")
+
+        router = make_tool_router({
+            "mcp__x__alpha": runner_a,
+            "mcp__x__beta": runner_b,
+        })
+
+        out_a = router(_ctx("mcp__x__alpha"))
+        out_b = router(_ctx("mcp__x__beta"))
+
+        assert out_a.content == "from-a"
+        assert out_a.is_error is False
+        assert out_b.content == "from-b"
+        assert seen == ["a:mcp__x__alpha", "b:mcp__x__beta"]
+
+    def test_unknown_tool_returns_error_result_not_raise(self) -> None:
+        def never_called(ctx: HandoffContext) -> HandoffResult:
+            raise AssertionError("must not be invoked")
+
+        router = make_tool_router({"mcp__x__alpha": never_called})
+
+        out = router(_ctx("mcp__x__gamma"))
+
+        assert out.is_error is True
+        assert "no handoff runner" in out.content
+        assert "mcp__x__gamma" in out.content
+        assert "mcp__x__alpha" in out.content
+
+    def test_routes_snapshotted_at_construction(self) -> None:
+        """Mutating the input dict after construction must not affect dispatch."""
+        def runner_a(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="a")
+
+        def runner_b(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="b-late")
+
+        routes: dict[str, Any] = {"mcp__x__alpha": runner_a}
+        router = make_tool_router(routes)
+
+        routes["mcp__x__beta"] = runner_b
+
+        out = router(_ctx("mcp__x__beta"))
+        assert out.is_error is True
+
+    def test_runner_exception_propagates(self) -> None:
+        """Router does not swallow runner errors.
+
+        The handoff loop has its own outer try/except for that;
+        the router stays a thin lookup.
+        """
+
+        def boom(ctx: HandoffContext) -> HandoffResult:
+            raise RuntimeError("runner exploded")
+
+        router = make_tool_router({"mcp__x__alpha": boom})
+
+        with pytest.raises(RuntimeError, match="runner exploded"):
+            router(_ctx("mcp__x__alpha"))
+
+    def test_empty_routes_always_returns_error(self) -> None:
+        router = make_tool_router({})
+        out = router(_ctx("mcp__x__anything"))
+        assert out.is_error is True
+        assert "registered tools: []" in out.content
+
+    def test_returned_callable_satisfies_block_runner_protocol(self) -> None:
+        """Smoke-test that the router plugs into ``run_agent_with_handoffs``."""
+
+        def runner_a(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        router: BlockRunner = make_tool_router({
+            "mcp__x__alpha": runner_a,
+        })
+
+        assert callable(router)
+        result = router(_ctx("mcp__x__alpha"))
+        assert isinstance(result, HandoffResult)

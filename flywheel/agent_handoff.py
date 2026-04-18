@@ -655,3 +655,57 @@ def launch_agent_with_handoffs(
         max_iterations=max_iterations,
         launch_fn=launch_fn,
     )
+
+
+def make_tool_router(
+    routes: dict[str, BlockRunner],
+) -> BlockRunner:
+    """Compose per-tool ``BlockRunner``s into one dispatcher.
+
+    Use this when a single agent run intercepts more than one
+    handoff tool (e.g. cyberarc's ``mcp__arc__take_action`` and
+    ``mcp__arc__predict_action``).  The returned callable
+    satisfies the :data:`BlockRunner` protocol and is the
+    ``block_runner`` you pass to
+    :func:`launch_agent_with_handoffs` /
+    :func:`run_agent_with_handoffs`.
+
+    The router is intentionally a thin dict lookup: every runner
+    in ``routes`` keeps its own state, construction args, and
+    error contract.  Adding a new handoff tool is just one more
+    entry here plus one more ``HANDOFF_TOOLS`` listing.
+
+    Args:
+        routes: Mapping from the fully qualified MCP tool name
+            the agent runner's ``PreToolUse`` hook intercepts
+            (e.g. ``"mcp__arc__take_action"``) to the runner
+            that should handle it.  The mapping is snapshotted
+            so later mutation of the original dict does not
+            affect dispatch.
+
+    Returns:
+        A :data:`BlockRunner` that dispatches each
+        :class:`HandoffContext` to the matching runner by
+        ``ctx.tool_name``.  When the tool is not in ``routes``
+        the router returns
+        ``HandoffResult(content="ERROR: ...", is_error=True)``
+        rather than raising, so a single misregistered tool
+        cannot crash the whole handoff loop — the agent sees
+        an explicit error and can adapt or terminate.
+    """
+    snapshot = dict(routes)
+
+    def _router(ctx: HandoffContext) -> HandoffResult:
+        runner = snapshot.get(ctx.tool_name)
+        if runner is None:
+            return HandoffResult(
+                content=(
+                    f"ERROR: no handoff runner registered for "
+                    f"tool {ctx.tool_name!r}; registered tools: "
+                    f"{sorted(snapshot)}"
+                ),
+                is_error=True,
+            )
+        return runner(ctx)
+
+    return _router
