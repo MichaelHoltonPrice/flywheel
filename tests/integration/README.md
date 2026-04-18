@@ -48,7 +48,49 @@ error rather than a long timeout.
 
 ## What lives here
 
-Currently only the B1 splice round-trip lives here.  As the
-campaign progresses, B8 will populate this directory with
-crash-resume integration tests covering every boundary state
-described in `plans/full-stop-state-contract.md`.
+- `test_full_stop_b1_splice_roundtrip.py` — splice round-trip
+  with Haiku (no container).
+- `test_full_stop_b1_container_roundtrip.py` — agent-in-Docker
+  handoff cycle with Haiku.
+- `test_full_stop_b1_two_container_roundtrip.py` — agent and
+  block runner each in their own Docker container.
+
+## Crash-resume coverage (B8)
+
+Every host-side failure mode listed in
+`plans/full-stop-state-contract.md → Failure modes` has a
+deterministic regression test in
+`flywheel/tests/test_handoff_resume.py` (no live API, no
+Docker, runs in <1s).  That file is the source of truth for
+the loop's recovery contract; integration tests here only
+add evidence that real containers obey the same contract.
+
+Container-internal kill points are intentionally NOT
+automated.  These boundaries live inside the agent runner
+process (kill mid-PreToolUse hook, kill between deny
+tool_result and clean exit, kill mid-resume), and the timing
+windows are too narrow to hit reliably from a test harness.
+When investigating a real-world incident at one of these
+boundaries, exercise it manually:
+
+1. Run `test_full_stop_b1_container_roundtrip.py` with
+   `--run-live-api` and a deliberately throttled prompt
+   (e.g. add `time.sleep` to the test MCP server).
+2. From a second shell, `docker kill <container-name>` at
+   the suspected crash point.  The test container name is
+   printed at startup; grep stderr for it.
+3. Inspect the bind-mounted workspace under `tmp_path`:
+   `pending_tool_calls.json`, `agent_session.jsonl`, and
+   `.agent_state.json` are the three artifacts the host
+   loop consults on the next launch.  The
+   `find_pending_deny_tool_use_ids` helper in
+   `flywheel.session_splice` enumerates unspliced
+   tool_use_ids from a saved JSONL.
+4. Re-invoke `run_agent_with_handoffs` against the same
+   workspace and observe whether the recovery matches what
+   `test_handoff_resume.py::TestRedriveAfterFailure`
+   asserts for the equivalent host-side scenario.
+
+If you discover a container-internal failure mode whose
+recovery doesn't match the unit-test contract, that's a real
+bug — open an issue with the workspace state captured.
