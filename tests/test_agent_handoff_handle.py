@@ -563,6 +563,53 @@ class TestLaunchFactory:
         result = handle.wait()
         assert result.execution_id == "exec-factory"
 
+    def test_factory_forwards_halt_source_to_loop(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """``halt_source`` must reach the loop intact: a non-empty
+        drain after the first cycle suppresses the relaunch and
+        the directives surface on ``loop_result.halts``.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-halt",
+            tool_use_ids=["toolu_h"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_h",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+                execution_id="exec-halt",
+            ),
+            _CycleScript(exit_reason="completed"),  # never reached
+        ]
+        launch = _make_launch_fn(workspace.path, scripts)
+
+        directive = {"reason": "drain-fired"}
+
+        def _drain() -> list[Any]:
+            return [directive]
+
+        def _br(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        handle = launch_agent_with_handoffs(
+            block_runner=_br,
+            halt_source=_drain,
+            launch_fn=launch,
+            **_base_kwargs(workspace),
+        )
+        handle.wait()
+
+        assert handle.loop_result is not None
+        assert handle.loop_result.halts == [directive]
+        assert len(handle.loop_result.cycles) == 1
+
     def test_factory_compatible_with_partial(
         self, workspace: _FakeWorkspace,
     ) -> None:

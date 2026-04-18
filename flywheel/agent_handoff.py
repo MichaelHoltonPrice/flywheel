@@ -165,7 +165,19 @@ class HandoffLoopResult:
     Attributes:
         cycles: One :class:`HandoffCycle` per container launch,
             in order.  ``cycles[-1]`` is always the terminating
-            cycle; ``cycles[-1].handoffs`` is always empty.
+            cycle.  Its ``handoffs`` is empty for the natural
+            termination case (agent exited with a non-handoff
+            ``exit_reason``).  When the loop terminates because a
+            post-check queued a halt directive between cycles,
+            ``cycles[-1].handoffs`` carries the resolved handoffs
+            for that final iteration and :attr:`halts` carries
+            the directives that suppressed the relaunch.
+        halts: Halt directives drained from ``halt_source`` that
+            caused the loop to stop relaunching.  Empty when the
+            loop terminated naturally (agent exit_reason was not
+            ``tool_handoff``).  Each entry is whatever shape the
+            ``halt_source`` callable returned -- the loop does
+            not interpret the contents, only their presence.
         final_result: Convenience alias for
             ``cycles[-1].agent_result``.
         total_handoffs: Count of pending tool calls resolved
@@ -173,15 +185,18 @@ class HandoffLoopResult:
     """
 
     cycles: list[HandoffCycle] = field(default_factory=list)
+    halts: list[Any] = field(default_factory=list)
 
     @property
     def final_result(self) -> AgentResult:
         """Return the terminal :class:`AgentResult`.
 
-        Equivalent to ``cycles[-1].agent_result``.  This is the
-        result whose ``exit_reason`` is *not* ``tool_handoff``
-        (the loop only returns once an iteration resolves
-        without queueing more pending tool calls).
+        Equivalent to ``cycles[-1].agent_result``.  When the
+        loop terminated naturally this is the agent run whose
+        ``exit_reason`` is not ``tool_handoff``; when the loop
+        terminated because a halt directive fired this is the
+        last agent run whose handoffs were resolved before the
+        halt suppressed the next relaunch.
         """
         return self.cycles[-1].agent_result
 
@@ -250,6 +265,7 @@ def _find_agent_ws(
 def run_agent_with_handoffs(
     *,
     block_runner: BlockRunner | None = None,
+    halt_source: Callable[[], list[Any]] | None = None,
     resume_prompt: str = DEFAULT_RESUME_PROMPT,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     launch_fn: Callable[..., Any] = launch_agent_block,
@@ -277,6 +293,17 @@ def run_agent_with_handoffs(
             branch, so existing callers can pass ``block_runner=
             None`` and the loop collapses to a single
             ``launch_agent_block`` + ``handle.wait()``.
+        halt_source: Optional zero-arg callable the loop polls
+            once per cycle, *after* resolving that cycle's
+            pending tool calls and *before* relaunching the agent.
+            When the callable returns a non-empty list the loop
+            terminates immediately, recording the directives in
+            ``HandoffLoopResult.halts``.  Production wires this
+            to :meth:`flywheel.local_block.LocalBlockRecorder.drain_halts`
+            so a post-execution check that fires during a
+            handoff can stop the run cleanly.  ``None`` (default)
+            disables halt detection entirely; the loop runs
+            until ``max_iterations`` or a non-handoff exit.
         resume_prompt: Stdin payload for relaunch cycles.  The
             agent runner sends this as a new user query *after*
             restoring the spliced session, so it must not
@@ -450,6 +477,17 @@ def run_agent_with_handoffs(
         with contextlib.suppress(FileNotFoundError):
             pending_path.unlink()
 
+        # Halt check: a post-execution callable invoked inside
+        # one of this cycle's block_runner calls may have queued
+        # a halt directive.  Drain the queue and stop the loop
+        # if anything was returned -- the agent has already had
+        # its tool results spliced in but we refuse to relaunch.
+        if halt_source is not None:
+            drained = halt_source()
+            if drained:
+                return HandoffLoopResult(
+                    cycles=cycles, halts=list(drained))
+
     raise HandoffLoopError(
         f"hit max_iterations={max_iterations} without a "
         f"non-handoff exit; last cycle exit_reason="
@@ -501,6 +539,7 @@ class HandoffAgentHandle:
         *,
         block_runner: BlockRunner | None,
         launch_kwargs: dict[str, Any],
+        halt_source: Callable[[], list[Any]] | None = None,
         resume_prompt: str = DEFAULT_RESUME_PROMPT,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         launch_fn: Callable[..., Any] = launch_agent_block,
@@ -517,6 +556,9 @@ class HandoffAgentHandle:
                 same arguments :func:`launch_agent_block`
                 requires.  Stored unmodified — the loop makes its
                 own copies for relaunches.
+            halt_source: Forwarded to
+                :func:`run_agent_with_handoffs`.  Production
+                passes :meth:`LocalBlockRecorder.drain_halts`.
             resume_prompt: Same as
                 :func:`run_agent_with_handoffs`.
             max_iterations: Same as
@@ -527,6 +569,7 @@ class HandoffAgentHandle:
                 inject a fake.
         """
         self._block_runner = block_runner
+        self._halt_source = halt_source
         self._launch_kwargs = launch_kwargs
         self._resume_prompt = resume_prompt
         self._max_iterations = max_iterations
@@ -556,6 +599,7 @@ class HandoffAgentHandle:
         try:
             self.loop_result = run_agent_with_handoffs(
                 block_runner=self._block_runner,
+                halt_source=self._halt_source,
                 resume_prompt=self._resume_prompt,
                 max_iterations=self._max_iterations,
                 launch_fn=self._launch_fn,
@@ -597,6 +641,7 @@ class HandoffAgentHandle:
 def launch_agent_with_handoffs(
     *,
     block_runner: BlockRunner | None = None,
+    halt_source: Callable[[], list[Any]] | None = None,
     resume_prompt: str = DEFAULT_RESUME_PROMPT,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     launch_fn: Callable[..., Any] = launch_agent_block,
@@ -637,6 +682,7 @@ def launch_agent_with_handoffs(
 
     Args:
         block_runner: Forwarded to :class:`HandoffAgentHandle`.
+        halt_source: Forwarded to :class:`HandoffAgentHandle`.
         resume_prompt: Same.
         max_iterations: Same.
         launch_fn: Same.
@@ -651,6 +697,7 @@ def launch_agent_with_handoffs(
     return HandoffAgentHandle(
         block_runner=block_runner,
         launch_kwargs=launch_kwargs,
+        halt_source=halt_source,
         resume_prompt=resume_prompt,
         max_iterations=max_iterations,
         launch_fn=launch_fn,

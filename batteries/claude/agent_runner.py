@@ -94,10 +94,6 @@ STATE_FILE = WORKSPACE / ".agent_state.json"
 RESUME_FILE = WORKSPACE / ".agent_resume"
 STOP_FILE = WORKSPACE / ".agent_stop"
 POLL_INTERVAL = 5  # seconds between resume-file checks
-# Channel-side halt-poll timeout.  The /halt endpoint is on
-# host.docker.internal so this is local-network latency; a tight
-# timeout means a broken channel doesn't slow the agent loop.
-HALT_POLL_TIMEOUT = 2.0
 
 # Rate limit auto-retry: sleep with exponential backoff before
 # retrying.  Falls back to .agent_resume after max retries.
@@ -181,47 +177,6 @@ def _export_session(session_id: str) -> None:
             "session_id": session_id,
             "message": str(exc),
         })
-
-
-# ------------------------------------------------------------------
-# Halt directives
-# ------------------------------------------------------------------
-
-def _check_for_halt() -> dict | None:
-    """Return the first matching halt directive, or ``None``.
-
-    Polls ``GET <EVAL_ENDPOINT>/halt`` for halt directives queued
-    by post-execution callbacks on the host side.  Without
-    per-agent identity we treat every directive as targeting this
-    runner (a single execution channel hosts at most one agent
-    today; multi-agent setups will need agent identity wired in
-    via an env var).
-
-    Returns the first directive (with at least ``scope`` and
-    ``reason`` keys) or ``None`` when nothing is queued or the
-    channel is unreachable.  Channel errors are swallowed so a
-    transient network blip doesn't kill the agent.
-    """
-    endpoint = os.environ.get("EVAL_ENDPOINT", "").rstrip("/")
-    if not endpoint:
-        return None
-    import urllib.error
-    import urllib.request
-    url = f"{endpoint}/halt"
-    try:
-        with urllib.request.urlopen(  # noqa: S310
-                url, timeout=HALT_POLL_TIMEOUT) as resp:
-            body = resp.read()
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return None
-    try:
-        data = json.loads(body)
-    except (ValueError, json.JSONDecodeError):
-        return None
-    halts = data.get("halts") or []
-    if not halts:
-        return None
-    return halts[0]
 
 
 # ------------------------------------------------------------------
@@ -653,7 +608,6 @@ async def main() -> None:
             while True:
                 completed = False
                 pause_reason = None
-                halt_reason: str = ""
 
                 async for message in client.receive_response():
                     try:
@@ -720,27 +674,6 @@ async def main() -> None:
                             pause_reason = "stop_requested"
                             break
 
-                        # Channel-side halt directive: a post-
-                        # execution callback asked us to stop.
-                        # Treated like .agent_stop except the
-                        # reason text is propagated from the
-                        # check, so operators see why.
-                        halt = await anyio.to_thread.run_sync(
-                            _check_for_halt)
-                        if halt is not None:
-                            pause_reason = "halted"
-                            halt_reason = halt.get(
-                                "reason", "halted by post-check")
-                            _emit({
-                                "type": "halted",
-                                "scope": halt.get("scope"),
-                                "reason": halt_reason,
-                                "block": halt.get("block"),
-                                "execution_id": halt.get(
-                                    "execution_id"),
-                            })
-                            break
-
                         # Tool-call handoff: PreToolUse hook captured
                         # one or more mapped tools in this turn.
                         # All deny tool_results are now in the live
@@ -784,16 +717,6 @@ async def main() -> None:
                         reason = ""
                     _save_state(
                         session_id, "tool_handoff", reason)
-                    return
-
-                # Channel-side halt directive.
-                if pause_reason == "halted":
-                    _emit({
-                        "type": "agent_state",
-                        "status": "halted",
-                        "reason": halt_reason,
-                    })
-                    _save_state(session_id, "halted", halt_reason)
                     return
 
                 # Natural completion.

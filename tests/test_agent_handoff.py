@@ -683,6 +683,248 @@ class TestMultiToolUseHandoff:
 
 
 # --------------------------------------------------------------------
+# Halt source.
+# --------------------------------------------------------------------
+
+
+class TestHaltSource:
+    """``halt_source`` lets a post-execution check stop the loop
+    between cycles.  The loop drains it after resolving each
+    cycle's pending tool calls and before relaunching; any
+    non-empty return terminates immediately and the directives
+    surface on ``HandoffLoopResult.halts``.
+    """
+
+    def test_no_halt_source_runs_to_natural_completion(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """Default ``halt_source=None`` is the no-halt path: the
+        loop runs until a non-handoff exit and ``halts`` stays
+        empty.  Pinned so adding ``halt_source`` cannot regress
+        existing callers that never opt in.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-no-halt",
+            tool_use_ids=["toolu_a"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_a",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+            ),
+            _CycleScript(exit_reason="completed"),
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(workspace.path, scripts, record)
+
+        def _br(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        out = run_agent_with_handoffs(
+            block_runner=_br,
+            launch_fn=launch,
+            **_base_kwargs(workspace),
+        )
+
+        assert out.halts == []
+        assert out.final_result.exit_reason == "completed"
+        assert len(out.cycles) == 2
+
+    def test_halt_source_returning_empty_does_not_stop(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """An empty drain is the steady state: the loop relaunches
+        normally.  Verifies the loop checks truthiness and not
+        ``is None``, so a recorder that always returns ``[]``
+        when nothing is queued behaves the same as no halt
+        source at all.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-empty",
+            tool_use_ids=["toolu_e"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_e",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+            ),
+            _CycleScript(exit_reason="completed"),
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(workspace.path, scripts, record)
+
+        drain_calls = {"n": 0}
+
+        def _drain() -> list[Any]:
+            drain_calls["n"] += 1
+            return []
+
+        def _br(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        out = run_agent_with_handoffs(
+            block_runner=_br,
+            launch_fn=launch,
+            halt_source=_drain,
+            **_base_kwargs(workspace),
+        )
+
+        assert drain_calls["n"] == 1, (
+            "halt_source should be drained once per cycle that "
+            "produced handoffs (the terminating cycle returns "
+            "early before the drain)"
+        )
+        assert out.halts == []
+        assert len(out.cycles) == 2
+        assert out.final_result.exit_reason == "completed"
+
+    def test_halt_source_returning_directive_stops_loop(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """A non-empty drain after cycle 0 stops the loop: the
+        cycle's handoffs are still recorded (the splice already
+        happened), but the second launch never fires.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-halt",
+            tool_use_ids=["toolu_h"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_h",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+                execution_id="exec-halted",
+            ),
+            _CycleScript(exit_reason="completed"),  # never reached
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(workspace.path, scripts, record)
+
+        directive = {
+            "scope": "run",
+            "reason": "post-check rejected",
+            "block": "demo_block",
+            "execution_id": "exec-failed",
+        }
+
+        def _drain() -> list[Any]:
+            return [directive]
+
+        def _br(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        out = run_agent_with_handoffs(
+            block_runner=_br,
+            launch_fn=launch,
+            halt_source=_drain,
+            **_base_kwargs(workspace),
+        )
+
+        assert len(record) == 1, (
+            "halt should suppress the relaunch; only cycle 0 ran"
+        )
+        assert len(out.cycles) == 1
+        assert out.cycles[0].agent_result.execution_id == (
+            "exec-halted")
+        assert len(out.cycles[0].handoffs) == 1, (
+            "the handoff that fired before the halt is still in "
+            "the cycle record (its splice happened first)"
+        )
+        assert out.halts == [directive]
+        assert out.final_result.exit_reason == "tool_handoff", (
+            "natural-completion exit_reason is not synthesized; "
+            "the last real launch was the handoff exit"
+        )
+
+    def test_halt_source_drain_only_once_per_handoff_cycle(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """Across two handoff cycles the drain runs once per
+        cycle and any directive in cycle 1 cuts off cycle 2's
+        launch.  Pins the contract that halts queued *during*
+        cycle N's handoffs apply *after* cycle N's results are
+        spliced in -- the agent already saw its tool results,
+        we just refuse to relaunch.
+        """
+        session_jsonl_a = _build_session_jsonl(
+            session_id="sess-multi-a",
+            tool_use_ids=["toolu_a"],
+        )
+        session_jsonl_b = _build_session_jsonl(
+            session_id="sess-multi-b",
+            tool_use_ids=["toolu_b"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_a",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl_a,
+                execution_id="exec-cycle0",
+            ),
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_b",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl_b,
+                execution_id="exec-cycle1",
+            ),
+            _CycleScript(exit_reason="completed"),  # never reached
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(workspace.path, scripts, record)
+
+        drained: list[list[Any]] = [[], [{"reason": "halt-now"}]]
+
+        def _drain() -> list[Any]:
+            return drained.pop(0)
+
+        def _br(ctx: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="ok")
+
+        out = run_agent_with_handoffs(
+            block_runner=_br,
+            launch_fn=launch,
+            halt_source=_drain,
+            **_base_kwargs(workspace),
+        )
+
+        assert len(record) == 2, (
+            "first drain returned [], so cycle 1 launched; "
+            "second drain returned a directive, so cycle 2 was "
+            "suppressed"
+        )
+        assert len(out.cycles) == 2
+        assert out.halts == [{"reason": "halt-now"}]
+
+
+# --------------------------------------------------------------------
 # Error paths.
 # --------------------------------------------------------------------
 
