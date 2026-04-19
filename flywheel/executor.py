@@ -168,7 +168,7 @@ class BlockExecutor(Protocol):
                 artifacts (used by executors that produce outputs
                 from in-memory data rather than container output).
             elapsed_s: Optional wall-clock time to record on the
-                execution row when known by the caller.
+                execution record when known by the caller.
             execution_id: Optional pre-assigned execution ID.
             overrides: CLI flag overrides for container blocks.
             allowed_blocks: If set, only these block names are

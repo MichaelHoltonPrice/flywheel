@@ -38,7 +38,7 @@ Production wiring is intentionally minimal:
 * No host-side HTTP bridge runs.  Block executions invoked
   during a handoff are recorded directly by the host runner
   via :class:`flywheel.local_block.LocalBlockRecorder`.
-* Each cycle's :class:`flywheel.artifact.BlockExecution` row is
+* Each cycle's :class:`flywheel.artifact.BlockExecution` record is
   recorded by the underlying :class:`flywheel.agent.AgentHandle`
   with its own ``execution_id``; this loop chains them via
   ``predecessor_id`` so an operator inspecting the workspace

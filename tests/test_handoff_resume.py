@@ -634,7 +634,7 @@ class TestStaleArtifactsTolerated:
         non-handoff exit terminates the loop cleanly without
         invoking the runner.
 
-        This is the "Before step 3" failure-mode row: the new
+        This is the "Before step 3" failure-mode execution: the new
         container's PreToolUse hook never fired, so even though
         leftover state suggests pending work, the *current*
         agent reports nothing pending.

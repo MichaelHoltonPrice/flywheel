@@ -41,7 +41,7 @@ narrow:
   the lifetime of the run.  Used for the persistent play agent.
 - ``every_n_executions`` — fire every N successful executions of
   a referenced block.  Used for periodic cohorts (brainstormers
-  after every 20 ``take_action`` rows).
+  after every 20 ``take_action`` executions).
 - ``on_request`` — fire when an agent invokes a named tool.  The
   tool string is intentionally not validated against any registry
   here; the pattern runner is the layer that knows about MCP
@@ -92,7 +92,7 @@ class ContinuousTrigger:
 class EveryNExecutionsTrigger:
     """Fire every ``n`` successful executions of ``of_block``.
 
-    The runner consults the workspace ledger; a row counts only
+    The runner consults the workspace ledger; an execution counts only
     once (``status == "succeeded"`` and not synthetic).  ``n``
     must be a positive integer.  The block name must resolve
     against the project's :class:`BlockRegistry`.

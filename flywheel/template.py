@@ -136,7 +136,7 @@ class BlockDefinition:
         post_check: Optional dotted Python path to a callable
             invoked by
             :class:`flywheel.local_block.LocalBlockRecorder` after
-            the row is finalized.  See :mod:`flywheel.post_check`.
+            the execution record is finalized.  See :mod:`flywheel.post_check`.
             ``None`` means no post-execution check is configured
             for this block.  Resolved eagerly at registry-load
             time (a typo fails startup, not the run).

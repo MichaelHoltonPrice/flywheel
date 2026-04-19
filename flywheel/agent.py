@@ -472,7 +472,7 @@ class AgentMount:
     name string.  Returned by :func:`prepare_agent_workspace` and
     recorded into :class:`flywheel.artifact.BlockExecution` so an
     operator looking at a ``foundry/workspaces/<ws>/agent_workspaces/<id>``
-    directory can find the row that produced it.
+    directory can find the execution that produced it.
 
     Attributes:
         relative_dir: Path of the mount relative to the workspace
@@ -520,7 +520,7 @@ def prepare_agent_workspace(
 
     The returned :class:`AgentMount` records the relative dir
     name so :class:`AgentHandle` can stamp it onto the
-    :class:`BlockExecution` row.
+    :class:`BlockExecution` record.
 
     Args:
         workspace: The flywheel workspace.

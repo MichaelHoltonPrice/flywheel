@@ -316,7 +316,7 @@ exceeded.
 For agents that need to invoke nested blocks, callers wrap
 ``launch_agent_block`` in :func:`flywheel.agent_handoff.run_agent_with_handoffs`.
 The handoff loop owns the launch → exit → splice → relaunch
-cycle; each cycle is its own ``BlockExecution`` row chained via
+cycle; each cycle is its own ``BlockExecution`` record chained via
 ``predecessor_id`` so an operator inspecting the workspace sees
 the cycle structure explicitly.
 
@@ -329,7 +329,7 @@ allowing the caller to control the container while it runs:
   ``/workspace/.agent_stop`` via ``docker exec`` (Docker
   Desktop's bind mounts on Windows do not reliably propagate
   host writes into the container).  The optional ``reason`` is
-  recorded on the resulting execution row.
+  recorded on the resulting execution record.
 - ``handle.wait()`` — block until exit, join the stdout/stderr
   drain threads, collect output artifacts, and return
   ``AgentResult``.  Must be called exactly once, even after
@@ -435,7 +435,7 @@ single ``begin`` context manager:
    slot, copies each into a per-mount staging tempdir (the same
    isolation rule that container blocks observe), and exposes
    the staging paths to the body.  Missing required inputs raise
-   ``LocalBlockError`` *before* a row is opened.  Incremental
+   ``LocalBlockError`` *before* an execution is opened.  Incremental
    inputs are snapshotted into the staging dir at this moment,
    so the body sees a frozen view of the sequence regardless of
    appends that happen during execution.
@@ -452,18 +452,18 @@ single ``begin`` context manager:
    in ``output/<name>/entries.jsonl`` (and any other ``*.jsonl``
    files in that directory) to the canonical incremental
    instance under a file lock.  It then writes a single
-   ``BlockExecution`` row with ``status="succeeded"`` and runs
+   ``BlockExecution`` record with ``status="succeeded"`` and runs
    the block's configured post-check.  On body exceptions or
    output-registration failures it rolls back any partial
-   artifacts and writes a single ``"failed"`` row carrying the
+   artifacts and writes a single ``"failed"`` execution record carrying the
    error message.  Per-mount staging dirs and the per-execution
    output tempdir are cleaned up at the end (retained on
-   failure for debugging).  There is no ``"running"`` row;
+   failure for debugging).  There is no ``"running"`` execution record;
    nothing crosses an asynchronous boundary, so the orphaned-
    ``running`` failure mode is structurally impossible.
 
 Post-execution callbacks (see :mod:`flywheel.post_check`) fire
-synchronously after the row is durable.  When a callback returns
+synchronously after the execution record is durable.  When a callback returns
 a ``HaltDirective``, the recorder appends it to an internal halt
 queue.  The host-side handoff loop drains that queue between
 cycles via :meth:`LocalBlockRecorder.drain_halts` and refuses to
@@ -477,7 +477,7 @@ Host-side block runners (``cyberarc.game_step_block.GameStepRunner``,
 they are plain ``BlockRunner`` callables registered with the
 handoff loop, invoked when the agent's ``PreToolUse`` hook
 intercepts the corresponding tool, and they wrap their work in
-``recorder.begin(...)`` so the resulting row, artifacts, and
+``recorder.begin(...)`` so the resulting execution record, artifacts, and
 post-check are recorded under the same workspace lock as every
 other execution.  The same pattern applies outside the agent
 loop: ``cyberarc/tools/play_server.py`` uses a
@@ -674,7 +674,7 @@ dir) or absent.
 
 ``BlockExecution`` records carry an ``agent_workspace_dir`` field
 populated from the ``AgentMount`` so an operator inspecting an
-``agent_workspaces/<id>/`` directory can find the row that
+``agent_workspaces/<id>/`` directory can find the execution that
 produced it via ``workspace.yaml``.
 
 ## Service dependencies
@@ -800,7 +800,7 @@ parallel and returned the result over an open MCP tool call.
 That worked, but it leaked state across the boundary: the agent
 process kept its in-memory context, the workspace could shift
 underneath between calls, a crash mid-body left an orphaned
-``running`` row, and the agent and its MCP server shared fate so
+``running`` execution, and the agent and its MCP server shared fate so
 a hang in one wedged the other.  We accepted some container-
 restart latency to make these failure modes structurally
 impossible.
@@ -828,16 +828,16 @@ each cycle as follows:
    cleanly.
 3. **Exit.**  The runner exports the SDK session JSONL to
    ``agent_session.jsonl`` and exits 0.  The container goes away;
-   ``AgentHandle.wait`` records a ``BlockExecution`` row for the
+   ``AgentHandle.wait`` records a ``BlockExecution`` for the
    agent itself with ``stop_reason="tool_handoff"``.
 4. **Run blocks.**  For each pending tool call, the handoff loop
    invokes the registered ``BlockRunner`` (one per handoff tool;
    composed via ``make_tool_router`` when more than one exists).
    The runner does its work through ``LocalBlockRecorder.begin``,
-   so each call produces its own ``BlockExecution`` row,
+   so each call produces its own ``BlockExecution`` record,
    artifacts, and post-check.  Multiple parallel tool_uses in a
    single assistant turn are handled serially: N tool_uses → N
-   independent rows.
+   independent executions.
 5. **Splice.**  The loop rewrites the session JSONL in place,
    replacing each synthetic ``deny`` ``tool_result`` (located by
    tool_use_id and the ``"handoff_to_flywheel"`` marker) with the
@@ -858,7 +858,7 @@ each cycle as follows:
 
 **Why this is right.**  Each block execution is the atomic unit
 it has always been advertised as: state is on disk at every
-boundary, no row can be orphaned, the agent cannot observe a
+boundary, no execution can be orphaned, the agent cannot observe a
 workspace mid-mutation by another execution, and host-side
 runners get all the host's tooling (debuggers, real exception
 traces, the workspace's own lock).  The tradeoff is that we move

@@ -266,12 +266,12 @@ class TestEveryNExecutions:
         )
         result = runner.run()
 
-        # 7 take_action rows / n=3 = 2 cohorts; cardinality 2 → 4 agents.
+        # 7 take_action executions / n=3 = 2 cohorts; cardinality 2 → 4 agents.
         assert result.cohorts_by_role["brainstorm"] == 2
         assert launches_by_role["brainstorm"] == 4
         assert launches_by_role["play"] == 1
 
-    def test_synthetic_failed_rows_do_not_count(
+    def test_synthetic_failed_executions_do_not_count(
             self, tmp_path: Path):
         ws = _FakeWorkspace(tmp_path)
         play_prompt = _write_prompt(tmp_path, "play.md", "play")

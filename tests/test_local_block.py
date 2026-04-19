@@ -6,20 +6,20 @@ the contract every cyberarc runner relies on:
 
 - ``begin`` resolves declared inputs against the workspace's
   latest instances; missing required inputs raise a typed error
-  *before* any row is written; missing optional inputs are
+  *before* any execution is opened; missing optional inputs are
   silently skipped.
 - The body writes files into ``ctx.output_dir(name)``; on clean
   exit the recorder registers a ``copy`` artifact from each
   per-output directory that has contents (and appends to the
   workspace's canonical ``incremental`` instance for incremental
-  outputs), then writes a single ``"succeeded"`` row.  No
-  intermediate ``"running"`` row exists.
+  outputs), then writes a single ``"succeeded"`` execution record.  No
+  intermediate ``"running"`` execution record exists.
 - Body exceptions propagate after the recorder writes a single
-  ``"failed"`` row with the expected ``error`` string and zero
+  ``"failed"`` execution record with the expected ``error`` string and zero
   output bindings.
 - Output write failures roll back partial copy artifacts and
-  surface as a failed row carrying the underlying error message.
-- Post-execution checks run after the row is durable; halt
+  surface as a failed execution carrying the underlying error message.
+- Post-execution checks run after the execution record is durable; halt
   directives queue on the recorder and drain through
   ``drain_halts``.
 - Scratch directories survive the body for read/write use and
@@ -224,7 +224,7 @@ class TestBeginInputResolution:
             pass
         assert exc_info.value.error_type == "unknown_block"
 
-    def test_missing_required_input_raises_before_row(
+    def test_missing_required_input_raises_before_execution(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
@@ -234,7 +234,7 @@ class TestBeginInputResolution:
         assert exc_info.value.error_type == "missing_input"
         assert "predictor" in str(exc_info.value)
         assert len(ws.executions) == executions_before, (
-            "missing-input rejection must not leave a row")
+            "missing-input rejection must not leave an execution")
 
     def test_missing_optional_input_is_silently_skipped(
             self, recorder_factory):
@@ -301,10 +301,10 @@ class TestBeginInputResolution:
         assert first != second
 
 
-class TestSucceededRow:
-    """Clean exit writes one ``"succeeded"`` row + the artifacts."""
+class TestSucceededExecution:
+    """Clean exit writes one ``"succeeded"`` execution + the artifacts."""
 
-    def test_succeeded_row_replaces_intermediate(
+    def test_succeeded_execution_replaces_intermediate(
             self, recorder_factory):
         make, ws = recorder_factory
         _seed_artifact(ws, "predictor", {"v": 1})
@@ -320,17 +320,17 @@ class TestSucceededRow:
                 "rationale": "deterministic",
             })
 
-        rows = list(ws.executions.values())
-        assert len(rows) == 1, (
-            "no intermediate `running` row should survive")
-        row = rows[0]
-        assert row.status == "succeeded"
-        assert row.block_name == "predict"
-        assert row.params == {
+        executions = list(ws.executions.values())
+        assert len(executions) == 1, (
+            "no intermediate `running` execution should survive")
+        execution = executions[0]
+        assert execution.status == "succeeded"
+        assert execution.block_name == "predict"
+        assert execution.params == {
             "action_id": 6, "x": 10, "y": 20}
-        assert row.caller == {
+        assert execution.caller == {
             "mcp_server": "arc", "tool": "predict_action"}
-        assert "prediction" in row.output_bindings
+        assert "prediction" in execution.output_bindings
 
     def test_artifact_file_written_with_payload(
             self, recorder_factory):
@@ -341,8 +341,8 @@ class TestSucceededRow:
             _emit_copy_output(ctx, "prediction", {
                 "predicted_state": [[0, 1], [2, 3]]})
 
-        row = next(iter(ws.executions.values()))
-        aid = row.output_bindings["prediction"]
+        execution = next(iter(ws.executions.values()))
+        aid = execution.output_bindings["prediction"]
         path = (ws.path / "artifacts" / aid / "prediction.json")
         assert path.exists()
         data = json.loads(path.read_text())
@@ -357,8 +357,8 @@ class TestSucceededRow:
         with rec.begin(block="predict") as ctx:
             _emit_copy_output(ctx, "prediction", {"v": 1})
         captured.update(ctx.output_bindings)
-        row = next(iter(ws.executions.values()))
-        assert captured == row.output_bindings
+        execution = next(iter(ws.executions.values()))
+        assert captured == execution.output_bindings
 
     def test_unset_output_slot_is_skipped(
             self, recorder_factory):
@@ -367,10 +367,10 @@ class TestSucceededRow:
         with rec.begin(block="emits_two") as ctx:
             _emit_copy_output(ctx, "prediction", {"only": "this one"})
 
-        row = next(iter(ws.executions.values()))
-        assert row.status == "succeeded"
-        assert "prediction" in row.output_bindings
-        assert "game_step" not in row.output_bindings
+        execution = next(iter(ws.executions.values()))
+        assert execution.status == "succeeded"
+        assert "prediction" in execution.output_bindings
+        assert "game_step" not in execution.output_bindings
 
     def test_output_dir_for_unknown_slot_raises(
             self, recorder_factory):
@@ -385,8 +385,8 @@ class TestSucceededRow:
         with rec.begin(
             block="noop", parent_execution_id="exec_parent01"):
             pass
-        row = next(iter(ws.executions.values()))
-        assert row.parent_execution_id == "exec_parent01"
+        execution = next(iter(ws.executions.values()))
+        assert execution.parent_execution_id == "exec_parent01"
 
     def test_copy_output_directory_with_multiple_files(
             self, recorder_factory):
@@ -398,8 +398,8 @@ class TestSucceededRow:
             (out / "first.json").write_text('{"a": 1}')
             (out / "second.txt").write_text("hello")
 
-        row = next(iter(ws.executions.values()))
-        aid = row.output_bindings["prediction"]
+        execution = next(iter(ws.executions.values()))
+        aid = execution.output_bindings["prediction"]
         out_dir = ws.path / "artifacts" / aid
         assert (out_dir / "first.json").exists()
         assert (out_dir / "second.txt").read_text() == "hello"
@@ -420,8 +420,8 @@ class TestIncrementalOutputs:
 
         latest = ws.latest_incremental_instance("game_history")
         assert latest is not None
-        row = next(iter(ws.executions.values()))
-        assert row.output_bindings["game_history"] == latest.id
+        execution = next(iter(ws.executions.values()))
+        assert execution.output_bindings["game_history"] == latest.id
         assert ws.read_incremental_entries(latest.id) == [
             {"step": 0, "action": "noop"},
         ]
@@ -439,11 +439,11 @@ class TestIncrementalOutputs:
                 ctx, "game_history", [{"step": 1}, {"step": 2}])
 
         latest = ws.latest_incremental_instance("game_history")
-        rows = sorted(
+        executions = sorted(
             ws.executions.values(), key=lambda r: r.started_at)
         assert all(
             r.output_bindings["game_history"] == latest.id
-            for r in rows
+            for r in executions
         )
         assert ws.read_incremental_entries(latest.id) == [
             {"step": 0}, {"step": 1}, {"step": 2},
@@ -462,9 +462,9 @@ class TestIncrementalOutputs:
             (ctx.output_dir("game_history")
              / "entries.jsonl").write_text("")
 
-        row = next(iter(ws.executions.values()))
-        assert row.status == "succeeded"
-        assert "game_history" not in row.output_bindings
+        execution = next(iter(ws.executions.values()))
+        assert execution.status == "succeeded"
+        assert "game_history" not in execution.output_bindings
         assert ws.latest_incremental_instance(
             "game_history") is None
 
@@ -475,12 +475,12 @@ class TestIncrementalOutputs:
         with rec.begin(block="emits_incremental"):
             pass
 
-        row = next(iter(ws.executions.values()))
-        assert "game_history" not in row.output_bindings
+        execution = next(iter(ws.executions.values()))
+        assert "game_history" not in execution.output_bindings
 
 
-class TestFailedRow:
-    """Body exceptions produce a single ``"failed"`` row."""
+class TestFailedExecution:
+    """Body exceptions produce a single ``"failed"`` execution record."""
 
     def test_body_exception_propagates(self, recorder_factory):
         make, _ = recorder_factory
@@ -488,18 +488,18 @@ class TestFailedRow:
         with pytest.raises(RuntimeError, match="boom"), rec.begin(block="noop"):
             raise RuntimeError("boom")
 
-    def test_failed_row_records_error_string(
+    def test_failed_execution_records_error_string(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
         with pytest.raises(RuntimeError), rec.begin(block="noop"):
             raise RuntimeError("boom")
-        row = next(iter(ws.executions.values()))
-        assert row.status == "failed"
-        assert row.error == "RuntimeError: boom"
-        assert row.output_bindings == {}
+        execution = next(iter(ws.executions.values()))
+        assert execution.status == "failed"
+        assert execution.error == "RuntimeError: boom"
+        assert execution.output_bindings == {}
 
-    def test_failed_row_does_not_register_outputs(
+    def test_failed_execution_does_not_register_outputs(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
@@ -511,7 +511,7 @@ class TestFailedRow:
 
 
 class TestPostCheck:
-    """Post-checks run after the row lands and queue halts."""
+    """Post-checks run after the execution lands and queue halts."""
 
     def test_post_check_invoked_with_finalized_context(
             self, recorder_factory):
@@ -568,11 +568,11 @@ class TestPostCheck:
         assert rec.drain_halts() == [], (
             "drain must clear the queue")
 
-        row = next(iter(ws.executions.values()))
-        assert row.halt_directive == {
+        execution = next(iter(ws.executions.values()))
+        assert execution.halt_directive == {
             "scope": "run", "reason": "enough already"}
 
-    def test_post_check_failure_recorded_on_row(
+    def test_post_check_failure_recorded_on_execution(
             self, recorder_factory):
         make, ws = recorder_factory
 
@@ -583,10 +583,10 @@ class TestPostCheck:
         with rec.begin(block="noop"):
             pass
 
-        row = next(iter(ws.executions.values()))
-        assert row.status == "succeeded"
+        execution = next(iter(ws.executions.values()))
+        assert execution.status == "succeeded"
         assert "RuntimeError: check broken" in (
-            row.post_check_error or "")
+            execution.post_check_error or "")
 
     def test_post_check_invalid_return_recorded(
             self, recorder_factory):
@@ -599,20 +599,20 @@ class TestPostCheck:
         with rec.begin(block="noop"):
             pass
 
-        row = next(iter(ws.executions.values()))
-        assert row.halt_directive is None
+        execution = next(iter(ws.executions.values()))
+        assert execution.halt_directive is None
         assert "expected HaltDirective" in (
-            row.post_check_error or "")
+            execution.post_check_error or "")
 
-    def test_no_post_check_leaves_row_unchanged(
+    def test_no_post_check_leaves_execution_unchanged(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
         with rec.begin(block="noop"):
             pass
-        row = next(iter(ws.executions.values()))
-        assert row.halt_directive is None
-        assert row.post_check_error is None
+        execution = next(iter(ws.executions.values()))
+        assert execution.halt_directive is None
+        assert execution.post_check_error is None
 
 
 class TestScratchAndCleanup:
@@ -688,10 +688,10 @@ class TestScratchAndCleanup:
         shutil.rmtree(seen[0], ignore_errors=True)
 
 
-class TestNoIntermediateRunningRow:
-    """Critical contract: no row exists with status=='running'."""
+class TestNoIntermediateRunningExecution:
+    """Critical contract: no execution exists with status=='running'."""
 
-    def test_in_body_workspace_has_no_intermediate_row(
+    def test_in_body_workspace_has_no_intermediate_execution(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
@@ -705,8 +705,8 @@ class TestNoIntermediateRunningRow:
         assert observed["count_during_body"] == "0"
         assert observed["running_during_body"] == "0"
         assert len(ws.executions) == 1
-        row = next(iter(ws.executions.values()))
-        assert row.status == "succeeded"
+        execution = next(iter(ws.executions.values()))
+        assert execution.status == "succeeded"
 
 
 class TestLocalExecutionContext:
@@ -744,10 +744,10 @@ class TestLocalExecutionContext:
             ctx.output_dir("missing")
 
 
-class TestRowIsolation:
+class TestExecutionIsolation:
     """Recorder writes nothing under failure scenarios mid-sequence."""
 
-    def test_two_sequential_runs_record_two_rows(
+    def test_two_sequential_runs_record_two_executions(
             self, recorder_factory):
         make, ws = recorder_factory
         rec = make()
@@ -755,10 +755,10 @@ class TestRowIsolation:
             pass
         with rec.begin(block="noop"):
             pass
-        rows = list(ws.executions.values())
-        assert len(rows) == 2
-        assert all(r.status == "succeeded" for r in rows)
-        assert rows[0].id != rows[1].id
+        executions = list(ws.executions.values())
+        assert len(executions) == 2
+        assert all(r.status == "succeeded" for r in executions)
+        assert executions[0].id != executions[1].id
 
     def test_failed_then_succeeded_runs_recorded_separately(
             self, recorder_factory):
@@ -768,12 +768,12 @@ class TestRowIsolation:
             raise RuntimeError("first attempt failed")
         with rec.begin(block="noop"):
             pass
-        rows = sorted(
+        executions = sorted(
             ws.executions.values(), key=lambda r: r.started_at)
-        assert [r.status for r in rows] == ["failed", "succeeded"]
+        assert [r.status for r in executions] == ["failed", "succeeded"]
 
 
-class TestExecutionRowFields:
+class TestExecutionRecordFields:
     """Exhaustive contract checks for the fields downstream consumes."""
 
     def test_runner_field_propagates(self, recorder_factory):
@@ -781,8 +781,8 @@ class TestExecutionRowFields:
         rec = make()
         with rec.begin(block="noop", runner="lifecycle"):
             pass
-        row: BlockExecution = next(iter(ws.executions.values()))
-        assert row.runner == "lifecycle"
+        execution: BlockExecution = next(iter(ws.executions.values()))
+        assert execution.runner == "lifecycle"
 
     def test_image_pulled_from_block_definition(
             self, recorder_factory):
@@ -790,11 +790,11 @@ class TestExecutionRowFields:
         rec = make()
         with rec.begin(block="noop"):
             pass
-        row = next(iter(ws.executions.values()))
+        execution = next(iter(ws.executions.values()))
         # noop has no container image; BlockDefinition surfaces
         # an empty string for that, not None — the recorder
         # passes it through verbatim.
-        assert row.image == ""
+        assert execution.image == ""
 
     def test_elapsed_s_is_recorded_as_float(
             self, recorder_factory):
@@ -802,6 +802,6 @@ class TestExecutionRowFields:
         rec = make()
         with rec.begin(block="noop"):
             pass
-        row = next(iter(ws.executions.values()))
-        assert isinstance(row.elapsed_s, float)
-        assert row.elapsed_s >= 0.0
+        execution = next(iter(ws.executions.values()))
+        assert isinstance(execution.elapsed_s, float)
+        assert execution.elapsed_s >= 0.0

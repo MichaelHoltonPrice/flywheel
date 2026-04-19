@@ -117,7 +117,7 @@ class PatternRunner:
         poll_interval_s: How often to re-scan the workspace
             ledger for trigger evaluation.  Lower values feel
             snappier but burn CPU; the default matches the
-            cadence of the tools that emit ``game_step`` rows
+            cadence of the tools that emit ``game_step`` executions
             (sub-second is overkill).
         max_total_runtime_s: Hard wall-clock cap.  ``None`` means
             wait until all continuous handles finish naturally
@@ -227,8 +227,8 @@ class PatternRunner:
     def _evaluate_ledger_triggers(self) -> None:
         """Fire ``every_n_executions`` cohorts that are due.
 
-        Counts only ``status=="succeeded"`` rows that are not
-        synthetic.  Synthetic-failed rows already trigger
+        Counts only ``status=="succeeded"`` executions that are not
+        synthetic.  Synthetic-failed executions already trigger
         post-check halts via
         :class:`flywheel.local_block.LocalBlockRecorder`; counting
         them here would double-count infrastructure failures as

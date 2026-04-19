@@ -2,7 +2,7 @@
 
 A *post-execution callback* is a project-side quality gate that
 runs after :class:`flywheel.local_block.LocalBlockRecorder`
-finalizes a block-execution row.  It can ask the runner that
+finalizes a block-execution record.  It can ask the runner that
 invoked the block to stop; it cannot emit artifacts, mutate the
 workspace, or change what was recorded.
 
@@ -21,9 +21,9 @@ training session.
 
 The callable is invoked synchronously by the recorder after
 ``end_execution`` (or after the recorder synthesises a failed
-row for a body that raised before ``end``).  Callbacks may
+execution record for a body that raised before ``end``).  Callbacks may
 return a :class:`HaltDirective` to ask the host loop to stop;
-they may not mutate the row, the workspace ledger, or the
+they may not mutate the execution record, the workspace ledger, or the
 artifacts.
 """
 
@@ -40,18 +40,18 @@ class HaltDirective:
     """A request to halt one or more runners.
 
     Returned from a post-execution callback.  The channel persists
-    the directive on the originating ``BlockExecution`` row and on
+    the directive on the originating ``BlockExecution`` record and on
     its per-channel halt queue, where runners pick it up via the
     ``/halt`` endpoint.
 
     Attributes:
         scope: Which runners to halt.  ``"caller"`` halts only the
             runner whose ``execution_id`` matches the originating
-            row's ``parent_execution_id`` (typically the agent
+            execution's ``parent_execution_id`` (typically the agent
             container that issued the tool call).  ``"run"`` halts
             every runner connected to the channel.
         reason: Human-readable explanation, surfaced verbatim in
-            the runner's exit message and persisted on the row.
+            the runner's exit message and persisted on the execution record.
     """
 
     scope: Literal["caller", "run"]
@@ -96,7 +96,7 @@ class PostCheckContext:
         outputs: Mapping from output slot name to the per-output
             directory the block wrote into, on the host filesystem.
             Post-checks may read from these directories but must
-            not modify them.  Empty mapping when the row is failed
+            not modify them.  Empty mapping when the execution is failed
             or when the block declared no outputs.  Note: this is
             *not* the canonical artifact directory — it's the
             ephemeral per-execution staging dir, valid for the
@@ -105,7 +105,7 @@ class PostCheckContext:
             :meth:`flywheel.workspace.Workspace.instance_path`.
         parent_execution_id: ID of the runner that invoked this
             block, when known.
-        synthetic: ``True`` if this row was synthesised by the
+        synthetic: ``True`` if this execution record was synthesised by the
             channel for a request that never made it past
             ``begin`` (e.g., manifest mismatch, unknown block).
             Use this to halt the whole run on infrastructure

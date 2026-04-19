@@ -12,9 +12,9 @@ defining structural properties:
 
 1. **No HTTP round-trip.**  The host-side block runner shares a
    Python process with the workspace, so it writes artifacts and
-   ledger rows directly under the workspace's own lock.  No
+   ledger executions directly under the workspace's own lock.  No
    loopback HTTP service runs.
-2. **No ``"running"`` row.**  Nothing needs to remember anything
+2. **No ``"running"`` execution record.**  Nothing needs to remember anything
    across an in-process boundary, so recorded executions go
    straight from non-existent → ``"succeeded"`` or ``"failed"``
    and the orphaned-``running`` class of bug becomes structurally
@@ -83,7 +83,7 @@ class LocalBlockError(RuntimeError):
 
     Attributes:
         error_type: One of ``"unknown_block"``, ``"missing_input"``.
-        execution_id: ``None`` because no row is written for
+        execution_id: ``None`` because no execution record is written for
             rejected requests.  Present on the exception only so
             callers that want to log a stable shape can do so.
     """
@@ -113,7 +113,7 @@ class LocalExecutionContext:
     Attributes:
         execution_id: Workspace-allocated ledger ID for this
             execution.  Stable for the life of the ``with`` block
-            and persists on the resulting row.
+            and persists on the resulting execution record.
         block_name: The block this execution corresponds to.
         input_bindings: ``{slot_name: artifact_id}`` resolved at
             ``begin`` time from the workspace's latest instances.
@@ -233,8 +233,8 @@ class LocalBlockRecorder:
        and runs the block's post-execution check (if
        configured).
     4. On exception the recorder writes no artifacts, builds a
-       ``"failed"`` row, runs the post-check with that row as
-       context, and re-raises.
+       ``"failed"`` execution record, runs the post-check with
+       that record as context, and re-raises.
 
     Halts produced by post-checks are appended to
     :attr:`halt_queue`; the host-side handoff loop calls
@@ -247,7 +247,7 @@ class LocalBlockRecorder:
         template: Template with the block definitions used to
             resolve inputs and validate outputs.
         post_checks: Mapping from block name to the post-execution
-            callable to invoke after each row finalizes.  Empty
+            callable to invoke after each execution finalizes.  Empty
             mapping means no post-checks are wired up.
         halt_queue: Mutable list of queued halt directives.
             Drained by :meth:`drain_halts`; the recorder never
@@ -286,13 +286,13 @@ class LocalBlockRecorder:
                 back through the yielded context.
             caller: Identifies the source of the call (e.g.,
                 ``{"mcp_server": "arc", "tool": "take_action"}``).
-                Recorded on the ledger row for downstream
+                Recorded on the ledger execution for downstream
                 analyses keyed on caller.
             runner: Caller-declared physical runner type (e.g.,
                 ``"lifecycle"``).  Recorded as-is.
             parent_execution_id: Execution ID of the runner that
                 invoked this block.  For agent-triggered blocks
-                this is the agent's own execution row.
+                this is the agent's own execution record.
 
         Yields:
             A :class:`LocalExecutionContext` for populating
@@ -305,7 +305,7 @@ class LocalBlockRecorder:
                 (``"missing_input"``).
             Exception: Any exception raised by the body propagates
                 out of the context manager after the recorder
-                writes a ``"failed"`` row and runs the post-check.
+                writes a ``"failed"`` execution record and runs the post-check.
         """
         block_def = self._find_block(block)
         if block_def is None:
@@ -461,7 +461,7 @@ class LocalBlockRecorder:
         caller: dict[str, Any] | None,
         runner: str | None,
     ) -> None:
-        """Register artifacts from per-output dirs and record a succeeded row.
+        """Register artifacts from per-output dirs and record a succeeded execution.
 
         For each declared output slot, looks up the artifact's
         declared kind, then either:
@@ -487,7 +487,7 @@ class LocalBlockRecorder:
         atomically once it lands in the ledger).  Incremental
         appends are not rolled back — they are append-only by
         design and partial appends remain visible to subsequent
-        readers.  A ``"failed"`` row is written with the
+        readers.  A ``"failed"`` execution record is written with the
         underlying error message so operators can diagnose
         without grepping logs.
         """
@@ -541,7 +541,7 @@ class LocalBlockRecorder:
                 shutil.rmtree(aid_dir, ignore_errors=True)
                 self.workspace.artifacts.pop(aid, None)
             failed_error = f"output_write_failed: {exc}"
-            self._write_row(BlockExecution(
+            self._write_execution(BlockExecution(
                 id=ctx.execution_id,
                 block_name=ctx.block_name,
                 started_at=started_at,
@@ -562,7 +562,7 @@ class LocalBlockRecorder:
         output_bindings = {name: aid for name, aid in registered}
         ctx.output_bindings = dict(output_bindings)
 
-        self._write_row(BlockExecution(
+        self._write_execution(BlockExecution(
             id=ctx.execution_id,
             block_name=ctx.block_name,
             started_at=started_at,
@@ -664,9 +664,9 @@ class LocalBlockRecorder:
         runner: str | None,
         error: BaseException,
     ) -> None:
-        """Record a failed row when the body raised."""
+        """Record a failed execution when the body raised."""
         error_str = f"{type(error).__name__}: {error}"
-        self._write_row(BlockExecution(
+        self._write_execution(BlockExecution(
             id=ctx.execution_id,
             block_name=ctx.block_name,
             started_at=started_at,
@@ -683,20 +683,20 @@ class LocalBlockRecorder:
             error=error_str,
         ), outputs={}, error=error_str)
 
-    def _write_row(
+    def _write_execution(
         self,
         execution: BlockExecution,
         *,
         outputs: dict[str, Path],
         error: str | None,
     ) -> None:
-        """Persist a finalized execution row, then run post-check.
+        """Persist a finalized execution record, then run post-check.
 
-        The row is written atomically with the workspace save, so
-        a crash between adding the row and saving leaves the
+        The execution record is written atomically with the workspace save, so
+        a crash between adding the record and saving leaves the
         workspace consistent (no orphans, no half-state).  After
-        the row is durable, the post-check runs against the
-        finalized state and may rewrite the row with a halt
+        the execution is durable, the post-check runs against the
+        finalized state and may rewrite the record with a halt
         directive or post-check error.
         """
         self.workspace.add_execution(execution)
@@ -719,7 +719,7 @@ class LocalBlockRecorder:
         outputs: dict[str, Path],
         error: str | None,
     ) -> BlockExecution:
-        """Invoke the configured post-check; return updated row.
+        """Invoke the configured post-check; return updated execution record.
 
         Returns ``execution`` unchanged when no check is wired up
         for this block name or the check returned ``None`` and

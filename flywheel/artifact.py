@@ -116,7 +116,7 @@ class BlockExecution:
             in the calling container), ``"subprocess"`` (local
             process), ``"record"`` (legacy record-mode, no work
             performed), or ``"agent"`` (long-lived agent container).
-            None for legacy rows that predate the runner concept.
+            None for legacy executions that predate the runner concept.
         caller: For tool-triggered logical executions, identifies
             which MCP server and tool invoked this block. Shape is
             ``{"mcp_server": str, "tool": str}``. None for executions
@@ -125,13 +125,13 @@ class BlockExecution:
             (e.g., ``{"action_id": 6, "x": 15, "y": 20}``).  These
             are not artifacts but are recorded for lineage so the
             full call can be reconstructed.  None if the block has
-            no params or for legacy rows.
+            no params or for legacy executions.
         error: Error message if status is ``"failed"`` and the
             failure produced a string description. None otherwise.
-        synthetic: ``True`` when the channel created this row in
-            place of a request that never made it past
-            ``/execution/begin`` (e.g., manifest mismatch,
-            unknown block, missing input).  Synthetic rows let
+        synthetic: ``True`` when the channel created this execution record in
+        place of a request that never made it past
+        ``/execution/begin`` (e.g., manifest mismatch,
+        unknown block, missing input).  Synthetic executions let
             post-execution checks see infrastructure failures the
             same way they see body failures.  Default ``False``.
         halt_directive: Persisted form of a
@@ -139,11 +139,11 @@ class BlockExecution:
             this block's post-execution callback.  Shape is
             ``{"scope": "caller"|"run", "reason": str}``.  Means
             "the post-check asked one or more runners to stop
-            after this row landed."  ``None`` when no directive
+            after this execution landed."  ``None`` when no directive
             was issued.  Distinct from ``stop_reason``, which
             describes why an *individual* execution ended.
         post_check_error: Error string if the post-execution
-            callback itself raised.  The row is not retroactively
+            callback itself raised.  The execution record is not retroactively
             marked failed; the field exists so operators can see
             the check is broken without it taking the run down.
             ``None`` when no callback was configured or it
@@ -152,9 +152,9 @@ class BlockExecution:
             ``/workspace`` bind mount used by this agent (e.g.,
             ``"agent_workspaces/abc12345"``).  Recorded so an
             operator looking at a workspace directory can find
-            the row that produced it (and vice versa) without
+            the execution that produced it (and vice versa) without
             having to grep timestamps.  ``None`` for non-agent
-            executions and for agent rows that predate this
+            executions and for agent executions that predate this
             field.
     """
 
