@@ -142,7 +142,7 @@ def _fake_run_success(
     mounted), then returns a :class:`FakePopen` already at
     ``exit_code``.  ``wait()`` on it returns immediately.
     """
-    def _fake(config, args=None, name=None):
+    def _fake(config, args=None, name=None, **_):
         for host, container, mode in config.mounts:
             if mode != "rw":
                 continue
@@ -247,13 +247,13 @@ class TestStateRoundTrip:
 
         seen_state_on_second: dict[str, str] = {}
 
-        def _fake_first(config, args=None, name=None):
+        def _fake_first(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     (Path(host) / "counter.txt").write_text("1")
             return FakePopen(returncode=0)
 
-        def _fake_second(config, args=None, name=None):
+        def _fake_second(config, args=None, name=None, **_):
             # Record what's visible in /state/ at start, then
             # append.
             for host, container, _mode in config.mounts:
@@ -315,7 +315,7 @@ class TestCanonicalNotMountedInvariant:
 
         captured_mounts: list[tuple[str, str, str]] = []
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             captured_mounts.extend(config.mounts)
             return FakePopen(returncode=0)
 
@@ -420,7 +420,7 @@ class TestIncrementalOutputs:
         ws = _make_workspace(tmp_path, template)
         executor = ProcessExitExecutor(template)
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == "/output/game_history":
                     (Path(host) / "entries.jsonl").write_text(
@@ -454,7 +454,7 @@ class TestIncrementalOutputs:
         executor = ProcessExitExecutor(template)
 
         def _fake_step(step_id: int):
-            def _inner(config, args=None, name=None):
+            def _inner(config, args=None, name=None, **_):
                 for host, container, _mode in config.mounts:
                     if container == "/output/game_history":
                         (Path(host) / "entries.jsonl").write_text(
@@ -508,7 +508,7 @@ class TestIncrementalOutputs:
         ws = _make_workspace(tmp_path, template)
         executor = ProcessExitExecutor(template)
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             # Write a file that isn't entries.jsonl.
             for host, container, _mode in config.mounts:
                 if container == "/output/game_history":
@@ -533,7 +533,7 @@ class TestStateCaptureFailure:
         ws = _make_workspace(tmp_path, template)
         executor = ProcessExitExecutor(template)
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             # Container writes state successfully.
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
@@ -570,7 +570,7 @@ class TestOutputCollectFailure:
         ws = _make_workspace(tmp_path, template)
         executor = ProcessExitExecutor(template)
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == "/output/result":
                     (Path(host) / "payload.txt").write_text("x")
@@ -610,7 +610,7 @@ class TestMissingStateDir:
         executor = ProcessExitExecutor(template)
 
         # Seed a prior execution + real state dir.
-        def _fake_first(config, args=None, name=None):
+        def _fake_first(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     (Path(host) / "counter.txt").write_text("1")
@@ -628,7 +628,7 @@ class TestMissingStateDir:
             ws.path / ws.executions[first.execution_id].state_dir)
 
         # Second execution must fail stage_in.
-        def _fake_second(config, args=None, name=None):
+        def _fake_second(config, args=None, name=None, **_):
             return FakePopen(returncode=0)
 
         with patch(
@@ -700,7 +700,7 @@ class TestStateRestoreEligibility:
         executor = ProcessExitExecutor(template)
         seen: dict[str, str] = {}
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     seen["tag"] = (
@@ -761,7 +761,7 @@ class TestStateRestoreEligibility:
         executor = ProcessExitExecutor(template)
         seen: dict[str, str] = {}
 
-        def _fake(config, args=None, name=None):
+        def _fake(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     seen["tag"] = (
@@ -805,7 +805,7 @@ class TestStateLineage:
         executor = ProcessExitExecutor(template)
 
         def _fake_write(tag: str):
-            def _inner(config, args=None, name=None):
+            def _inner(config, args=None, name=None, **_):
                 for host, container, _mode in config.mounts:
                     if container == runtime.STATE_MOUNT_PATH:
                         (Path(host) / "tag.txt").write_text(tag)
@@ -826,7 +826,7 @@ class TestStateLineage:
         # A-lineage state is not its predecessor.
         seen: dict[str, str] = {}
 
-        def _fake_b(config, args=None, name=None):
+        def _fake_b(config, args=None, name=None, **_):
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     host_p = Path(host)
@@ -975,7 +975,7 @@ def _start_cancellable(
     """
     popen_ref: dict = {}
 
-    def _factory(config, args=None, name=None):
+    def _factory(config, args=None, name=None, **_):
         # Locate the work-area mount (host path for /workspace).
         work_area = None
         for host, container, _mode in config.mounts:
@@ -1198,3 +1198,319 @@ class TestValidation:
         ):
             executor.launch(
                 "logical", ws, input_bindings={})
+
+
+class TestExtraEnvAndMounts:
+    """``extra_env`` and ``extra_mounts`` are generic launch knobs.
+
+    They let a launcher (pattern runner, agent adapter) layer
+    runtime configuration on top of a block's static declaration
+    without making the launch DSL a second imperative surface.
+    """
+
+    def test_extra_env_merges_with_block_env(self, tmp_path: Path):
+        template = _make_template()
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        # Pre-populate block.env with a default the caller
+        # overrides and an unrelated key.
+        template.blocks[0].env["DEFAULT_MODEL"] = "block-default"
+        template.blocks[0].env["UNRELATED"] = "stays"
+
+        captured: dict = {}
+
+        def _fake(config, args=None, name=None, **_):
+            captured["env"] = dict(config.env)
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={},
+                extra_env={"DEFAULT_MODEL": "override",
+                           "EXTRA": "value"},
+            )
+            handle.wait()
+
+        assert captured["env"]["DEFAULT_MODEL"] == "override"
+        assert captured["env"]["EXTRA"] == "value"
+        assert captured["env"]["UNRELATED"] == "stays"
+
+    def test_extra_mounts_appended_to_mount_list(
+        self, tmp_path: Path,
+    ):
+        template = _make_template()
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        src = tmp_path / "prompt_src"
+        src.mkdir()
+        (src / "prompt.md").write_text("hello")
+
+        captured: dict = {}
+
+        def _fake(config, args=None, name=None, **_):
+            captured["mounts"] = list(config.mounts)
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={},
+                extra_mounts=[(str(src), "/prompt", "ro")],
+            )
+            handle.wait()
+
+        # Contract mounts still present (work-area).
+        assert any(m[1] == "/workspace" for m in captured["mounts"])
+        # Extra mount landed at the requested container path.
+        assert (str(src), "/prompt", "ro") in captured["mounts"]
+
+
+class TestLogDir:
+    """``log_dir`` captures stdout/stderr into per-execution files."""
+
+    def test_log_dir_creates_stdout_and_stderr_files(
+        self, tmp_path: Path,
+    ):
+        template = _make_template()
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        class _LinePopen:
+            """Popen fake that surfaces fixed stdout + stderr lines."""
+
+            def __init__(self):
+                self.returncode = 0
+                self.stdout = iter([
+                    "line one\n", "line two\n",
+                ])
+                self.stderr = iter(["warn one\n"])
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _fake(config, args=None, name=None, **_):
+            return _LinePopen()
+
+        log_dir = tmp_path / "logs"
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={},
+                log_dir=log_dir,
+            )
+            handle.wait()
+
+        stdout_log = (log_dir / "stdout.log").read_text(
+            encoding="utf-8")
+        stderr_log = (log_dir / "stderr.log").read_text(
+            encoding="utf-8")
+        assert "line one" in stdout_log
+        assert "line two" in stdout_log
+        assert "warn one" in stderr_log
+
+    def test_on_stdout_line_callback_sees_each_line(
+        self, tmp_path: Path,
+    ):
+        template = _make_template()
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        class _LinePopen:
+            def __init__(self):
+                self.returncode = 0
+                self.stdout = iter(["first\n", "second\n"])
+                self.stderr = iter([])
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _fake(config, args=None, name=None, **_):
+            return _LinePopen()
+
+        seen: list[str] = []
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={},
+                log_dir=tmp_path / "logs",
+                on_stdout_line=seen.append,
+            )
+            handle.wait()
+
+        assert seen == ["first", "second"]
+
+
+class _WatchdogTestPopen:
+    """Popen fake that busy-polls the sentinel on ``wait(None)``.
+
+    Differs from :class:`_CancellableFakePopen` in one way: when
+    ``wait()`` is called with no timeout, it loops with short
+    sleeps until the sentinel path appears (cooperative exit)
+    rather than raising AssertionError.  That matches the real
+    :meth:`subprocess.Popen.wait` blocking semantics the
+    watchdog test needs.
+    """
+
+    def __init__(self, sentinel_path: Path):
+        import time as _time
+        self._sentinel_path = sentinel_path
+        self._time = _time
+        self.returncode: int | None = None
+
+    def _check(self) -> None:
+        if (self.returncode is None
+                and self._sentinel_path.exists()):
+            self.returncode = 0
+
+    def poll(self) -> int | None:
+        self._check()
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = (
+            self._time.monotonic() + timeout
+            if timeout is not None else None
+        )
+        while True:
+            self._check()
+            if self.returncode is not None:
+                return self.returncode
+            if deadline is not None:
+                remaining = deadline - self._time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        cmd="fake", timeout=timeout)
+                self._time.sleep(min(remaining, 0.05))
+            else:
+                self._time.sleep(0.05)
+
+
+class TestWatchdogTimeout:
+    """Watchdog enforces ``total_timeout_s`` independent of stdout."""
+
+    def test_quiet_container_still_hit_by_timeout(
+        self, tmp_path: Path,
+    ):
+        """A container that never writes stdout still gets stopped.
+
+        This is the blind-spot that stdout-tied timeout
+        enforcement had: if nothing prints, nothing polls the
+        wall clock.  The watchdog thread polls independently.
+        """
+        template = _make_template(stop_timeout_s=1)
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        popen_ref: dict = {}
+
+        def _factory(config, args=None, name=None, **_):
+            work_area = None
+            for host, container, _mode in config.mounts:
+                if container == "/workspace":
+                    work_area = Path(host)
+                    break
+            assert work_area is not None
+            popen = _WatchdogTestPopen(
+                sentinel_path=(
+                    work_area
+                    / runtime.STOP_SENTINEL_WORKSPACE_RELATIVE
+                ),
+            )
+            popen_ref["popen"] = popen
+            return popen
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_factory,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={},
+                total_timeout_s=0.2,
+            )
+            result = handle.wait()
+
+        # Watchdog fired stop() with reason "total_timeout";
+        # sentinel write caused the cooperative exit.
+        assert result.status == "interrupted"
+        execution = ws.executions[result.execution_id]
+        assert execution.stop_reason == "total_timeout"
+
+
+class TestStopConcurrency:
+    """``stop()`` is idempotent and lock-protected.
+
+    The operator, the watchdog, and a racing natural exit can all
+    land in ``stop()``; the first caller wins and runs the body,
+    others see a no-op.  Exactly one TERM/KILL escalation per
+    handle.
+    """
+
+    def test_second_stop_call_is_noop(self, tmp_path: Path):
+        template = _make_template(stop_timeout_s=1)
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        factory, popen_ref = _start_cancellable(
+            exits_on_sentinel=True)
+
+        signal_calls: list[str] = []
+
+        def _fake_signal(name, signal):
+            signal_calls.append(signal)
+            popen = popen_ref["popen"]
+            if signal == "TERM":
+                popen.receive_term()
+            elif signal == "KILL":
+                popen.receive_kill()
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=factory,
+        ), patch(
+            "flywheel.executor._docker_send_signal",
+            side_effect=_fake_signal,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            handle.stop(reason="first")
+            # Second call should short-circuit; the recorded
+            # reason stays at "first".
+            handle.stop(reason="second")
+            result = handle.wait()
+
+        assert result.status == "interrupted"
+        execution = ws.executions[result.execution_id]
+        assert execution.stop_reason == "first"
+
+    def test_stop_after_natural_exit_is_noop(
+        self, tmp_path: Path,
+    ):
+        """Calling stop() on a container that already exited is
+        a no-op: no stop_reason set, status stays succeeded."""
+        template = _make_template()
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake_run_success(),
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            handle.stop(reason="late")
+            result = handle.wait()
+
+        assert result.status == "succeeded"

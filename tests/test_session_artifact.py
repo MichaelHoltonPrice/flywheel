@@ -193,7 +193,13 @@ class TestSessionImport:
 
 
 class TestStopFile:
-    def test_stop_file_constant(self):
-        """STOP_FILE is at /workspace/.agent_stop by default."""
-        assert _runner.STOP_FILE.name == ".agent_stop"
-        assert str(_runner.STOP_FILE).endswith(".agent_stop")
+    def test_stop_file_matches_substrate_sentinel(self):
+        """STOP_FILE is the contract's ``/workspace/.stop`` sentinel.
+
+        The agent runner watches the same path the substrate
+        writes for cooperative cancellation, so
+        :meth:`ContainerExecutionHandle.stop` and a handoff-loop
+        stop both terminate the agent through one channel.
+        """
+        assert _runner.STOP_FILE.name == ".stop"
+        assert str(_runner.STOP_FILE).endswith(".stop")

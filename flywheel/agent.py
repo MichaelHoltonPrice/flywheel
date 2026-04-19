@@ -1,54 +1,48 @@
 """Agent block execution orchestration.
 
-Runs an AI agent (Claude Code) inside a Docker container.  The
-agent reads source code, writes artifacts, and may trigger nested
-block executions via the host-side full-stop handoff path
-(:mod:`flywheel.agent_handoff`); see
-:mod:`flywheel.local_block` for the recorder side.
-
-The agent container receives:
-- A workspace directory (read-write) for writing artifacts
-- Source code directories (read-only)
-- Previous artifacts as optional inputs (read-only)
-
-Each block the agent invokes becomes a tracked block execution
-with full artifact provenance in the workspace.
+Runs a Claude Code agent as a one-shot container block via
+:class:`flywheel.executor.ProcessExitExecutor`.  The agent reads
+its prompt from a bind-mounted ``/prompt/prompt.md``, writes
+declared outputs to ``/output/<slot>/``, and persists its
+conversation session through the ``/state/`` mount.  Cancellation
+(operator, watchdog, natural exit) lives in
+:class:`flywheel.executor.ContainerExecutionHandle`; this module's
+:class:`AgentHandle` is a thin wrapper that translates the
+container's :class:`flywheel.executor.ExecutionResult` into an
+:class:`AgentResult` carrying agent-specific fields
+(``exit_reason``, ``evals_run``).
 
 Two APIs are provided:
 
 - ``launch_agent_block()`` returns an ``AgentHandle`` immediately
   for non-blocking control.  The handle supports ``stop()`` to
   request a graceful shutdown and ``wait()`` to block until
-  completion and collect artifacts.
-- ``run_agent_block()`` is a blocking convenience wrapper that
-  calls ``launch_agent_block()`` then ``handle.wait()``.
+  completion and collect the result.
+- ``run_agent_block()`` is a blocking convenience wrapper.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import subprocess
 import sys
-import threading
-import time
-import uuid
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from flywheel import runtime
-from flywheel.artifact import BlockExecution, LifecycleEvent
-from flywheel.executor import capture_state, populate_state_mount
-from flywheel.input_staging import (
-    cleanup_staged_inputs,
-    stage_artifact_instances,
+from flywheel.artifact import LifecycleEvent
+from flywheel.executor import (
+    ContainerExecutionHandle,
+    ProcessExitExecutor,
 )
 from flywheel.template import Template
 from flywheel.workspace import Workspace
+
+
+# Default total timeout for an agent launch (4 hours).
+DEFAULT_TOTAL_TIMEOUT = 14400
 
 
 @dataclass(frozen=True)
@@ -58,25 +52,18 @@ class AgentResult:
     Attributes:
         exit_code: The agent container's exit code.
         elapsed_s: Wall-clock time in seconds.
-        evals_run: Number of evaluations the agent triggered.
-        execution_id: The workspace execution ID recorded for
-            this agent run, or None if recording was skipped.
+        evals_run: Number of nested block executions triggered
+            during this agent run (computed as the delta of
+            workspace-wide execution count, minus one for the
+            agent's own record).
+        execution_id: The workspace execution ID for this run.
         stop_reason: Why the agent was stopped, if applicable.
         exit_reason: Semantic classification of why the agent
             exited.  One of: ``"completed"``, ``"auth_failure"``,
             ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
-            ``"crashed"``, ``"tool_handoff"``.  ``"tool_handoff"``
-            indicates the agent runner intercepted one or more
-            handoff tool calls and exited cleanly to let the host
-            run the corresponding blocks; the host-side handoff
-            loop (``flywheel.agent_handoff``) is responsible for
-            splicing results back and re-launching.
-        agent_workspace_dir: Workspace-relative path of the
-            directory the agent was bind-mounted at (e.g.,
-            ``"agent_workspaces/abc12345"``).  Callers that need
-            to read post-run files (output collection,
-            log scraping) read this rather than guessing the
-            path.  ``None`` only when recording was skipped.
+            ``"crashed"``, ``"tool_handoff"``.  Derived from the
+            ``agent_exit_state`` artifact the agent runner wrote
+            on exit.
     """
 
     exit_code: int
@@ -85,375 +72,66 @@ class AgentResult:
     execution_id: str | None = None
     stop_reason: str | None = None
     exit_reason: str | None = None
-    agent_workspace_dir: str | None = None
-
-
-def _classify_exit(
-    exit_code: int,
-    stop_reason: str | None,
-    agent_ws: Path,
-) -> str:
-    """Classify an agent exit into a semantic exit_reason.
-
-    Reads ``.agent_state.json`` from the agent workspace (written
-    by the agent_runner) to determine why the agent stopped.
-
-    Args:
-        exit_code: The container's exit code.
-        stop_reason: If the agent was externally stopped, the
-            reason string.
-        agent_ws: Path to the agent workspace directory.
-
-    Returns:
-        One of: ``"completed"``, ``"auth_failure"``,
-        ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
-        ``"crashed"``, ``"tool_handoff"``.
-    """
-    if stop_reason:
-        return "stopped"
-
-    state_file = agent_ws / ".agent_state.json"
-    if state_file.exists():
-        try:
-            state = json.loads(
-                state_file.read_text(encoding="utf-8"))
-            status = state.get("status", "")
-            reason = state.get("reason", "")
-
-            if status == "tool_handoff":
-                return "tool_handoff"
-            if "auth" in reason:
-                return "auth_failure"
-            if "rate_limit" in reason:
-                return "rate_limit"
-            if reason == "max_turns":
-                return "max_turns"
-            if status == "complete":
-                return "completed"
-        except Exception:
-            pass
-
-    if exit_code == 0:
-        return "completed"
-    return "crashed"
-
-
-def _resolve_path(path: Path) -> str:
-    """Resolve a path for Docker volume mounts (Windows-safe)."""
-    resolved = str(path.resolve())
-    if sys.platform == "win32":
-        resolved = resolved.replace("\\", "/")
-    return resolved
-
-
-# Default total timeout for an agent step (4 hours).
-DEFAULT_TOTAL_TIMEOUT = 14400
-
-
-def _read_stdout(
-    process: subprocess.Popen,
-    event_log: Path,
-    start_time: float,
-    total_timeout: int,
-    container_name: str = "",
-) -> None:
-    """Read agent stdout in a background thread.
-
-    Writes JSON events to the event log, prints summaries via
-    ``_log_event``, and requests a graceful stop if the total
-    timeout is exceeded.
-    """
-    with open(event_log, "w") as log_f:
-        for line in process.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            log_f.write(line + "\n")
-            log_f.flush()
-
-            try:
-                event = json.loads(line)
-                _log_event(event)
-            except json.JSONDecodeError:
-                pass
-
-            if time.monotonic() - start_time > total_timeout:
-                print(f"  [agent] total timeout "
-                      f"({total_timeout}s) exceeded -- stopping")
-                if container_name:
-                    subprocess.run(
-                        ["docker", "exec", container_name,
-                         "touch", "/workspace/.agent_stop"],
-                        capture_output=True, timeout=10,
-                    )
-                else:
-                    process.kill()
-                break
-
-
-class AgentHandle:
-    """Handle to a running agent container.
-
-    Returned by ``launch_agent_block()``.  Provides non-blocking
-    control over the container lifecycle.
-
-    The caller **must** call ``wait()`` exactly once to clean up
-    resources (join threads, collect artifacts).  Call ``stop()``
-    to request a graceful shutdown — the agent runner detects the
-    stop file, exports its session, and exits on its own.
-    """
-
-    def __init__(
-        self,
-        process: subprocess.Popen,
-        workspace: Workspace,
-        agent_ws: Path,
-        output_names: list[str] | None,
-        start_time: float,
-        executions_before: int,
-        agent_image: str,
-        stdout_thread: threading.Thread,
-        stderr_thread: threading.Thread,
-        block_name: str,
-        container_name: str = "",
-        predecessor_id: str | None = None,
-        agent_workspace_dir: str | None = None,
-        staged_inputs: dict[str, Path] | None = None,
-        state_mount: Path | None = None,
-    ):
-        """Initialize from a launched container and its resources."""
-        self._process = process
-        self._workspace = workspace
-        self._agent_ws = agent_ws
-        self._output_names = output_names
-        self._start_time = start_time
-        self._executions_before = executions_before
-        self._agent_image = agent_image
-        self._stdout_thread = stdout_thread
-        self._stderr_thread = stderr_thread
-        self._container_name = container_name
-        self._predecessor_id = predecessor_id
-        self._block_name = block_name
-        self._agent_workspace_dir = agent_workspace_dir
-        self._staged_inputs = staged_inputs or {}
-        self._state_mount = state_mount
-        self._stop_reason: str | None = None
-        self._waited = False
-
-    def is_alive(self) -> bool:
-        """Check if the container process is still running."""
-        return self._process.poll() is None
-
-    def stop(self, reason: str = "requested") -> None:
-        """Request a graceful shutdown of the agent.
-
-        Creates a ``.agent_stop`` file inside the container via
-        ``docker exec``.  The agent runner checks for this file
-        between turns, exports the session artifact, and exits
-        cleanly.
-
-        Uses ``docker exec`` rather than host-side file writes
-        because Docker Desktop bind mounts on Windows don't
-        reliably propagate host writes to the container.
-
-        The caller **must** still call ``wait()`` afterward to join
-        threads and collect artifacts.
-
-        Args:
-            reason: Why the agent is being stopped (e.g.,
-                ``"exploration_request"``, ``"prediction_mismatch"``).
-                Recorded in the workspace execution record.
-        """
-        self._stop_reason = reason
-        if self._container_name:
-            subprocess.run(
-                ["docker", "exec", self._container_name,
-                 "touch", "/workspace/.agent_stop"],
-                capture_output=True, timeout=10,
-            )
-
-    def wait(self) -> AgentResult:
-        """Block until the container exits and return results.
-
-        Joins background threads, collects output artifacts,
-        records the agent execution in the workspace, and returns
-        ``AgentResult``.  Must be called exactly once.
-
-        Raises:
-            RuntimeError: If ``wait()`` has already been called.
-        """
-        if self._waited:
-            raise RuntimeError(
-                "wait() already called on this AgentHandle")
-        self._waited = True
-
-        started_at = datetime.fromtimestamp(
-            self._start_time - time.monotonic() + time.time(),
-            tz=UTC,
-        )
-
-        try:
-            self._stdout_thread.join()
-            self._process.wait()
-        finally:
-            self._stderr_thread.join(timeout=5)
-            # Per-mount staging tempdirs are scoped to the
-            # container's lifetime: the container has now exited
-            # so any further read against the mount is the host's
-            # bug, not ours.  Cleanup is best-effort; a leaked
-            # tempdir is preferable to crashing on the way out.
-            cleanup_staged_inputs(self._staged_inputs)
-            self._staged_inputs = {}
-
-        elapsed = time.monotonic() - self._start_time
-        finished_at = datetime.now(UTC)
-
-        execution_id = self._workspace.generate_execution_id()
-
-        # Capture /state/ into the workspace's state dir so the
-        # next execution of this block can resume.  Runs before
-        # the rest of finalization so state_dir can be recorded
-        # on the execution row.  If capture raises we record
-        # that as the execution's failure_phase so downstream
-        # callers (e.g. the handoff loop) get a clear error
-        # rather than a confusing "session missing" at splice
-        # time.
-        state_dir_rel: str | None = None
-        state_capture_error: str | None = None
-        if self._state_mount is not None:
-            try:
-                state_dir_rel = capture_state(
-                    self._workspace,
-                    self._block_name,
-                    execution_id,
-                    self._state_mount,
-                )
-            except OSError as exc:
-                state_capture_error = f"state_capture: {exc}"
-                print(
-                    f"  [agent] state capture failed: {exc}",
-                    file=sys.stderr,
-                )
-            finally:
-                shutil.rmtree(self._state_mount, ignore_errors=True)
-                self._state_mount = None
-
-        # Collect output artifacts from agent workspace.
-        output_bindings: dict[str, str] = {}
-        if self._output_names and self._agent_ws.exists():
-            for name in self._output_names:
-                for candidate in self._agent_ws.iterdir():
-                    if candidate.is_file() and candidate.stem == name:
-                        inst = self._workspace.register_artifact(
-                            name, candidate,
-                            source=f"agent output ({self._agent_image})",
-                        )
-                        output_bindings[name] = inst.id
-                        break
-
-        evals_run = (
-            len(self._workspace.executions) - self._executions_before
-        )
-        exit_code = (
-            self._process.returncode
-            if self._process is not None else -1
-        )
-
-        # Record the agent execution in the workspace.
-        if self._stop_reason:
-            status = "interrupted"
-        elif exit_code == 0:
-            status = "succeeded"
-        else:
-            status = "failed"
-
-        failure_phase = (
-            runtime.FAILURE_STATE_CAPTURE
-            if state_capture_error is not None else None
-        )
-        execution = BlockExecution(
-            id=execution_id,
-            block_name=self._block_name,
-            started_at=started_at,
-            finished_at=finished_at,
-            status=status,
-            output_bindings=output_bindings,
-            exit_code=exit_code,
-            elapsed_s=elapsed,
-            image=self._agent_image,
-            stop_reason=self._stop_reason,
-            predecessor_id=self._predecessor_id,
-            agent_workspace_dir=self._agent_workspace_dir,
-            state_dir=state_dir_rel,
-            failure_phase=failure_phase,
-            error=state_capture_error,
-        )
-        self._workspace.add_execution(execution)
-
-        # Record a lifecycle event if the agent was stopped.
-        if self._stop_reason:
-            event = LifecycleEvent(
-                id=self._workspace.generate_event_id(),
-                kind="agent_stopped",
-                timestamp=finished_at,
-                execution_id=execution_id,
-                detail={"reason": self._stop_reason},
-            )
-            self._workspace.add_event(event)
-
-        self._workspace.save()
-
-        print(
-            f"  [agent] completed: exit_code={exit_code}, "
-            f"elapsed={elapsed:.1f}s, evals={evals_run}"
-        )
-
-        exit_reason = _classify_exit(
-            exit_code, self._stop_reason, self._agent_ws)
-
-        return AgentResult(
-            exit_code=exit_code,
-            elapsed_s=elapsed,
-            evals_run=evals_run,
-            execution_id=execution_id,
-            stop_reason=self._stop_reason,
-            exit_reason=exit_reason,
-            agent_workspace_dir=self._agent_workspace_dir,
-        )
 
 
 @dataclass
 class AgentBlockConfig:
     """Configuration for an agent block launch.
 
-    Groups the parameters for ``launch_agent_block`` into a
-    reusable, inspectable object.  Used by ``AgentGroup`` to
-    define a base config with per-member overrides.
+    Shared across pattern-driven launches via a base config plus
+    per-role overrides; see
+    :meth:`flywheel.pattern_runner.PatternRunner._kwargs_for`.
 
     Attributes:
         workspace: The flywheel workspace for artifact tracking.
         template: The template containing block definitions.
         project_root: Path to the project root.
         prompt: The system prompt for the agent.
-        agent_image: Docker image for the agent container.
-        auth_volume: Docker named volume with API credentials.
+        agent_image: Docker image for the agent container (kept
+            for compatibility with launchers that predate
+            block-YAML-authoritative images; the executor reads
+            ``block_def.image`` authoritatively).
+        auth_volume: Docker named volume carrying API credentials.
         model: Model name (e.g., ``"claude-sonnet-4-6"``).
         max_turns: Maximum agent conversation turns.
-        total_timeout: Maximum wall-clock seconds.
-        allowed_blocks: Block names the agent may invoke.
-        source_dirs: Source directories to mount read-only.
-        input_artifacts: Maps mount names to artifact instance IDs.
-        output_names: Artifact names to collect after completion.
-        overrides: CLI flag overrides for invoked containers.
-        mcp_servers: Comma-separated MCP server names.
-        allowed_tools: Comma-separated tool whitelist.
-        extra_env: Additional environment variables.
-        extra_mounts: Additional volume mounts.
-        pre_launch_hook: Callback before container launch.
-        isolated_network: Enable iptables-based network isolation.
-        agent_workspace_dir: Subdirectory name for the agent workspace.
-        predecessor_id: Execution ID of a previous agent run that
-            this launch resumes from.
+        total_timeout: Maximum wall-clock seconds for the run.
+        allowed_blocks: Reserved; not consulted on the launch
+            path anymore (the executor validates at the
+            substrate boundary).  Kept for API compatibility.
+        source_dirs: Project source directories to mount
+            read-only into the container.
+        input_artifacts: Maps input slot names to artifact
+            instance IDs.  Passed straight to the executor.
+        output_names: Reserved; block-declared outputs are the
+            substrate's single source of truth.  Kept for API
+            compatibility with pattern-runner wiring.
+        overrides: Per-launch CLI flag overrides forwarded to
+            the executor.
+        mcp_servers: Comma-separated MCP server names enabled
+            inside the agent container.
+        allowed_tools: Comma-separated tool whitelist for the
+            agent runner.
+        extra_env: Additional environment variables merged on
+            top of the block's declared env.
+        extra_mounts: Additional bind mounts appended to the
+            substrate's mount list (auth volume, source dirs,
+            MCP servers, ...).
+        pre_launch_hook: Reserved; retained for pattern-runner
+            API stability.  The substrate does not invoke it.
+        isolated_network: When ``True``, add
+            ``--cap-add=NET_ADMIN`` and set
+            ``NETWORK_ISOLATION=1`` in the container env so the
+            in-container firewall script drops outbound traffic.
+        agent_workspace_dir: Reserved; no-op under the substrate.
+            The /workspace bind is always the executor's per-
+            execution scratch tempdir.
+        predecessor_id: Execution ID of a previous agent run
+            this launch resumes from.  Recorded on the
+            :class:`BlockExecution` for chain traversal.
+        post_checks: Reserved; kept for API compatibility.
+        prompt_substitutions: ``{{KEY}} -> value`` substitutions
+            applied by the pattern runner to the role's prompt
+            text before launch.
     """
 
     workspace: Workspace
@@ -478,160 +156,240 @@ class AgentBlockConfig:
     isolated_network: bool = False
     agent_workspace_dir: str | None = None
     predecessor_id: str | None = None
-    # Pre-resolved post-execution callbacks keyed by block name.
-    # See :mod:`flywheel.post_check`.  Reserved for future use:
-    # the agent path itself does not run post-checks today; the
-    # full-stop handoff loop registers them on its own
-    # :class:`flywheel.local_block.LocalBlockRecorder` instead.
     post_checks: dict[str, Any] | None = None
-    # Optional ``{{KEY}} -> value`` substitutions applied by
-    # :class:`flywheel.pattern_runner.PatternRunner` to each
-    # role's prompt text before launch.  The :mod:`launch_agent_block`
-    # path does not consult this (the loop already substitutes
-    # via ``--key value`` overrides parsed from the CLI tail);
-    # patterns surface it as an explicit hook return so the
-    # equivalent of ``{{GAME_ID}}`` keeps working without
-    # leaking ``--key value`` plumbing into the runner.
     prompt_substitutions: dict[str, str] | None = None
 
 
-# Subdirectory under the workspace where auto-named agent
-# workspaces live; one ``<short-uuid>`` directory per agent
-# launch.  Pulled out as a module constant so cyberarc tooling
-# (``play_server``, replay scripts) can refer to it without
-# duplicating the literal.
-AGENT_WORKSPACES_DIR = "agent_workspaces"
+def _resolve_host_path(path: Path) -> str:
+    """Normalize a host path for Docker bind mounts on Windows."""
+    resolved = str(path.resolve())
+    if sys.platform == "win32":
+        resolved = resolved.replace("\\", "/")
+    return resolved
 
 
-@dataclass(frozen=True)
-class AgentMount:
-    """A bind-mount target prepared for one agent launch.
-
-    Bundles the host directory (rooted under the workspace), the
-    container path it'll be mounted at, and whether it's
-    writable, so callers don't have to recompute these from the
-    name string.  Returned by :func:`prepare_agent_workspace` and
-    recorded into :class:`flywheel.artifact.BlockExecution` so an
-    operator looking at a ``foundry/workspaces/<ws>/agent_workspaces/<id>``
-    directory can find the execution that produced it.
-
-    Attributes:
-        relative_dir: Path of the mount relative to the workspace
-            root (e.g., ``"agent_workspaces/abc12345"``).  This
-            is what gets recorded into ``BlockExecution`` for
-            traceability.
-        host_path: Absolute host path to the prepared directory.
-        container_path: Where the directory is mounted inside the
-            container.  Always ``/workspace`` today; field exists
-            so future patterns can mount auxiliary workspaces.
-        mode: ``"rw"`` (the agent writes here) or ``"ro"``.
-            Always ``"rw"`` for the primary agent workspace.
-    """
-
-    relative_dir: str
-    host_path: Path
-    container_path: str = "/workspace"
-    mode: str = "rw"
-
-
-def prepare_agent_workspace(
-    workspace: Workspace,
-    agent_workspace_dir: str | None = None,
+def _build_agent_env(
     *,
-    reuse_workspace: bool = False,
-) -> AgentMount:
-    """Prepare a fresh agent workspace directory.
+    model: str | None,
+    max_turns: int | None,
+    mcp_servers: str | None,
+    allowed_tools: str | None,
+    allowed_blocks: list[str] | None,
+    isolated_network: bool,
+    extra_env: dict[str, str] | None,
+) -> dict[str, str]:
+    """Assemble the env dict passed to the agent runner.
 
-    When ``agent_workspace_dir`` is ``None`` the directory is
-    auto-named ``agent_workspaces/<short-uuid>`` so parallel
-    launches can never collide.  When the caller passes an
-    explicit name and the target directory already exists with
-    content, this function raises ``FileExistsError`` instead of
-    silently rmtree-ing — refusing to clobber existing content
-    is the only way to keep parallel launches from racing each
-    other into a hand-set workspace dir.  Empty / non-existent explicit
-    targets are still accepted (so tests that pre-create an
-    empty dir keep working) and existing-but-empty dirs are
-    reused in place.
-
-    The agent workspace is **scratch only** — the agent obtains
-    all artifact data through its mounted ``/input/<slot>``
-    directories (staged copies of canonical artifacts; see
-    :func:`flywheel.input_staging.stage_artifact_instances`).
-
-    The returned :class:`AgentMount` records the relative dir
-    name so :class:`AgentHandle` can stamp it onto the
-    :class:`BlockExecution` record.
-
-    Args:
-        workspace: The flywheel workspace.
-        agent_workspace_dir: Optional explicit subdirectory name.
-            Pass ``None`` (the default) to get a unique
-            auto-named mount; pass a string when the caller has
-            its own naming convention and is willing to take
-            responsibility for collision avoidance.
-        reuse_workspace: When ``True``, treat an existing
-            non-empty ``agent_workspace_dir`` as intentional reuse
-            (no ``FileExistsError``).  Used by the host-side
-            handoff loop (``flywheel.agent_handoff``) so a
-            relaunch into the same agent workspace finds the
-            control files (``pending_tool_calls.json``,
-            ``.agent_state.json``) that the previous cycle left
-            behind.  The session JSONL itself lives in
-            ``/state/`` and is restored independently; nothing
-            in the reused workspace dir carries it.  Requires an
-            explicit ``agent_workspace_dir``; passing both
-            ``agent_workspace_dir=None`` and
-            ``reuse_workspace=True`` raises ``ValueError`` because
-            there is nothing to reuse.
-
-    Returns:
-        :class:`AgentMount` describing the prepared directory.
-
-    Raises:
-        FileExistsError: if ``agent_workspace_dir`` is explicit,
-            the target directory exists with content, and
-            ``reuse_workspace`` is ``False``.
-        ValueError: if ``reuse_workspace`` is ``True`` but
-            ``agent_workspace_dir`` is ``None``.
+    The runner consumes ``MODEL``, ``MAX_TURNS``, ``MCP_SERVERS``,
+    ``ALLOWED_TOOLS``, and (via HANDOFF_TOOLS etc.) the caller's
+    own extras.  ``NETWORK_ISOLATION`` flips the in-container
+    firewall script.  Caller-supplied ``extra_env`` wins on key
+    collision so a per-role override always takes effect.
     """
-    if reuse_workspace and agent_workspace_dir is None:
-        raise ValueError(
-            "reuse_workspace=True requires an explicit "
-            "agent_workspace_dir; nothing to reuse otherwise."
+    env: dict[str, str] = {
+        "EVAL_BLOCK": (
+            allowed_blocks[0] if allowed_blocks else "eval_bot"),
+        "MCP_SERVERS": mcp_servers or "eval",
+        "ALLOWED_TOOLS": (
+            allowed_tools or "Read,Write,Edit,Glob,Grep"),
+        "PYTHONUNBUFFERED": "1",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
+    }
+    if model:
+        env["MODEL"] = model
+    if max_turns is not None:
+        env["MAX_TURNS"] = str(max_turns)
+    if isolated_network:
+        env["NETWORK_ISOLATION"] = "1"
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def _build_agent_mounts(
+    *,
+    project_root: Path,
+    auth_volume: str,
+    source_dirs: list[str] | None,
+    prompt_dir: Path,
+    extra_mounts: list[tuple[str, str, str]] | None,
+    isolated_network: bool,
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Build the agent-specific extra mounts + docker_args.
+
+    Returns ``(mounts, docker_args)``.  ``mounts`` is what gets
+    forwarded to :meth:`ProcessExitExecutor.launch` as the
+    ``extra_mounts`` kwarg; the executor appends it to the
+    substrate-reserved mount list (``/input/*``, ``/output/*``,
+    ``/state``, ``/workspace``).  ``docker_args`` extends
+    ``block_def.docker_args`` for network-isolation runs.
+    """
+    mounts: list[tuple[str, str, str]] = [
+        (auth_volume, "/home/claude/.claude", "rw"),
+        (_resolve_host_path(prompt_dir), "/prompt", "ro"),
+    ]
+    if source_dirs:
+        for i, src in enumerate(source_dirs):
+            src_path = project_root / src
+            container_path = (
+                "/source" if i == 0 else f"/source{i + 1}")
+            mounts.append(
+                (_resolve_host_path(src_path),
+                 container_path, "ro"))
+    if extra_mounts:
+        mounts.extend(extra_mounts)
+
+    docker_args: list[str] = []
+    if isolated_network:
+        docker_args.append("--cap-add=NET_ADMIN")
+
+    return mounts, docker_args
+
+
+def _classify_exit(
+    workspace: Workspace,
+    execution_id: str | None,
+) -> tuple[str, str | None]:
+    """Classify an agent exit from the ``agent_exit_state`` artifact.
+
+    Reads the JSON the agent runner wrote into
+    ``/output/agent_exit_state/agent_exit_state.json`` (now a
+    first-class artifact instance) and maps its
+    ``status`` / ``reason`` fields to a semantic ``exit_reason``.
+    Returns ``(exit_reason, stop_reason)`` — ``stop_reason`` is
+    the :class:`BlockExecution` field populated by the executor
+    when a :meth:`ContainerExecutionHandle.stop` call caused the
+    exit; it takes precedence over any runner-side status.
+    """
+    if execution_id is None:
+        return "crashed", None
+    execution = workspace.executions.get(execution_id)
+    if execution is None:
+        return "crashed", None
+    stop_reason = execution.stop_reason
+    if stop_reason:
+        return "stopped", stop_reason
+
+    binding = execution.output_bindings.get("agent_exit_state")
+    if binding:
+        instance = workspace.artifacts.get(binding)
+        if instance is not None:
+            artifact_dir = (
+                workspace.path / "artifacts" / instance.copy_path)
+            state_file = (
+                artifact_dir / "agent_exit_state.json")
+            if state_file.is_file():
+                try:
+                    state = json.loads(
+                        state_file.read_text(encoding="utf-8"))
+                    status = state.get("status", "")
+                    reason = state.get("reason", "")
+                    if status == "tool_handoff":
+                        return "tool_handoff", None
+                    if "auth" in reason:
+                        return "auth_failure", None
+                    if "rate_limit" in reason:
+                        return "rate_limit", None
+                    if reason == "max_turns":
+                        return "max_turns", None
+                    if status == "complete":
+                        return "completed", None
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+    if execution.exit_code == 0:
+        return "completed", None
+    return "crashed", None
+
+
+class AgentHandle:
+    """Thin adapter around a :class:`ContainerExecutionHandle`.
+
+    ``is_alive`` / ``stop`` delegate directly to the inner
+    handle.  ``wait`` blocks on the inner handle's post-exit
+    pipeline, then reads the agent exit-state artifact to
+    classify ``exit_reason`` and counts the workspace-execution
+    delta for ``evals_run``.
+
+    The caller **must** call ``wait()`` exactly once.  Failing to
+    call it leaks the prompt tempdir and the inner handle's
+    thread resources.
+    """
+
+    def __init__(
+        self,
+        *,
+        inner: ContainerExecutionHandle,
+        workspace: Workspace,
+        executions_before: int,
+        prompt_tempdir: Path,
+    ) -> None:
+        """Capture references the adapter needs to build AgentResult."""
+        self._inner = inner
+        self._workspace = workspace
+        self._executions_before = executions_before
+        self._prompt_tempdir = prompt_tempdir
+        self._waited = False
+
+    def is_alive(self) -> bool:
+        """Whether the inner container is still running."""
+        return self._inner.is_alive()
+
+    def stop(self, reason: str = "requested") -> None:
+        """Forward to the inner handle's two-phase cancellation."""
+        self._inner.stop(reason=reason)
+
+    def wait(self) -> AgentResult:
+        """Block for container exit and return :class:`AgentResult`.
+
+        Cleans up the prompt tempdir in a ``finally`` so a raise
+        during the inner wait doesn't leak it.
+
+        Raises:
+            RuntimeError: If called more than once.
+        """
+        if self._waited:
+            raise RuntimeError(
+                "wait() already called on this AgentHandle")
+        self._waited = True
+        try:
+            result = self._inner.wait()
+        finally:
+            shutil.rmtree(
+                self._prompt_tempdir, ignore_errors=True)
+
+        # +1 for the agent's own execution record.
+        evals_run = max(
+            0,
+            len(self._workspace.executions)
+            - self._executions_before - 1,
         )
-    if agent_workspace_dir is None:
-        ws_dir_name = (
-            f"{AGENT_WORKSPACES_DIR}/{uuid.uuid4().hex[:8]}")
-        agent_ws = workspace.path / ws_dir_name
-        # In the (cosmically unlikely) event of a uuid collision
-        # against an existing dir, redraw rather than rmtree —
-        # the whole point of auto-naming is "never blow away
-        # someone else's workspace".
-        while agent_ws.exists():
-            ws_dir_name = (
-                f"{AGENT_WORKSPACES_DIR}/{uuid.uuid4().hex[:8]}")
-            agent_ws = workspace.path / ws_dir_name
-    else:
-        ws_dir_name = agent_workspace_dir
-        agent_ws = workspace.path / ws_dir_name
-        if (agent_ws.exists() and any(agent_ws.iterdir())
-                and not reuse_workspace):
-            raise FileExistsError(
-                f"agent_workspace_dir={agent_workspace_dir!r} "
-                f"already exists at {agent_ws} with content. "
-                f"Pass agent_workspace_dir=None to auto-name "
-                f"this launch under {AGENT_WORKSPACES_DIR}/, or "
-                f"choose a unique name to avoid clobbering "
-                f"another launch's working directory."
-            )
 
-    agent_ws.mkdir(parents=True, exist_ok=True)
+        exit_reason, stop_reason = _classify_exit(
+            self._workspace, result.execution_id)
 
-    return AgentMount(
-        relative_dir=ws_dir_name,
-        host_path=agent_ws,
-    )
+        if stop_reason:
+            execution = self._workspace.executions.get(
+                result.execution_id)
+            if execution is not None:
+                event = LifecycleEvent(
+                    id=self._workspace.generate_event_id(),
+                    kind="agent_stopped",
+                    timestamp=execution.finished_at,
+                    execution_id=result.execution_id,
+                    detail={"reason": stop_reason},
+                )
+                self._workspace.add_event(event)
+                self._workspace.save()
+
+        return AgentResult(
+            exit_code=result.exit_code,
+            elapsed_s=result.elapsed_s,
+            evals_run=evals_run,
+            execution_id=result.execution_id,
+            stop_reason=stop_reason,
+            exit_reason=exit_reason,
+        )
 
 
 def launch_agent_block(
@@ -659,301 +417,135 @@ def launch_agent_block(
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
     post_checks: dict[str, Any] | None = None,
-    reuse_workspace: bool = False,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
-    Sets up the workspace, launches the Docker container, and
-    returns an ``AgentHandle`` immediately.  The container runs
-    in the background.
+    Translates agent-specific launch parameters into a
+    :meth:`ProcessExitExecutor.launch` call:
 
-    The caller must call ``handle.wait()`` to clean up and get
-    the result.  Call ``handle.stop()`` to request a graceful
-    shutdown, then ``wait()`` to finalize.
+    * ``prompt`` is written to a tempdir ``prompt.md`` and passed
+      as an ``extra_mount`` at ``/prompt`` (the agent runner
+      reads it at startup).
+    * ``auth_volume`` + ``source_dirs`` + any caller
+      ``extra_mounts`` append to the substrate's own mounts.
+    * ``model``, ``max_turns``, ``mcp_servers``, ``allowed_tools``
+      become environment variables via ``extra_env``.
+    * ``block_name`` picks the block definition the executor runs;
+      ``block_def.image`` / ``inputs`` / ``outputs`` are
+      authoritative.
 
     Args:
-        workspace: The flywheel workspace for artifact tracking.
+        workspace: The flywheel workspace.
         template: The template containing block definitions.
-        project_root: Path to the project root.
-        prompt: The system prompt for the agent.
-        block_name: Name of the block this launch represents.
-            Written verbatim into the ``BlockExecution`` record
-            and used as the state-chain key for
-            :func:`populate_state_mount` — every launch of the
-            same block with the same ``state_lineage_id``
-            chains through the same state lineage.
-        agent_image: Docker image for the agent container.
-        auth_volume: Docker named volume with API credentials.
-        model: Model name (e.g., "claude-sonnet-4-6").
-        max_turns: Maximum agent conversation turns.
-        total_timeout: Maximum wall-clock seconds.
-        allowed_blocks: Block names the agent may invoke.
-        source_dirs: Source directories to mount read-only.
-        input_artifacts: Maps mount names to artifact instance IDs.
-        output_names: Artifact names to collect after completion.
-        overrides: CLI flag overrides for invoked containers.
+        project_root: Project root (for resolving ``source_dirs``).
+        prompt: The system prompt.  Mounted at ``/prompt/prompt.md``.
+        block_name: Name of the block to execute.  Must exist in
+            the template and declare ``runner: container``.
+        agent_image: Reserved; the executor reads
+            ``block_def.image`` authoritatively.
+        auth_volume: Docker named volume carrying agent credentials.
+        model: Optional model override.
+        max_turns: Optional turn budget.
+        total_timeout: Wall-clock cap.  Enforced by the
+            substrate's watchdog thread.
+        allowed_blocks: Reserved.
+        source_dirs: Project source dirs to mount read-only.
+        input_artifacts: Block input slot bindings.
+        output_names: Reserved; outputs are block-declared.
+        overrides: CLI flag overrides forwarded to the executor.
         mcp_servers: Comma-separated MCP server names.
         allowed_tools: Comma-separated tool whitelist.
-        extra_env: Additional environment variables.
-        extra_mounts: Additional volume mounts.
-        pre_launch_hook: Callback before container launch.
-        isolated_network: Enable iptables-based network isolation
-            inside the container.
-        agent_workspace_dir: Subdirectory name for the agent workspace.
-            Defaults to ``"agent_workspace"``.  Use distinct names
-            when launching multiple agents in parallel against the
-            same flywheel workspace.
-        predecessor_id: Execution ID of a previous agent run that
-            this launch resumes from.  Recorded in the workspace
-            execution for resume chain tracking.
-        post_checks: Reserved.  The agent path itself runs no
-            post-checks; nested-block post-checks live on the
-            host-side :class:`flywheel.local_block.LocalBlockRecorder`
-            owned by the handoff loop.
-        reuse_workspace: When ``True``, the launcher skips the
-            "fresh workspace" check and the prior-artifact
-            seeding pass.  Used by the host-side handoff loop
-            (``flywheel.agent_handoff``) so a relaunch into the
-            same agent workspace finds the control files
-            (``pending_tool_calls.json``, ``.agent_state.json``)
-            from the prior cycle.  Session resume is
-            independent: ``/state/`` is populated from the prior
-            execution's captured state_dir regardless of this
-            flag.  Requires an explicit ``agent_workspace_dir``.
+        extra_env: Additional env merged into the container's env.
+        extra_mounts: Additional bind mounts appended to the
+            substrate mount list.
+        pre_launch_hook: Reserved.
+        isolated_network: When ``True``, adds
+            ``--cap-add=NET_ADMIN`` and sets
+            ``NETWORK_ISOLATION=1``.
+        agent_workspace_dir: Reserved; no-op.
+        predecessor_id: Not passed to the executor today (the
+            substrate does not accept a predecessor on launch).
+            Callers that chain executions — the handoff loop —
+            are responsible for writing ``predecessor_id`` onto
+            the :class:`BlockExecution` record after wait().
+        post_checks: Reserved.
 
     Returns:
-        An ``AgentHandle`` for monitoring and controlling the agent.
+        An :class:`AgentHandle` for monitoring and controlling
+        the agent.
     """
-    del overrides, post_checks  # accepted for API compatibility
-    mount = prepare_agent_workspace(
-        workspace, agent_workspace_dir,
-        reuse_workspace=reuse_workspace,
-    )
-    agent_ws = mount.host_path
-    # Bind the resolved name back so AgentHandle records the
-    # directory the run actually used.
-    agent_workspace_dir = mount.relative_dir
+    del (overrides, post_checks, output_names,
+         agent_workspace_dir, pre_launch_hook, allowed_blocks,
+         agent_image, predecessor_id)
 
+    # Pattern runners pass ``total_timeout=None`` to mean "no
+    # wall-clock cap"; the executor treats that the same way.
+    timeout_s = (
+        float(total_timeout) if total_timeout else None)
+
+    prompt_tempdir = Path(tempfile.mkdtemp(
+        prefix=f"flywheel-prompt-{block_name}-"))
+    (prompt_tempdir / "prompt.md").write_text(
+        prompt, encoding="utf-8")
+
+    mounts, docker_args = _build_agent_mounts(
+        project_root=project_root,
+        auth_volume=auth_volume,
+        source_dirs=source_dirs,
+        prompt_dir=prompt_tempdir,
+        extra_mounts=extra_mounts,
+        isolated_network=isolated_network,
+    )
+
+    env = _build_agent_env(
+        model=model,
+        max_turns=max_turns,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        allowed_blocks=None,
+        isolated_network=isolated_network,
+        extra_env=extra_env,
+    )
+
+    log_dir = workspace.path / "logs" / block_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    executor = ProcessExitExecutor(template)
     executions_before = len(workspace.executions)
 
-    # Build Docker command with a named container for reliable stop.
-    container_name = f"flywheel-{uuid.uuid4().hex[:12]}"
-    cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
-
-    if isolated_network:
-        cmd.extend(["--cap-add=NET_ADMIN"])
-
-    cmd.extend(["-v", f"{auth_volume}:/home/claude/.claude"])
-    cmd.extend(["-v", f"{_resolve_path(agent_ws)}:/workspace"])
-
-    if source_dirs:
-        for i, src in enumerate(source_dirs):
-            src_path = project_root / src
-            mount_point = "/source" if i == 0 else f"/source{i + 1}"
-            cmd.extend([
-                "-v", f"{_resolve_path(src_path)}:{mount_point}:ro",
-            ])
-
-    # Per-mount input staging: the canonical artifact directory
-    # is never bind-mounted directly.  Each input slot gets a
-    # fresh ephemeral copy (see :mod:`flywheel.input_staging`).
-    # AgentHandle cleans up the tempdirs after the container
-    # exits.
-    staged_inputs: dict[str, Path] = {}
-    if input_artifacts:
-        staged_inputs = stage_artifact_instances(
-            workspace, dict(input_artifacts))
-    # Any failure between here and AgentHandle construction must
-    # release the staging tempdirs; AgentHandle.wait() handles
-    # them once the handle is built.
-    state_mount: Path | None = None
     try:
-        for mount_name, host_path in staged_inputs.items():
-            cmd.extend([
-                "-v",
-                f"{_resolve_path(host_path)}"
-                f":/input/{mount_name}:ro",
-            ])
-
-        # /state/ mount: populated from the most recent prior
-        # successful execution of this block (or empty for the
-        # first run in the lineage).  The agent runner reads its
-        # session from ``/state/session.jsonl`` at startup and
-        # writes it back on exit; AgentHandle captures the mount
-        # contents into ``<workspace>/state/<block>/<exec_id>/``
-        # after the container exits.  Session is no longer an
-        # artifact.
-        state_mount = populate_state_mount(
-            workspace,
+        inner = executor.launch(
             block_name=block_name,
-            state_lineage_id=None,
-        )
-        cmd.extend([
-            "-v",
-            f"{_resolve_path(state_mount)}"
-            f":{runtime.STATE_MOUNT_PATH}:rw",
-        ])
-
-        return _continue_launch(
             workspace=workspace,
-            agent_ws=agent_ws,
-            agent_workspace_dir=agent_workspace_dir,
-            agent_image=agent_image,
-            block_name=block_name,
-            output_names=output_names,
-            executions_before=executions_before,
-            container_name=container_name,
-            cmd=cmd,
-            staged_inputs=staged_inputs,
-            state_mount=state_mount,
-            extra_mounts=extra_mounts,
-            allowed_blocks=allowed_blocks,
-            mcp_servers=mcp_servers,
-            allowed_tools=allowed_tools,
-            model=model,
-            max_turns=max_turns,
-            isolated_network=isolated_network,
-            extra_env=extra_env,
-            pre_launch_hook=pre_launch_hook,
-            total_timeout=total_timeout,
-            predecessor_id=predecessor_id,
-            prompt=prompt,
+            input_bindings=input_artifacts or {},
+            extra_env=env,
+            extra_mounts=mounts,
+            extra_docker_args=docker_args or None,
+            log_dir=log_dir,
+            total_timeout_s=timeout_s,
         )
     except BaseException:
-        cleanup_staged_inputs(staged_inputs)
-        if state_mount is not None:
-            shutil.rmtree(state_mount, ignore_errors=True)
+        shutil.rmtree(prompt_tempdir, ignore_errors=True)
         raise
 
-
-def _continue_launch(
-    *,
-    workspace: Workspace,
-    agent_ws: Path,
-    agent_workspace_dir: str,
-    agent_image: str,
-    block_name: str,
-    output_names: list[str] | None,
-    executions_before: int,
-    container_name: str,
-    cmd: list[str],
-    staged_inputs: dict[str, Path],
-    state_mount: Path | None,
-    extra_mounts: list[tuple[str, str, str]] | None,
-    allowed_blocks: list[str] | None,
-    mcp_servers: str | None,
-    allowed_tools: str | None,
-    model: str | None,
-    max_turns: int | None,
-    isolated_network: bool,
-    extra_env: dict[str, str] | None,
-    pre_launch_hook: Callable[[Path], None] | None,
-    total_timeout: int,
-    predecessor_id: str | None,
-    prompt: str,
-) -> AgentHandle:
-    """Tail half of :func:`launch_agent_block`.
-
-    Split out so the staging-cleanup ``try/except`` in the
-    parent wraps a single call rather than the entire body.
-    Behaviour is unchanged from the inline version this replaced.
-    """
-    if extra_mounts:
-        for host_path, container_path, mode in extra_mounts:
-            cmd.extend([
-                "-v",
-                f"{_resolve_path(Path(host_path))}"
-                f":{container_path}:{mode}",
-            ])
-
-    default_block = (
-        allowed_blocks[0] if allowed_blocks else "eval_bot"
-    )
-    env_vars = {
-        "EVAL_BLOCK": default_block,
-        "MCP_SERVERS": mcp_servers or "eval",
-        "ALLOWED_TOOLS": (
-            allowed_tools or "Read,Write,Edit,Glob,Grep"
-        ),
-    }
-    if model:
-        env_vars["MODEL"] = model
-    if max_turns is not None:
-        env_vars["MAX_TURNS"] = str(max_turns)
-    env_vars["PYTHONUNBUFFERED"] = "1"
-    env_vars["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "128000"
-    if isolated_network:
-        env_vars["NETWORK_ISOLATION"] = "1"
-
-    if extra_env:
-        env_vars.update(extra_env)
-
-    if pre_launch_hook is not None:
-        pre_launch_hook(agent_ws)
-        if extra_env:
-            env_vars.update(extra_env)
-
-    for key, value in env_vars.items():
-        cmd.extend(["-e", f"{key}={value}"])
-
-    cmd.append(agent_image)
-
-    # Launch agent container.
-    env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"
-
-    print(f"  [agent] launching {agent_image}")
-    start = time.monotonic()
-    event_log = workspace.path / "agent_events.jsonl"
-    stderr_log = workspace.path / "agent_stderr.log"
-
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=env,
-    )
-
-    process.stdin.write(prompt)
-    process.stdin.close()
-
-    # Background threads for stdout and stderr.
-    def _drain_stderr():
-        with open(stderr_log, "w", encoding="utf-8") as f:
-            for line in process.stderr:
-                f.write(line)
-
-    stderr_thread = threading.Thread(
-        target=_drain_stderr, daemon=True)
-    stderr_thread.start()
-
-    stdout_thread = threading.Thread(
-        target=_read_stdout,
-        args=(process, event_log, start, total_timeout,
-              container_name),
-        daemon=True,
-    )
-    stdout_thread.start()
+    if not isinstance(inner, ContainerExecutionHandle):
+        # Pre-container failure: the executor returned a
+        # :class:`SyncExecutionHandle`.  Still wrap it so the
+        # caller's wait/stop/is_alive protocol works uniformly;
+        # wait() will get back a pre-completed ExecutionResult
+        # and classify exit_reason as "crashed".
+        return AgentHandle(
+            inner=inner,  # type: ignore[arg-type]
+            workspace=workspace,
+            executions_before=executions_before,
+            prompt_tempdir=prompt_tempdir,
+        )
 
     return AgentHandle(
-        process=process,
+        inner=inner,
         workspace=workspace,
-        agent_ws=agent_ws,
-        output_names=output_names,
-        start_time=start,
         executions_before=executions_before,
-        agent_image=agent_image,
-        stdout_thread=stdout_thread,
-        stderr_thread=stderr_thread,
-        block_name=block_name,
-        container_name=container_name,
-        predecessor_id=predecessor_id,
-        agent_workspace_dir=agent_workspace_dir,
-        staged_inputs=dict(staged_inputs),
-        state_mount=state_mount,
+        prompt_tempdir=prompt_tempdir,
     )
 
 
@@ -963,34 +555,14 @@ def run_agent_block(
     project_root: Path,
     prompt: str,
     block_name: str,
-    agent_image: str = "flywheel-claude:latest",
-    auth_volume: str = "claude-auth",
-    model: str | None = None,
-    max_turns: int | None = None,
-    total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
-    allowed_blocks: list[str] | None = None,
-    source_dirs: list[str] | None = None,
-    input_artifacts: dict[str, str] | None = None,
-    output_names: list[str] | None = None,
-    overrides: dict[str, Any] | None = None,
-    mcp_servers: str | None = None,
-    allowed_tools: str | None = None,
-    extra_env: dict[str, str] | None = None,
-    extra_mounts: list[tuple[str, str, str]] | None = None,
-    pre_launch_hook: Callable[[Path], None] | None = None,
-    isolated_network: bool = False,
-    agent_workspace_dir: str | None = None,
-    predecessor_id: str | None = None,
-    post_checks: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> AgentResult:
-    """Run an agent block execution (blocking).
+    """Run an agent block to completion (blocking).
 
-    Convenience wrapper around ``launch_agent_block()`` +
-    ``handle.wait()``.  See ``launch_agent_block()`` for full
-    argument documentation.
-
-    Returns:
-        AgentResult with exit code, elapsed time, and invocation count.
+    Convenience wrapper: launch, wait, return the result.  On
+    KeyboardInterrupt, requests a graceful stop before
+    propagating the exception so the container's teardown path
+    runs.
     """
     handle = launch_agent_block(
         workspace=workspace,
@@ -998,68 +570,17 @@ def run_agent_block(
         project_root=project_root,
         prompt=prompt,
         block_name=block_name,
-        agent_image=agent_image,
-        auth_volume=auth_volume,
-        model=model,
-        max_turns=max_turns,
-        total_timeout=total_timeout,
-        allowed_blocks=allowed_blocks,
-        source_dirs=source_dirs,
-        input_artifacts=input_artifacts,
-        output_names=output_names,
-        overrides=overrides,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        extra_env=extra_env,
-        extra_mounts=extra_mounts,
-        pre_launch_hook=pre_launch_hook,
-        isolated_network=isolated_network,
-        agent_workspace_dir=agent_workspace_dir,
-        predecessor_id=predecessor_id,
-        post_checks=post_checks,
+        **kwargs,
     )
     try:
         return handle.wait()
     except KeyboardInterrupt:
+        # The inner handle's wait() raised after setting the
+        # single-wait sentinel on the adapter, so a second
+        # ``handle.wait()`` would error.  Forward the operator
+        # signal as a stop() so the substrate's two-phase
+        # cancellation has a chance to terminate the container
+        # if it is still running, then propagate the interrupt.
         print("  [agent] interrupted -- requesting graceful stop")
         handle.stop(reason="keyboard_interrupt")
-        try:
-            handle._process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            print("  [agent] stop timed out -- terminating")
-            handle._process.terminate()
-            handle._process.wait()
         raise
-
-
-def _log_event(event: dict) -> None:
-    """Print a concise summary of an agent event."""
-    event_type = event.get("type", "")
-
-    if event_type == "assistant":
-        content = event.get("content", [])
-        for block in content:
-            if isinstance(block, dict):
-                btype = block.get("type", "")
-                if btype == "text":
-                    text = block.get("text", "")
-                    preview = text[:120].replace("\n", " ")
-                    if preview:
-                        # Replace non-ASCII to avoid cp1252 errors on Windows.
-                        safe = preview.encode("ascii", "replace").decode("ascii")
-                        print(f"  [agent] {safe}")
-                elif btype == "tool_use":
-                    tool = block.get("name", "?")
-                    if tool.startswith("mcp__"):
-                        short = tool.split("__")[-1]
-                        print(f"  [agent] [mcp] {short}()")
-                    else:
-                        print(f"  [agent] [tool] {tool}()")
-
-    elif event_type == "result":
-        subtype = event.get("subtype", "")
-        print(f"  [agent] result: {subtype}")
-
-    elif event_type == "error":
-        msg = event.get("message", "unknown error")
-        print(f"  [agent] ERROR: {msg}")

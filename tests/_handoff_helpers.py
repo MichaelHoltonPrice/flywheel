@@ -38,23 +38,27 @@ import pytest
 
 from flywheel.agent import AgentResult
 from flywheel.agent_handoff import (
+    PENDING_ARTIFACT_NAME,
     PENDING_FILE_NAME,
     SESSION_FILE_NAME,
 )
-from flywheel.artifact import BlockExecution
+from flywheel.artifact import ArtifactInstance, BlockExecution
 
 
 @dataclass
 class _FakeWorkspace:
     """Stand-in for :class:`flywheel.workspace.Workspace`.
 
-    The handoff loop reads ``workspace.path`` to resolve paths
-    and ``workspace.executions`` to locate captured state_dirs.
-    Anything else stays untouched.
+    The handoff loop reads ``workspace.path`` to resolve paths,
+    ``workspace.executions`` to locate captured state_dirs, and
+    ``workspace.artifacts`` to resolve the pending-tool-calls
+    output binding back to its on-disk directory.
     """
 
     path: Path
     executions: dict[str, BlockExecution] = field(default_factory=dict)
+    artifacts: dict[str, ArtifactInstance] = field(
+        default_factory=dict)
 
 
 _TEST_BLOCK_NAME = "play"
@@ -167,17 +171,19 @@ class _FakeAgentHandle:
         """Apply the cycle's script and return the AgentResult.
 
         Simulates what a real launch + capture would produce:
-        writes the session JSONL into a state_dir
-        (``<workspace>/state/<block_name>/<exec_id>/session.jsonl``)
-        and registers a matching :class:`BlockExecution` on the
-        fake workspace so the handoff loop can look it up.
-        Pending tool calls stay in the agent workspace bind.
-        """
-        agent_ws = (
-            self._workspace_root / self._script.agent_workspace_dir
-        )
-        agent_ws.mkdir(parents=True, exist_ok=True)
 
+        * Writes the session JSONL into the captured state dir
+          (``<workspace>/state/<block_name>/<exec_id>/session.jsonl``).
+        * On a ``tool_handoff`` exit, registers a
+          ``pending_tool_calls`` artifact instance and binds it
+          to the simulated execution's ``output_bindings``, with
+          the pending-file contents sitting under the artifact
+          directory exactly like the substrate's
+          ``_collect_outputs`` pipeline would have left them.
+        * Adds the matching :class:`BlockExecution` record on the
+          fake workspace so the handoff loop can resolve
+          ``state_dir`` and ``output_bindings``.
+        """
         state_dir: str | None = None
         if self._script.write_session:
             state_dir_path = _fake_state_dir(
@@ -192,8 +198,36 @@ class _FakeAgentHandle:
                 state_dir_path.relative_to(self._workspace_root)
             ).replace("\\", "/")
 
+        output_bindings: dict[str, str] = {}
+        if self._script.exit_reason == "tool_handoff":
+            aid = f"pending-{self._script.execution_id}"
+            artifact_dir = (
+                self._workspace_root / "artifacts" / aid)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            if self._script.pending_text is not None:
+                (artifact_dir / PENDING_FILE_NAME).write_text(
+                    self._script.pending_text, encoding="utf-8")
+            else:
+                envelope = {
+                    "schema_version": 2,
+                    "session_id": "sess-fake",
+                    "pending": list(self._script.pending),
+                }
+                (artifact_dir / PENDING_FILE_NAME).write_text(
+                    json.dumps(envelope), encoding="utf-8")
+            if self._workspace is not None:
+                self._workspace.artifacts[aid] = ArtifactInstance(
+                    id=aid,
+                    name=PENDING_ARTIFACT_NAME,
+                    kind="copy",
+                    copy_path=aid,
+                    created_at=datetime.now(UTC),
+                    source="fake",
+                )
+            output_bindings[PENDING_ARTIFACT_NAME] = aid
+
         # Register the fake execution so the loop can look up
-        # state_dir from workspace.executions[execution_id].
+        # state_dir and output_bindings by execution id.
         if self._workspace is not None:
             now = datetime.now(UTC)
             self._workspace.executions[
@@ -205,20 +239,8 @@ class _FakeAgentHandle:
                 finished_at=now,
                 status=self._script.status,
                 state_dir=state_dir,
+                output_bindings=output_bindings,
             )
-
-        if self._script.exit_reason == "tool_handoff":
-            if self._script.pending_text is not None:
-                (agent_ws / PENDING_FILE_NAME).write_text(
-                    self._script.pending_text, encoding="utf-8")
-            else:
-                envelope = {
-                    "schema_version": 2,
-                    "session_id": "sess-fake",
-                    "pending": list(self._script.pending),
-                }
-                (agent_ws / PENDING_FILE_NAME).write_text(
-                    json.dumps(envelope), encoding="utf-8")
 
         return AgentResult(
             exit_code=0,
@@ -227,7 +249,6 @@ class _FakeAgentHandle:
             execution_id=self._script.execution_id,
             stop_reason=None,
             exit_reason=self._script.exit_reason,
-            agent_workspace_dir=self._script.agent_workspace_dir,
         )
 
 

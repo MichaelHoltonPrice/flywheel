@@ -110,8 +110,31 @@ def _read_session(
     ).read_text(encoding="utf-8")
 
 
-def _pending_path(workspace: _FakeWorkspace) -> Path:
-    return _agent_ws(workspace) / PENDING_FILE_NAME
+def _pending_path(
+    workspace: _FakeWorkspace, execution_id: str = "exec-0",
+) -> Path:
+    """Resolve the pending-tool-calls artifact path for a cycle.
+
+    Each handoff cycle produces its own ``pending_tool_calls``
+    artifact instance bound to that cycle's
+    :class:`BlockExecution`.  The path persists for the life of
+    the workspace (the artifact graph is append-only); "stale"
+    pending files from a prior cycle cannot leak into a later
+    one because each cycle reads its own artifact binding.
+    """
+    execution = workspace.executions.get(execution_id)
+    if execution is None:
+        return (
+            workspace.path / "artifacts" / "missing"
+            / PENDING_FILE_NAME)
+    binding = execution.output_bindings.get("pending_tool_calls")
+    if not binding:
+        return (
+            workspace.path / "artifacts" / "missing"
+            / PENDING_FILE_NAME)
+    return (
+        workspace.path / "artifacts" / binding
+        / PENDING_FILE_NAME)
 
 
 def _session_path(
@@ -435,7 +458,10 @@ class TestPendingFileShape:
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError("runner should not be called")
 
-        with pytest.raises(HandoffLoopError, match="no tool calls"):
+        with pytest.raises(
+            HandoffLoopError,
+            match="pending_tool_calls artifact is missing or empty",
+        ):
             run_agent_with_handoffs(
                 block_runner=_br,
                 launch_fn=launch,
@@ -465,7 +491,10 @@ class TestPendingFileShape:
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError("runner should not be called")
 
-        with pytest.raises(HandoffLoopError, match="no tool calls"):
+        with pytest.raises(
+            HandoffLoopError,
+            match="pending_tool_calls artifact is missing or empty",
+        ):
             run_agent_with_handoffs(
                 block_runner=_br,
                 launch_fn=launch,
@@ -833,17 +862,14 @@ class TestPendingFileLifecycle:
         )
         assert not _pending_path(workspace).exists()
 
-    def test_pending_removed_when_halt_fires_after_splice(
+    def test_halt_after_splice_preserves_pending_artifact(
         self, workspace: _FakeWorkspace,
     ) -> None:
         """A halt directive fires after the cycle's splice but
-        before the relaunch.  The pending file is *still*
-        removed, because the batch fully resolved — the halt
-        suppresses the next *launch*, not the splice cleanup.
-
-        Operators reading the workspace after a halt should see
-        a clean state: spliced session, no pending file, halts
-        recorded in the loop result.
+        before the relaunch.  The pending artifact from the
+        resolved cycle stays in the workspace as first-class
+        provenance — each cycle's output is append-only — and
+        the halt suppresses the next launch.
         """
         ids = ["toolu_h"]
         scripts = [
@@ -863,9 +889,10 @@ class TestPendingFileLifecycle:
             **_base_kwargs(workspace),
         )
         assert out.halts == [{"reason": "stop"}]
-        assert not _pending_path(workspace).exists()
         # Splice did happen.
         assert "real-h" in _read_session(workspace)
+        # The cycle's pending artifact persists as provenance.
+        assert _pending_path(workspace).is_file()
 
 
 # --------------------------------------------------------------------

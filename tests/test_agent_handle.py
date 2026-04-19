@@ -1,438 +1,559 @@
-"""Tests for AgentHandle and launch_agent_block.
+"""Tests for :class:`flywheel.agent.AgentHandle`.
 
-Tests the non-blocking agent handle API using mock subprocesses
-(no actual Docker containers).
+AgentHandle is a thin adapter around
+:class:`flywheel.executor.ContainerExecutionHandle`: it delegates
+lifecycle (``is_alive`` / ``stop`` / ``wait``) to the inner
+handle and translates the returned
+:class:`flywheel.executor.ExecutionResult` into an
+:class:`flywheel.agent.AgentResult` with agent-specific fields
+(``exit_reason`` from the agent exit-state artifact,
+``evals_run`` from the workspace-execution delta).
+
+These tests exercise that translation layer with mocked inner
+handles; the underlying container / executor pipeline has its
+own coverage in :mod:`tests.test_process_exit_executor`.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-from io import StringIO
+import json
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
-from unittest.mock import patch as mock_patch
 
 import pytest
 
-from flywheel.agent import (
-    AgentHandle,
-    AgentResult,
-    launch_agent_block,
-    prepare_agent_workspace,
-)
+from flywheel.agent import AgentHandle, AgentResult
+from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.executor import ExecutionResult
+
+
+class _FakeInner:
+    """Minimal stand-in for a :class:`ContainerExecutionHandle`.
+
+    Satisfies the adapter's ``is_alive`` / ``stop`` / ``wait``
+    interface and records how ``stop`` was called so the
+    delegation test can assert on it.
+    """
+
+    def __init__(
+        self,
+        *,
+        result: ExecutionResult,
+        alive: bool = False,
+    ) -> None:
+        self._result = result
+        self._alive = alive
+        self.stop_calls: list[str] = []
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def stop(self, reason: str = "requested") -> None:
+        self.stop_calls.append(reason)
+        self._alive = False
+
+    def wait(self) -> ExecutionResult:
+        self._alive = False
+        return self._result
+
+
+def _make_workspace(
+    tmp_path: Path,
+    *,
+    execution_id: str = "exec-1",
+    exit_code: int = 0,
+    stop_reason: str | None = None,
+    exit_state: dict | None = None,
+    executions_before: int = 0,
+) -> tuple[MagicMock, ExecutionResult]:
+    """Build a MagicMock workspace holding the right execution record.
+
+    Optionally writes an ``agent_exit_state`` artifact under
+    ``<tmp_path>/artifacts/<aid>/agent_exit_state.json`` and binds
+    it to the execution's output_bindings so the adapter's
+    exit-reason classifier can read it.
+    """
+    artifacts: dict[str, ArtifactInstance] = {}
+    output_bindings: dict[str, str] = {}
+
+    if exit_state is not None:
+        aid = f"aid-{execution_id}"
+        artifact_dir = tmp_path / "artifacts" / aid
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "agent_exit_state.json").write_text(
+            json.dumps(exit_state), encoding="utf-8")
+        artifacts[aid] = ArtifactInstance(
+            id=aid,
+            name="agent_exit_state",
+            kind="copy",
+            copy_path=aid,
+            created_at=datetime.now(UTC),
+            source="test",
+        )
+        output_bindings["agent_exit_state"] = aid
+
+    execution = BlockExecution(
+        id=execution_id,
+        block_name="play",
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        status=(
+            "interrupted" if stop_reason
+            else "succeeded" if exit_code == 0 else "failed"),
+        exit_code=exit_code,
+        elapsed_s=1.0,
+        output_bindings=output_bindings,
+        stop_reason=stop_reason,
+    )
+
+    workspace = MagicMock()
+    workspace.path = tmp_path
+    workspace.executions = {execution_id: execution}
+    workspace.artifacts = artifacts
+    workspace.generate_event_id = MagicMock(return_value="ev-1")
+
+    result = ExecutionResult(
+        exit_code=exit_code,
+        elapsed_s=1.0,
+        output_bindings=output_bindings,
+        execution_id=execution_id,
+        status=execution.status,
+    )
+    return workspace, result
 
 
 def _make_handle(
     *,
-    exit_code: int = 0,
-    stdout_lines: list[str] | None = None,
-    stderr_lines: list[str] | None = None,
-    workspace: MagicMock | None = None,
-    agent_ws: Path | None = None,
-    output_names: list[str] | None = None,
-    predecessor_id: str | None = None,
-) -> AgentHandle:
-    """Create an AgentHandle with a mock process."""
-    process = MagicMock()
-    process.returncode = exit_code
-    process.poll.return_value = exit_code
-    process.wait.return_value = exit_code
-
-    stdout_data = "\n".join(stdout_lines or []) + "\n"
-    process.stdout = StringIO(stdout_data)
-
-    stderr_data = "\n".join(stderr_lines or [])
-    process.stderr = StringIO(stderr_data)
-
-    if workspace is None:
-        workspace = MagicMock()
-        workspace.executions = {}
-        workspace.artifacts = {}
-
-    stdout_thread = MagicMock(spec=threading.Thread)
-    stderr_thread = MagicMock(spec=threading.Thread)
-
-    return AgentHandle(
-        process=process,
+    workspace: MagicMock,
+    result: ExecutionResult,
+    tmp_path: Path,
+    executions_before: int = 0,
+) -> tuple[AgentHandle, _FakeInner]:
+    """Build an AgentHandle over a _FakeInner and a prompt tempdir."""
+    inner = _FakeInner(result=result)
+    prompt_tempdir = Path(tempfile.mkdtemp(
+        prefix="flywheel-test-prompt-", dir=tmp_path))
+    handle = AgentHandle(
+        inner=inner,
         workspace=workspace,
-        agent_ws=agent_ws or Path("/tmp/agent_ws"),
-        output_names=output_names,
-        start_time=time.monotonic(),
-        executions_before=0,
-        agent_image="test-image:latest",
-        stdout_thread=stdout_thread,
-        stderr_thread=stderr_thread,
-        block_name="test_block",
-        predecessor_id=predecessor_id,
+        executions_before=executions_before,
+        prompt_tempdir=prompt_tempdir,
     )
+    return handle, inner
 
 
 class TestAgentHandleBasics:
-    def test_wait_returns_agent_result(self):
-        handle = _make_handle(exit_code=0)
-        result = handle.wait()
-        assert isinstance(result, AgentResult)
-        assert result.exit_code == 0
-        assert result.elapsed_s >= 0
+    def test_wait_returns_agent_result(self, tmp_path: Path):
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert isinstance(out, AgentResult)
+        assert out.exit_code == 0
+        assert out.execution_id == "exec-1"
 
-    def test_wait_joins_threads(self):
-        handle = _make_handle()
-        handle.wait()
-        handle._stdout_thread.join.assert_called_once()
-        handle._stderr_thread.join.assert_called_once_with(timeout=5)
-
-    def test_wait_propagates_process_error(self):
-        handle = _make_handle()
-        handle._process.wait.side_effect = OSError("boom")
-        with pytest.raises(OSError):
-            handle.wait()
-
-
-class TestAgentHandleStop:
-    @mock_patch("flywheel.agent.subprocess.run")
-    def test_stop_calls_docker_exec(self, mock_run):
-        handle = _make_handle()
-        handle._container_name = "flywheel-test123"
-        handle.stop()
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert args[:3] == ["docker", "exec", "flywheel-test123"]
-        assert "/workspace/.agent_stop" in args
-
-    @mock_patch("flywheel.agent.subprocess.run")
-    def test_stop_then_wait(self, mock_run):
-        handle = _make_handle(exit_code=0)
-        handle._container_name = "flywheel-test123"
-        handle.stop()
-        result = handle.wait()
-        assert result.exit_code == 0
-
-
-class TestAgentHandleIsAlive:
-    def test_alive_while_running(self):
-        handle = _make_handle()
-        handle._process.poll.return_value = None
-        assert handle.is_alive() is True
-
-    def test_not_alive_after_exit(self):
-        handle = _make_handle()
-        handle._process.poll.return_value = 0
-        assert handle.is_alive() is False
-
-
-class TestAgentHandleDoubleWait:
-    def test_double_wait_raises(self):
-        handle = _make_handle()
+    def test_wait_called_twice_raises(self, tmp_path: Path):
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
         handle.wait()
         with pytest.raises(RuntimeError, match="already called"):
             handle.wait()
 
-
-class TestAgentHandleArtifacts:
-    def test_collects_output_artifacts(self, tmp_path: Path):
-        """Output files matching output_names are registered."""
-        agent_ws = tmp_path / "agent_ws"
-        agent_ws.mkdir()
-        (agent_ws / "game_log.txt").write_text("log data")
-        (agent_ws / "unrelated.txt").write_text("other")
-
-        ws = MagicMock()
-        ws.executions = {}
-        ws.path = tmp_path
-
-        handle = _make_handle(
+    def test_is_alive_delegates_to_inner(self, tmp_path: Path):
+        ws, result = _make_workspace(tmp_path)
+        inner = _FakeInner(result=result, alive=True)
+        handle = AgentHandle(
+            inner=inner,
             workspace=ws,
-            agent_ws=agent_ws,
-            output_names=["game_log"],
+            executions_before=0,
+            prompt_tempdir=Path(tempfile.mkdtemp(
+                prefix="t-", dir=tmp_path)),
         )
-        handle.wait()
+        assert handle.is_alive() is True
 
-        ws.register_artifact.assert_called_once()
-        call_args = ws.register_artifact.call_args
-        assert call_args[0][0] == "game_log"
-        assert call_args[0][1].name == "game_log.txt"
+    def test_stop_forwards_to_inner(self, tmp_path: Path):
+        ws, result = _make_workspace(
+            tmp_path, stop_reason="test_reason")
+        handle, inner = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        handle.stop(reason="test_reason")
+        assert inner.stop_calls == ["test_reason"]
 
-    def test_no_output_names_skips_collection(self, tmp_path: Path):
-        agent_ws = tmp_path / "agent_ws"
-        agent_ws.mkdir()
-        (agent_ws / "something.txt").write_text("data")
-
-        ws = MagicMock()
-        ws.executions = {}
-
-        handle = _make_handle(
+    def test_prompt_tempdir_cleaned_up_on_wait(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(tmp_path)
+        inner = _FakeInner(result=result)
+        prompt_dir = Path(tempfile.mkdtemp(
+            prefix="flywheel-test-prompt-", dir=tmp_path))
+        handle = AgentHandle(
+            inner=inner,
             workspace=ws,
-            agent_ws=agent_ws,
-            output_names=None,
+            executions_before=0,
+            prompt_tempdir=prompt_dir,
         )
+        assert prompt_dir.is_dir()
         handle.wait()
-        ws.register_artifact.assert_not_called()
+        assert not prompt_dir.exists()
 
 
-class TestAgentHandleEvals:
-    def test_evals_counted_from_executions(self):
-        ws = MagicMock()
-        ws.executions = {"e1": None, "e2": None}
+class TestExitReasonClassification:
+    """Adapter reads the ``agent_exit_state`` artifact to classify."""
 
-        handle = _make_handle(workspace=ws)
-        # executions_before was 0, now there are 2.
-        result = handle.wait()
-        assert result.evals_run == 2
+    def test_handoff_status_maps_to_tool_handoff(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path,
+            exit_state={"status": "tool_handoff",
+                        "reason": "take_action"},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "tool_handoff"
+
+    def test_complete_status_maps_to_completed(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path,
+            exit_state={"status": "complete", "reason": ""},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "completed"
+
+    def test_auth_reason_maps_to_auth_failure(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path,
+            exit_state={"status": "paused",
+                        "reason": "auth_error"},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "auth_failure"
+
+    def test_rate_limit_reason_maps_to_rate_limit(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path,
+            exit_state={"status": "paused",
+                        "reason": "rate_limit"},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "rate_limit"
+
+    def test_max_turns_reason_maps_to_max_turns(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path,
+            exit_state={"status": "complete",
+                        "reason": "max_turns"},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "max_turns"
+
+    def test_stop_reason_takes_precedence_over_artifact(
+        self, tmp_path: Path,
+    ):
+        """When the execution record has ``stop_reason`` set, the
+        classifier returns ``stopped`` regardless of what the
+        agent-written exit state says."""
+        ws, result = _make_workspace(
+            tmp_path,
+            stop_reason="operator_requested",
+            exit_state={"status": "complete", "reason": ""},
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "stopped"
+        assert out.stop_reason == "operator_requested"
+
+    def test_missing_artifact_defaults_to_exit_code(
+        self, tmp_path: Path,
+    ):
+        """No ``agent_exit_state`` artifact + zero exit_code
+        means natural completion; non-zero means crashed."""
+        ws, result = _make_workspace(tmp_path, exit_state=None)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "completed"
+
+    def test_missing_artifact_nonzero_exit_is_crashed(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(
+            tmp_path, exit_code=1, exit_state=None)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path)
+        out = handle.wait()
+        assert out.exit_reason == "crashed"
 
 
-class TestLaunchFailure:
-    def test_popen_failure_propagates(self, tmp_path: Path):
-        """If Popen raises, launch_agent_block surfaces the error."""
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.executions = {}
-        ws.artifacts = {}
-        ws.instances_for = MagicMock(return_value=[])
-
-        template = MagicMock()
-
-        with (
-            mock_patch("flywheel.agent.subprocess.Popen",
-                       side_effect=OSError("Docker not found")),
-            pytest.raises(OSError, match="Docker not found"),
-        ):
-            launch_agent_block(
-                workspace=ws,
-                template=template,
-                project_root=tmp_path,
-                prompt="test",
-                block_name="test_block",
+class TestEvalsRunCount:
+    def test_evals_run_counts_additional_executions(
+        self, tmp_path: Path,
+    ):
+        """``evals_run`` is the delta of workspace executions
+        minus one for the agent's own record."""
+        ws, result = _make_workspace(tmp_path)
+        # Add two extra executions to the workspace (nested
+        # blocks triggered during the agent run).
+        for i in range(2):
+            ws.executions[f"nested-{i}"] = BlockExecution(
+                id=f"nested-{i}",
+                block_name="game_step",
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                status="succeeded",
+                exit_code=0,
+                elapsed_s=0.1,
             )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
+            executions_before=0,
+        )
+        out = handle.wait()
+        # Total executions: 3 (agent + 2 nested).  Before: 0.
+        # evals_run = 3 - 0 - 1 = 2.
+        assert out.evals_run == 2
+
+    def test_evals_run_zero_when_no_nested(self, tmp_path: Path):
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
+            executions_before=0,
+        )
+        out = handle.wait()
+        # Total 1 (agent), before 0.  evals_run = 1 - 0 - 1 = 0.
+        assert out.evals_run == 0
+
+    def test_evals_run_respects_executions_before(
+        self, tmp_path: Path,
+    ):
+        """When ``executions_before`` is nonzero, only executions
+        recorded *after* launch count as evals.  Pre-existing
+        workspace history must not inflate the delta."""
+        ws, result = _make_workspace(
+            tmp_path, execution_id="exec-new")
+        # Seed two pre-existing executions that predate the
+        # agent launch.
+        for i in range(2):
+            ws.executions[f"pre-{i}"] = BlockExecution(
+                id=f"pre-{i}",
+                block_name="game_step",
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                status="succeeded",
+                exit_code=0,
+                elapsed_s=0.1,
+            )
+        # Add one nested execution triggered during the run.
+        ws.executions["nested-0"] = BlockExecution(
+            id="nested-0",
+            block_name="game_step",
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="succeeded",
+            exit_code=0,
+            elapsed_s=0.1,
+        )
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
+            executions_before=2,
+        )
+        out = handle.wait()
+        # Total 4 (2 pre + agent + 1 nested), before 2.
+        # evals_run = 4 - 2 - 1 = 1.
+        assert out.evals_run == 1
 
 
-class TestStopReason:
-    @mock_patch("flywheel.agent.subprocess.run")
-    def test_stop_stores_reason(self, mock_run):
-        handle = _make_handle()
-        handle._container_name = "flywheel-test123"
-        handle.stop(reason="exploration_request")
-        assert handle._stop_reason == "exploration_request"
+class _RaisingInner:
+    """Inner stand-in whose ``wait()`` raises mid-flight.
 
-    @mock_patch("flywheel.agent.subprocess.run")
-    def test_stop_default_reason(self, mock_run):
-        handle = _make_handle()
-        handle._container_name = "flywheel-test123"
-        handle.stop()
-        assert handle._stop_reason == "requested"
+    Used to verify the adapter's cleanup path when the substrate
+    wait fails rather than returning a result.
+    """
 
-    def test_wait_returns_stop_reason(self):
-        handle = _make_handle()
-        handle._stop_reason = "prediction_mismatch"
-        result = handle.wait()
-        assert result.stop_reason == "prediction_mismatch"
+    def __init__(self, *, exc: Exception) -> None:
+        self._exc = exc
+        self.stop_calls: list[str] = []
 
-    def test_wait_returns_none_when_not_stopped(self):
-        handle = _make_handle()
-        result = handle.wait()
-        assert result.stop_reason is None
+    def is_alive(self) -> bool:
+        return True
+
+    def stop(self, reason: str = "requested") -> None:
+        self.stop_calls.append(reason)
+
+    def wait(self):
+        raise self._exc
 
 
-class TestExecutionRecording:
-    def test_wait_records_execution(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_test1"
-        ws.generate_event_id.return_value = "evt_test1"
+class _KeyboardInterruptingInner:
+    """Inner whose first ``wait()`` raises ``KeyboardInterrupt``.
 
-        handle = _make_handle(workspace=ws, exit_code=0)
-        result = handle.wait()
+    A second ``wait()`` returns a real ``ExecutionResult`` so
+    ``run_agent_block`` can finish its shutdown after forwarding
+    the stop.
+    """
 
-        ws.add_execution.assert_called_once()
-        execution = ws.add_execution.call_args[0][0]
-        assert execution.id == "exec_test1"
-        assert execution.block_name == "test_block"
-        assert execution.status == "succeeded"
-        assert execution.image == "test-image:latest"
-        assert result.execution_id == "exec_test1"
+    def __init__(self, *, final: ExecutionResult) -> None:
+        self._final = final
+        self._called = 0
+        self.stop_calls: list[str] = []
 
-    def test_failed_execution_recorded(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_fail"
+    def is_alive(self) -> bool:
+        return self._called == 0
 
-        handle = _make_handle(workspace=ws, exit_code=1)
-        handle.wait()
+    def stop(self, reason: str = "requested") -> None:
+        self.stop_calls.append(reason)
 
-        execution = ws.add_execution.call_args[0][0]
-        assert execution.status == "failed"
-        assert execution.exit_code == 1
-
-    def test_stopped_execution_recorded_as_interrupted(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_stop"
-        ws.generate_event_id.return_value = "evt_stop"
-
-        handle = _make_handle(workspace=ws, exit_code=0)
-        handle._stop_reason = "exploration_request"
-        handle.wait()
-
-        execution = ws.add_execution.call_args[0][0]
-        assert execution.status == "interrupted"
-        assert execution.stop_reason == "exploration_request"
-
-    def test_predecessor_id_recorded(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_resume"
-
-        handle = _make_handle(
-            workspace=ws, predecessor_id="exec_prev")
-        handle.wait()
-
-        execution = ws.add_execution.call_args[0][0]
-        assert execution.predecessor_id == "exec_prev"
-
-    def test_lifecycle_event_on_stop(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_ev"
-        ws.generate_event_id.return_value = "evt_ev"
-
-        handle = _make_handle(workspace=ws)
-        handle._stop_reason = "timeout"
-        handle.wait()
-
-        ws.add_event.assert_called_once()
-        event = ws.add_event.call_args[0][0]
-        assert event.kind == "agent_stopped"
-        assert event.execution_id == "exec_ev"
-        assert event.detail == {"reason": "timeout"}
-
-    def test_no_lifecycle_event_on_normal_exit(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_ok"
-
-        handle = _make_handle(workspace=ws)
-        handle.wait()
-
-        ws.add_event.assert_not_called()
-
-    def test_wait_saves_workspace(self):
-        ws = MagicMock()
-        ws.executions = {}
-        ws.generate_execution_id.return_value = "exec_s"
-
-        handle = _make_handle(workspace=ws)
-        handle.wait()
-
-        ws.save.assert_called_once()
+    def wait(self) -> ExecutionResult:
+        self._called += 1
+        if self._called == 1:
+            raise KeyboardInterrupt
+        return self._final
 
 
-class TestPrepareAgentWorkspace:
-    def test_auto_names_under_agent_workspaces(self, tmp_path: Path):
-        """No explicit dir → auto-named under agent_workspaces/."""
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.instances_for = MagicMock(return_value=[])
+class TestWaitFailurePaths:
+    """The adapter must clean up the prompt tempdir even when the
+    inner wait raises, and must surface the original exception.
+    """
 
-        mount = prepare_agent_workspace(ws)
-        assert mount.host_path.exists()
-        assert mount.host_path.is_dir()
-        # Auto-named directory lives under
-        # ``agent_workspaces/`` (the parent dir).
-        assert mount.host_path.parent.name == "agent_workspaces"
-        assert mount.relative_dir.startswith(
-            "agent_workspaces/")
-        assert mount.container_path == "/workspace"
-        assert mount.mode == "rw"
+    def test_prompt_tempdir_cleaned_when_inner_wait_raises(
+        self, tmp_path: Path,
+    ):
+        workspace = MagicMock()
+        workspace.path = tmp_path
+        workspace.executions = {}
+        workspace.artifacts = {}
 
-    def test_auto_naming_yields_unique_dirs(
-            self, tmp_path: Path):
-        """Two back-to-back launches get distinct directories.
+        inner = _RaisingInner(exc=RuntimeError("boom"))
+        prompt_dir = Path(tempfile.mkdtemp(
+            prefix="flywheel-test-prompt-", dir=tmp_path))
+        handle = AgentHandle(
+            inner=inner,
+            workspace=workspace,
+            executions_before=0,
+            prompt_tempdir=prompt_dir,
+        )
+        assert prompt_dir.is_dir()
+        with pytest.raises(RuntimeError, match="boom"):
+            handle.wait()
+        assert not prompt_dir.exists(), (
+            "prompt tempdir must be cleaned even when inner.wait()"
+            " raises"
+        )
 
-        Auto-naming is the whole point — parallel launches must
-        not be able to clobber each other by sharing a path.
-        """
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.instances_for = MagicMock(return_value=[])
 
-        a = prepare_agent_workspace(ws)
-        b = prepare_agent_workspace(ws)
-        assert a.host_path != b.host_path
-        assert a.relative_dir != b.relative_dir
+class TestPreContainerSyncHandle:
+    """``launch_agent_block`` may return a pre-completed handle
+    when the executor's pre-container pipeline fails.  The adapter
+    must still route that through ``wait()`` without leaking."""
 
-    def test_custom_dir_name(self, tmp_path: Path):
-        """Explicit name is honored when the target is empty."""
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.instances_for = MagicMock(return_value=[])
+    def test_sync_handle_result_classified_as_crashed(
+        self, tmp_path: Path,
+    ):
+        """A :class:`SyncExecutionHandle` returned from a pre-
+        container failure reports a non-zero exit_code and no
+        ``agent_exit_state`` artifact; the adapter maps that to
+        ``exit_reason='crashed'``."""
+        from flywheel.executor import (
+            INVOKE_FAILURE_EXIT_CODE,
+            SyncExecutionHandle,
+        )
 
-        mount = prepare_agent_workspace(
-            ws, agent_workspace_dir="explore_0")
-        assert mount.host_path.name == "explore_0"
-        assert mount.host_path.exists()
-        assert mount.relative_dir == "explore_0"
+        workspace = MagicMock()
+        workspace.path = tmp_path
+        workspace.executions = {
+            "exec-fail": BlockExecution(
+                id="exec-fail",
+                block_name="play",
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                status="failed",
+                exit_code=INVOKE_FAILURE_EXIT_CODE,
+                elapsed_s=0.0,
+                failure_phase="stage_in",
+            ),
+        }
+        workspace.artifacts = {}
+        workspace.generate_event_id = MagicMock(return_value="ev")
 
-    def test_explicit_dir_with_content_raises(
-            self, tmp_path: Path):
-        """A non-empty hand-stamped agent_workspace_dir raises.
+        sync = SyncExecutionHandle(ExecutionResult(
+            exit_code=INVOKE_FAILURE_EXIT_CODE,
+            elapsed_s=0.0,
+            output_bindings={},
+            execution_id="exec-fail",
+            status="failed",
+        ))
+        prompt_dir = Path(tempfile.mkdtemp(
+            prefix="flywheel-test-prompt-", dir=tmp_path))
+        handle = AgentHandle(
+            inner=sync,
+            workspace=workspace,
+            executions_before=0,
+            prompt_tempdir=prompt_dir,
+        )
+        out = handle.wait()
+        assert out.exit_reason == "crashed"
+        assert not prompt_dir.exists()
 
-        If a caller hand-stamps an ``agent_workspace_dir`` and
-        the target already has files, refusing the launch is the
-        only way to guarantee we don't blow away data the
-        previous launch (or another concurrent launch) wrote.
-        """
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.instances_for = MagicMock(return_value=[])
 
-        existing = tmp_path / "explore_0"
-        existing.mkdir()
-        (existing / "old_file.txt").write_text("old")
+class TestRunAgentBlockKeyboardInterrupt:
+    """``run_agent_block`` must forward a KeyboardInterrupt to the
+    inner handle as a graceful stop, finalize the run, and re-
+    raise the interrupt.
+    """
 
-        with pytest.raises(FileExistsError):
-            prepare_agent_workspace(
-                ws, agent_workspace_dir="explore_0")
-        # The old file was left intact — proof we didn't rmtree.
-        assert (existing / "old_file.txt").read_text() == "old"
+    def test_keyboard_interrupt_triggers_stop_and_reraises(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        workspace, base_result = _make_workspace(
+            tmp_path, execution_id="exec-interrupted")
 
-    def test_explicit_empty_dir_is_reused(self, tmp_path: Path):
-        """Pre-existing-but-empty dirs are accepted as targets."""
-        ws = MagicMock()
-        ws.path = tmp_path
-        ws.instances_for = MagicMock(return_value=[])
+        inner = _KeyboardInterruptingInner(final=base_result)
 
-        existing = tmp_path / "explore_0"
-        existing.mkdir()
+        prompt_dir = Path(tempfile.mkdtemp(
+            prefix="flywheel-test-prompt-", dir=tmp_path))
+        handle = AgentHandle(
+            inner=inner,
+            workspace=workspace,
+            executions_before=0,
+            prompt_tempdir=prompt_dir,
+        )
 
-        mount = prepare_agent_workspace(
-            ws, agent_workspace_dir="explore_0")
-        assert mount.host_path == existing
-        assert mount.relative_dir == "explore_0"
+        def _fake_launch(**_):
+            return handle
 
-    def test_workspace_starts_empty(self, tmp_path: Path):
-        """Agent workspace is scratch only.
+        # Patch launch_agent_block via the module the wrapper
+        # imports it from.
+        monkeypatch.setattr(
+            "flywheel.agent.launch_agent_block", _fake_launch)
 
-        The workspace must never carry seeded artifact contents.
-        The agent sees artifact data only through its mounted
-        ``/input/<slot>`` directories (staged copies of canonical
-        artifacts; see :mod:`flywheel.input_staging`).  This
-        test pins the invariant: a fresh workspace is empty.
-        """
-        ws = MagicMock()
-        ws.path = tmp_path
-
-        # Even with prior copy-kind instances on the workspace,
-        # ``prepare_agent_workspace`` must not seed them in.
-        art_dir = tmp_path / "artifacts" / "game_log@abc"
-        art_dir.mkdir(parents=True)
-        (art_dir / "game_log.txt").write_text("log data")
-        inst = MagicMock()
-        inst.kind = "copy"
-        inst.copy_path = "game_log@abc"
-        ws.instances_for = MagicMock(return_value=[inst])
-
-        mount = prepare_agent_workspace(ws)
-        assert list(mount.host_path.iterdir()) == []
-        # And ``instances_for`` is never even consulted: we
-        # removed the seeding loop entirely.
-        ws.instances_for.assert_not_called()
+        from flywheel.agent import run_agent_block
+        with pytest.raises(KeyboardInterrupt):
+            run_agent_block(
+                workspace=workspace,
+                template=MagicMock(),
+                project_root=tmp_path,
+                prompt="hi",
+                block_name="play",
+            )
+        assert inner.stop_calls == ["keyboard_interrupt"]

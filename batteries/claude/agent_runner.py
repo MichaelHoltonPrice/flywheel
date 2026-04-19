@@ -37,14 +37,19 @@ Environment variables:
                       one or more in a single assistant turn, the
                       hook denies each (recording deny tool_results
                       in the session), captures every intercepted
-                      call into ``pending_tool_calls.json`` in the
-                      workspace, sets ``.agent_state.json`` status
-                      to ``tool_handoff``, and signals the runner
-                      to exit cleanly so a host-side driver can
-                      run the blocks out-of-band, splice every
-                      real result into the captured state_dir's
-                      session.jsonl, and let the next launch
-                      pick it up via the ``/state/`` populate.
+                      call into ``/output/pending_tool_calls/
+                      pending_tool_calls.json``, sets the exit
+                      state in ``/output/agent_exit_state/
+                      agent_exit_state.json`` to status
+                      ``tool_handoff``, and signals the runner to
+                      exit cleanly so a host-side driver can run
+                      the blocks out-of-band, splice every real
+                      result into the captured state_dir's
+                      session.jsonl, and let the next launch pick
+                      it up via the ``/state/`` populate.  Both
+                      files are declared outputs of the agent
+                      block; the handoff loop reads them as
+                      workspace artifacts.
     HANDOFF_DENY_MARKER — Substring that the splice helper uses to
                       locate the deny tool_result on disk.  Defaults
                       to ``handoff_to_flywheel``.
@@ -96,9 +101,8 @@ from claude_agent_sdk.types import (
 # ------------------------------------------------------------------
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
-STATE_FILE = WORKSPACE / ".agent_state.json"
+STOP_FILE = WORKSPACE / ".stop"
 RESUME_FILE = WORKSPACE / ".agent_resume"
-STOP_FILE = WORKSPACE / ".agent_stop"
 POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Rate limit auto-retry: sleep with exponential backoff before
@@ -121,14 +125,21 @@ STATE_DIR = Path("/state")
 SESSION_FILE = STATE_DIR / "session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-# Pending tool-call handoff: artifact-shaped file the PreToolUse
-# handoff hook writes when it intercepts mapped tools in an
-# assistant turn.  Plural because a single turn can contain
-# multiple parallel tool_use blocks; we capture every one and let
-# the host-side driver run, splice, and resume them all in a
-# single stop/restart cycle.  Schema is versioned via
-# ``PENDING_TOOL_CALLS_SCHEMA_VERSION`` below.
-PENDING_TOOL_CALLS_FILE = WORKSPACE / "pending_tool_calls.json"
+# Prompt delivery: the pattern runner renders the prompt into a
+# tempdir and mounts it read-only at ``/prompt``.  Reading the
+# prompt from a file (rather than stdin) frees stdin for log
+# capture and matches the runtime contract's "inputs arrive via
+# file mounts" convention.
+PROMPT_FILE = Path("/prompt/prompt.md")
+
+# Orchestration control outputs.  Both files are declared outputs
+# of the agent block and appear as artifact instances in the
+# workspace after capture.  The host-side handoff loop reads them
+# by artifact ID rather than scanning a durable agent workspace.
+PENDING_TOOL_CALLS_FILE = Path(
+    "/output/pending_tool_calls/pending_tool_calls.json")
+EXIT_STATE_FILE = Path(
+    "/output/agent_exit_state/agent_exit_state.json")
 PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
 
@@ -275,6 +286,8 @@ def _persist_handoff(session_id: str) -> None:
         "session_id": session_id,
         "pending": pending,
     }
+    PENDING_TOOL_CALLS_FILE.parent.mkdir(
+        parents=True, exist_ok=True)
     PENDING_TOOL_CALLS_FILE.write_text(
         json.dumps(payload, indent=2), encoding="utf-8")
     _emit({
@@ -392,14 +405,13 @@ def _emit(data: dict) -> None:
 
 
 def _save_state(session_id: str, status: str, reason: str = "") -> None:
-    """Persist agent state for resume and external visibility.
+    """Persist agent exit state into the declared output slot.
 
-    NOTE: The session_id saved here is only useful for resume if
-    the container is still running.  The SDK stores session history
-    as local files at ~/.claude/projects/<cwd>/<session-id>.jsonl
-    inside the container — these are lost when the container dies.
-    To support cross-container resume, mount a persistent volume
-    at /home/claude/.claude/projects/.  See docs/architecture.md.
+    The host-side handoff loop reads the resulting artifact to
+    classify ``AgentResult.exit_reason`` and to decide whether to
+    relaunch after a handoff.  Written into
+    ``/output/agent_exit_state/`` so it lands as a first-class
+    artifact instance tied to this execution.
     """
     state = {
         "session_id": session_id,
@@ -407,7 +419,8 @@ def _save_state(session_id: str, status: str, reason: str = "") -> None:
         "reason": reason,
         "timestamp": time.time(),
     }
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    EXIT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EXIT_STATE_FILE.write_text(json.dumps(state, indent=2))
     _emit({"type": "agent_state", **state})
 
 
@@ -461,8 +474,18 @@ def _get_input_tokens(message) -> int:
 
 async def main() -> None:
     """Run the Claude Code agent with mid-session compaction."""
-    # --- Read initial prompt ---
-    prompt = sys.stdin.read()
+    # --- Read initial prompt from the /prompt/ mount ---
+    if not PROMPT_FILE.is_file():
+        _emit({
+            "type": "error",
+            "message": (
+                f"Prompt file not found at {PROMPT_FILE}; the "
+                f"launcher must mount a read-only prompt "
+                f"directory at /prompt/ with a prompt.md file."
+            ),
+        })
+        sys.exit(1)
+    prompt = PROMPT_FILE.read_text(encoding="utf-8")
     if not prompt.strip():
         _emit({"type": "error", "message": "Empty prompt"})
         sys.exit(1)

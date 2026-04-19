@@ -51,6 +51,7 @@ import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.agent_handoff import (
+    PENDING_ARTIFACT_NAME,
     PENDING_FILE_NAME,
     SESSION_FILE_NAME,
     HandoffAgentHandle,
@@ -59,7 +60,7 @@ from flywheel.agent_handoff import (
     HandoffResult,
     launch_agent_with_handoffs,
 )
-from flywheel.artifact import BlockExecution
+from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.pattern import ContinuousTrigger, Pattern, Role
 from flywheel.pattern_runner import PatternRunner
 
@@ -79,13 +80,16 @@ paths."""
 class _FakeWorkspace:
     """Stand-in for :class:`flywheel.workspace.Workspace`.
 
-    The handoff loop reads ``workspace.path`` and
-    ``workspace.executions[exec_id].state_dir`` to locate the
-    session JSONL after each cycle.
+    The handoff loop reads ``workspace.path``,
+    ``workspace.executions[exec_id]``, and
+    ``workspace.artifacts[aid]`` to resolve captured state dirs
+    and the pending-tool-calls artifact binding.
     """
 
     path: Path
     executions: dict[str, BlockExecution] = field(default_factory=dict)
+    artifacts: dict[str, ArtifactInstance] = field(
+        default_factory=dict)
 
 
 @dataclass
@@ -126,11 +130,6 @@ class _FakeAgentHandle:
         if self._script.pre_wait_delay_s > 0:
             time.sleep(self._script.pre_wait_delay_s)
 
-        agent_ws = (
-            self._workspace_root / self._script.agent_workspace_dir
-        )
-        agent_ws.mkdir(parents=True, exist_ok=True)
-
         state_dir_rel: str | None = None
         if self._script.write_session:
             state_dir_path = (
@@ -145,6 +144,30 @@ class _FakeAgentHandle:
                 state_dir_path.relative_to(self._workspace_root)
             ).replace("\\", "/")
 
+        output_bindings: dict[str, str] = {}
+        if self._script.exit_reason == "tool_handoff":
+            aid = f"pending-{self._script.execution_id}"
+            artifact_dir = (
+                self._workspace_root / "artifacts" / aid)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            envelope = {
+                "schema_version": 2,
+                "session_id": "sess-fake",
+                "pending": list(self._script.pending),
+            }
+            (artifact_dir / PENDING_FILE_NAME).write_text(
+                json.dumps(envelope), encoding="utf-8")
+            if self._workspace is not None:
+                self._workspace.artifacts[aid] = ArtifactInstance(
+                    id=aid,
+                    name=PENDING_ARTIFACT_NAME,
+                    kind="copy",
+                    copy_path=aid,
+                    created_at=datetime.now(UTC),
+                    source="fake",
+                )
+            output_bindings[PENDING_ARTIFACT_NAME] = aid
+
         if self._workspace is not None:
             now = datetime.now(UTC)
             self._workspace.executions[
@@ -156,16 +179,8 @@ class _FakeAgentHandle:
                 finished_at=now,
                 status="succeeded",
                 state_dir=state_dir_rel,
+                output_bindings=output_bindings,
             )
-
-        if self._script.exit_reason == "tool_handoff":
-            envelope = {
-                "schema_version": 2,
-                "session_id": "sess-fake",
-                "pending": list(self._script.pending),
-            }
-            (agent_ws / PENDING_FILE_NAME).write_text(
-                json.dumps(envelope), encoding="utf-8")
 
         return AgentResult(
             exit_code=0,
@@ -174,7 +189,6 @@ class _FakeAgentHandle:
             execution_id=self._script.execution_id,
             stop_reason=None,
             exit_reason=self._script.exit_reason,
-            agent_workspace_dir=self._script.agent_workspace_dir,
         )
 
 
@@ -712,12 +726,14 @@ class TestPatternRunnerIntegration:
         class _MiniWS:
             """Just enough Workspace surface for PatternRunner.
 
-            PatternRunner only reads ``workspace.executions`` and
-            ``workspace.path`` for the paths exercised by a
+            PatternRunner and the handoff loop read
+            ``workspace.executions``, ``workspace.artifacts``,
+            and ``workspace.path`` for the paths exercised by a
             single continuous role.
             """
             path: Path
             executions: dict[str, Any] = field(default_factory=dict)
+            artifacts: dict[str, Any] = field(default_factory=dict)
 
             def instances_for(self, name: str) -> list[Any]:
                 return []

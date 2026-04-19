@@ -1,16 +1,23 @@
 """Drive an agent container through tool-call handoff cycles.
 
-.. note::
+.. deprecated::
 
-   This module is a parallel (older) handoff driver that still
-   uses the pre-substrate ``RESUME_SESSION_FILE`` /
-   ``/workspace/agent_session.jsonl`` convention.  It has not
-   yet been migrated to the ``/state/``-based session
-   persistence used by :mod:`flywheel.agent_handoff`.  Its
-   consumers and tests still pin the old contract.  Migration
-   is tracked as pre-step-5 cleanup in
-   ``cyber-root/substrate-plan.md``; until then, do not mix
-   the two drivers in a single code path.
+   This module is a legacy handoff driver that predates the
+   substrate contract.  It still uses the pre-substrate
+   ``RESUME_SESSION_FILE`` / ``/workspace/agent_session.jsonl``
+   convention, a durable agent workspace directory, and
+   ``.agent_stop`` as the cancellation sentinel — none of which
+   match the contract implemented by
+   :mod:`flywheel.agent_handoff` +
+   :mod:`flywheel.executor.ProcessExitExecutor`.
+
+   The only authoritative handoff path is
+   :mod:`flywheel.agent_handoff`.  New code must not import
+   from this module.  Existing callers and tests pinned to the
+   legacy contract are tracked for migration in
+   ``cyber-root/substrate-plan.md`` — until they move, this
+   module exists only to keep those tests running; it is not
+   part of the substrate-conformance story.
 
 The flywheel-claude agent runner exposes a ``HANDOFF_TOOLS`` env
 var.  When the agent invokes one or more matched MCP tools in a

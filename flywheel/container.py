@@ -87,6 +87,8 @@ def start_container(
     config: ContainerConfig,
     args: list[str] | None = None,
     name: str | None = None,
+    *,
+    capture_output: bool = False,
 ) -> subprocess.Popen:
     """Launch a Docker container non-blockingly.
 
@@ -104,6 +106,12 @@ def start_container(
         name: Optional container name.  Required if the caller
             intends to signal the container via ``docker kill``
             (which addresses containers by name).
+        capture_output: When ``True``, wire the child process's
+            stdout and stderr to pipes the caller can drain.
+            Default ``False`` lets the streams inherit the parent's
+            file descriptors (prints to the terminal).  Capture is
+            how :class:`flywheel.executor.ContainerExecutionHandle`
+            routes container output into per-execution log files.
 
     Returns:
         A running :class:`subprocess.Popen` for the container.
@@ -113,7 +121,13 @@ def start_container(
     # (e.g., /output -> C:/Program Files/Git/output).
     env = os.environ.copy()
     env["MSYS_NO_PATHCONV"] = "1"
-    return subprocess.Popen(cmd, env=env)
+    popen_kwargs: dict = {"env": env}
+    if capture_output:
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+        popen_kwargs["text"] = True
+        popen_kwargs["encoding"] = "utf-8"
+    return subprocess.Popen(cmd, **popen_kwargs)
 
 
 def run_container(

@@ -30,7 +30,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -288,8 +290,37 @@ class ContainerExecutionHandle(ExecutionHandle):
         work_area: Path,
         input_bindings: dict[str, str],
         state_lineage_id: str | None,
+        log_dir: Path | None = None,
+        total_timeout_s: float | None = None,
+        on_stdout_line: Callable[[str], None] | None = None,
     ):
-        """Capture every piece of state :meth:`wait` will need."""
+        """Capture every piece of state :meth:`wait` will need.
+
+        The ``log_dir``, ``total_timeout_s``, and ``on_stdout_line``
+        parameters opt in to three orthogonal background threads:
+
+        * When ``log_dir`` is set, two drain threads copy the
+          container's stdout and stderr into ``log_dir/stdout.log``
+          and ``log_dir/stderr.log`` respectively.  Requires that
+          the process was started with ``capture_output=True`` so
+          ``process.stdout`` and ``process.stderr`` are real pipes.
+        * When ``total_timeout_s`` is set, a watchdog thread
+          polls the process and calls :meth:`stop` with reason
+          ``"total_timeout"`` if wall-clock elapsed exceeds the
+          budget.  Decoupled from stdout drainage: a container
+          that stalls silently still hits the timeout.
+        * When ``on_stdout_line`` is set and ``log_dir`` is set,
+          the stdout drain thread calls the callback for each
+          newline-terminated line as it arrives.  Used by callers
+          that want to parse structured events from the stream
+          without re-reading the log file post-exit.
+
+        Concurrency contract: :meth:`stop` is idempotent and
+        lock-protected.  Whichever caller initiates the stop
+        (operator, watchdog, or natural-exit racer) wins; the
+        others see a no-op.  Exactly one SIGTERM/SIGKILL
+        escalation per handle.
+        """
         self._process = process
         self._workspace = workspace
         self._block_def = block_def
@@ -303,8 +334,101 @@ class ContainerExecutionHandle(ExecutionHandle):
         self._work_area = work_area
         self._input_bindings = input_bindings
         self._state_lineage_id = state_lineage_id
+        self._log_dir = log_dir
+        self._total_timeout_s = total_timeout_s
+        self._on_stdout_line = on_stdout_line
         self._stop_reason: str | None = None
+        self._stop_lock = threading.Lock()
+        self._stop_initiated = False
         self._waited = False
+
+        # Start auxiliary threads.  They run for the lifetime of
+        # the handle and are joined in :meth:`wait`'s finally.
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
+
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._stdout_thread = threading.Thread(
+                target=self._drain_stream,
+                args=(self._process.stdout,
+                      log_dir / "stdout.log",
+                      on_stdout_line),
+                name=f"flywheel-stdout-{container_name}",
+                daemon=True,
+            )
+            self._stdout_thread.start()
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stream,
+                args=(self._process.stderr,
+                      log_dir / "stderr.log",
+                      None),
+                name=f"flywheel-stderr-{container_name}",
+                daemon=True,
+            )
+            self._stderr_thread.start()
+
+        if total_timeout_s is not None and total_timeout_s > 0:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_body,
+                name=f"flywheel-watchdog-{container_name}",
+                daemon=True,
+            )
+            self._watchdog_thread.start()
+
+    @staticmethod
+    def _drain_stream(
+        pipe: Any,
+        log_path: Path,
+        on_line: Callable[[str], None] | None,
+    ) -> None:
+        """Copy a pipe line-by-line to a log file, optionally emitting.
+
+        Runs in a background thread for the container's lifetime.
+        Exits when the pipe returns EOF (container closed stdout/
+        stderr on exit).  Errors writing the log are swallowed —
+        log capture must never mask the real container exit.
+        """
+        if pipe is None:
+            return
+        try:
+            with open(log_path, "w", encoding="utf-8") as sink:
+                for line in pipe:
+                    try:
+                        sink.write(line)
+                        sink.flush()
+                    except OSError:
+                        pass
+                    if on_line is not None:
+                        try:
+                            on_line(line.rstrip("\n"))
+                        except Exception:
+                            # Callback errors are the caller's
+                            # problem; don't kill the drain.
+                            pass
+        except Exception:
+            pass
+
+    def _watchdog_body(self) -> None:
+        """Enforce ``total_timeout_s`` independent of stdout activity.
+
+        Polls the process every second and triggers :meth:`stop`
+        when the wall-clock budget is exhausted.  Exits silently
+        on natural container exit.  The ``stop()`` body runs
+        outside the watchdog thread's frame (via lock hand-off),
+        so a slow two-phase cancellation does not pin this thread.
+        """
+        assert self._total_timeout_s is not None
+        deadline = self._start_monotonic + self._total_timeout_s
+        while True:
+            if self._process.poll() is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.stop(reason="total_timeout")
+                return
+            time.sleep(min(remaining, 1.0))
 
     def is_alive(self) -> bool:
         """True while the container process has no exit code yet."""
@@ -322,25 +446,27 @@ class ContainerExecutionHandle(ExecutionHandle):
         SIGTERM via ``docker kill`` and wait a short grace.  If
         SIGTERM is ignored too, escalate to SIGKILL.
 
-        Safe to call on an already-exited container: the poll
-        check short-circuits.  Idempotent within one handle: a
-        second ``stop()`` after the first completed is a no-op.
+        Concurrency: the operator, the watchdog thread, and a
+        racing natural exit can all land here concurrently.  A
+        short lock guards the "has anyone initiated stop?"
+        decision; the first caller wins and runs the body, while
+        later callers return immediately.  ``reason`` is recorded
+        from the winning caller.  The TERM/KILL escalation runs
+        outside the lock; subsequent stop() calls do not block on
+        it.
         """
-        if self._process.poll() is not None:
-            # Already exited naturally; nothing to cancel, and
-            # no stop_reason to set — this call is a no-op.
-            return
-
-        # From here on we consider the execution interrupted —
-        # the operator explicitly asked us to stop a running
-        # container.  There's a very narrow race where the
-        # container is *about* to exit naturally when stop()
-        # fires, in which case we'll label an effectively-
-        # natural exit as interrupted; that misclassification
-        # is acceptable given we can't distinguish "exit caused
-        # by sentinel" from "exit that coincidentally happened
-        # after sentinel write" without extra signal.
-        self._stop_reason = reason
+        with self._stop_lock:
+            if self._stop_initiated:
+                return
+            if self._process.poll() is not None:
+                # Container already exited naturally; mark
+                # initiated to keep subsequent stop() calls a
+                # no-op but leave stop_reason unset — the status
+                # is not "interrupted".
+                self._stop_initiated = True
+                return
+            self._stop_initiated = True
+            self._stop_reason = reason
 
         # Phase 1: cooperative stop via sentinel.
         sentinel = self._work_area / (
@@ -440,6 +566,19 @@ class ContainerExecutionHandle(ExecutionHandle):
                     failure_phase = runtime.FAILURE_OUTPUT_COLLECT
                     error = f"output_collect: {e}"
         finally:
+            # Join auxiliary threads before tearing down their
+            # dependencies (pipes, work_area).  Drain threads
+            # exit on pipe EOF; the watchdog exits on a non-
+            # None poll().  Explicit joins guarantee log
+            # flushes and watchdog-initiated stop() bodies
+            # have finished before cleanup runs.
+            if self._stdout_thread is not None:
+                self._stdout_thread.join(timeout=30)
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=30)
+            if self._watchdog_thread is not None:
+                self._watchdog_thread.join(timeout=30)
+
             # Cleanup is best-effort; never mask a real failure.
             cleanup_staged_inputs(self._staged_inputs)
             if self._state_mount is not None:
@@ -538,6 +677,12 @@ class ProcessExitExecutor:
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
         state_lineage_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
+        extra_docker_args: list[str] | None = None,
+        log_dir: Path | None = None,
+        total_timeout_s: float | None = None,
+        on_stdout_line: Callable[[str], None] | None = None,
     ) -> ExecutionHandle:
         """Start a one-shot container execution.
 
@@ -577,6 +722,39 @@ class ProcessExitExecutor:
                 bucket — matches every stateful-block use case
                 we support today.  Callers that want parallel or
                 forked state chains can pass distinct IDs.
+            extra_env: Per-launch environment variables to merge
+                into ``block_def.env`` before building the
+                ``ContainerConfig``.  Later writes win, so a
+                launcher can override a block-declared default.
+            extra_mounts: Per-launch bind mounts appended to the
+                block's staged-input / output / state / workspace
+                mount list.  Each entry is ``(host_path,
+                container_path, mode)``.  Mount paths must not
+                collide with the contract-reserved ``/input/*``,
+                ``/output/*``, ``/state``, or ``/workspace`` —
+                collision surfaces as a Docker error.
+            extra_docker_args: Per-launch Docker CLI flags
+                appended to ``block_def.docker_args``.  Used for
+                launch-time policies such as ``--cap-add=NET_ADMIN``
+                that the caller turns on or off per run without
+                rewriting the block definition.  The merge is
+                local to this launch; the block definition is
+                not mutated.
+            log_dir: When set, capture the container's stdout
+                and stderr into ``log_dir/stdout.log`` and
+                ``log_dir/stderr.log`` via background drain
+                threads.  Default ``None`` lets the streams
+                inherit the parent's file descriptors.
+            total_timeout_s: When set, a watchdog thread enforces
+                a wall-clock budget independent of stdout
+                activity; on expiry it calls :meth:`stop` with
+                reason ``"total_timeout"``.  Default ``None``
+                disables the watchdog (natural exit only).
+            on_stdout_line: When set (alongside ``log_dir``),
+                the stdout drain thread calls this function for
+                each line as it arrives.  Used by callers that
+                want structured event processing without
+                post-exit log re-reads.
 
         Returns:
             A live :class:`ContainerExecutionHandle` on the
@@ -676,10 +854,18 @@ class ProcessExitExecutor:
                 block_def, staged_inputs, output_tempdirs,
                 state_mount, work_area,
             )
+            if extra_mounts:
+                mounts.extend(extra_mounts)
+            merged_env = dict(block_def.env)
+            if extra_env:
+                merged_env.update(extra_env)
+            merged_docker_args = list(block_def.docker_args)
+            if extra_docker_args:
+                merged_docker_args.extend(extra_docker_args)
             cc = ContainerConfig(
                 image=block_def.image,
-                docker_args=list(block_def.docker_args),
-                env=dict(block_def.env),
+                docker_args=merged_docker_args,
+                env=merged_env,
                 mounts=mounts,
             )
             container_args = _build_container_args(
@@ -687,11 +873,13 @@ class ProcessExitExecutor:
             container_name = f"flywheel-block-{exec_id}"
 
             start_monotonic = time.monotonic()
+            capture_output = log_dir is not None
             try:
                 process = start_container(
                     cc,
                     args=container_args or None,
                     name=container_name,
+                    capture_output=capture_output,
                 )
             except Exception as e:
                 return _record_pre_container_failure(
@@ -730,6 +918,9 @@ class ProcessExitExecutor:
             work_area=work_area,
             input_bindings=input_bindings,
             state_lineage_id=state_lineage_id,
+            log_dir=log_dir,
+            total_timeout_s=total_timeout_s,
+            on_stdout_line=on_stdout_line,
         )
 
 

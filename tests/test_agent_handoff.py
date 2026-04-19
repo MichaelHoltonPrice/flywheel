@@ -267,10 +267,12 @@ class TestSingleHandoffRoundTrip:
         }
 
         cycle1 = record[1].kwargs
-        assert cycle1["reuse_workspace"] is True
+        # ``reuse_workspace`` and a durable ``agent_workspace_dir``
+        # are gone: /workspace is now the substrate's per-
+        # execution scratch tempdir.  What survives across cycles
+        # is the predecessor link and the switch to the resume
+        # prompt.
         assert cycle1["predecessor_id"] == "exec-prev"
-        assert cycle1["agent_workspace_dir"] == (
-            "agent_workspaces/handoff_test")
         assert cycle1["prompt"] == DEFAULT_RESUME_PROMPT
         # extra_env is preserved verbatim across relaunch — no
         # resume-session env var anymore; session resume is via
@@ -769,7 +771,8 @@ class TestErrorPaths:
             return HandoffResult(content="ok")
 
         with pytest.raises(
-            HandoffLoopError, match="no tool calls",
+            HandoffLoopError,
+            match="pending_tool_calls artifact is missing or empty",
         ):
             run_agent_with_handoffs(
                 block_runner=_br,
@@ -968,7 +971,6 @@ def _ctx(tool_name: str, **overrides: Any) -> HandoffContext:
         tool_input={},
         session_id="sess-1",
         tool_use_id="toolu_x",
-        agent_workspace=Path("/tmp/ws"),
         iteration=0,
         index_in_iteration=0,
         siblings=1,

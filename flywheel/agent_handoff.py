@@ -3,32 +3,41 @@
 The agent runner inside the container raises a ``tool_handoff``
 state when its ``PreToolUse`` hook intercepts one or more handoff
 tool calls in a single assistant turn (see
-``batteries/claude/agent_runner.py``).  On that exit:
+``batteries/claude/agent_runner.py``).  On that exit the runner
+writes two declared outputs:
 
-* ``.agent_state.json`` reports ``status == "tool_handoff"``;
-* ``pending_tool_calls.json`` (schema_version 2) lists every
-  intercepted ``tool_use`` in the order the SDK emitted them;
-* the SDK session JSONL (at ``/state/session.jsonl`` inside the
-  container, captured into
-  ``<workspace>/state/<block>/<exec_id>/session.jsonl``) carries
-  the conversation with synthetic deny ``tool_result`` entries
-  for each ``tool_use_id``.
+* ``agent_exit_state`` — JSON with ``status == "tool_handoff"``
+  and a reason summary;
+* ``pending_tool_calls`` (schema_version 2) — every intercepted
+  ``tool_use`` in the order the SDK emitted them.
 
-This module's :func:`run_agent_with_handoffs` is the host-side
-counterpart that closes the loop:
+The SDK session JSONL (at ``/state/session.jsonl`` inside the
+container, captured into
+``<workspace>/state/<block>/<exec_id>/session.jsonl``) carries
+the conversation with synthetic deny ``tool_result`` entries for
+each ``tool_use_id``.
+
+This module's :func:`run_agent_with_handoffs` closes the loop:
 
 1. Launch the agent (via :func:`flywheel.agent.launch_agent_block`).
 2. Wait for it to exit.
-3. If the exit is ``tool_handoff``: invoke the caller-supplied
-   ``block_runner`` once per pending entry (preserving SDK
-   emission order), splice each real result into the captured
-   state_dir's ``session.jsonl`` via
-   :func:`flywheel.session_splice.splice_tool_result`, and
-   remove the pending file.  Relaunching the agent is automatic
-   — the next execution's ``/state/`` populate reads the
-   mutated state_dir.
+3. If ``exit_reason == "tool_handoff"``: look up the
+   ``pending_tool_calls`` artifact bound to this execution,
+   invoke the caller-supplied ``block_runner`` once per entry
+   (preserving SDK emission order), and splice each real result
+   into the captured state_dir's ``session.jsonl`` via
+   :func:`flywheel.session_splice.splice_tool_result`.  The
+   next execution's ``/state/`` populate picks up the mutated
+   state_dir automatically.
 4. Repeat until the agent exits without a handoff (or
    ``max_iterations`` is hit).
+
+Because each cycle's control outputs live in the workspace
+artifact graph — tied to that cycle's :class:`BlockExecution` —
+there is no durable per-agent workspace directory; ``/workspace``
+is the substrate's per-execution scratch, torn down by
+:class:`flywheel.executor.ContainerExecutionHandle` on exit.  No
+stale pending file can leak into a later launch.
 
 The function returns the *terminal* :class:`flywheel.agent.AgentResult`
 plus a list of :class:`HandoffCycle` records describing each
@@ -36,26 +45,10 @@ intermediate launch.  When no handoff occurs (the common case
 today, with no tools registered in ``HANDOFF_TOOLS``) it
 collapses to a single ``launch_agent_block`` + ``handle.wait()``
 and is observationally identical to :func:`run_agent_block`.
-
-Production wiring is intentionally minimal:
-
-* No host-side HTTP bridge runs.  Block executions invoked
-  during a handoff are recorded directly by the host runner
-  via :class:`flywheel.local_block.LocalBlockRecorder`.
-* Each cycle's :class:`flywheel.artifact.BlockExecution` record is
-  recorded by the underlying :class:`flywheel.agent.AgentHandle`
-  with its own ``execution_id``; this loop chains them via
-  ``predecessor_id`` so an operator inspecting the workspace
-  sees the cycle structure explicitly.
-
-The on-disk handoff state (the pending tool-call file the
-agent runner writes when it intercepts a mapped tool) is
-documented inline in :mod:`flywheel.batteries.claude.agent_runner`.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import threading
 from collections.abc import Callable
@@ -66,6 +59,15 @@ from typing import Any
 from flywheel import runtime
 from flywheel.agent import AgentResult, launch_agent_block
 from flywheel.session_splice import SpliceError, splice_tool_result
+
+PENDING_ARTIFACT_NAME = "pending_tool_calls"
+"""Declared-output slot name the agent runner writes on handoff.
+
+The runner emits the pending file to
+``/output/pending_tool_calls/pending_tool_calls.json``; the
+substrate registers the artifact instance and binds it to the
+cycle's :class:`BlockExecution` under this slot name.  The loop
+reads it back via that binding."""
 
 PENDING_FILE_NAME = "pending_tool_calls.json"
 SESSION_FILE_NAME = "session.jsonl"
@@ -103,13 +105,9 @@ class HandoffContext:
         tool_input: Verbatim arguments the model emitted, as the
             ``PreToolUse`` hook saw them.
         session_id: Agent's current SDK session ID, as recorded
-            in the pending file (or in ``.agent_state.json`` if
-            the pending file omits it).
+            in the pending artifact payload.
         tool_use_id: SDK-assigned correlation ID for this tool
             call; the splice key.
-        agent_workspace: Host-side path to the agent's workspace
-            directory (the same directory bind-mounted into the
-            container at ``/workspace``).
         iteration: 0-based index of which container launch this
             handoff was surfaced by; shared across all handoffs
             from the same launch.
@@ -125,7 +123,6 @@ class HandoffContext:
     tool_input: dict[str, Any]
     session_id: str
     tool_use_id: str
-    agent_workspace: Path
     iteration: int
     index_in_iteration: int = 0
     siblings: int = 1
@@ -255,23 +252,41 @@ def _normalize_pending(doc: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _find_agent_ws(
-    workspace_path: Path,
-    agent_workspace_dir: str | None,
-) -> Path:
-    """Resolve the host-side agent workspace path for a result.
+def _read_pending_artifact(
+    workspace: Any,
+    execution_id: str,
+) -> tuple[dict[str, Any], Path | None]:
+    """Resolve the ``pending_tool_calls`` artifact for an execution.
 
-    The :class:`AgentResult` reports ``agent_workspace_dir`` as a
-    workspace-relative subpath (e.g. ``agent_workspaces/abc12345``).
-    The handoff loop needs the absolute host path to read the
-    pending file and splice the session JSONL.
+    Returns ``(parsed_json, artifact_file_path)``.  ``parsed_json``
+    is ``{}`` when the artifact is missing or malformed;
+    ``artifact_file_path`` is the on-disk location of
+    ``pending_tool_calls.json`` inside the captured artifact
+    directory (returned so error messages can show it).
     """
-    if not agent_workspace_dir:
-        raise HandoffLoopError(
-            "agent result has no agent_workspace_dir; cannot "
-            "locate workspace for handoff resolution"
+    execution = workspace.executions.get(execution_id)
+    if execution is None:
+        return {}, None
+    binding = execution.output_bindings.get(
+        PENDING_ARTIFACT_NAME)
+    if not binding:
+        return {}, None
+    instance = workspace.artifacts.get(binding)
+    if instance is None:
+        return {}, None
+    artifact_dir = (
+        workspace.path / "artifacts" / instance.copy_path)
+    pending_file = artifact_dir / PENDING_FILE_NAME
+    if not pending_file.is_file():
+        return {}, pending_file
+    try:
+        return (
+            json.loads(
+                pending_file.read_text(encoding="utf-8")),
+            pending_file,
         )
-    return workspace_path / agent_workspace_dir
+    except (OSError, json.JSONDecodeError):
+        return {}, pending_file
 
 
 def run_agent_with_handoffs(
@@ -358,34 +373,40 @@ def run_agent_with_handoffs(
 
     cycles: list[HandoffCycle] = []
     last_execution_id: str | None = base_kwargs.get("predecessor_id")
-    last_agent_workspace_dir: str | None = base_kwargs.get(
-        "agent_workspace_dir")
+
+    # Hooks the threaded wrapper reads so a stop() call can
+    # forward to the currently-running inner handle.  ``None`` in
+    # direct :func:`run_agent_with_handoffs` callers.
+    inner_handle_ref: dict | None = (
+        base_kwargs.pop("_inner_handle_ref", None))
+    cancel_event = base_kwargs.pop("_cancel_event", None)
 
     for iteration in range(max_iterations):
+        if (iteration > 0
+                and cancel_event is not None
+                and cancel_event.is_set()):
+            # Cancelled between cycles.  Surface the last cycle
+            # as the terminal result so HandoffLoopResult.final_result
+            # has something to return.
+            return HandoffLoopResult(cycles=cycles)
+
         kwargs = dict(base_kwargs)
         if iteration == 0:
             pass
         else:
-            # ``reuse_workspace`` keeps pending_tool_calls.json +
-            # .agent_state.json visible to the next iteration via
-            # the persistent agent-workspace bind.  The session
-            # resume path no longer runs through this bind — the
-            # next container's ``/state/`` is populated from the
-            # previous execution's captured state_dir, which we
-            # mutated in place via splice_tool_result.
-            kwargs["reuse_workspace"] = True
             kwargs["predecessor_id"] = last_execution_id
-            kwargs["agent_workspace_dir"] = last_agent_workspace_dir
             kwargs["prompt"] = resume_prompt
 
         handle = launch_fn(**kwargs)
+        if inner_handle_ref is not None:
+            inner_handle_ref["handle"] = handle
         try:
             agent_result = handle.wait()
-        except Exception:
-            raise
+        finally:
+            if inner_handle_ref is not None:
+                inner_handle_ref["handle"] = None
 
         last_execution_id = agent_result.execution_id
-        last_agent_workspace_dir = agent_result.agent_workspace_dir
 
         if agent_result.exit_reason != "tool_handoff":
             cycles.append(HandoffCycle(
@@ -403,16 +424,6 @@ def run_agent_with_handoffs(
                 f"intercepted tools from HANDOFF_TOOLS."
             )
 
-        agent_ws = _find_agent_ws(
-            workspace.path, agent_result.agent_workspace_dir)
-        pending_path = agent_ws / PENDING_FILE_NAME
-
-        # Session lives in the captured state dir.  The
-        # execution record's ``state_dir`` points us there.
-        # If state capture itself failed, surface that as the
-        # primary error — without it the session lookup below
-        # would fail with a confusing "session missing" message
-        # that hides the real cause.
         execution = workspace.executions.get(
             agent_result.execution_id)
         if (execution is not None
@@ -432,13 +443,16 @@ def run_agent_with_handoffs(
                 / SESSION_FILE_NAME
             )
 
-        pending_doc = _read_json(pending_path)
+        pending_doc, pending_file_path = _read_pending_artifact(
+            workspace, agent_result.execution_id)
         pending_list = _normalize_pending(pending_doc)
         if not pending_list:
             raise HandoffLoopError(
-                f"agent exited with tool_handoff but pending "
-                f"file {pending_path} has no tool calls; "
-                f"cannot resolve handoff (doc={pending_doc!r})"
+                f"agent (iteration={iteration}) exited with "
+                f"exit_reason='tool_handoff' but the "
+                f"pending_tool_calls artifact is missing or "
+                f"empty (file={pending_file_path!r}, "
+                f"doc={pending_doc!r})"
             )
         if session_path is None or not session_path.is_file():
             raise HandoffLoopError(
@@ -460,12 +474,12 @@ def run_agent_with_handoffs(
             tool_name = pending.get("tool_name")
             if not isinstance(tool_use_id, str) or not tool_use_id:
                 raise HandoffLoopError(
-                    f"{pending_path.name} entry {idx} malformed "
+                    f"pending_tool_calls entry {idx} malformed "
                     f"(no tool_use_id): {pending}"
                 )
             if not isinstance(tool_name, str) or not tool_name:
                 raise HandoffLoopError(
-                    f"{pending_path.name} entry {idx} malformed "
+                    f"pending_tool_calls entry {idx} malformed "
                     f"(no tool_name): {pending}"
                 )
 
@@ -475,7 +489,6 @@ def run_agent_with_handoffs(
                 session_id=str(pending.get(
                     "session_id", session_id_fallback) or ""),
                 tool_use_id=tool_use_id,
-                agent_workspace=agent_ws,
                 iteration=iteration,
                 index_in_iteration=idx,
                 siblings=siblings,
@@ -513,11 +526,9 @@ def run_agent_with_handoffs(
             handoffs=handoff_records,
         ))
 
-        # Drop the pending file before relaunch so a leftover
-        # cannot trick a future cycle into thinking new handoffs
-        # are queued.
-        with contextlib.suppress(FileNotFoundError):
-            pending_path.unlink()
+        # Each cycle's pending artifact is bound to that cycle's
+        # own :class:`BlockExecution`; no cross-cycle leakage is
+        # possible, so nothing to delete before relaunch.
 
         # Halt check: a post-execution callable invoked inside
         # one of this cycle's block_runner calls may have queued
@@ -561,11 +572,20 @@ class HandoffAgentHandle:
     is also exposed on the handle as ``loop_result`` for callers
     that want to inspect the chain.
 
-    The wrapper does not implement ``stop()``: the pattern runner
-    does not call it today, and a clean stop semantics across an
-    in-flight handoff cycle (mid-``block_runner`` invocation,
-    mid-splice) is its own design.  When that need arises it
-    becomes its own piece of work.
+    Stop semantics: :meth:`stop` sets a cancel flag that
+    suppresses the *next* relaunch and forwards the stop to the
+    currently-running inner :class:`flywheel.agent.AgentHandle`
+    (if any) so it can terminate via the substrate's two-phase
+    cancellation.  Host-side work between cycles (reading the
+    pending artifact, running nested blocks via the block
+    runner, splicing results) is **not** interrupted — it runs
+    to completion before the cancel flag takes effect.  A stop
+    that lands during a handoff cycle therefore still produces
+    a terminal :class:`AgentResult`; its ``exit_reason`` may be
+    ``"tool_handoff"`` if the stop fired between an inner exit
+    and the relaunch that would have resolved the next turn.
+    Callers should treat post-stop ``tool_handoff`` results as
+    a "stopped mid-chain" outcome rather than a protocol error.
 
     Attributes:
         loop_result: Populated once the loop terminates (whether
@@ -621,6 +641,12 @@ class HandoffAgentHandle:
         self.loop_error: BaseException | None = None
         self._waited = False
 
+        # Shared state the loop thread reads so :meth:`stop` can
+        # forward to the active inner handle and so the loop can
+        # refuse to relaunch once stop has been requested.
+        self._cancel_event = threading.Event()
+        self._inner_handle_ref: dict[str, Any] = {"handle": None}
+
         self._thread = threading.Thread(
             target=self._run_loop,
             name="flywheel-handoff-loop",
@@ -638,6 +664,9 @@ class HandoffAgentHandle:
         loop should still surface to the caller rather than
         leaking out of the daemon thread.
         """
+        kwargs = dict(self._launch_kwargs)
+        kwargs["_inner_handle_ref"] = self._inner_handle_ref
+        kwargs["_cancel_event"] = self._cancel_event
         try:
             self.loop_result = run_agent_with_handoffs(
                 block_runner=self._block_runner,
@@ -645,7 +674,7 @@ class HandoffAgentHandle:
                 resume_prompt=self._resume_prompt,
                 max_iterations=self._max_iterations,
                 launch_fn=self._launch_fn,
-                **self._launch_kwargs,
+                **kwargs,
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised in wait()
             self.loop_error = exc
@@ -653,6 +682,28 @@ class HandoffAgentHandle:
     def is_alive(self) -> bool:
         """Return whether the loop's background thread is running."""
         return self._thread.is_alive()
+
+    def stop(self, reason: str = "requested") -> None:
+        """Cancel the next relaunch and forward to the inner handle.
+
+        Sets a cancel flag the loop checks before each relaunch,
+        and forwards the stop to the currently-running inner
+        :class:`flywheel.agent.AgentHandle` (if any) so the
+        substrate's two-phase cancellation terminates the
+        container.  Host-side work already in flight (pending
+        artifact read, nested block execution, session splice)
+        completes naturally; this call does not abort it.
+        """
+        self._cancel_event.set()
+        inner = self._inner_handle_ref.get("handle")
+        if inner is not None:
+            try:
+                inner.stop(reason=reason)
+            except Exception:
+                # A stop() call that raced inner.wait() returning
+                # can see a stale handle; swallow so the cancel
+                # flag still takes effect on the next relaunch.
+                pass
 
     def wait(self) -> AgentResult:
         """Block until the loop terminates and return the terminal result.
