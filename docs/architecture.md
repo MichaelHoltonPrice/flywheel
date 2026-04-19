@@ -142,8 +142,9 @@ Each block execution record includes:
 Block executions are append-only. The workspace accumulates a
 history of executions that forms the complete provenance graph.
 
-A **run** is a higher-level concept — an orchestration pattern
-composed of multiple block executions, potentially in parallel.
+A **run** is a higher-level concept that likely sits between
+workspace and block execution: a durable grouping of related
+executions, often but not necessarily driven by a pattern.
 Runs are not yet implemented; block execution is the primitive.
 
 ### Dependency injection: build-time vs runtime
@@ -880,6 +881,80 @@ A more sophisticated policy might need per-subclass defaults
 based on an evaluation metric rather than recency. A formal
 `current_bindings` map on the workspace could support these
 patterns, but the right design is not yet clear.
+
+### Runs and ad hoc execution grouping
+
+Today flywheel has workspaces, artifact instances, execution
+records, and lifecycle events, but no first-class notion of a
+**run**.  A plausible future shape is:
+
+- ``Workspace``: the long-lived corpus and capability surface.
+- ``Run``: a durable grouping of related executions inside one
+  workspace.
+- ``BlockExecution``: the atomic unit of work.
+
+Under that model, ad hoc work is not "outside" the run concept;
+it is a run with no pattern contract attached.  Pattern-driven
+work would then be a specialized run shape rather than a separate
+kind of container entirely.
+
+One likely asymmetry is:
+
+- a pattern-governed run may continue with ad hoc executions later
+  (relaxing constraints is safe);
+- an ad hoc run should not be retroactively reclassified as a
+  pattern run, because the prior history may not satisfy the
+  pattern's structural guarantees. At least, this should not be
+  done naively.
+
+The exact data model is still open.  One direction is that every
+execution carries a ``run_id``, and a run optionally carries a
+``pattern_name`` when it is pattern-governed.
+
+### Artifact scope and transfers between contexts
+
+If runs become first-class, artifact scope will likely need to
+distinguish between:
+
+- **workspace-scoped** artifacts, shared across all runs in the
+  workspace;
+- **run-scoped** artifacts, belonging to one run's lineage.
+
+Scope should be independent of storage kind: a copy, git, or
+incremental artifact may be workspace-scoped or run-scoped
+depending on its declaration.
+
+It should also be possible to move information explicitly between
+contexts inside one workspace.  The likely operation is not
+aliasing one artifact instance into multiple contexts, but
+creating a **new** artifact instance in the target context whose
+provenance points at the source instance.  Examples include:
+
+- copying an artifact from one run to another;
+- promoting a run-scoped artifact into workspace scope;
+- seeding a new run from workspace-scoped artifacts or from
+  artifacts produced by an earlier run.
+
+This keeps provenance honest: movement across contexts is explicit
+and recorded rather than implicit shared mutable state.
+
+### Workspace run policy
+
+Not every workspace wants the same run semantics.  Some projects
+want one durable thread of work in a workspace; others want many
+parallel or historical runs sharing one corpus.
+
+A future workspace-level policy may be useful, for example:
+
+- ``single``: one run total;
+- ``multi``: multiple runs allowed;
+- possibly later ``single_active``: multiple historical runs are
+  allowed, but only one may remain open at a time.
+
+This policy would let flywheel enforce operator intent rather
+than relying on convention.  A research-paper workspace, for
+example, might choose ``single``; an experimentation workspace
+or game-playing workspace might choose ``multi``.
 
 ### Schema versioning
 
