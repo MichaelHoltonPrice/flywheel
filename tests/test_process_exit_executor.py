@@ -26,7 +26,7 @@ from unittest.mock import patch
 import pytest
 
 from flywheel import runtime
-from flywheel.artifact import ArtifactInstance
+from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.executor import (
     INVOKE_FAILURE_EXIT_CODE,
     ProcessExitExecutor,
@@ -549,7 +549,7 @@ class TestStateCaptureFailure:
                 side_effect=_fake,
             ),
             patch(
-                "flywheel.executor._capture_state",
+                "flywheel.executor.capture_state",
                 side_effect=_raise,
             ),
         ):
@@ -642,6 +642,134 @@ class TestMissingStateDir:
         ex = ws.executions[result.execution_id]
         assert ex.failure_phase == runtime.FAILURE_STAGE_IN
         assert "missing on disk" in ex.error
+
+
+class TestStateRestoreEligibility:
+    """Which prior executions does populate_state_mount restore from?"""
+
+    def test_interrupted_execution_state_is_restored(
+        self, tmp_path: Path,
+    ):
+        """An operator-stopped execution leaves valid state (the
+        container's teardown path still runs), so the next
+        execution should restore from it — not silently chain
+        past to an older successful one."""
+        template = _make_template(state=True)
+        ws = _make_workspace(tmp_path, template)
+
+        # Seed a successful prior execution so we can tell the
+        # difference between "restored from success" and
+        # "restored from more-recent interrupted."
+        succeeded_exec = BlockExecution(
+            id="exec-old-success",
+            block_name="train",
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="succeeded",
+            state_dir="state/train/exec-old-success",
+        )
+        ws.add_execution(succeeded_exec)
+        (ws.path / "state" / "train" / "exec-old-success"
+         ).mkdir(parents=True)
+        (ws.path / "state" / "train" / "exec-old-success"
+         / "tag.txt").write_text("OLD")
+
+        # Then a more recent interrupted execution with its
+        # own state.
+        interrupted_exec = BlockExecution(
+            id="exec-recent-interrupted",
+            block_name="train",
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="interrupted",
+            stop_reason="operator",
+            state_dir="state/train/exec-recent-interrupted",
+        )
+        ws.add_execution(interrupted_exec)
+        (ws.path / "state" / "train" / "exec-recent-interrupted"
+         ).mkdir(parents=True)
+        (ws.path / "state" / "train" / "exec-recent-interrupted"
+         / "tag.txt").write_text("RECENT")
+        ws.save()
+
+        executor = ProcessExitExecutor(template)
+        seen: dict[str, str] = {}
+
+        def _fake(config, args=None, name=None):
+            for host, container, _mode in config.mounts:
+                if container == runtime.STATE_MOUNT_PATH:
+                    seen["tag"] = (
+                        Path(host) / "tag.txt"
+                    ).read_text()
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            executor.launch("train", ws, input_bindings={}).wait()
+
+        # The interrupted execution's state is newer, so we
+        # should see "RECENT", not "OLD".
+        assert seen["tag"] == "RECENT"
+
+    def test_failed_execution_state_is_skipped(
+        self, tmp_path: Path,
+    ):
+        """A failed execution's state may be mid-write or
+        otherwise untrustworthy — skip it and restore from the
+        prior successful execution instead."""
+        template = _make_template(state=True)
+        ws = _make_workspace(tmp_path, template)
+
+        succeeded_exec = BlockExecution(
+            id="exec-old-success",
+            block_name="train",
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="succeeded",
+            state_dir="state/train/exec-old-success",
+        )
+        ws.add_execution(succeeded_exec)
+        (ws.path / "state" / "train" / "exec-old-success"
+         ).mkdir(parents=True)
+        (ws.path / "state" / "train" / "exec-old-success"
+         / "tag.txt").write_text("OLD")
+
+        failed_exec = BlockExecution(
+            id="exec-recent-failed",
+            block_name="train",
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="failed",
+            failure_phase=runtime.FAILURE_INVOKE,
+            state_dir="state/train/exec-recent-failed",
+        )
+        ws.add_execution(failed_exec)
+        (ws.path / "state" / "train" / "exec-recent-failed"
+         ).mkdir(parents=True)
+        (ws.path / "state" / "train" / "exec-recent-failed"
+         / "tag.txt").write_text("PARTIAL")
+        ws.save()
+
+        executor = ProcessExitExecutor(template)
+        seen: dict[str, str] = {}
+
+        def _fake(config, args=None, name=None):
+            for host, container, _mode in config.mounts:
+                if container == runtime.STATE_MOUNT_PATH:
+                    seen["tag"] = (
+                        Path(host) / "tag.txt"
+                    ).read_text()
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container", side_effect=_fake,
+        ):
+            executor.launch("train", ws, input_bindings={}).wait()
+
+        # The failed execution's state is skipped; we chain
+        # back to the prior success.
+        assert seen["tag"] == "OLD"
 
 
 class TestStateLineage:

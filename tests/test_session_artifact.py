@@ -106,7 +106,7 @@ class TestExportSession:
         with (
             patch.object(_runner, "SDK_PROJECTS_DIR",
                          tmp_path / ".claude" / "projects"),
-            patch.object(_runner, "SESSION_OUTPUT_FILE",
+            patch.object(_runner, "SESSION_FILE",
                          output_file),
         ):
             _runner._export_session("test-session")
@@ -116,7 +116,7 @@ class TestExportSession:
 
     def test_empty_session_id_is_noop(self, tmp_path: Path):
         output_file = tmp_path / "agent_session.jsonl"
-        with patch.object(_runner, "SESSION_OUTPUT_FILE",
+        with patch.object(_runner, "SESSION_FILE",
                           output_file):
             _runner._export_session("")
         assert not output_file.exists()
@@ -127,7 +127,7 @@ class TestExportSession:
         with (
             patch.object(_runner, "SDK_PROJECTS_DIR",
                          tmp_path / "nonexistent"),
-            patch.object(_runner, "SESSION_OUTPUT_FILE",
+            patch.object(_runner, "SESSION_FILE",
                          output_file),
         ):
             _runner._export_session("missing-session")
@@ -146,7 +146,7 @@ class TestExportSession:
         with (
             patch.object(_runner, "SDK_PROJECTS_DIR",
                          tmp_path / ".claude" / "projects"),
-            patch.object(_runner, "SESSION_OUTPUT_FILE",
+            patch.object(_runner, "SESSION_FILE",
                          output_file),
         ):
             _runner._export_session("sess1")
@@ -184,7 +184,7 @@ class TestSessionImport:
 
         with (
             patch.object(_runner, "SDK_PROJECTS_DIR", sdk_projects),
-            patch.object(_runner, "SESSION_OUTPUT_FILE", output_file),
+            patch.object(_runner, "SESSION_FILE", output_file),
         ):
             # Non-existent session -> no file created.
             _runner._export_session("nonexistent-id")

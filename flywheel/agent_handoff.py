@@ -8,8 +8,11 @@ tool calls in a single assistant turn (see
 * ``.agent_state.json`` reports ``status == "tool_handoff"``;
 * ``pending_tool_calls.json`` (schema_version 2) lists every
   intercepted ``tool_use`` in the order the SDK emitted them;
-* ``agent_session.jsonl`` carries the SDK session with synthetic
-  deny ``tool_result`` entries for each ``tool_use_id``.
+* the SDK session JSONL (at ``/state/session.jsonl`` inside the
+  container, captured into
+  ``<workspace>/state/<block>/<exec_id>/session.jsonl``) carries
+  the conversation with synthetic deny ``tool_result`` entries
+  for each ``tool_use_id``.
 
 This module's :func:`run_agent_with_handoffs` is the host-side
 counterpart that closes the loop:
@@ -17,12 +20,13 @@ counterpart that closes the loop:
 1. Launch the agent (via :func:`flywheel.agent.launch_agent_block`).
 2. Wait for it to exit.
 3. If the exit is ``tool_handoff``: invoke the caller-supplied
-   ``block_runner`` once per pending entry (preserving SDK emission
-   order), splice each real result into the workspace's
-   ``agent_session.jsonl`` artifact via
-   :func:`flywheel.session_splice.splice_tool_result`, remove the
-   pending file, and relaunch the agent against the same workspace
-   with ``RESUME_SESSION_FILE`` pointing at the spliced JSONL.
+   ``block_runner`` once per pending entry (preserving SDK
+   emission order), splice each real result into the captured
+   state_dir's ``session.jsonl`` via
+   :func:`flywheel.session_splice.splice_tool_result`, and
+   remove the pending file.  Relaunching the agent is automatic
+   — the next execution's ``/state/`` populate reads the
+   mutated state_dir.
 4. Repeat until the agent exits without a handoff (or
    ``max_iterations`` is hit).
 
@@ -59,12 +63,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from flywheel import runtime
 from flywheel.agent import AgentResult, launch_agent_block
 from flywheel.session_splice import SpliceError, splice_tool_result
 
 PENDING_FILE_NAME = "pending_tool_calls.json"
-SESSION_ARTIFACT_NAME = "agent_session.jsonl"
-RESUME_ENV_VAR = "RESUME_SESSION_FILE"
+SESSION_FILE_NAME = "session.jsonl"
+"""Name of the session JSONL inside a captured state directory.
+
+The agent runner writes ``/state/session.jsonl`` at container
+exit; flywheel captures ``/state/`` into
+``<workspace>/state/<block>/<exec_id>/``, so the session ends up
+at ``<workspace>/state/<block>/<exec_id>/session.jsonl``.  The
+handoff loop splices tool results into that file between
+iterations; the next launch's state-populate copies the spliced
+contents into the new execution's ``/state/`` mount."""
 
 DEFAULT_MAX_ITERATIONS = 16
 
@@ -275,10 +288,12 @@ def run_agent_with_handoffs(
     Drives the host-side loop described in this module's docstring.
     All ``launch_kwargs`` are forwarded to :func:`launch_agent_block`
     on the first cycle.  On each subsequent cycle the loop
-    relaunches with ``reuse_workspace=True``, the prior cycle's
-    ``execution_id`` as ``predecessor_id``, and ``extra_env`` set
-    to point ``RESUME_SESSION_FILE`` at the in-workspace
-    ``agent_session.jsonl`` (already spliced).
+    relaunches with ``reuse_workspace=True`` (so the agent
+    workspace's control files survive) and the prior cycle's
+    ``execution_id`` as ``predecessor_id``.  Session resume is
+    automatic: the launcher populates ``/state/`` from the prior
+    execution's captured state_dir, which the handoff loop has
+    just mutated in place via :func:`splice_tool_result`.
 
     Args:
         block_runner: Caller-supplied function invoked once per
@@ -351,14 +366,17 @@ def run_agent_with_handoffs(
         if iteration == 0:
             pass
         else:
+            # ``reuse_workspace`` keeps pending_tool_calls.json +
+            # .agent_state.json visible to the next iteration via
+            # the persistent agent-workspace bind.  The session
+            # resume path no longer runs through this bind — the
+            # next container's ``/state/`` is populated from the
+            # previous execution's captured state_dir, which we
+            # mutated in place via splice_tool_result.
             kwargs["reuse_workspace"] = True
             kwargs["predecessor_id"] = last_execution_id
             kwargs["agent_workspace_dir"] = last_agent_workspace_dir
             kwargs["prompt"] = resume_prompt
-            extra_env = dict(kwargs.get("extra_env") or {})
-            extra_env[RESUME_ENV_VAR] = (
-                "/workspace/" + SESSION_ARTIFACT_NAME)
-            kwargs["extra_env"] = extra_env
 
         handle = launch_fn(**kwargs)
         try:
@@ -388,7 +406,31 @@ def run_agent_with_handoffs(
         agent_ws = _find_agent_ws(
             workspace.path, agent_result.agent_workspace_dir)
         pending_path = agent_ws / PENDING_FILE_NAME
-        session_path = agent_ws / SESSION_ARTIFACT_NAME
+
+        # Session lives in the captured state dir.  The
+        # execution record's ``state_dir`` points us there.
+        # If state capture itself failed, surface that as the
+        # primary error — without it the session lookup below
+        # would fail with a confusing "session missing" message
+        # that hides the real cause.
+        execution = workspace.executions.get(
+            agent_result.execution_id)
+        if (execution is not None
+                and execution.failure_phase
+                == runtime.FAILURE_STATE_CAPTURE):
+            raise HandoffLoopError(
+                f"agent exited with tool_handoff but state "
+                f"capture failed for execution "
+                f"{agent_result.execution_id!r}: "
+                f"{execution.error}; cannot resume the "
+                f"conversation without captured state"
+            )
+        session_path: Path | None = None
+        if execution is not None and execution.state_dir:
+            session_path = (
+                workspace.path / execution.state_dir
+                / SESSION_FILE_NAME
+            )
 
         pending_doc = _read_json(pending_path)
         pending_list = _normalize_pending(pending_doc)
@@ -398,11 +440,12 @@ def run_agent_with_handoffs(
                 f"file {pending_path} has no tool calls; "
                 f"cannot resolve handoff (doc={pending_doc!r})"
             )
-        if not session_path.is_file():
+        if session_path is None or not session_path.is_file():
             raise HandoffLoopError(
                 f"agent exited with tool_handoff but session "
-                f"artifact {session_path} is missing; cannot "
-                f"splice tool results back into the conversation"
+                f"file {session_path} is missing from the "
+                f"captured state_dir; cannot splice tool "
+                f"results back into the conversation"
             )
 
         siblings = len(pending_list)

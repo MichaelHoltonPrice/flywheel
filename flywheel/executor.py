@@ -413,7 +413,7 @@ class ContainerExecutionHandle(ExecutionHandle):
             # partial state is worth preserving for debugging.
             if self._state_mount is not None:
                 try:
-                    state_dir_rel = _capture_state(
+                    state_dir_rel = capture_state(
                         self._workspace,
                         self._block_def.name,
                         self._execution_id,
@@ -640,7 +640,7 @@ class ProcessExitExecutor:
             # Populate /state/ mount for stateful blocks.
             if block_def.state:
                 try:
-                    state_mount = _populate_state_mount(
+                    state_mount = populate_state_mount(
                         workspace, block_name, state_lineage_id)
                 except OSError as e:
                     return _record_pre_container_failure(
@@ -732,7 +732,24 @@ class ProcessExitExecutor:
         )
 
 
-def _populate_state_mount(
+_STATE_ELIGIBLE_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "interrupted"}
+)
+"""Execution statuses whose captured state is safe to restore from.
+
+``succeeded`` is the clean-exit case.  ``interrupted`` is the
+operator-requested-stop case: the container exited cleanly via
+its teardown path (e.g. an agent's ``finally:`` exports the
+session) so the captured state is just as valid as a natural
+exit.  ``failed`` is deliberately excluded — a non-zero exit or
+body-level error may have left state mid-write, and we don't
+currently have enough signal to tell partial state from complete
+state.  That case would need explicit per-block opt-in if we
+ever wanted to restore from it.
+"""
+
+
+def populate_state_mount(
     workspace: Workspace,
     block_name: str,
     state_lineage_id: str | None,
@@ -740,10 +757,12 @@ def _populate_state_mount(
     """Create a tempdir populated with the block's prior state.
 
     Walks the workspace's executions in reverse chronological
-    order, picks the most recent successful execution of
-    ``block_name`` within the given ``state_lineage_id``, and
-    copies its captured state into a fresh tempdir.  The tempdir
-    is what gets mounted at ``/state/`` inside the container.
+    order, picks the most recent execution of ``block_name``
+    within the given ``state_lineage_id`` whose status is in
+    :data:`_STATE_ELIGIBLE_STATUSES` and that has a captured
+    ``state_dir``, and copies its captured state into a fresh
+    tempdir.  The tempdir is what gets mounted at ``/state/``
+    inside the container.
 
     Matching on ``state_lineage_id`` (including the ``None``
     default) lets callers keep independent state chains for the
@@ -764,8 +783,8 @@ def _populate_state_mount(
     staging = Path(tempfile.mkdtemp(
         prefix=f"flywheel-state-{block_name}-"))
 
-    # Find the most recent successful execution with state in
-    # the target lineage.
+    # Find the most recent state-eligible execution in the
+    # target lineage.
     prior: BlockExecution | None = None
     for ex in sorted(
         workspace.executions.values(),
@@ -773,7 +792,7 @@ def _populate_state_mount(
         reverse=True,
     ):
         if (ex.block_name == block_name
-                and ex.status == "succeeded"
+                and ex.status in _STATE_ELIGIBLE_STATUSES
                 and ex.state_dir is not None
                 and ex.state_lineage_id == state_lineage_id):
             prior = ex
@@ -801,7 +820,7 @@ def _populate_state_mount(
     return staging
 
 
-def _capture_state(
+def capture_state(
     workspace: Workspace,
     block_name: str,
     exec_id: str,

@@ -57,7 +57,7 @@ import pytest
 
 from flywheel.agent_handoff import (
     PENDING_FILE_NAME,
-    SESSION_ARTIFACT_NAME,
+    SESSION_FILE_NAME,
     HandoffContext,
     HandoffLoopError,
     HandoffResult,
@@ -69,6 +69,7 @@ from ._handoff_helpers import (
     _base_kwargs,
     _build_session_jsonl,
     _CycleScript,
+    _fake_state_dir,
     _FakeWorkspace,
     _LaunchCall,
     _make_launch_fn,
@@ -95,18 +96,32 @@ def _agent_ws(workspace: _FakeWorkspace) -> Path:
     return workspace.path / _AGENT_WS_SUBPATH
 
 
-def _read_session(workspace: _FakeWorkspace) -> str:
-    """Convenience: read the spliced session JSONL from disk."""
-    return (_agent_ws(workspace) / SESSION_ARTIFACT_NAME).read_text(
-        encoding="utf-8")
+def _read_session(
+    workspace: _FakeWorkspace, execution_id: str = "exec-0",
+) -> str:
+    """Convenience: read the spliced session JSONL from disk.
+
+    Defaults to ``exec-0`` to match the default script
+    ``execution_id``; pass explicitly when a test uses a
+    non-default id.
+    """
+    return (
+        _session_path(workspace, execution_id)
+    ).read_text(encoding="utf-8")
 
 
 def _pending_path(workspace: _FakeWorkspace) -> Path:
     return _agent_ws(workspace) / PENDING_FILE_NAME
 
 
-def _session_path(workspace: _FakeWorkspace) -> Path:
-    return _agent_ws(workspace) / SESSION_ARTIFACT_NAME
+def _session_path(
+    workspace: _FakeWorkspace, execution_id: str = "exec-0",
+) -> Path:
+    """Resolve the session JSONL path inside the captured state_dir."""
+    return (
+        _fake_state_dir(workspace.path, execution_id)
+        / SESSION_FILE_NAME
+    )
 
 
 def _multi_pending_script(
@@ -165,7 +180,7 @@ class TestBlockRunnerFailure:
         scripts = [_multi_pending_script(
             session_id="sess-fail-first", tool_use_ids=ids)]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             raise RuntimeError("simulated runner crash")
@@ -203,7 +218,7 @@ class TestBlockRunnerFailure:
         scripts = [_multi_pending_script(
             session_id="sess-fail-mid", tool_use_ids=ids)]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             if ctx.index_in_iteration == 0:
@@ -248,7 +263,7 @@ class TestBlockRunnerFailure:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(
@@ -348,7 +363,7 @@ class TestSpliceFailureMidBatch:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         runner_calls: list[str] = []
 
@@ -415,7 +430,7 @@ class TestPendingFileShape:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError("runner should not be called")
@@ -445,7 +460,7 @@ class TestPendingFileShape:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError("runner should not be called")
@@ -493,7 +508,7 @@ class TestPendingFileShape:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content=f"real-{ctx.tool_use_id}")
@@ -561,7 +576,7 @@ class TestStaleArtifactsTolerated:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         runner_seen: list[str] = []
 
@@ -599,7 +614,7 @@ class TestStaleArtifactsTolerated:
         # the fresh run.  If the loop accidentally read this it
         # would either crash on splice or silently splice the
         # wrong file.
-        (agent_ws / SESSION_ARTIFACT_NAME).write_text(
+        (agent_ws / SESSION_FILE_NAME).write_text(
             "STALE_CONTENT_FROM_PRIOR_RUN", encoding="utf-8")
 
         ids = ["toolu_after"]
@@ -609,7 +624,7 @@ class TestStaleArtifactsTolerated:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="real-after")
@@ -663,7 +678,7 @@ class TestStaleArtifactsTolerated:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError(
@@ -722,7 +737,7 @@ class TestSpliceTmpFileTolerated:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="real-after-tmp")
@@ -770,7 +785,7 @@ class TestPendingFileLifecycle:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         present_during_runner: list[bool] = []
 
@@ -806,7 +821,7 @@ class TestPendingFileLifecycle:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -836,7 +851,7 @@ class TestPendingFileLifecycle:
                 session_id="sess-halt-clean", tool_use_ids=ids),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="real-h")
@@ -888,7 +903,8 @@ class TestRedriveAfterFailure:
         scripts_1 = [_multi_pending_script(
             session_id="sess-1", tool_use_ids=ids_1)]
         record_1: list[_LaunchCall] = []
-        launch_1 = _make_launch_fn(workspace.path, scripts_1, record_1)
+        launch_1 = _make_launch_fn(
+            workspace.path, scripts_1, record_1, workspace=workspace)
 
         def _br_crashy(ctx: HandoffContext) -> HandoffResult:
             if ctx.index_in_iteration == 0:
@@ -914,7 +930,8 @@ class TestRedriveAfterFailure:
             _CycleScript(exit_reason="completed"),
         ]
         record_2: list[_LaunchCall] = []
-        launch_2 = _make_launch_fn(workspace.path, scripts_2, record_2)
+        launch_2 = _make_launch_fn(
+            workspace.path, scripts_2, record_2, workspace=workspace)
 
         runner_2_seen: list[str] = []
 

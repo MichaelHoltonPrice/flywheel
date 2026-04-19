@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,13 +40,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from flywheel import runtime
 from flywheel.artifact import BlockExecution, LifecycleEvent
+from flywheel.executor import capture_state, populate_state_mount
 from flywheel.input_staging import (
     cleanup_staged_inputs,
     stage_artifact_instances,
 )
 from flywheel.template import Template
 from flywheel.workspace import Workspace
+
+# Default block name for agent executions until callers pass the
+# real block name they're launching.  State chaining and ledger
+# entries both key off this value, so it has to be stable.
+_AGENT_DEFAULT_BLOCK_NAME = "__agent__"
 
 
 @dataclass(frozen=True)
@@ -213,9 +221,10 @@ class AgentHandle:
         stderr_thread: threading.Thread,
         container_name: str = "",
         predecessor_id: str | None = None,
-        block_name: str = "__agent__",
+        block_name: str = _AGENT_DEFAULT_BLOCK_NAME,
         agent_workspace_dir: str | None = None,
         staged_inputs: dict[str, Path] | None = None,
+        state_mount: Path | None = None,
     ):
         """Initialize from a launched container and its resources."""
         self._process = process
@@ -232,6 +241,7 @@ class AgentHandle:
         self._block_name = block_name
         self._agent_workspace_dir = agent_workspace_dir
         self._staged_inputs = staged_inputs or {}
+        self._state_mount = state_mount
         self._stop_reason: str | None = None
         self._waited = False
 
@@ -303,6 +313,36 @@ class AgentHandle:
         elapsed = time.monotonic() - self._start_time
         finished_at = datetime.now(UTC)
 
+        execution_id = self._workspace.generate_execution_id()
+
+        # Capture /state/ into the workspace's state dir so the
+        # next execution of this block can resume.  Runs before
+        # the rest of finalization so state_dir can be recorded
+        # on the execution row.  If capture raises we record
+        # that as the execution's failure_phase so downstream
+        # callers (e.g. the handoff loop) get a clear error
+        # rather than a confusing "session missing" at splice
+        # time.
+        state_dir_rel: str | None = None
+        state_capture_error: str | None = None
+        if self._state_mount is not None:
+            try:
+                state_dir_rel = capture_state(
+                    self._workspace,
+                    self._block_name,
+                    execution_id,
+                    self._state_mount,
+                )
+            except OSError as exc:
+                state_capture_error = f"state_capture: {exc}"
+                print(
+                    f"  [agent] state capture failed: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                shutil.rmtree(self._state_mount, ignore_errors=True)
+                self._state_mount = None
+
         # Collect output artifacts from agent workspace.
         output_bindings: dict[str, str] = {}
         if self._output_names and self._agent_ws.exists():
@@ -332,7 +372,10 @@ class AgentHandle:
         else:
             status = "failed"
 
-        execution_id = self._workspace.generate_execution_id()
+        failure_phase = (
+            runtime.FAILURE_STATE_CAPTURE
+            if state_capture_error is not None else None
+        )
         execution = BlockExecution(
             id=execution_id,
             block_name=self._block_name,
@@ -346,6 +389,9 @@ class AgentHandle:
             stop_reason=self._stop_reason,
             predecessor_id=self._predecessor_id,
             agent_workspace_dir=self._agent_workspace_dir,
+            state_dir=state_dir_rel,
+            failure_phase=failure_phase,
+            error=state_capture_error,
         )
         self._workspace.add_execution(execution)
 
@@ -532,10 +578,14 @@ def prepare_agent_workspace(
         reuse_workspace: When ``True``, treat an existing
             non-empty ``agent_workspace_dir`` as intentional reuse
             (no ``FileExistsError``).  Used by the host-side
-            handoff loop (``flywheel.agent_handoff``) to relaunch
-            into a workspace that already contains the spliced
-            ``agent_session.jsonl`` from a prior cycle.  Requires
-            an explicit ``agent_workspace_dir``; passing both
+            handoff loop (``flywheel.agent_handoff``) so a
+            relaunch into the same agent workspace finds the
+            control files (``pending_tool_calls.json``,
+            ``.agent_state.json``) that the previous cycle left
+            behind.  The session JSONL itself lives in
+            ``/state/`` and is restored independently; nothing
+            in the reused workspace dir carries it.  Requires an
+            explicit ``agent_workspace_dir``; passing both
             ``agent_workspace_dir=None`` and
             ``reuse_workspace=True`` raises ``ValueError`` because
             there is nothing to reuse.
@@ -661,11 +711,13 @@ def launch_agent_block(
         reuse_workspace: When ``True``, the launcher skips the
             "fresh workspace" check and the prior-artifact
             seeding pass.  Used by the host-side handoff loop
-            (``flywheel.agent_handoff``) to relaunch an agent
-            into the same workspace its prior cycle wrote to,
-            so the spliced ``agent_session.jsonl`` is on disk
-            ready for ``RESUME_SESSION_FILE``.  Requires an
-            explicit ``agent_workspace_dir``.
+            (``flywheel.agent_handoff``) so a relaunch into the
+            same agent workspace finds the control files
+            (``pending_tool_calls.json``, ``.agent_state.json``)
+            from the prior cycle.  Session resume is
+            independent: ``/state/`` is populated from the prior
+            execution's captured state_dir regardless of this
+            flag.  Requires an explicit ``agent_workspace_dir``.
 
     Returns:
         An ``AgentHandle`` for monitoring and controlling the agent.
@@ -712,6 +764,7 @@ def launch_agent_block(
     # Any failure between here and AgentHandle construction must
     # release the staging tempdirs; AgentHandle.wait() handles
     # them once the handle is built.
+    state_mount: Path | None = None
     try:
         for mount_name, host_path in staged_inputs.items():
             cmd.extend([
@@ -719,6 +772,25 @@ def launch_agent_block(
                 f"{_resolve_path(host_path)}"
                 f":/input/{mount_name}:ro",
             ])
+
+        # /state/ mount: populated from the most recent prior
+        # successful execution of this block (or empty for the
+        # first run in the lineage).  The agent runner reads its
+        # session from ``/state/session.jsonl`` at startup and
+        # writes it back on exit; AgentHandle captures the mount
+        # contents into ``<workspace>/state/<block>/<exec_id>/``
+        # after the container exits.  Session is no longer an
+        # artifact.
+        state_mount = populate_state_mount(
+            workspace,
+            block_name=_AGENT_DEFAULT_BLOCK_NAME,
+            state_lineage_id=None,
+        )
+        cmd.extend([
+            "-v",
+            f"{_resolve_path(state_mount)}"
+            f":{runtime.STATE_MOUNT_PATH}:rw",
+        ])
 
         return _continue_launch(
             workspace=workspace,
@@ -730,6 +802,7 @@ def launch_agent_block(
             container_name=container_name,
             cmd=cmd,
             staged_inputs=staged_inputs,
+            state_mount=state_mount,
             extra_mounts=extra_mounts,
             allowed_blocks=allowed_blocks,
             mcp_servers=mcp_servers,
@@ -745,6 +818,8 @@ def launch_agent_block(
         )
     except BaseException:
         cleanup_staged_inputs(staged_inputs)
+        if state_mount is not None:
+            shutil.rmtree(state_mount, ignore_errors=True)
         raise
 
 
@@ -759,6 +834,7 @@ def _continue_launch(
     container_name: str,
     cmd: list[str],
     staged_inputs: dict[str, Path],
+    state_mount: Path | None,
     extra_mounts: list[tuple[str, str, str]] | None,
     allowed_blocks: list[str] | None,
     mcp_servers: str | None,
@@ -872,6 +948,7 @@ def _continue_launch(
         predecessor_id=predecessor_id,
         agent_workspace_dir=agent_workspace_dir,
         staged_inputs=dict(staged_inputs),
+        state_mount=state_mount,
     )
 
 

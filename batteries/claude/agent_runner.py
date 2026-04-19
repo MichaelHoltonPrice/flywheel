@@ -42,14 +42,21 @@ Environment variables:
                       to ``tool_handoff``, and signals the runner
                       to exit cleanly so a host-side driver can
                       run the blocks out-of-band, splice every
-                      real result into the session JSONL, and
-                      restart the container with
-                      RESUME_SESSION_FILE set.
+                      real result into the captured state_dir's
+                      session.jsonl, and let the next launch
+                      pick it up via the ``/state/`` populate.
     HANDOFF_DENY_MARKER — Substring that the splice helper uses to
                       locate the deny tool_result on disk.  Defaults
                       to ``handoff_to_flywheel``.
-    RESUME_SESSION_FILE — Path to a .jsonl session file to resume
-                      on startup. The filename stem is the session ID.
+
+    Session resume:
+        The runner reads ``/state/session.jsonl`` on startup if
+        flywheel populated one from a prior execution's captured
+        state; otherwise it starts a fresh conversation.  The
+        session is written back to ``/state/session.jsonl`` in a
+        ``finally:`` at exit so flywheel captures it regardless
+        of how the run ended.  No env var governs this — the
+        presence or absence of the file is the whole signal.
     COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
                       compaction. Overrides the default percentage-
                       based calculation. Use for large-context models
@@ -103,9 +110,15 @@ RATE_LIMIT_BACKOFFS = [60, 120, 300, 300, 300]  # seconds per attempt
 COMPACT_THRESHOLD = 0.20
 DEFAULT_CONTEXT_WINDOW = 200_000
 
-# Session artifact: export the SDK session JSONL on exit so flywheel
-# can collect it as an artifact for cross-container resume.
-SESSION_OUTPUT_FILE = WORKSPACE / "agent_session.jsonl"
+# Session persistence: the SDK session JSONL is the container's
+# private memory across restarts.  It lives at ``/state/session.jsonl``
+# — flywheel populates ``/state/`` from the prior execution's
+# captured state at launch and captures its final contents after
+# the container exits.  Not an artifact; not in the artifact
+# graph.  See ``cyber-root/substrate-contract.md`` for the
+# runtime contract.
+STATE_DIR = Path("/state")
+SESSION_FILE = STATE_DIR / "session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Pending tool-call handoff: artifact-shaped file the PreToolUse
@@ -147,22 +160,28 @@ def _sdk_session_path(
 
 
 def _export_session(session_id: str) -> None:
-    """Copy the SDK session JSONL to the workspace for artifact collection.
+    """Copy the SDK session JSONL into ``/state/session.jsonl``.
 
-    Called in a finally block on exit, so it must not raise.
+    Called in a finally block on exit.  Flywheel captures the
+    contents of ``/state/`` after the container exits and
+    populates ``/state/`` from it on the next execution's launch,
+    so this single file is enough to resume the conversation in a
+    fresh container.
+
+    Must not raise — it runs during teardown and a failure here
+    shouldn't mask the real exit reason.
     """
     if not session_id:
         return
     try:
         src = _sdk_session_path(session_id)
         if src.exists():
-            SESSION_OUTPUT_FILE.parent.mkdir(
-                parents=True, exist_ok=True)
-            shutil.copy2(src, SESSION_OUTPUT_FILE)
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, SESSION_FILE)
             _emit({
                 "type": "session_export",
                 "session_id": session_id,
-                "path": str(SESSION_OUTPUT_FILE),
+                "path": str(SESSION_FILE),
             })
         else:
             _emit({
@@ -547,35 +566,35 @@ async def main() -> None:
     if max_turns:
         options.max_turns = max_turns
 
-    # --- Session resume from file ---
-    resume_session_file = os.environ.get("RESUME_SESSION_FILE", "")
+    # --- Session resume from /state/ ---
+    # Flywheel populates ``/state/`` with the prior execution's
+    # captured state before launching us.  If a session file is
+    # present, extract the SDK session id from its first line and
+    # hand it to the SDK so the conversation continues.  Absence
+    # of the file means "first execution in this lineage";
+    # nothing to resume.
     session_id = ""
-    if resume_session_file:
-        resume_path = Path(resume_session_file)
-        if resume_path.exists() and resume_path.suffix == ".jsonl":
-            # Extract the real session ID from the JSONL content.
-            # The filename is a fixed name (agent_session.jsonl) but
-            # the SDK needs the original session UUID.
-            resume_sid = resume_path.stem
-            try:
-                first_line = resume_path.read_text(
-                    encoding="utf-8").split("\n", 1)[0]
-                entry = json.loads(first_line)
-                sid_from_file = entry.get("sessionId", "")
-                if sid_from_file:
-                    resume_sid = sid_from_file
-            except Exception:
-                pass  # Fall back to filename stem.
-            sdk_dest = _sdk_session_path(resume_sid)
-            sdk_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(resume_path, sdk_dest)
-            options.resume = resume_sid
-            session_id = resume_sid
-            _emit({
-                "type": "session_resume",
-                "session_id": resume_sid,
-                "source": str(resume_path),
-            })
+    if SESSION_FILE.exists():
+        resume_sid = SESSION_FILE.stem
+        try:
+            first_line = SESSION_FILE.read_text(
+                encoding="utf-8").split("\n", 1)[0]
+            entry = json.loads(first_line)
+            sid_from_file = entry.get("sessionId", "")
+            if sid_from_file:
+                resume_sid = sid_from_file
+        except Exception:
+            pass  # Fall back to filename stem.
+        sdk_dest = _sdk_session_path(resume_sid)
+        sdk_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SESSION_FILE, sdk_dest)
+        options.resume = resume_sid
+        session_id = resume_sid
+        _emit({
+            "type": "session_resume",
+            "session_id": resume_sid,
+            "source": str(SESSION_FILE),
+        })
 
     # --- Connect and run ---
     last_input_tokens = 0

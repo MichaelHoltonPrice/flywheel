@@ -37,8 +37,7 @@ import pytest
 from flywheel.agent_handoff import (
     DEFAULT_RESUME_PROMPT,
     PENDING_FILE_NAME,
-    RESUME_ENV_VAR,
-    SESSION_ARTIFACT_NAME,
+    SESSION_FILE_NAME,
     BlockRunner,
     HandoffContext,
     HandoffLoopError,
@@ -51,6 +50,7 @@ from ._handoff_helpers import (
     _base_kwargs,
     _build_session_jsonl,
     _CycleScript,
+    _fake_state_dir,
     _FakeWorkspace,
     _LaunchCall,
     _make_launch_fn,
@@ -80,7 +80,7 @@ class TestNoHandoffPath:
     ) -> None:
         scripts = [_CycleScript(exit_reason="completed")]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         out = run_agent_with_handoffs(
             block_runner=None,
@@ -154,7 +154,7 @@ class TestSingleHandoffRoundTrip:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         invocations: list[HandoffContext] = []
 
@@ -205,7 +205,7 @@ class TestSingleHandoffRoundTrip:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _block_runner(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="REAL_RESULT_AFTER_SPLICE")
@@ -216,13 +216,13 @@ class TestSingleHandoffRoundTrip:
             **_base_kwargs(workspace),
         )
 
-        agent_ws = workspace.path / "agent_workspaces/handoff_test"
-        spliced = (agent_ws / SESSION_ARTIFACT_NAME).read_text(
+        state_dir = _fake_state_dir(workspace.path, "exec-0")
+        spliced = (state_dir / SESSION_FILE_NAME).read_text(
             encoding="utf-8")
         assert "REAL_RESULT_AFTER_SPLICE" in spliced
         assert "permission denied: handoff_to_flywheel" not in spliced
 
-    def test_relaunch_kwargs_set_resume_env_and_reuse_workspace(
+    def test_relaunch_kwargs_set_reuse_workspace_and_resume_prompt(
         self, workspace: _FakeWorkspace,
     ) -> None:
         session_jsonl = _build_session_jsonl(
@@ -244,7 +244,7 @@ class TestSingleHandoffRoundTrip:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -272,9 +272,11 @@ class TestSingleHandoffRoundTrip:
         assert cycle1["agent_workspace_dir"] == (
             "agent_workspaces/handoff_test")
         assert cycle1["prompt"] == DEFAULT_RESUME_PROMPT
+        # extra_env is preserved verbatim across relaunch — no
+        # resume-session env var anymore; session resume is via
+        # the /state/ mount populated from the captured state_dir.
         assert cycle1["extra_env"] == {
             "PRESERVED_KEY": "preserved_value",
-            RESUME_ENV_VAR: "/workspace/" + SESSION_ARTIFACT_NAME,
         }
 
     def test_pending_file_removed_after_handoff(
@@ -298,7 +300,7 @@ class TestSingleHandoffRoundTrip:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -336,7 +338,7 @@ class TestSingleHandoffRoundTrip:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -389,7 +391,7 @@ class TestMultiToolUseHandoff:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         invocations: list[HandoffContext] = []
 
@@ -418,8 +420,8 @@ class TestMultiToolUseHandoff:
         assert [c.siblings for c in invocations] == [3, 3, 3]
         assert [c.iteration for c in invocations] == [0, 0, 0]
 
-        agent_ws = workspace.path / "agent_workspaces/handoff_test"
-        spliced = (agent_ws / SESSION_ARTIFACT_NAME).read_text(
+        state_dir = _fake_state_dir(workspace.path, "exec-0")
+        spliced = (state_dir / SESSION_FILE_NAME).read_text(
             encoding="utf-8")
         for i, tuid in enumerate(ids):
             assert f"RESULT[{i}]:{tuid}" in spliced, (
@@ -448,7 +450,7 @@ class TestMultiToolUseHandoff:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content=ctx.tool_use_id)
@@ -511,7 +513,7 @@ class TestHaltSource:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -553,7 +555,7 @@ class TestHaltSource:
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         drain_calls = {"n": 0}
 
@@ -606,7 +608,7 @@ class TestHaltSource:
             _CycleScript(exit_reason="completed"),  # never reached
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         directive = {
             "scope": "run",
@@ -688,7 +690,7 @@ class TestHaltSource:
             _CycleScript(exit_reason="completed"),  # never reached
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         drained: list[list[Any]] = [[], [{"reason": "halt-now"}]]
 
@@ -739,7 +741,7 @@ class TestErrorPaths:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         with pytest.raises(HandoffLoopError, match="block_runner"):
             run_agent_with_handoffs(
@@ -761,7 +763,7 @@ class TestErrorPaths:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -792,7 +794,7 @@ class TestErrorPaths:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -821,13 +823,13 @@ class TestErrorPaths:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
 
         with pytest.raises(
-            HandoffLoopError, match="session artifact",
+            HandoffLoopError, match="session file.*missing",
         ):
             run_agent_with_handoffs(
                 block_runner=_br,
@@ -853,7 +855,7 @@ class TestErrorPaths:
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -885,7 +887,7 @@ class TestErrorPaths:
             for i in range(max_iter)
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content="ok")
@@ -941,7 +943,7 @@ class TestHandoffLoopResult:
             execution_id="exec-final",
         ))
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record)
+        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content=f"r-{ctx.tool_use_id}")

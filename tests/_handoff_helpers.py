@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,20 +39,33 @@ import pytest
 from flywheel.agent import AgentResult
 from flywheel.agent_handoff import (
     PENDING_FILE_NAME,
-    SESSION_ARTIFACT_NAME,
+    SESSION_FILE_NAME,
 )
+from flywheel.artifact import BlockExecution
 
 
 @dataclass
 class _FakeWorkspace:
     """Stand-in for :class:`flywheel.workspace.Workspace`.
 
-    The handoff loop only reads ``workspace.path`` to resolve the
-    agent workspace dir relative to it.  Anything else stays
-    untouched.
+    The handoff loop reads ``workspace.path`` to resolve paths
+    and ``workspace.executions`` to locate captured state_dirs.
+    Anything else stays untouched.
     """
 
     path: Path
+    executions: dict[str, BlockExecution] = field(default_factory=dict)
+
+
+def _fake_state_dir(
+    workspace_root: Path, execution_id: str,
+) -> Path:
+    """Return the state_dir path for a given execution.
+
+    Mirrors what a real launch+capture would produce:
+    ``<workspace>/state/__agent__/<exec_id>/``.
+    """
+    return workspace_root / "state" / "__agent__" / execution_id
 
 
 @dataclass
@@ -86,6 +100,14 @@ class _CycleScript:
             written verbatim, letting tests stage malformed JSON
             or alternative envelope shapes the loop's defensive
             decoder must tolerate.
+        status: Execution status to stamp on the simulated
+            :class:`BlockExecution` record.  Real runtime can
+            record any of ``"succeeded"``, ``"failed"``,
+            ``"interrupted"`` with a captured ``state_dir``;
+            the fake defaults to ``"succeeded"`` for
+            happy-path tests but lets failure-path tests set
+            this explicitly so they can pin what the state
+            restore logic does with non-clean captures.
     """
 
     exit_reason: str = "completed"
@@ -95,6 +117,7 @@ class _CycleScript:
     execution_id: str = "exec-0"
     agent_workspace_dir: str = "agent_workspaces/handoff_test"
     pending_text: str | None = None
+    status: str = "succeeded"
 
 
 @dataclass
@@ -126,20 +149,55 @@ class _FakeAgentHandle:
         *,
         workspace_root: Path,
         script: _CycleScript,
+        workspace: _FakeWorkspace | None = None,
     ) -> None:
         self._workspace_root = workspace_root
         self._script = script
+        self._workspace = workspace
 
     def wait(self) -> AgentResult:
-        """Apply the cycle's script and return the AgentResult."""
+        """Apply the cycle's script and return the AgentResult.
+
+        Simulates what a real launch + capture would produce:
+        writes the session JSONL into a state_dir
+        (``<workspace>/state/__agent__/<exec_id>/session.jsonl``)
+        and registers a matching :class:`BlockExecution` on the
+        fake workspace so the handoff loop can look it up.
+        Pending tool calls stay in the agent workspace bind —
+        that path is unchanged in S4 commit 1.
+        """
         agent_ws = (
             self._workspace_root / self._script.agent_workspace_dir
         )
         agent_ws.mkdir(parents=True, exist_ok=True)
 
+        state_dir: str | None = None
         if self._script.write_session:
-            (agent_ws / SESSION_ARTIFACT_NAME).write_text(
+            state_dir_path = _fake_state_dir(
+                self._workspace_root,
+                self._script.execution_id,
+            )
+            state_dir_path.mkdir(parents=True, exist_ok=True)
+            (state_dir_path / SESSION_FILE_NAME).write_text(
                 self._script.session_jsonl_text, encoding="utf-8")
+            state_dir = str(
+                state_dir_path.relative_to(self._workspace_root)
+            ).replace("\\", "/")
+
+        # Register the fake execution so the loop can look up
+        # state_dir from workspace.executions[execution_id].
+        if self._workspace is not None:
+            now = datetime.now(UTC)
+            self._workspace.executions[
+                self._script.execution_id
+            ] = BlockExecution(
+                id=self._script.execution_id,
+                block_name="__agent__",
+                started_at=now,
+                finished_at=now,
+                status=self._script.status,
+                state_dir=state_dir,
+            )
 
         if self._script.exit_reason == "tool_handoff":
             if self._script.pending_text is not None:
@@ -169,16 +227,21 @@ def _make_launch_fn(
     workspace_root: Path,
     scripts: list[_CycleScript],
     record: list[_LaunchCall],
+    workspace: _FakeWorkspace | None = None,
 ) -> Callable[..., _FakeAgentHandle]:
     """Build a fake launch_fn that walks ``scripts`` cycle by cycle.
 
     Each call pops the next script and constructs a
     :class:`_FakeAgentHandle` honoring it.  ``record`` is appended
     to with the kwargs the loop used so the test can assert on the
-    relaunch wiring (resume env var, predecessor id, reuse flag,
-    prompt swap).  Calling more times than there are scripts is a
-    test bug and surfaces as ``IndexError`` rather than silent
-    passing.
+    relaunch wiring (predecessor id, reuse flag, prompt swap).
+    Calling more times than there are scripts is a test bug and
+    surfaces as ``IndexError`` rather than silent passing.
+
+    ``workspace`` is the fake workspace the handles should record
+    simulated executions on.  Passing it lets the fake handles
+    write state_dir entries that the handoff loop needs in order
+    to locate the session JSONL.
     """
     iteration = {"i": 0}
 
@@ -189,6 +252,7 @@ def _make_launch_fn(
         return _FakeAgentHandle(
             workspace_root=workspace_root,
             script=scripts[idx],
+            workspace=workspace,
         )
 
     return _fake

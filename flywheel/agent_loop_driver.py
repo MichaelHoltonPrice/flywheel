@@ -1,5 +1,17 @@
 """Drive an agent container through tool-call handoff cycles.
 
+.. note::
+
+   This module is a parallel (older) handoff driver that still
+   uses the pre-substrate ``RESUME_SESSION_FILE`` /
+   ``/workspace/agent_session.jsonl`` convention.  It has not
+   yet been migrated to the ``/state/``-based session
+   persistence used by :mod:`flywheel.agent_handoff`.  Its
+   consumers and tests still pin the old contract.  Migration
+   is tracked as pre-step-5 cleanup in
+   ``cyber-root/substrate-plan.md``; until then, do not mix
+   the two drivers in a single code path.
+
 The flywheel-claude agent runner exposes a ``HANDOFF_TOOLS`` env
 var.  When the agent invokes one or more matched MCP tools in a
 single assistant turn, a ``PreToolUse`` hook denies each call

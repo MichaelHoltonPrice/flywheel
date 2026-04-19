@@ -42,6 +42,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -51,13 +52,14 @@ import pytest
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.agent_handoff import (
     PENDING_FILE_NAME,
-    SESSION_ARTIFACT_NAME,
+    SESSION_FILE_NAME,
     HandoffAgentHandle,
     HandoffContext,
     HandoffLoopError,
     HandoffResult,
     launch_agent_with_handoffs,
 )
+from flywheel.artifact import BlockExecution
 from flywheel.pattern import ContinuousTrigger, Pattern, Role
 from flywheel.pattern_runner import PatternRunner
 
@@ -69,9 +71,15 @@ from flywheel.pattern_runner import PatternRunner
 
 @dataclass
 class _FakeWorkspace:
-    """Stand-in for :class:`flywheel.workspace.Workspace`."""
+    """Stand-in for :class:`flywheel.workspace.Workspace`.
+
+    The handoff loop reads ``workspace.path`` and
+    ``workspace.executions[exec_id].state_dir`` to locate the
+    session JSONL after each cycle.
+    """
 
     path: Path
+    executions: dict[str, BlockExecution] = field(default_factory=dict)
 
 
 @dataclass
@@ -95,12 +103,20 @@ class _FakeAgentHandle:
         *,
         workspace_root: Path,
         script: _CycleScript,
+        workspace: _FakeWorkspace | None = None,
     ) -> None:
         self._workspace_root = workspace_root
         self._script = script
+        self._workspace = workspace
 
     def wait(self) -> AgentResult:
-        """Apply the cycle's script and return the AgentResult."""
+        """Apply the cycle's script and return the AgentResult.
+
+        Simulates state capture: writes the session JSONL into a
+        synthetic state_dir and records a matching
+        :class:`BlockExecution` on the workspace so the handoff
+        loop can resolve ``state_dir`` from ``execution_id``.
+        """
         if self._script.pre_wait_delay_s > 0:
             time.sleep(self._script.pre_wait_delay_s)
 
@@ -109,9 +125,32 @@ class _FakeAgentHandle:
         )
         agent_ws.mkdir(parents=True, exist_ok=True)
 
+        state_dir_rel: str | None = None
         if self._script.write_session:
-            (agent_ws / SESSION_ARTIFACT_NAME).write_text(
+            state_dir_path = (
+                self._workspace_root
+                / "state" / "__agent__"
+                / self._script.execution_id
+            )
+            state_dir_path.mkdir(parents=True, exist_ok=True)
+            (state_dir_path / SESSION_FILE_NAME).write_text(
                 self._script.session_jsonl_text, encoding="utf-8")
+            state_dir_rel = str(
+                state_dir_path.relative_to(self._workspace_root)
+            ).replace("\\", "/")
+
+        if self._workspace is not None:
+            now = datetime.now(UTC)
+            self._workspace.executions[
+                self._script.execution_id
+            ] = BlockExecution(
+                id=self._script.execution_id,
+                block_name="__agent__",
+                started_at=now,
+                finished_at=now,
+                status="succeeded",
+                state_dir=state_dir_rel,
+            )
 
         if self._script.exit_reason == "tool_handoff":
             envelope = {
@@ -137,6 +176,7 @@ def _make_launch_fn(
     workspace_root: Path,
     scripts: list[_CycleScript],
     record: list[dict[str, Any]] | None = None,
+    workspace: _FakeWorkspace | None = None,
 ) -> Callable[..., _FakeAgentHandle]:
     """Build a fake launch_fn that walks ``scripts`` cycle by cycle."""
     iteration = {"i": 0}
@@ -149,6 +189,7 @@ def _make_launch_fn(
         return _FakeAgentHandle(
             workspace_root=workspace_root,
             script=scripts[idx],
+            workspace=workspace,
         )
 
     return _fake
@@ -258,7 +299,7 @@ class TestNoHandoffPath:
     ) -> None:
         scripts = [_CycleScript(
             exit_reason="completed", execution_id="exec-only")]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -277,7 +318,7 @@ class TestNoHandoffPath:
         self, workspace: _FakeWorkspace,
     ) -> None:
         scripts = [_CycleScript(exit_reason="completed")]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -296,7 +337,7 @@ class TestNoHandoffPath:
         # mid-flight state without racing.
         scripts = [_CycleScript(
             exit_reason="completed", pre_wait_delay_s=0.5)]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -344,7 +385,7 @@ class TestHandoffRoundTripThroughHandle:
                 execution_id="exec-cycle1",
             ),
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         invocations: list[HandoffContext] = []
 
@@ -395,7 +436,7 @@ class TestHandoffRoundTripThroughHandle:
                 execution_id="exec-final",
             ),
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
             return HandoffResult(content=ctx.tool_use_id)
@@ -441,7 +482,7 @@ class TestExceptionPropagation:
                     session_id="s", tool_use_ids=["toolu_x"]),
             ),
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -469,7 +510,7 @@ class TestExceptionPropagation:
                     session_id="s", tool_use_ids=["toolu_x"]),
             ),
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         class _BoomError(RuntimeError):
             pass
@@ -497,7 +538,7 @@ class TestIdempotentWait:
     ) -> None:
         scripts = [_CycleScript(
             exit_reason="completed", execution_id="exec-once")]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -524,7 +565,7 @@ class TestIdempotentWait:
                     session_id="s", tool_use_ids=["toolu_x"]),
             ),
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = HandoffAgentHandle(
             block_runner=None,
@@ -552,7 +593,7 @@ class TestLaunchFactory:
     ) -> None:
         scripts = [_CycleScript(
             exit_reason="completed", execution_id="exec-factory")]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         handle = launch_agent_with_handoffs(
             block_runner=None,
@@ -588,7 +629,7 @@ class TestLaunchFactory:
             ),
             _CycleScript(exit_reason="completed"),  # never reached
         ]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         directive = {"reason": "drain-fired"}
 
@@ -618,7 +659,7 @@ class TestLaunchFactory:
         # callable as a launch_fn.
         scripts = [_CycleScript(
             exit_reason="completed", execution_id="exec-partial")]
-        launch = _make_launch_fn(workspace.path, scripts)
+        launch = _make_launch_fn(workspace.path, scripts, workspace=workspace)
 
         invocations: list[HandoffContext] = []
 
@@ -730,7 +771,7 @@ class TestPatternRunnerIntegration:
         # through the handle factory.  The factory keeps a
         # reference so the test can inspect the underlying
         # loop_result after run() returns.
-        fake_launch = _make_launch_fn(ws_path, scripts)
+        fake_launch = _make_launch_fn(ws_path, scripts, workspace=ws)
 
         def _factory(**kwargs: Any) -> HandoffAgentHandle:
             handle = HandoffAgentHandle(
