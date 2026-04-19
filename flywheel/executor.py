@@ -24,6 +24,7 @@ container runtime contract these executors implement lives in
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import subprocess
@@ -36,7 +37,10 @@ from typing import Any, Protocol, runtime_checkable
 
 from flywheel import runtime
 from flywheel.artifact import ArtifactInstance, BlockExecution
-from flywheel.container import ContainerConfig, run_container
+from flywheel.container import (
+    ContainerConfig,
+    start_container,
+)
 from flywheel.input_staging import (
     StagingError,
     cleanup_staged_inputs,
@@ -46,13 +50,20 @@ from flywheel.template import BlockDefinition, Template
 from flywheel.workspace import Workspace
 
 # Sentinel exit code for "the container never produced one."
-# Used when ``run_container`` raises before an exit status exists
-# (Docker daemon gone, container failed to start, etc.).  ``-1``
-# distinguishes this case from a real successful exit in the
-# returned :class:`ExecutionResult`; the ``BlockExecution.status``
-# field is the authoritative signal, but API-level callers
-# reading just ``exit_code`` should see a non-zero value.
+# Used when container startup raises before an exit status
+# exists (Docker daemon gone, container failed to start, etc.).
+# ``-1`` distinguishes this case from a real successful exit in
+# the returned :class:`ExecutionResult`; the
+# :attr:`BlockExecution.status` field is the authoritative
+# signal, but API-level callers reading just ``exit_code``
+# should see a non-zero value.
 INVOKE_FAILURE_EXIT_CODE: int = -1
+
+# Grace period between SIGTERM and SIGKILL when forced
+# termination is needed.  Short because well-behaved SIGTERM
+# handlers wrap up in a few seconds; anything slower than this
+# is treated as "unresponsive to TERM" and escalated to KILL.
+_TERM_TO_KILL_GRACE_S: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -227,6 +238,255 @@ class _AbortExecution(Exception):
     """
 
 
+def _docker_send_signal(container_name: str, signal: str) -> None:
+    """Send a signal to a running container by name.
+
+    Extracted so tests can patch the Docker interaction without
+    needing a real daemon.  ``check=False`` because the container
+    may have already exited between the caller's decision and
+    this call — that race is always possible and isn't an error
+    on the caller's side.
+    """
+    subprocess.run(
+        ["docker", "kill", "--signal", signal, container_name],
+        check=False,
+        capture_output=True,
+    )
+
+
+class ContainerExecutionHandle(ExecutionHandle):
+    """Handle to a running container execution.
+
+    Returned by :meth:`ProcessExitExecutor.launch` when the
+    container has been started.  The caller must call
+    :meth:`wait` exactly once to drive the post-exit pipeline
+    (state capture, output collection, execution record).
+    :meth:`stop` is optional; when called, it runs the two-phase
+    cancellation protocol.
+
+    The handle owns a substantial amount of pipeline state (the
+    staged inputs, the state mount, the output tempdirs, the
+    work-area tempdir).  Cleanup of those happens in
+    :meth:`wait`'s ``finally`` block so partial exits leave no
+    tempdirs behind.
+    """
+
+    def __init__(
+        self,
+        *,
+        process: subprocess.Popen,
+        workspace: Workspace,
+        block_def: BlockDefinition,
+        execution_id: str,
+        started_at: datetime,
+        start_monotonic: float,
+        container_name: str,
+        staged_inputs: dict[str, Path],
+        state_mount: Path | None,
+        output_tempdirs: dict[str, Path],
+        work_area: Path,
+        input_bindings: dict[str, str],
+        state_lineage_id: str | None,
+    ):
+        """Capture every piece of state :meth:`wait` will need."""
+        self._process = process
+        self._workspace = workspace
+        self._block_def = block_def
+        self._execution_id = execution_id
+        self._started_at = started_at
+        self._start_monotonic = start_monotonic
+        self._container_name = container_name
+        self._staged_inputs = staged_inputs
+        self._state_mount = state_mount
+        self._output_tempdirs = output_tempdirs
+        self._work_area = work_area
+        self._input_bindings = input_bindings
+        self._state_lineage_id = state_lineage_id
+        self._stop_reason: str | None = None
+        self._waited = False
+
+    def is_alive(self) -> bool:
+        """True while the container process has no exit code yet."""
+        return self._process.poll() is None
+
+    def stop(self, reason: str = "requested") -> None:
+        """Run the two-phase cancellation protocol.
+
+        Phase 1 — *cooperative.*  Write the stop sentinel file at
+        ``<work_area>/.stop`` (visible inside the container as
+        ``/workspace/.stop``) and wait up to the block's
+        ``stop_timeout_s`` for the container to exit on its own.
+
+        Phase 2 — *forced.*  If cooperative times out, send
+        SIGTERM via ``docker kill`` and wait a short grace.  If
+        SIGTERM is ignored too, escalate to SIGKILL.
+
+        Safe to call on an already-exited container: the poll
+        check short-circuits.  Idempotent within one handle: a
+        second ``stop()`` after the first completed is a no-op.
+        """
+        if self._process.poll() is not None:
+            # Already exited naturally; nothing to cancel, and
+            # no stop_reason to set — this call is a no-op.
+            return
+
+        # From here on we consider the execution interrupted —
+        # the operator explicitly asked us to stop a running
+        # container.  There's a very narrow race where the
+        # container is *about* to exit naturally when stop()
+        # fires, in which case we'll label an effectively-
+        # natural exit as interrupted; that misclassification
+        # is acceptable given we can't distinguish "exit caused
+        # by sentinel" from "exit that coincidentally happened
+        # after sentinel write" without extra signal.
+        self._stop_reason = reason
+
+        # Phase 1: cooperative stop via sentinel.
+        sentinel = self._work_area / (
+            runtime.STOP_SENTINEL_WORKSPACE_RELATIVE)
+        # If we can't write the sentinel, skip straight to
+        # forced termination; phase 2 guarantees the container
+        # stops regardless.
+        with contextlib.suppress(OSError):
+            sentinel.touch()
+
+        timeout = max(0, self._block_def.stop_timeout_s)
+        if timeout > 0:
+            try:
+                self._process.wait(timeout=timeout)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+        # Phase 2a: SIGTERM.
+        _docker_send_signal(self._container_name, "TERM")
+        try:
+            self._process.wait(timeout=_TERM_TO_KILL_GRACE_S)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Phase 2b: SIGKILL — container cannot refuse.
+        _docker_send_signal(self._container_name, "KILL")
+        self._process.wait()
+
+    def wait(self) -> ExecutionResult:
+        """Block for container exit, then finalize the execution.
+
+        After the container process has exited, runs the
+        post-exit pipeline: capture ``/state/``, collect outputs
+        into canonical artifact dirs, write the
+        :class:`BlockExecution` record with the right
+        ``status``, ``failure_phase``, and (for cancelled
+        executions) ``stop_reason``.
+
+        Raises:
+            RuntimeError: If called more than once on the same
+                handle.
+        """
+        if self._waited:
+            raise RuntimeError(
+                "wait() already called on this handle")
+        self._waited = True
+
+        failure_phase: str | None = None
+        error: str | None = None
+        state_dir_rel: str | None = None
+        output_bindings: dict[str, str] = {}
+
+        try:
+            self._process.wait()
+            exit_code = self._process.returncode
+            finished_at = datetime.now(UTC)
+            elapsed = time.monotonic() - self._start_monotonic
+
+            # If the container exited non-zero and wasn't
+            # explicitly stopped, treat it as invoke failure.
+            if exit_code != 0 and self._stop_reason is None:
+                failure_phase = runtime.FAILURE_INVOKE
+                error = (
+                    f"invoke: container exited with code "
+                    f"{exit_code}"
+                )
+
+            # State capture runs even on invoke failure —
+            # partial state is worth preserving for debugging.
+            if self._state_mount is not None:
+                try:
+                    state_dir_rel = _capture_state(
+                        self._workspace,
+                        self._block_def.name,
+                        self._execution_id,
+                        self._state_mount,
+                    )
+                except OSError as e:
+                    if failure_phase is None:
+                        failure_phase = (
+                            runtime.FAILURE_STATE_CAPTURE)
+                        error = f"state_capture: {e}"
+
+            # Output collection.
+            try:
+                output_bindings = _collect_outputs(
+                    self._workspace,
+                    self._block_def,
+                    self._output_tempdirs,
+                    self._execution_id,
+                    finished_at,
+                )
+            except Exception as e:
+                if failure_phase is None:
+                    failure_phase = runtime.FAILURE_OUTPUT_COLLECT
+                    error = f"output_collect: {e}"
+        finally:
+            # Cleanup is best-effort; never mask a real failure.
+            cleanup_staged_inputs(self._staged_inputs)
+            if self._state_mount is not None:
+                shutil.rmtree(
+                    self._state_mount, ignore_errors=True)
+            for path in self._output_tempdirs.values():
+                shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(self._work_area, ignore_errors=True)
+
+        # Status: interrupted if we explicitly cancelled; failed
+        # on any failure_phase; succeeded otherwise.
+        if self._stop_reason is not None:
+            status = "interrupted"
+        elif failure_phase is not None:
+            status = "failed"
+        else:
+            status = "succeeded"
+
+        execution = BlockExecution(
+            id=self._execution_id,
+            block_name=self._block_def.name,
+            started_at=self._started_at,
+            finished_at=finished_at,
+            status=status,
+            input_bindings=self._input_bindings,
+            output_bindings=output_bindings,
+            exit_code=exit_code,
+            elapsed_s=elapsed,
+            image=self._block_def.image,
+            runner="container",
+            state_dir=state_dir_rel,
+            failure_phase=failure_phase,
+            error=error,
+            state_lineage_id=self._state_lineage_id,
+            stop_reason=self._stop_reason,
+        )
+        self._workspace.add_execution(execution)
+        self._workspace.save()
+
+        return ExecutionResult(
+            exit_code=exit_code,
+            elapsed_s=elapsed,
+            output_bindings=output_bindings,
+            execution_id=self._execution_id,
+            status=status,
+        )
+
+
 class ProcessExitExecutor:
     """Process-exit protocol executor — one container per execution.
 
@@ -277,8 +537,23 @@ class ProcessExitExecutor:
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
         state_lineage_id: str | None = None,
-    ) -> SyncExecutionHandle:
-        """Launch a one-shot container and return when it exits.
+    ) -> ExecutionHandle:
+        """Start a one-shot container execution.
+
+        The returned handle is live — the container is running.
+        Call :meth:`ExecutionHandle.wait` to block for exit and
+        finalize the execution; call :meth:`ExecutionHandle.stop`
+        first for cooperative-then-forced cancellation.
+        ``wait()`` does the post-exit pipeline (state capture,
+        output collection, execution record), so a caller that
+        never calls ``wait`` leaks both the container and its
+        pipeline state.
+
+        On pre-container failures (staging errors, container-
+        start exceptions), the returned handle is a
+        :class:`SyncExecutionHandle` that's already recorded the
+        failure — ``wait()`` returns immediately and ``stop()``
+        is a no-op.
 
         Args:
             block_name: Name of the block to execute.  Must
@@ -303,9 +578,11 @@ class ProcessExitExecutor:
                 forked state chains can pass distinct IDs.
 
         Returns:
-            A :class:`SyncExecutionHandle` wrapping the
-            execution's result.  ``wait()`` returns immediately
-            with a pre-computed :class:`ExecutionResult`.
+            A live :class:`ContainerExecutionHandle` on the
+            normal path, or a pre-completed
+            :class:`SyncExecutionHandle` if a pre-container
+            phase failed.  Both satisfy the
+            :class:`ExecutionHandle` protocol.
 
         Raises:
             ValueError: If the block is not found or not
@@ -330,62 +607,73 @@ class ProcessExitExecutor:
         exec_id = execution_id or workspace.generate_execution_id()
         started_at = datetime.now(UTC)
 
-        # Pipeline state.  ``failure_phase`` is the first phase
-        # that failed; subsequent phases still run (best-effort
-        # state/output capture for debugging) but do not
-        # overwrite it.
-        failure_phase: str | None = None
-        error: str | None = None
+        # Pre-container pipeline state.  Any failure here short-
+        # circuits into a pre-completed :class:`SyncExecutionHandle`
+        # — the container never started, so there's nothing for
+        # a caller to ``stop()``.
         staged_inputs: dict[str, Path] = {}
         state_mount: Path | None = None
         output_tempdirs: dict[str, Path] = {}
-        output_bindings: dict[str, str] = {}
-        state_dir_rel: str | None = None
-        result = None
-        finished_at = started_at
+        work_area: Path | None = None
 
         try:
-            # Phase: stage_in.  Any staging failure aborts
-            # immediately — the container can't run without its
-            # declared inputs.
+            # Phase: stage_in.
             try:
                 staged_inputs = stage_artifact_instances(
                     workspace, input_bindings)
             except StagingError as e:
-                failure_phase = runtime.FAILURE_STAGE_IN
-                error = f"stage_in: {e}"
-                raise _AbortExecution from e
+                return _record_pre_container_failure(
+                    workspace=workspace,
+                    block_def=block_def,
+                    exec_id=exec_id,
+                    started_at=started_at,
+                    input_bindings=input_bindings,
+                    state_lineage_id=state_lineage_id,
+                    failure_phase=runtime.FAILURE_STAGE_IN,
+                    error=f"stage_in: {e}",
+                    staged_inputs=staged_inputs,
+                    state_mount=state_mount,
+                    output_tempdirs=output_tempdirs,
+                    work_area=work_area,
+                )
 
-            # Populate /state/ mount for stateful blocks.  Counted
-            # as part of stage_in — a missing prior state isn't a
-            # failure (first execution has none), but an I/O
-            # error copying the canonical state dir is.  A prior
-            # execution whose state_dir is recorded in the ledger
-            # but missing on disk is *also* a stage_in failure —
-            # silently cold-starting would mask workspace
-            # corruption.
+            # Populate /state/ mount for stateful blocks.
             if block_def.state:
                 try:
                     state_mount = _populate_state_mount(
                         workspace, block_name, state_lineage_id)
                 except OSError as e:
-                    failure_phase = runtime.FAILURE_STAGE_IN
-                    error = f"stage_in (state): {e}"
-                    raise _AbortExecution from e
+                    return _record_pre_container_failure(
+                        workspace=workspace,
+                        block_def=block_def,
+                        exec_id=exec_id,
+                        started_at=started_at,
+                        input_bindings=input_bindings,
+                        state_lineage_id=state_lineage_id,
+                        failure_phase=runtime.FAILURE_STAGE_IN,
+                        error=f"stage_in (state): {e}",
+                        staged_inputs=staged_inputs,
+                        state_mount=state_mount,
+                        output_tempdirs=output_tempdirs,
+                        work_area=work_area,
+                    )
 
-            # Allocate per-slot output tempdirs.  Write-side of
-            # the "canonical never directly mounted" invariant —
-            # the container writes here; we move to canonical
-            # after exit.
+            # Allocate per-slot output tempdirs.
             for slot in block_def.outputs:
                 output_tempdirs[slot.name] = Path(
                     tempfile.mkdtemp(
                         prefix=f"flywheel-output-{slot.name}-"))
 
-            # Phase: invoke.  Build mounts and run.
+            # Allocate the /workspace/ work-area tempdir where
+            # flywheel and the container communicate (stop
+            # sentinel, future runtime socket).
+            work_area = Path(tempfile.mkdtemp(
+                prefix=f"flywheel-work-{block_name}-"))
+
+            # Phase: invoke (start the container, non-blocking).
             mounts = _build_mounts(
                 block_def, staged_inputs, output_tempdirs,
-                state_mount,
+                state_mount, work_area,
             )
             cc = ContainerConfig(
                 image=block_def.image,
@@ -397,114 +685,51 @@ class ProcessExitExecutor:
                 self._overrides, overrides)
             container_name = f"flywheel-block-{exec_id}"
 
+            start_monotonic = time.monotonic()
             try:
-                result = run_container(
+                process = start_container(
                     cc,
                     args=container_args or None,
                     name=container_name,
                 )
             except Exception as e:
-                failure_phase = runtime.FAILURE_INVOKE
-                error = f"invoke: {e}"
-                finished_at = datetime.now(UTC)
-                raise _AbortExecution from e
-
-            finished_at = datetime.now(UTC)
-
-            # Non-zero exit == block body failure.  Phase is
-            # ``invoke``; we still capture state/outputs for
-            # debugging.
-            if result.exit_code != 0:
-                failure_phase = runtime.FAILURE_INVOKE
-                error = (
-                    f"invoke: container exited with code "
-                    f"{result.exit_code}"
+                return _record_pre_container_failure(
+                    workspace=workspace,
+                    block_def=block_def,
+                    exec_id=exec_id,
+                    started_at=started_at,
+                    input_bindings=input_bindings,
+                    state_lineage_id=state_lineage_id,
+                    failure_phase=runtime.FAILURE_INVOKE,
+                    error=f"invoke: {e}",
+                    staged_inputs=staged_inputs,
+                    state_mount=state_mount,
+                    output_tempdirs=output_tempdirs,
+                    work_area=work_area,
                 )
-
-            # Phase: state_capture.  Runs even on invoke failure
-            # — the container may have written partial state
-            # worth preserving.
-            if state_mount is not None:
-                try:
-                    state_dir_rel = _capture_state(
-                        workspace, block_name, exec_id,
-                        state_mount,
-                    )
-                except OSError as e:
-                    if failure_phase is None:
-                        failure_phase = runtime.FAILURE_STATE_CAPTURE
-                        error = f"state_capture: {e}"
-
-            # Phase: output_collect.  Move per-slot output
-            # tempdir contents into canonical artifact dirs and
-            # register.
-            try:
-                output_bindings = _collect_outputs(
-                    workspace, block_def, output_tempdirs,
-                    exec_id, finished_at,
-                )
-            except Exception as e:
-                if failure_phase is None:
-                    failure_phase = runtime.FAILURE_OUTPUT_COLLECT
-                    error = f"output_collect: {e}"
-
         except _AbortExecution:
-            # Phase already set; fall through to record-keeping.
-            if finished_at == started_at:
-                finished_at = datetime.now(UTC)
-        finally:
-            # Cleanup is best-effort and must never mask a real
-            # failure with a cleanup error.
-            cleanup_staged_inputs(staged_inputs)
-            if state_mount is not None:
-                shutil.rmtree(state_mount, ignore_errors=True)
-            for path in output_tempdirs.values():
-                shutil.rmtree(path, ignore_errors=True)
+            # Defensive: no current path raises this anymore,
+            # but keep the sentinel so future refactors don't
+            # silently drop pre-container failures.
+            raise
 
-        # Phase: artifact_commit.  Record the execution.  If
-        # add_execution/save raise, there's no recoverable way to
-        # leave a phase marker behind — the record can't be
-        # written — so we propagate.  Robust-commit is a future
-        # concern.
-        status = "failed" if failure_phase else "succeeded"
-        exit_code = result.exit_code if result is not None else None
-        elapsed_s = result.elapsed_s if result is not None else 0.0
-
-        execution = BlockExecution(
-            id=exec_id,
-            block_name=block_name,
+        # Container is running; hand off to the handle, which
+        # owns the post-exit pipeline and cleanup.
+        return ContainerExecutionHandle(
+            process=process,
+            workspace=workspace,
+            block_def=block_def,
+            execution_id=exec_id,
             started_at=started_at,
-            finished_at=finished_at,
-            status=status,
+            start_monotonic=start_monotonic,
+            container_name=container_name,
+            staged_inputs=staged_inputs,
+            state_mount=state_mount,
+            output_tempdirs=output_tempdirs,
+            work_area=work_area,
             input_bindings=input_bindings,
-            output_bindings=output_bindings,
-            exit_code=exit_code,
-            elapsed_s=elapsed_s,
-            image=block_def.image,
-            runner="container",
-            state_dir=state_dir_rel,
-            failure_phase=failure_phase,
-            error=error,
             state_lineage_id=state_lineage_id,
         )
-        workspace.add_execution(execution)
-        workspace.save()
-
-        # ``exit_code`` may be None when ``run_container`` raised
-        # before producing a result.  Surface a clear non-zero
-        # sentinel so API-level callers reading just the
-        # ExecutionResult see the failure.
-        result_exit_code = (
-            exit_code if exit_code is not None
-            else INVOKE_FAILURE_EXIT_CODE
-        )
-        return SyncExecutionHandle(ExecutionResult(
-            exit_code=result_exit_code,
-            elapsed_s=elapsed_s,
-            output_bindings=output_bindings,
-            execution_id=exec_id,
-            status=status,
-        ))
 
 
 def _populate_state_mount(
@@ -722,11 +947,15 @@ def _build_mounts(
     staged_inputs: dict[str, Path],
     output_tempdirs: dict[str, Path],
     state_mount: Path | None,
+    work_area: Path,
 ) -> list[tuple[str, str, str]]:
     """Assemble the (host, container, mode) mount tuples.
 
     Never includes a canonical workspace path — every mount
-    points at a per-execution staged tempdir.
+    points at a per-execution staged tempdir.  The ``work_area``
+    is mounted rw at ``/workspace/`` so flywheel and the
+    container can exchange control signals (the stop sentinel,
+    and later the runtime socket for request-response blocks).
     """
     mounts: list[tuple[str, str, str]] = []
     for slot in block_def.inputs:
@@ -742,7 +971,69 @@ def _build_mounts(
     if state_mount is not None:
         mounts.append(
             (str(state_mount), runtime.STATE_MOUNT_PATH, "rw"))
+    mounts.append((str(work_area), "/workspace", "rw"))
     return mounts
+
+
+def _record_pre_container_failure(
+    *,
+    workspace: Workspace,
+    block_def: BlockDefinition,
+    exec_id: str,
+    started_at: datetime,
+    input_bindings: dict[str, str],
+    state_lineage_id: str | None,
+    failure_phase: str,
+    error: str,
+    staged_inputs: dict[str, Path],
+    state_mount: Path | None,
+    output_tempdirs: dict[str, Path],
+    work_area: Path | None,
+) -> SyncExecutionHandle:
+    """Write a failure :class:`BlockExecution` and clean up.
+
+    Used when the pre-container pipeline fails (stage_in or the
+    non-blocking container start itself).  No container ever
+    ran, so there's no handle for a caller to ``stop()`` — the
+    returned :class:`SyncExecutionHandle` is pre-completed.
+    """
+    # Best-effort cleanup of whatever tempdirs we managed to
+    # allocate before the failure.
+    cleanup_staged_inputs(staged_inputs)
+    if state_mount is not None:
+        shutil.rmtree(state_mount, ignore_errors=True)
+    for path in output_tempdirs.values():
+        shutil.rmtree(path, ignore_errors=True)
+    if work_area is not None:
+        shutil.rmtree(work_area, ignore_errors=True)
+
+    finished_at = datetime.now(UTC)
+    execution = BlockExecution(
+        id=exec_id,
+        block_name=block_def.name,
+        started_at=started_at,
+        finished_at=finished_at,
+        status="failed",
+        input_bindings=input_bindings,
+        output_bindings={},
+        exit_code=None,
+        elapsed_s=0.0,
+        image=block_def.image,
+        runner="container",
+        failure_phase=failure_phase,
+        error=error,
+        state_lineage_id=state_lineage_id,
+    )
+    workspace.add_execution(execution)
+    workspace.save()
+
+    return SyncExecutionHandle(ExecutionResult(
+        exit_code=INVOKE_FAILURE_EXIT_CODE,
+        elapsed_s=0.0,
+        output_bindings={},
+        execution_id=exec_id,
+        status="failed",
+    ))
 
 
 def _build_container_args(

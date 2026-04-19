@@ -1,6 +1,6 @@
 """Tests for :class:`flywheel.executor.ProcessExitExecutor`.
 
-Uses mocked ``run_container`` so the tests don't need Docker.
+Uses mocked ``start_container`` so the tests don't need Docker.
 Coverage:
 
 - happy path (stateless and stateful blocks),
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -26,7 +27,6 @@ import pytest
 
 from flywheel import runtime
 from flywheel.artifact import ArtifactInstance
-from flywheel.container import ContainerResult
 from flywheel.executor import (
     INVOKE_FAILURE_EXIT_CODE,
     ProcessExitExecutor,
@@ -42,6 +42,26 @@ from flywheel.template import (
 from flywheel.workspace import Workspace
 
 
+class FakePopen:
+    """Minimal :class:`subprocess.Popen` stand-in.
+
+    Holds a ``returncode`` that :meth:`poll` / :meth:`wait` can
+    return.  Sufficient for tests whose simulated container has
+    already finished its work synchronously by the time
+    ``start_container`` returns.  Cancellation tests extend this
+    with richer state transitions.
+    """
+
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+
 def _make_template(
     *,
     block_name: str = "train",
@@ -49,12 +69,15 @@ def _make_template(
     inputs: list[str] | None = None,
     outputs: list[str] | None = None,
     output_kinds: dict[str, str] | None = None,
+    stop_timeout_s: int = 30,
 ) -> Template:
     """Build a tiny Template with one container block.
 
-    ``output_kinds`` overrides the kind of individual outputs; any
-    unlisted output (and every input) defaults to ``copy``.  Used
-    by tests that need incremental outputs.
+    ``output_kinds`` overrides the kind of individual outputs;
+    any unlisted output (and every input) defaults to ``copy``.
+    ``stop_timeout_s`` sets the cooperative-cancel window, so
+    cancellation tests can assert the configured value is
+    respected.
     """
     inputs = inputs or []
     outputs = outputs or []
@@ -80,6 +103,7 @@ def _make_template(
             for n in outputs
         ],
         state=state,
+        stop_timeout_s=stop_timeout_s,
     )
     return Template(
         name="t", artifacts=artifacts, blocks=[block])
@@ -109,12 +133,14 @@ def _fake_run_success(
     state_contents: dict[str, str] | None = None,
     exit_code: int = 0,
 ):
-    """Return a ``run_container`` replacement that writes files.
+    """Return a ``start_container`` replacement that writes files.
 
-    The replacement inspects the `mounts` passed to it and writes
-    the given ``container_contents`` into every rw output mount,
-    plus ``state_contents`` into the `/state/` mount if present.
-    That lets tests simulate what a real container would write.
+    Simulates a container that has finished its work
+    synchronously by the time ``start_container`` returns:
+    writes the given ``container_contents`` into every rw
+    output mount, plus ``state_contents`` into ``/state/`` (if
+    mounted), then returns a :class:`FakePopen` already at
+    ``exit_code``.  ``wait()`` on it returns immediately.
     """
     def _fake(config, args=None, name=None):
         for host, container, mode in config.mounts:
@@ -125,11 +151,15 @@ def _fake_run_success(
                 if state_contents:
                     for fname, content in state_contents.items():
                         (host_p / fname).write_text(content)
+            elif container == "/workspace":
+                # The work-area mount; no files expected here
+                # for the success path.
+                continue
             else:
                 if container_contents:
                     for fname, content in container_contents.items():
                         (host_p / fname).write_text(content)
-        return ContainerResult(exit_code=exit_code, elapsed_s=0.1)
+        return FakePopen(returncode=exit_code)
     return _fake
 
 
@@ -140,7 +170,7 @@ class TestHappyPathStateless:
         executor = ProcessExitExecutor(template)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_run_success(
                 container_contents={"payload.txt": "ok"}),
         ):
@@ -172,7 +202,7 @@ class TestHappyPathStateless:
         executor = ProcessExitExecutor(template)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_run_success(),  # writes nothing
         ):
             handle = executor.launch(
@@ -190,7 +220,7 @@ class TestStateRoundTrip:
         executor = ProcessExitExecutor(template)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_run_success(
                 state_contents={"counter.txt": "1"}),
         ):
@@ -221,7 +251,7 @@ class TestStateRoundTrip:
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     (Path(host) / "counter.txt").write_text("1")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         def _fake_second(config, args=None, name=None):
             # Record what's visible in /state/ at start, then
@@ -233,16 +263,16 @@ class TestStateRoundTrip:
                         seen_state_on_second[child.name] = (
                             child.read_text())
                     (host_p / "counter.txt").write_text("2")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_first,
         ):
             executor.launch("train", ws, input_bindings={}).wait()
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_second,
         ):
             handle = executor.launch(
@@ -262,7 +292,7 @@ class TestCanonicalNotMountedInvariant:
     def test_input_mounts_do_not_use_canonical_path(
         self, tmp_path: Path,
     ):
-        """Mounts handed to ``run_container`` must not include any
+        """Mounts handed to ``start_container`` must not include any
         path under ``<workspace>/artifacts/`` — that would violate
         the canonical-never-directly-mounted invariant."""
         template = _make_template(
@@ -287,10 +317,10 @@ class TestCanonicalNotMountedInvariant:
 
         def _fake(config, args=None, name=None):
             captured_mounts.extend(config.mounts)
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_fake,
+            "flywheel.executor.start_container", side_effect=_fake,
         ):
             executor.launch(
                 "train", ws,
@@ -340,7 +370,7 @@ class TestFailurePhases:
         executor = ProcessExitExecutor(template)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_run_success(exit_code=2),
         ):
             handle = executor.launch(
@@ -353,7 +383,7 @@ class TestFailurePhases:
         assert ex.failure_phase == runtime.FAILURE_INVOKE
         assert "exited with code 2" in ex.error
 
-    def test_invoke_failure_run_container_raises(
+    def test_invoke_failure_start_container_raises(
         self, tmp_path: Path,
     ):
         template = _make_template(outputs=["result"])
@@ -364,7 +394,7 @@ class TestFailurePhases:
             raise RuntimeError("docker daemon gone")
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_boom,
+            "flywheel.executor.start_container", side_effect=_boom,
         ):
             handle = executor.launch(
                 "train", ws, input_bindings={})
@@ -395,10 +425,10 @@ class TestIncrementalOutputs:
                 if container == "/output/game_history":
                     (Path(host) / "entries.jsonl").write_text(
                         '{"step": 1}\n{"step": 2}\n')
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_fake,
+            "flywheel.executor.start_container", side_effect=_fake,
         ):
             handle = executor.launch(
                 "train", ws, input_bindings={})
@@ -429,17 +459,17 @@ class TestIncrementalOutputs:
                     if container == "/output/game_history":
                         (Path(host) / "entries.jsonl").write_text(
                             f'{{"step": {step_id}}}\n')
-                return ContainerResult(exit_code=0, elapsed_s=0.1)
+                return FakePopen(returncode=0)
             return _inner
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_step(1),
         ):
             r1 = executor.launch(
                 "train", ws, input_bindings={}).wait()
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_step(2),
         ):
             r2 = executor.launch(
@@ -483,10 +513,10 @@ class TestIncrementalOutputs:
             for host, container, _mode in config.mounts:
                 if container == "/output/game_history":
                     (Path(host) / "README").write_text("debug")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_fake,
+            "flywheel.executor.start_container", side_effect=_fake,
         ):
             result = executor.launch(
                 "train", ws, input_bindings={}).wait()
@@ -508,14 +538,14 @@ class TestStateCaptureFailure:
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     (Path(host) / "counter.txt").write_text("1")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         def _raise(*args, **kwargs):
             raise OSError("simulated disk-full")
 
         with (
             patch(
-                "flywheel.executor.run_container",
+                "flywheel.executor.start_container",
                 side_effect=_fake,
             ),
             patch(
@@ -544,14 +574,14 @@ class TestOutputCollectFailure:
             for host, container, _mode in config.mounts:
                 if container == "/output/result":
                     (Path(host) / "payload.txt").write_text("x")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         def _raise(*args, **kwargs):
             raise RuntimeError("simulated workspace lock failure")
 
         with (
             patch(
-                "flywheel.executor.run_container",
+                "flywheel.executor.start_container",
                 side_effect=_fake,
             ),
             patch(
@@ -584,10 +614,10 @@ class TestMissingStateDir:
             for host, container, _mode in config.mounts:
                 if container == runtime.STATE_MOUNT_PATH:
                     (Path(host) / "counter.txt").write_text("1")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_first,
         ):
             first = executor.launch(
@@ -599,10 +629,10 @@ class TestMissingStateDir:
 
         # Second execution must fail stage_in.
         def _fake_second(config, args=None, name=None):
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_second,
         ):
             result = executor.launch(
@@ -621,7 +651,7 @@ class TestStateLineage:
         executor = ProcessExitExecutor(template)
 
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_run_success(),
         ):
             result = executor.launch(
@@ -644,12 +674,12 @@ class TestStateLineage:
                 for host, container, _mode in config.mounts:
                     if container == runtime.STATE_MOUNT_PATH:
                         (Path(host) / "tag.txt").write_text(tag)
-                return ContainerResult(exit_code=0, elapsed_s=0.1)
+                return FakePopen(returncode=0)
             return _inner
 
         # Execution in lineage A writes "A".
         with patch(
-            "flywheel.executor.run_container",
+            "flywheel.executor.start_container",
             side_effect=_fake_write("A"),
         ):
             executor.launch(
@@ -670,10 +700,10 @@ class TestStateLineage:
                         else "no"
                     )
                     (host_p / "tag.txt").write_text("B")
-            return ContainerResult(exit_code=0, elapsed_s=0.1)
+            return FakePopen(returncode=0)
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_fake_b,
+            "flywheel.executor.start_container", side_effect=_fake_b,
         ):
             executor.launch(
                 "train", ws, input_bindings={},
@@ -699,7 +729,7 @@ class TestExitCodeOnInvokeException:
             raise RuntimeError("docker daemon gone")
 
         with patch(
-            "flywheel.executor.run_container", side_effect=_boom,
+            "flywheel.executor.start_container", side_effect=_boom,
         ):
             result = executor.launch(
                 "train", ws, input_bindings={}).wait()
@@ -713,6 +743,287 @@ class TestExitCodeOnInvokeException:
         # into the ledger.
         ex = ws.executions[result.execution_id]
         assert ex.exit_code is None
+
+
+class _CancellableFakePopen:
+    """Richer FakePopen for two-phase cancellation tests.
+
+    Simulates a running process that can exit for one of three
+    reasons:
+
+    - The cooperative stop sentinel appeared at
+      ``sentinel_path`` AND ``exits_on_sentinel`` is True.
+    - A SIGTERM was signaled AND ``exits_on_term`` is True.
+    - A SIGKILL was signaled.
+
+    ``wait(timeout=...)`` returns the exit code if the process
+    has exited, or raises ``subprocess.TimeoutExpired`` after
+    the specified delay (simulated — does not actually sleep).
+    Tests drive the "does the timeout fire?" decision by
+    arranging sentinel / signal state before each ``wait``
+    call.
+    """
+
+    def __init__(
+        self,
+        *,
+        sentinel_path,
+        exits_on_sentinel: bool = True,
+        exits_on_term: bool = True,
+        natural_exit_code: int = 0,
+    ):
+        self._sentinel_path = sentinel_path
+        self._exits_on_sentinel = exits_on_sentinel
+        self._exits_on_term = exits_on_term
+        self._natural_exit_code = natural_exit_code
+        self._term_signaled = False
+        self._kill_signaled = False
+        self.returncode: int | None = None
+        # Records the timeout seen on every ``wait`` call.  Tests
+        # assert these match the block's configured
+        # ``stop_timeout_s``, so the executor can't silently pass
+        # the wrong value.
+        self.wait_timeouts: list[float | None] = []
+
+    def receive_term(self) -> None:
+        """Called by the test's docker-kill mock on SIGTERM."""
+        self._term_signaled = True
+
+    def receive_kill(self) -> None:
+        """Called by the test's docker-kill mock on SIGKILL."""
+        self._kill_signaled = True
+
+    def _update_exit(self) -> None:
+        if self.returncode is not None:
+            return
+        if self._kill_signaled:
+            self.returncode = 137  # conventional SIGKILL exit code
+        elif self._term_signaled and self._exits_on_term:
+            self.returncode = 143  # conventional SIGTERM exit code
+        elif (self._exits_on_sentinel
+                and self._sentinel_path is not None
+                and self._sentinel_path.exists()):
+            self.returncode = self._natural_exit_code
+
+    def poll(self) -> int | None:
+        self._update_exit()
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeouts.append(timeout)
+        self._update_exit()
+        if self.returncode is not None:
+            return self.returncode
+        if timeout is None:
+            # Wouldn't terminate; treat as a broken-test signal.
+            raise AssertionError(
+                "_CancellableFakePopen.wait() without timeout "
+                "and no exit condition — test setup is wrong"
+            )
+        raise subprocess.TimeoutExpired(
+            cmd="fake", timeout=timeout)
+
+
+def _start_cancellable(
+    *,
+    exits_on_sentinel: bool = True,
+    exits_on_term: bool = True,
+    natural_exit_code: int = 0,
+):
+    """Return a ``start_container`` replacement for cancel tests.
+
+    The returned callable constructs a ``_CancellableFakePopen``
+    bound to the work-area's sentinel path, and returns it —
+    wiring the pipeline for cancellation exercises.  The test
+    keeps a reference to the returned popen via the outer
+    ``popen_ref`` dict so it can drive transitions.
+    """
+    popen_ref: dict = {}
+
+    def _factory(config, args=None, name=None):
+        # Locate the work-area mount (host path for /workspace).
+        work_area = None
+        for host, container, _mode in config.mounts:
+            if container == "/workspace":
+                work_area = Path(host)
+                break
+        sentinel_path = (
+            (work_area / runtime.STOP_SENTINEL_WORKSPACE_RELATIVE)
+            if work_area is not None else None
+        )
+        popen = _CancellableFakePopen(
+            sentinel_path=sentinel_path,
+            exits_on_sentinel=exits_on_sentinel,
+            exits_on_term=exits_on_term,
+            natural_exit_code=natural_exit_code,
+        )
+        popen_ref["popen"] = popen
+        return popen
+
+    return _factory, popen_ref
+
+
+class TestCooperativeStop:
+    """Cooperative stop: container sees the sentinel and exits."""
+
+    def test_honoring_container_records_interrupted(
+        self, tmp_path: Path,
+    ):
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        factory, popen_ref = _start_cancellable(
+            exits_on_sentinel=True)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=factory,
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            handle.stop(reason="test_cancel")
+            result = handle.wait()
+
+        assert result.status == "interrupted"
+        ex = ws.executions[result.execution_id]
+        assert ex.stop_reason == "test_cancel"
+        # Forced termination wasn't needed — the container
+        # exited on the sentinel, so exit_code is the natural
+        # one we passed in.
+        assert ex.exit_code == 0
+
+
+class TestForcedTermination:
+    """Container ignores the sentinel; TERM (and maybe KILL) fires."""
+
+    def test_ignoring_sentinel_triggers_term_after_configured_timeout(
+        self, tmp_path: Path,
+    ):
+        # Use a non-default timeout and assert it's what the
+        # executor actually passes to wait().
+        configured_timeout = 7
+        template = _make_template(
+            outputs=["result"],
+            stop_timeout_s=configured_timeout,
+        )
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        factory, popen_ref = _start_cancellable(
+            exits_on_sentinel=False,
+            exits_on_term=True,
+        )
+
+        def _fake_signal(container_name, signal):
+            popen = popen_ref["popen"]
+            if signal == "TERM":
+                popen.receive_term()
+            elif signal == "KILL":
+                popen.receive_kill()
+
+        with (
+            patch(
+                "flywheel.executor.start_container",
+                side_effect=factory,
+            ),
+            patch(
+                "flywheel.executor._docker_send_signal",
+                side_effect=_fake_signal,
+            ),
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            handle.stop(reason="timeout")
+            result = handle.wait()
+
+        assert result.status == "interrupted"
+        ex = ws.executions[result.execution_id]
+        assert ex.stop_reason == "timeout"
+        assert ex.exit_code == 143  # SIGTERM exit
+
+        # Proves the configured stop_timeout_s was what the
+        # executor passed to the cooperative wait.  Should be
+        # the first timed wait in the sequence.
+        popen = popen_ref["popen"]
+        assert configured_timeout in popen.wait_timeouts, (
+            f"Expected cooperative wait to use "
+            f"stop_timeout_s={configured_timeout}; "
+            f"saw {popen.wait_timeouts}"
+        )
+
+    def test_ignoring_term_triggers_kill(
+        self, tmp_path: Path,
+    ):
+        """Container ignores sentinel AND SIGTERM; only SIGKILL
+        ends it — proves TERM/KILL escalation works."""
+        template = _make_template(
+            outputs=["result"], stop_timeout_s=0)
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        factory, popen_ref = _start_cancellable(
+            exits_on_sentinel=False,
+            exits_on_term=False,
+        )
+        signals_sent: list[str] = []
+
+        def _fake_signal(container_name, signal):
+            signals_sent.append(signal)
+            popen = popen_ref["popen"]
+            if signal == "KILL":
+                popen.receive_kill()
+            # TERM is deliberately not honored by this popen.
+
+        with (
+            patch(
+                "flywheel.executor.start_container",
+                side_effect=factory,
+            ),
+            patch(
+                "flywheel.executor._docker_send_signal",
+                side_effect=_fake_signal,
+            ),
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            handle.stop(reason="hung")
+            result = handle.wait()
+
+        assert signals_sent == ["TERM", "KILL"], (
+            f"Expected TERM then KILL; got {signals_sent}"
+        )
+        assert result.status == "interrupted"
+        ex = ws.executions[result.execution_id]
+        assert ex.exit_code == 137  # SIGKILL exit
+
+
+class TestStopOnExitedContainer:
+    """stop() when the container already finished must not mislabel."""
+
+    def test_stop_after_natural_exit(self, tmp_path: Path):
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+        executor = ProcessExitExecutor(template)
+
+        # Happy-path fake: container already returned a popen
+        # with returncode=0, so stop() should short-circuit.
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake_run_success(),
+        ):
+            handle = executor.launch(
+                "train", ws, input_bindings={})
+            # Calling stop here must not raise or alter the
+            # execution record.
+            handle.stop(reason="late")
+            result = handle.wait()
+
+        assert result.status == "succeeded"
+        ex = ws.executions[result.execution_id]
+        # Natural exit; stop_reason should be None.
+        assert ex.stop_reason is None
+
 
 
 class TestValidation:

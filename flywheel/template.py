@@ -133,6 +133,14 @@ class BlockDefinition:
             ``cyber-root/substrate-contract.md``.  Mutually
             exclusive with ``lifecycle: workspace_persistent``
             (that lifecycle preserves state in-memory instead).
+        stop_timeout_s: Seconds to wait after writing the
+            cooperative stop sentinel before escalating to
+            SIGTERM (and then SIGKILL after a short grace).
+            Block authors whose containers poll the sentinel
+            can set this to whatever cadence matches their
+            cleanup window; containers that ignore the sentinel
+            will always be forcibly stopped after this many
+            seconds plus the TERM grace.  Default 30s.
     """
 
     name: str
@@ -146,6 +154,7 @@ class BlockDefinition:
     post_check: str | None = None
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
     state: bool = False
+    stop_timeout_s: int = 30
 
 
 @dataclass(frozen=True)
@@ -390,6 +399,7 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
     "post_check",
     "lifecycle",
     "state",
+    "stop_timeout_s",
 })
 
 _BLOCK_LIFECYCLES: tuple[str, ...] = ("one_shot", "workspace_persistent")
@@ -515,6 +525,29 @@ def parse_block_definition(
             f"containers preserve state in-memory, not on disk)"
         )
 
+    # stop_timeout_s: seconds to wait for cooperative stop before
+    # escalating to TERM/KILL.  Only applies to container
+    # runners.  A bool check separately because isinstance(x, int)
+    # is True for booleans in Python.
+    stop_timeout_s = entry.get("stop_timeout_s", 30)
+    if isinstance(stop_timeout_s, bool) or not isinstance(
+            stop_timeout_s, int):
+        raise ValueError(
+            f"Block {name!r}: 'stop_timeout_s' must be a "
+            f"non-negative integer (got "
+            f"{type(stop_timeout_s).__name__})"
+        )
+    if stop_timeout_s < 0:
+        raise ValueError(
+            f"Block {name!r}: 'stop_timeout_s' must be "
+            f"non-negative (got {stop_timeout_s})"
+        )
+    if "stop_timeout_s" in entry and runner != "container":
+        raise ValueError(
+            f"Block {name!r}: 'stop_timeout_s' is only valid "
+            f"for runner 'container' (got {runner!r})"
+        )
+
     return BlockDefinition(
         name=name,
         image=image,
@@ -528,6 +561,7 @@ def parse_block_definition(
         post_check=post_check,
         lifecycle=lifecycle,
         state=state,
+        stop_timeout_s=stop_timeout_s,
     )
 
 

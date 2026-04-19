@@ -707,6 +707,121 @@ blocks:
             _from_yaml_with_inline_blocks(path)
 
 
+class TestStopTimeout:
+    """``stop_timeout_s:`` on a block YAML sets the cooperative
+    stop grace window before forced termination."""
+
+    def test_default_is_thirty(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "default.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].stop_timeout_s == 30
+
+    def test_explicit_override_parses(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    stop_timeout_s: 120
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "custom.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].stop_timeout_s == 120
+
+    def test_zero_is_allowed(self, tmp_path: Path):
+        """Zero means 'skip cooperative, go straight to TERM';
+        explicitly permitted for containers that don't poll."""
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    stop_timeout_s: 0
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "zero.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].stop_timeout_s == 0
+
+    def test_negative_rejected(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    stop_timeout_s: -1
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="must be non-negative",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_non_int_rejected(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    stop_timeout_s: "30"
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="non-negative integer",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejected_on_non_container(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    runner: lifecycle
+    runner_justification: "test fixture"
+    stop_timeout_s: 15
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="only valid for runner 'container'",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+
 class TestUnknownBlockKeys:
     """Strict top-level key validation on block YAMLs."""
 
