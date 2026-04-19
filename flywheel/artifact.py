@@ -155,6 +155,23 @@ class BlockExecution:
             having to grep timestamps.  ``None`` for non-agent
             executions and for agent executions that predate this
             field.
+        state_dir: Workspace-relative path to the directory where
+            this execution's private state was captured (e.g.,
+            ``"state/play/exec_a3f7b2e1"``).  Set only for blocks
+            that declare ``state: true`` and whose state-capture
+            step succeeded.  Not an artifact — never in the
+            artifact graph, never consumed by other blocks.
+            ``None`` for stateless blocks, for executions that
+            failed before state could be captured, and for legacy
+            executions that predate this field.
+        failure_phase: When ``status == "failed"``, identifies
+            *which* step of the execution pipeline failed.  One
+            of ``"stage_in"``, ``"invoke"``, ``"state_capture"``,
+            ``"output_collect"``, ``"artifact_commit"`` — see
+            :mod:`flywheel.runtime` for the canonical constants.
+            ``None`` for succeeded / interrupted / running
+            executions, and for failed executions that predate
+            this field.
     """
 
     id: str
@@ -180,6 +197,8 @@ class BlockExecution:
     halt_directive: dict[str, Any] | None = None
     post_check_error: str | None = None
     agent_workspace_dir: str | None = None
+    state_dir: str | None = None
+    failure_phase: str | None = None
 
 
 @dataclass(frozen=True)

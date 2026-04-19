@@ -677,6 +677,8 @@ class Workspace:
                 post_check_error=entry.get("post_check_error"),
                 agent_workspace_dir=entry.get(
                     "agent_workspace_dir"),
+                state_dir=entry.get("state_dir"),
+                failure_phase=entry.get("failure_phase"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -768,6 +770,10 @@ class Workspace:
                 if ex.agent_workspace_dir is not None:
                     entry["agent_workspace_dir"] = (
                         ex.agent_workspace_dir)
+                if ex.state_dir is not None:
+                    entry["state_dir"] = ex.state_dir
+                if ex.failure_phase is not None:
+                    entry["failure_phase"] = ex.failure_phase
                 serialized_executions[eid] = entry
 
             serialized_events = {}

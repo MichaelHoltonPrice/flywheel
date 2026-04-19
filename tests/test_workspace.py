@@ -535,6 +535,80 @@ class TestBlockExecutionNewFields:
         assert loaded.executions["exec1"].predecessor_id is None
 
 
+class TestBlockExecutionStateAndFailurePhase:
+    """Tests for the runtime-contract fields on BlockExecution."""
+
+    def test_round_trip_with_state_dir(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="play", started_at=now,
+            finished_at=now, status="succeeded",
+            state_dir="state/play/exec1",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.executions["exec1"].state_dir == "state/play/exec1"
+        assert loaded.executions["exec1"].failure_phase is None
+
+    def test_round_trip_with_failure_phase(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            finished_at=now, status="failed",
+            failure_phase="state_capture",
+            error="copy failed: permission denied",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.executions["exec1"].failure_phase == "state_capture"
+        assert loaded.executions["exec1"].status == "failed"
+
+    def test_none_fields_not_serialized(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            status="succeeded",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        exec_data = raw["executions"]["exec1"]
+        assert "state_dir" not in exec_data
+        assert "failure_phase" not in exec_data
+
+    def test_load_old_format_defaults_none(self, tmp_path: Path):
+        """Old workspace.yaml without these fields loads cleanly."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            status="succeeded",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.executions["exec1"].state_dir is None
+        assert loaded.executions["exec1"].failure_phase is None
+
+
 class TestLifecycleEvents:
     """Tests for the LifecycleEvent entity on Workspace."""
 
