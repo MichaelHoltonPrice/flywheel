@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -659,12 +659,16 @@ class TestStateRestoreEligibility:
 
         # Seed a successful prior execution so we can tell the
         # difference between "restored from success" and
-        # "restored from more-recent interrupted."
+        # "restored from more-recent interrupted."  Use
+        # explicit timestamps so the reverse-chronological sort
+        # is deterministic — ``datetime.now()`` resolution can
+        # collide on fast machines.
+        base = datetime.now(UTC)
         succeeded_exec = BlockExecution(
             id="exec-old-success",
             block_name="train",
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
+            started_at=base,
+            finished_at=base,
             status="succeeded",
             state_dir="state/train/exec-old-success",
         )
@@ -675,12 +679,13 @@ class TestStateRestoreEligibility:
          / "tag.txt").write_text("OLD")
 
         # Then a more recent interrupted execution with its
-        # own state.
+        # own state (one second later, unambiguously after).
+        later = base + timedelta(seconds=1)
         interrupted_exec = BlockExecution(
             id="exec-recent-interrupted",
             block_name="train",
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
+            started_at=later,
+            finished_at=later,
             status="interrupted",
             stop_reason="operator",
             state_dir="state/train/exec-recent-interrupted",
@@ -721,11 +726,12 @@ class TestStateRestoreEligibility:
         template = _make_template(state=True)
         ws = _make_workspace(tmp_path, template)
 
+        base = datetime.now(UTC)
         succeeded_exec = BlockExecution(
             id="exec-old-success",
             block_name="train",
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
+            started_at=base,
+            finished_at=base,
             status="succeeded",
             state_dir="state/train/exec-old-success",
         )
@@ -735,11 +741,12 @@ class TestStateRestoreEligibility:
         (ws.path / "state" / "train" / "exec-old-success"
          / "tag.txt").write_text("OLD")
 
+        later = base + timedelta(seconds=1)
         failed_exec = BlockExecution(
             id="exec-recent-failed",
             block_name="train",
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
+            started_at=later,
+            finished_at=later,
             status="failed",
             failure_phase=runtime.FAILURE_INVOKE,
             state_dir="state/train/exec-recent-failed",

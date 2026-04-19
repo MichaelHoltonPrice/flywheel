@@ -28,6 +28,7 @@ import contextlib
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -797,6 +798,32 @@ def populate_state_mount(
                 and ex.state_lineage_id == state_lineage_id):
             prior = ex
             break
+
+    # Migration visibility: when a workspace has prior state
+    # captured under the legacy synthetic ``__agent__`` name but
+    # no state under the caller-supplied ``block_name``, warn
+    # once so the operator sees the cold-start isn't a bug in
+    # flywheel, it's unmigrated state.  Resolution is
+    # operator-driven (rename the state_dir + rewrite the
+    # execution record's block_name, or accept the cold start).
+    if prior is None and block_name != "__agent__":
+        legacy_present = any(
+            ex.block_name == "__agent__"
+            and ex.state_dir is not None
+            and ex.status in _STATE_ELIGIBLE_STATUSES
+            for ex in workspace.executions.values()
+        )
+        if legacy_present:
+            print(
+                f"  [flywheel] WARNING: workspace has state "
+                f"captured under the legacy '__agent__' block "
+                f"name but the current launch keys on "
+                f"{block_name!r}.  Starting fresh; migrate by "
+                f"renaming state/__agent__/ -> "
+                f"state/{block_name}/ and updating "
+                f"workspace.yaml execution block_name fields.",
+                file=sys.stderr,
+            )
 
     if prior is not None and prior.state_dir is not None:
         src = workspace.path / prior.state_dir

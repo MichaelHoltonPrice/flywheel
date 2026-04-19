@@ -63,6 +63,12 @@ from flywheel.artifact import BlockExecution
 from flywheel.pattern import ContinuousTrigger, Pattern, Role
 from flywheel.pattern_runner import PatternRunner
 
+_TEST_BLOCK_NAME = "play"
+"""Default block name the fake agent records its executions
+under.  Mirrors :const:`tests._handoff_helpers._TEST_BLOCK_NAME`
+so the two test modules produce consistent ledger and state-dir
+paths."""
+
 # --------------------------------------------------------------------
 # Reused fakes (mirroring test_agent_handoff.py's helpers; kept
 # in this file so the two suites can evolve independently).
@@ -129,7 +135,7 @@ class _FakeAgentHandle:
         if self._script.write_session:
             state_dir_path = (
                 self._workspace_root
-                / "state" / "__agent__"
+                / "state" / _TEST_BLOCK_NAME
                 / self._script.execution_id
             )
             state_dir_path.mkdir(parents=True, exist_ok=True)
@@ -145,7 +151,7 @@ class _FakeAgentHandle:
                 self._script.execution_id
             ] = BlockExecution(
                 id=self._script.execution_id,
-                block_name="__agent__",
+                block_name=_TEST_BLOCK_NAME,
                 started_at=now,
                 finished_at=now,
                 status="succeeded",

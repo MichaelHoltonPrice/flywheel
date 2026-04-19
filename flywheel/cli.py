@@ -89,6 +89,13 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser = run_sub.add_parser("agent")
     agent_parser.add_argument("--workspace", required=True)
     agent_parser.add_argument("--template", required=True)
+    agent_parser.add_argument(
+        "--block-name", required=True,
+        help=(
+            "Block name to record this execution under.  "
+            "Also keys the /state/ restore chain."
+        ),
+    )
     agent_parser.add_argument("--prompt-file", required=True,
                               help="Path to the agent system prompt file.")
     agent_parser.add_argument("--model", default=None)
@@ -384,6 +391,7 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         template=template,
         project_root=config.project_root,
         prompt=prompt,
+        block_name=args.block_name,
         agent_image=args.agent_image,
         auth_volume=args.auth_volume,
         model=args.model,

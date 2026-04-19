@@ -50,11 +50,6 @@ from flywheel.input_staging import (
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
-# Default block name for agent executions until callers pass the
-# real block name they're launching.  State chaining and ledger
-# entries both key off this value, so it has to be stable.
-_AGENT_DEFAULT_BLOCK_NAME = "__agent__"
-
 
 @dataclass(frozen=True)
 class AgentResult:
@@ -219,9 +214,9 @@ class AgentHandle:
         agent_image: str,
         stdout_thread: threading.Thread,
         stderr_thread: threading.Thread,
+        block_name: str,
         container_name: str = "",
         predecessor_id: str | None = None,
-        block_name: str = _AGENT_DEFAULT_BLOCK_NAME,
         agent_workspace_dir: str | None = None,
         staged_inputs: dict[str, Path] | None = None,
         state_mount: Path | None = None,
@@ -644,6 +639,7 @@ def launch_agent_block(
     template: Template,
     project_root: Path,
     prompt: str,
+    block_name: str,
     agent_image: str = "flywheel-claude:latest",
     auth_volume: str = "claude-auth",
     model: str | None = None,
@@ -680,6 +676,12 @@ def launch_agent_block(
         template: The template containing block definitions.
         project_root: Path to the project root.
         prompt: The system prompt for the agent.
+        block_name: Name of the block this launch represents.
+            Written verbatim into the ``BlockExecution`` record
+            and used as the state-chain key for
+            :func:`populate_state_mount` — every launch of the
+            same block with the same ``state_lineage_id``
+            chains through the same state lineage.
         agent_image: Docker image for the agent container.
         auth_volume: Docker named volume with API credentials.
         model: Model name (e.g., "claude-sonnet-4-6").
@@ -783,7 +785,7 @@ def launch_agent_block(
         # artifact.
         state_mount = populate_state_mount(
             workspace,
-            block_name=_AGENT_DEFAULT_BLOCK_NAME,
+            block_name=block_name,
             state_lineage_id=None,
         )
         cmd.extend([
@@ -797,6 +799,7 @@ def launch_agent_block(
             agent_ws=agent_ws,
             agent_workspace_dir=agent_workspace_dir,
             agent_image=agent_image,
+            block_name=block_name,
             output_names=output_names,
             executions_before=executions_before,
             container_name=container_name,
@@ -829,6 +832,7 @@ def _continue_launch(
     agent_ws: Path,
     agent_workspace_dir: str,
     agent_image: str,
+    block_name: str,
     output_names: list[str] | None,
     executions_before: int,
     container_name: str,
@@ -944,6 +948,7 @@ def _continue_launch(
         agent_image=agent_image,
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
+        block_name=block_name,
         container_name=container_name,
         predecessor_id=predecessor_id,
         agent_workspace_dir=agent_workspace_dir,
@@ -957,6 +962,7 @@ def run_agent_block(
     template: Template,
     project_root: Path,
     prompt: str,
+    block_name: str,
     agent_image: str = "flywheel-claude:latest",
     auth_volume: str = "claude-auth",
     model: str | None = None,
@@ -991,6 +997,7 @@ def run_agent_block(
         template=template,
         project_root=project_root,
         prompt=prompt,
+        block_name=block_name,
         agent_image=agent_image,
         auth_volume=auth_volume,
         model=model,

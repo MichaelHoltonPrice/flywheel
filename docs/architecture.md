@@ -306,10 +306,11 @@ The single-launch lifecycle inside ``launch_agent_block``:
    drained in a background thread to prevent pipe deadlocks.
 4. Stream JSON events from the agent's stdout and log them.
 5. On exit (clean, timeout, ``.agent_stop``, or handoff), record
-   the agent itself as a ``BlockExecution`` with
-   ``block_name="__agent__"``, collect output artifacts by
-   matching filenames in the workspace to declared output names,
-   and return an ``AgentResult``.
+   the agent itself as a ``BlockExecution`` under the
+   caller-supplied ``block_name`` (typically the role name such
+   as ``play``), collect output artifacts by matching filenames
+   in the workspace to declared output names, and return an
+   ``AgentResult``.
 
 A total timeout (default 4 hours) kills the container if
 exceeded.
@@ -590,11 +591,13 @@ or crashes.
 ### Agent execution recording
 
 ``AgentHandle.wait()`` records the agent container itself as a
-``BlockExecution`` with ``block_name="__agent__"``. This fills
-a previous gap where the workspace tracked nested block executions
-(game steps, evaluations) but not the agent run that triggered
-them. The ``stop_reason`` field captures why the agent was stopped,
-and ``predecessor_id`` links consecutive runs of the same agent.
+``BlockExecution`` under the caller-supplied ``block_name``
+(typically the role name from the pattern, e.g. ``play``). This
+fills a previous gap where the workspace tracked nested block
+executions (game steps, evaluations) but not the agent run that
+triggered them. The ``stop_reason`` field captures why the agent
+was stopped, and ``predecessor_id`` links consecutive runs of the
+same agent.
 
 ### Lifecycle events
 

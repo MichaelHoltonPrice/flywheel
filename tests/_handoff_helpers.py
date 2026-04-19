@@ -57,15 +57,23 @@ class _FakeWorkspace:
     executions: dict[str, BlockExecution] = field(default_factory=dict)
 
 
+_TEST_BLOCK_NAME = "play"
+"""Default block name the fakes record for their simulated
+executions.  Mirrors a realistic cyberarc-shaped workload so the
+state_dir path looks like what the real runtime would produce."""
+
+
 def _fake_state_dir(
-    workspace_root: Path, execution_id: str,
+    workspace_root: Path,
+    execution_id: str,
+    block_name: str = _TEST_BLOCK_NAME,
 ) -> Path:
     """Return the state_dir path for a given execution.
 
     Mirrors what a real launch+capture would produce:
-    ``<workspace>/state/__agent__/<exec_id>/``.
+    ``<workspace>/state/<block_name>/<exec_id>/``.
     """
-    return workspace_root / "state" / "__agent__" / execution_id
+    return workspace_root / "state" / block_name / execution_id
 
 
 @dataclass
@@ -160,11 +168,10 @@ class _FakeAgentHandle:
 
         Simulates what a real launch + capture would produce:
         writes the session JSONL into a state_dir
-        (``<workspace>/state/__agent__/<exec_id>/session.jsonl``)
+        (``<workspace>/state/<block_name>/<exec_id>/session.jsonl``)
         and registers a matching :class:`BlockExecution` on the
         fake workspace so the handoff loop can look it up.
-        Pending tool calls stay in the agent workspace bind —
-        that path is unchanged in S4 commit 1.
+        Pending tool calls stay in the agent workspace bind.
         """
         agent_ws = (
             self._workspace_root / self._script.agent_workspace_dir
@@ -176,6 +183,7 @@ class _FakeAgentHandle:
             state_dir_path = _fake_state_dir(
                 self._workspace_root,
                 self._script.execution_id,
+                block_name=_TEST_BLOCK_NAME,
             )
             state_dir_path.mkdir(parents=True, exist_ok=True)
             (state_dir_path / SESSION_FILE_NAME).write_text(
@@ -192,7 +200,7 @@ class _FakeAgentHandle:
                 self._script.execution_id
             ] = BlockExecution(
                 id=self._script.execution_id,
-                block_name="__agent__",
+                block_name=_TEST_BLOCK_NAME,
                 started_at=now,
                 finished_at=now,
                 status=self._script.status,
@@ -331,5 +339,6 @@ def _base_kwargs(workspace: _FakeWorkspace) -> dict[str, Any]:
         "template": object(),
         "project_root": workspace.path,
         "prompt": "do the thing",
+        "block_name": _TEST_BLOCK_NAME,
         "agent_workspace_dir": "agent_workspaces/handoff_test",
     }

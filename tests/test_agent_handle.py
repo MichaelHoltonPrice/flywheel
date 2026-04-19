@@ -63,6 +63,7 @@ def _make_handle(
         agent_image="test-image:latest",
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
+        block_name="test_block",
         predecessor_id=predecessor_id,
     )
 
@@ -201,6 +202,7 @@ class TestLaunchFailure:
                 template=template,
                 project_root=tmp_path,
                 prompt="test",
+                block_name="test_block",
             )
 
 
@@ -244,7 +246,7 @@ class TestExecutionRecording:
         ws.add_execution.assert_called_once()
         execution = ws.add_execution.call_args[0][0]
         assert execution.id == "exec_test1"
-        assert execution.block_name == "__agent__"
+        assert execution.block_name == "test_block"
         assert execution.status == "succeeded"
         assert execution.image == "test-image:latest"
         assert result.execution_id == "exec_test1"

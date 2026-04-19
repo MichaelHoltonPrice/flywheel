@@ -294,11 +294,16 @@ class PatternRunner:
                 self._base.prompt_substitutions or {}).items():
             prompt = prompt.replace("{{" + key + "}}", value)
 
+        # A role's name is the block name this launch represents.
+        # When the pattern DSL moves to explicit block instances
+        # (step 6 of the reshape) this becomes a per-instance
+        # override; for now, role.name == block_name.
         kwargs: dict[str, Any] = {
             "workspace": self._base.workspace,
             "template": self._base.template,
             "project_root": self._base.project_root,
             "prompt": prompt,
+            "block_name": role.name,
             "agent_image": self._base.agent_image,
             "auth_volume": self._base.auth_volume,
             "model": role.model or self._base.model,
