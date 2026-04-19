@@ -34,7 +34,7 @@ from flywheel.execution import run_block
 from flywheel.pattern import Pattern, discover_patterns
 from flywheel.pattern_runner import PatternRunner
 from flywheel.project_hooks import load_project_hooks_class
-from flywheel.template import Template, check_service_dependencies
+from flywheel.template import Template
 from flywheel.workspace import Workspace
 
 
@@ -430,10 +430,6 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         template_path, block_registry=block_registry)
 
     ws = Workspace.load(Path(args.workspace))
-
-    warnings = check_service_dependencies(template)
-    for w in warnings:
-        print(f"  [flywheel] WARNING: {w}")
 
     patterns = discover_patterns(config.patterns_dir)
     if args.pattern_name not in patterns:

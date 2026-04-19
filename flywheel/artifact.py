@@ -112,11 +112,10 @@ class BlockExecution:
             parent is "who launched me," predecessor is "who am I
             resuming."
         runner: How this execution was physically performed:
-            ``"container"`` (Docker), ``"inprocess"`` (function call
-            in the calling container), ``"subprocess"`` (local
-            process), ``"record"`` (legacy record-mode, no work
-            performed), or ``"agent"`` (long-lived agent container).
-            None for legacy executions that predate the runner concept.
+            ``"container"`` (Docker), ``"record"`` (legacy
+            record-mode, no work performed), or ``"agent"``
+            (long-lived agent container).  None for legacy
+            executions that predate the runner concept.
         caller: For tool-triggered logical executions, identifies
             which MCP server and tool invoked this block. Shape is
             ``{"mcp_server": str, "tool": str}``. None for executions

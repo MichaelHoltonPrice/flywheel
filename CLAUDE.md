@@ -21,7 +21,6 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 - **Project hooks** (`flywheel/project_hooks.py`): The shrunken project-side surface consumed by `flywheel run pattern`. `ProjectHooks.init(workspace, template, project_root, args) -> dict` parses project-specific CLI args (after `--`) and returns `AgentBlockConfig` overrides (env vars, mounts, pre-launch hook, etc.). Optional `teardown()` releases resources after the run. Discovered via `project_hooks: module.path:ClassName` in `flywheel.yaml` (or the `--project-hooks` CLI flag); `load_project_hooks_class()` resolves the import path.
 - **Exit reason classification**: `AgentResult.exit_reason` classifies why the agent exited: `"completed"`, `"auth_failure"`, `"rate_limit"`, `"max_turns"`, `"stopped"`, `"crashed"`. Reads `.agent_state.json` written by the agent_runner.
 - **Block groups** (`flywheel/block_group.py`): Generic parallel execution for any `BlockExecutor` type. `BlockGroup` launches N blocks via an executor, waits sequentially, records lifecycle events. `AgentGroup` remains for agent-specific parallel launches.
-- **Service dependencies**: Templates declare external services via a `services` key. `ServiceDependency` records name, `url_env`, and description. `check_service_dependencies()` warns about unset env vars.
 
 ## Batteries (solve-once capabilities)
 

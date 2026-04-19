@@ -7,7 +7,6 @@ import pytest
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
-    check_service_dependencies,
 )
 from tests._inline_blocks import (
     from_yaml_with_inline_blocks as _from_yaml_with_inline_blocks,
@@ -506,91 +505,188 @@ blocks:
         assert template.blocks[0].outputs[0].name == "session"
 
 
-class TestServiceDependencies:
-    def test_parse_services(self, tmp_path: Path):
+class TestLifecycle:
+    """``lifecycle:`` on a block YAML declares the container-lifetime model."""
+
+    def test_default_is_one_shot(self, tmp_path: Path):
         yaml_content = """\
 artifacts:
-  - name: checkpoint
+  - name: data
     kind: copy
-
-blocks: []
-
-services:
-  - name: game_server
-    url_env: ARC_SERVER_URL
-    description: "ARC-AGI-3 game server"
-  - name: auth_service
-    url_env: AUTH_URL
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs: []
+    outputs: [data]
 """
-        path = tmp_path / "with_services.yaml"
+        path = tmp_path / "default.yaml"
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].lifecycle == "one_shot"
 
-        assert len(template.services) == 2
-        assert template.services[0].name == "game_server"
-        assert template.services[0].url_env == "ARC_SERVER_URL"
-        assert template.services[0].description == "ARC-AGI-3 game server"
-        assert template.services[1].name == "auth_service"
-        assert template.services[1].description == ""
-
-    def test_no_services_key(self, tmp_path: Path):
-        """Templates without services key default to empty list."""
-        path = tmp_path / "no_services.yaml"
-        path.write_text(VALID_TEMPLATE_YAML)
-        template = _from_yaml_with_inline_blocks(path)
-        assert template.services == []
-
-    def test_service_name_validated(self, tmp_path: Path):
+    def test_workspace_persistent_parses(self, tmp_path: Path):
         yaml_content = """\
-artifacts: []
-blocks: []
-services:
-  - name: "invalid/name"
-    url_env: SOME_URL
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecycle: workspace_persistent
+    inputs: []
+    outputs: [data]
 """
-        path = tmp_path / "bad_service.yaml"
+        path = tmp_path / "persistent.yaml"
         path.write_text(yaml_content)
-        with pytest.raises(ValueError, match="invalid"):
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].lifecycle == "workspace_persistent"
+
+    def test_unknown_lifecycle_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecycle: forever
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="unknown lifecycle"):
             _from_yaml_with_inline_blocks(path)
 
-    def test_check_service_dependencies_warns(
-        self, tmp_path: Path, monkeypatch,
-    ):
+    def test_persistent_rejected_on_non_container(self, tmp_path: Path):
+        """Lifecycle only applies to container runners."""
         yaml_content = """\
-artifacts: []
-blocks: []
-services:
-  - name: game_server
-    url_env: ARC_SERVER_URL
-  - name: other
-    url_env: OTHER_URL
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    runner: lifecycle
+    runner_justification: "test fixture"
+    lifecycle: workspace_persistent
+    inputs: []
+    outputs: [data]
 """
-        path = tmp_path / "svc.yaml"
+        path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
-        template = _from_yaml_with_inline_blocks(path)
+        with pytest.raises(
+            ValueError, match="only valid for runner 'container'",
+        ):
+            _from_yaml_with_inline_blocks(path)
 
-        monkeypatch.delenv("ARC_SERVER_URL", raising=False)
-        monkeypatch.delenv("OTHER_URL", raising=False)
-
-        warnings = check_service_dependencies(template)
-        assert len(warnings) == 2
-        assert "ARC_SERVER_URL" in warnings[0]
-
-    def test_check_service_dependencies_no_warning_when_set(
-        self, tmp_path: Path, monkeypatch,
+    def test_explicit_one_shot_rejected_on_non_container(
+        self, tmp_path: Path,
     ):
+        """Even the default value is rejected — the key itself is the error.
+
+        ``lifecycle`` has no meaning for non-container blocks, so
+        declaring it at all on one is a config mistake worth
+        surfacing.  Matches the docstring contract.
+        """
         yaml_content = """\
-artifacts: []
-blocks: []
-services:
-  - name: game_server
-    url_env: ARC_SERVER_URL
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    runner: lifecycle
+    runner_justification: "test fixture"
+    lifecycle: one_shot
+    inputs: []
+    outputs: [data]
 """
-        path = tmp_path / "svc.yaml"
+        path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
-        template = _from_yaml_with_inline_blocks(path)
+        with pytest.raises(
+            ValueError, match="only valid for runner 'container'",
+        ):
+            _from_yaml_with_inline_blocks(path)
 
-        monkeypatch.setenv("ARC_SERVER_URL", "http://localhost:8001")
 
-        warnings = check_service_dependencies(template)
-        assert warnings == []
+class TestUnknownBlockKeys:
+    """Strict top-level key validation on block YAMLs."""
+
+    def test_unknown_key_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    notes: random extra field
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="unknown top-level"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_typo_in_known_key_raises(self, tmp_path: Path):
+        """A typo like ``lifecylce`` surfaces instead of being dropped."""
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecylce: workspace_persistent
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "typo.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="lifecylce"):
+            _from_yaml_with_inline_blocks(path)
+
+
+class TestUnknownSlotKeys:
+    """Strict key validation extends into nested input/output mappings."""
+
+    def test_unknown_key_in_input_slot_raises(self, tmp_path: Path):
+        """``optionl`` (typo of ``optional``) should surface."""
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs:
+      - name: data
+        container_path: /input/data
+        optionl: true
+    outputs: [data]
+"""
+        path = tmp_path / "bad_in.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="optionl"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_unknown_key_in_output_slot_raises(self, tmp_path: Path):
+        """``container_pat`` (typo of ``container_path``) should surface."""
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs: []
+    outputs:
+      - name: data
+        container_pat: /output/data
+"""
+        path = tmp_path / "bad_out.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="container_pat"):
+            _from_yaml_with_inline_blocks(path)
+
+

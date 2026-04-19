@@ -678,27 +678,6 @@ populated from the ``AgentMount`` so an operator inspecting an
 ``agent_workspaces/<id>/`` directory can find the execution that
 produced it via ``workspace.yaml``.
 
-## Service dependencies
-
-Templates can declare external service dependencies:
-
-```yaml
-services:
-  - name: game_server
-    url_env: ARC_SERVER_URL
-    description: "ARC-AGI-3 game server"
-```
-
-``ServiceDependency`` records the service name, the environment
-variable that blocks expect to contain its URL, and an optional
-description. Flywheel does not start or manage the service — the
-declaration is for documentation, validation, and future
-automation.
-
-``check_service_dependencies(template)`` returns warnings for
-any declared service whose ``url_env`` is not set in the current
-environment.
-
 ## Patterns (declarative agent topology)
 
 ``Pattern`` (in ``flywheel.pattern``) and ``PatternRunner``

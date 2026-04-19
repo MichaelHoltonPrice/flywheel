@@ -11,7 +11,6 @@ and are loaded into a :class:`BlockRegistry`.  The template's
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -56,7 +55,7 @@ class InputSlot:
             ``/execution/begin`` the channel resolves this to the
             latest registered instance of that name.
         container_path: Where the artifact is mounted inside a
-            container block.  For ``inprocess`` blocks it is just
+            container block.  For ``lifecycle`` blocks it is just
             documentation; the resolver returns the host path
             either way.
         optional: If ``True``, missing instances skip the slot
@@ -81,31 +80,13 @@ class OutputSlot:
 
 
 @dataclass(frozen=True)
-class BlockImplementation:
-    """How an ``inprocess`` or ``subprocess`` block's payload is dispatched.
-
-    Required for non-``container`` runners. Names a Python module and
-    a callable inside it that the runner imports and invokes with the
-    block's :class:`ExecutionContext`.
-
-    Attributes:
-        python_module: Dotted Python module path
-            (e.g., ``"cyberarc.blocks.predict_block"``).
-        entry: Callable name within the module (default ``"run"``).
-    """
-
-    python_module: str
-    entry: str = "run"
-
-
-@dataclass(frozen=True)
 class BlockDefinition:
     """A declared block in a template — image, Docker flags, and I/O slots.
 
     Attributes:
         name: Block identifier, unique per template.
         image: Docker image.  Required for ``runner == "container"``;
-            forbidden for every other runner.
+            forbidden for ``runner == "lifecycle"``.
         inputs: Declared input artifact slots.
         outputs: Declared output artifact slots.
         docker_args: Extra docker run args for container blocks.
@@ -113,26 +94,16 @@ class BlockDefinition:
         runner: How the block is physically performed.  One of:
 
             - ``"container"`` (default): launched as a Docker
-              container by ``ContainerExecutor``.  Requires ``image``.
-            - ``"inprocess"``: dispatched by the channel into a
-              Python entrypoint declared in ``implementation``.
-              Reserved for future phases; not currently used.
-            - ``"subprocess"``: dispatched as a local subprocess.
-              Reserved for future phases.
+              container by ``ContainerExecutor``.  Requires
+              ``image``.
             - ``"lifecycle"``: has no body of its own.  The block
               is invoked exclusively through the ``/execution/begin
               + /execution/end`` lifecycle API by an MCP tool.  The
               tool→block binding lives in a tool-block manifest;
               the manifest entry is what makes the block reachable.
-              Use this for blocks whose body is the tool function
-              itself (e.g., cyberarc's ``predict``, ``game_step``,
-              ``exploration_request``, ``brainstorm_request``).
         runner_justification: Required free-text rationale when
-            ``runner != "container"``. Forces the author to state
+            ``runner != "container"``.  Forces the author to state
             why container isolation isn't appropriate.
-        implementation: Where the runner finds the payload.
-            Required for ``inprocess`` and ``subprocess``.
-            Forbidden for ``container`` and ``lifecycle``.
         post_check: Optional dotted Python path to a callable
             invoked by
             :class:`flywheel.local_block.LocalBlockRecorder` after
@@ -140,6 +111,18 @@ class BlockDefinition:
             ``None`` means no post-execution check is configured
             for this block.  Resolved eagerly at registry-load
             time (a typo fails startup, not the run).
+        lifecycle: Container-lifetime model.  One of:
+
+            - ``"one_shot"``: container lifetime equals one
+              execution.
+            - ``"workspace_persistent"``: container lifetime
+              equals the workspace's lifetime.
+
+            The block definition only declares intent.  How
+            executions discover, start, or attach to a container
+            is executor policy.  State — whether a block has
+            internal state that must survive across executions —
+            is a separate concern, not implied by either value.
     """
 
     name: str
@@ -148,33 +131,10 @@ class BlockDefinition:
     outputs: list[OutputSlot] = field(default_factory=list)
     docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    runner: Literal[
-        "container", "inprocess", "subprocess", "lifecycle"
-    ] = "container"
+    runner: Literal["container", "lifecycle"] = "container"
     runner_justification: str | None = None
-    implementation: BlockImplementation | None = None
     post_check: str | None = None
-
-
-@dataclass(frozen=True)
-class ServiceDependency:
-    """A declared external service dependency.
-
-    Documents that a workspace requires an external service to
-    be running.  Flywheel does not start or manage the service,
-    but records the dependency for documentation, validation,
-    and future automation.
-
-    Attributes:
-        name: Service name.
-        url_env: Environment variable name that blocks expect
-            to contain the service URL.
-        description: Human-readable description.
-    """
-
-    name: str
-    url_env: str
-    description: str = ""
+    lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
 
 
 @dataclass(frozen=True)
@@ -184,7 +144,6 @@ class Template:
     name: str
     artifacts: list[ArtifactDeclaration]
     blocks: list[BlockDefinition]
-    services: list[ServiceDependency] = field(default_factory=list)
 
     @classmethod
     def from_yaml(
@@ -254,21 +213,10 @@ class Template:
                 block, artifact_names, artifact_kinds, path.name)
             blocks.append(block)
 
-        services: list[ServiceDependency] = []
-        for entry in data.get("services", []):
-            svc_name = entry["name"]
-            _validate_name(svc_name, "Service")
-            services.append(ServiceDependency(
-                name=svc_name,
-                url_env=entry["url_env"],
-                description=entry.get("description", ""),
-            ))
-
         return cls(
             name=path.stem,
             artifacts=artifacts,
             blocks=blocks,
-            services=services,
         )
 
 
@@ -317,8 +265,29 @@ def _parse_artifacts(
     return artifacts, artifact_names, artifact_kinds
 
 
+# Keys accepted inside a nested input-slot mapping.  Unknown
+# keys raise, so typos like ``container_pat`` or ``optionl`` are
+# surfaced instead of silently defaulted.
+_INPUT_SLOT_KEYS: frozenset[str] = frozenset({
+    "name",
+    "container_path",
+    "optional",
+})
+
+# Keys accepted inside a nested output-slot mapping.
+_OUTPUT_SLOT_KEYS: frozenset[str] = frozenset({
+    "name",
+    "container_path",
+})
+
+
 def _parse_input_slots(raw: list) -> list[InputSlot]:
-    """Parse a list of raw input entries into InputSlot objects."""
+    """Parse a list of raw input entries into InputSlot objects.
+
+    Each entry is either a string (bare artifact name) or a
+    mapping with a known set of keys; unknown keys raise so
+    typos surface.
+    """
     slots: list[InputSlot] = []
     for inp in raw:
         if isinstance(inp, str):
@@ -336,6 +305,13 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
                 f"the source artifact as 'kind: incremental' "
                 f"instead and reference it directly here."
             )
+        unknown = set(inp) - _INPUT_SLOT_KEYS
+        if unknown:
+            raise ValueError(
+                f"Input slot {ref!r}: unknown key(s) "
+                f"{sorted(unknown)!r}; valid keys are "
+                f"{sorted(_INPUT_SLOT_KEYS)!r}"
+            )
 
         slots.append(InputSlot(
             name=ref,
@@ -351,7 +327,10 @@ def _parse_output_slots(
 ) -> list[OutputSlot]:
     """Parse a list of raw output entries into OutputSlot objects.
 
-    Validates that no output name is duplicated within the block.
+    Each entry is either a string (bare artifact name) or a
+    mapping with a known set of keys.  Validates that no output
+    name is duplicated within the block and that no unknown keys
+    appear in a mapping entry.
     """
     slots: list[OutputSlot] = []
     seen: set[str] = set()
@@ -364,6 +343,13 @@ def _parse_output_slots(
             ))
         else:
             ref = out["name"]
+            unknown = set(out) - _OUTPUT_SLOT_KEYS
+            if unknown:
+                raise ValueError(
+                    f"Output slot {ref!r}: unknown key(s) "
+                    f"{sorted(unknown)!r}; valid keys are "
+                    f"{sorted(_OUTPUT_SLOT_KEYS)!r}"
+                )
             slots.append(OutputSlot(
                 name=ref,
                 container_path=out.get(
@@ -374,6 +360,27 @@ def _parse_output_slots(
                 f"Block {block_name!r} has duplicate output {ref!r}")
         seen.add(ref)
     return slots
+
+
+# Top-level keys accepted in a per-block YAML (or inline block
+# definition).  ``parse_block_definition`` rejects anything
+# outside this set so typos — e.g., ``lifecylce`` for
+# ``lifecycle`` — surface as errors instead of silently
+# disappearing into the parser.
+_BLOCK_YAML_KEYS: frozenset[str] = frozenset({
+    "name",
+    "runner",
+    "image",
+    "runner_justification",
+    "inputs",
+    "outputs",
+    "docker_args",
+    "env",
+    "post_check",
+    "lifecycle",
+})
+
+_BLOCK_LIFECYCLES: tuple[str, ...] = ("one_shot", "workspace_persistent")
 
 
 def parse_block_definition(
@@ -398,7 +405,8 @@ def parse_block_definition(
         :meth:`Template.from_yaml`.
 
     Raises:
-        ValueError: For any structural problem in the block YAML.
+        ValueError: For any structural problem in the block YAML,
+            including unknown top-level keys.
     """
     if "name" not in entry:
         raise ValueError(
@@ -408,9 +416,19 @@ def parse_block_definition(
     name = entry["name"]
     _validate_name(name, "Block")
 
+    # Reject unknown top-level keys before reading any field, so a
+    # typo like ``lifecylce`` produces an error naming the offending
+    # key rather than being silently dropped.
+    unknown = set(entry) - _BLOCK_YAML_KEYS
+    if unknown:
+        raise ValueError(
+            f"Block {name!r}: unknown top-level key(s) "
+            f"{sorted(unknown)!r}; valid keys are "
+            f"{sorted(_BLOCK_YAML_KEYS)!r}"
+        )
+
     runner = entry.get("runner", "container")
-    valid_runners = (
-        "container", "inprocess", "subprocess", "lifecycle")
+    valid_runners = ("container", "lifecycle")
     if runner not in valid_runners:
         raise ValueError(
             f"Block {name!r}: unknown runner {runner!r}; "
@@ -419,7 +437,6 @@ def parse_block_definition(
 
     image = entry.get("image", "")
     runner_justification = entry.get("runner_justification")
-    raw_impl = entry.get("implementation")
 
     if runner == "container":
         if not image:
@@ -427,26 +444,14 @@ def parse_block_definition(
                 f"Block {name!r}: runner 'container' requires "
                 f"a non-empty 'image' field"
             )
-        if raw_impl is not None:
-            raise ValueError(
-                f"Block {name!r}: runner 'container' must not "
-                f"declare 'implementation'"
-            )
     elif runner == "lifecycle":
         # Lifecycle blocks have no body of their own; the channel
         # never dispatches them.  The MCP-tool manifest binding is
-        # the implementation, so neither image nor implementation
-        # belongs on the block definition.
+        # the implementation, so an image doesn't belong here.
         if image:
             raise ValueError(
                 f"Block {name!r}: runner 'lifecycle' must not "
                 f"declare 'image' (got {image!r})"
-            )
-        if raw_impl is not None:
-            raise ValueError(
-                f"Block {name!r}: runner 'lifecycle' must not "
-                f"declare 'implementation' (the manifest binding "
-                f"to an MCP tool is the implementation)"
             )
         if not runner_justification:
             raise ValueError(
@@ -454,45 +459,28 @@ def parse_block_definition(
                 f"'runner_justification' (free-text rationale "
                 f"for why the block has no container body)"
             )
-    else:
-        if image:
-            raise ValueError(
-                f"Block {name!r}: runner {runner!r} must not "
-                f"declare 'image' (got {image!r})"
-            )
-        if not runner_justification:
-            raise ValueError(
-                f"Block {name!r}: runner {runner!r} requires "
-                f"'runner_justification' (free-text rationale)"
-            )
-        if raw_impl is None:
-            raise ValueError(
-                f"Block {name!r}: runner {runner!r} requires "
-                f"'implementation' (python_module + entry)"
-            )
-
-    implementation: BlockImplementation | None = None
-    if raw_impl is not None:
-        if not isinstance(raw_impl, dict):
-            raise ValueError(
-                f"Block {name!r}: 'implementation' must be a "
-                f"mapping, got {type(raw_impl).__name__}"
-            )
-        if "python_module" not in raw_impl:
-            raise ValueError(
-                f"Block {name!r}: 'implementation' is missing "
-                f"required 'python_module' field"
-            )
-        implementation = BlockImplementation(
-            python_module=raw_impl["python_module"],
-            entry=raw_impl.get("entry", "run"),
-        )
 
     post_check = entry.get("post_check")
     if post_check is not None and not isinstance(post_check, str):
         raise ValueError(
             f"Block {name!r}: 'post_check' must be a dotted "
             f"Python path string (got {type(post_check).__name__})"
+        )
+
+    # ``lifecycle`` is only meaningful for container blocks.
+    # Reject the key entirely on non-container runners, even when
+    # its value is the default ``one_shot`` — the point is to flag
+    # semantically nonsensical configs, not just wrong values.
+    if "lifecycle" in entry and runner != "container":
+        raise ValueError(
+            f"Block {name!r}: 'lifecycle' is only valid for "
+            f"runner 'container' (got {runner!r})"
+        )
+    lifecycle = entry.get("lifecycle", "one_shot")
+    if lifecycle not in _BLOCK_LIFECYCLES:
+        raise ValueError(
+            f"Block {name!r}: unknown lifecycle {lifecycle!r}; "
+            f"expected one of {', '.join(_BLOCK_LIFECYCLES)}"
         )
 
     return BlockDefinition(
@@ -505,8 +493,8 @@ def parse_block_definition(
         env=entry.get("env", {}),
         runner=runner,
         runner_justification=runner_justification,
-        implementation=implementation,
         post_check=post_check,
+        lifecycle=lifecycle,
     )
 
 
@@ -538,24 +526,3 @@ def _validate_block_against_artifacts(
             )
 
 
-def check_service_dependencies(template: Template) -> list[str]:
-    """Return warnings for unset service URL environment variables.
-
-    Checks each service dependency declared in the template and
-    returns a warning string for any whose ``url_env`` is not set
-    in the current environment.
-
-    Args:
-        template: The template to check.
-
-    Returns:
-        List of warning strings (empty if all services are available).
-    """
-    warnings: list[str] = []
-    for svc in template.services:
-        if not os.environ.get(svc.url_env):
-            warnings.append(
-                f"Service {svc.name!r} expects {svc.url_env} "
-                f"but it is not set"
-            )
-    return warnings

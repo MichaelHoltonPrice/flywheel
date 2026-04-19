@@ -3,7 +3,7 @@
 Covers:
 
 - ``BlockRegistry.from_directory`` loads ``workforce/blocks/*.yaml``.
-- Block YAML schema validation (runner, image, implementation,
+- Block YAML schema validation (runner, image,
   runner_justification rules).
 - Template integration: string entries in ``blocks:`` resolve to
   registry blocks; inline-dict entries are rejected.
@@ -22,7 +22,6 @@ import yaml
 from flywheel.blocks import BlockRegistry, load_block_file
 from flywheel.config import load_project_config
 from flywheel.template import (
-    BlockImplementation,
     Template,
     parse_block_definition,
 )
@@ -40,24 +39,17 @@ CONTAINER_BLOCK = {
     ],
 }
 
-INPROCESS_BLOCK = {
-    "name": "predict",
-    "runner": "inprocess",
-    "runner_justification": (
-        "Lightweight Python evaluation; container overhead would "
-        "dominate the actual compute."
-    ),
+# A second container-block fixture used alongside CONTAINER_BLOCK
+# to exercise multi-block registries.
+EVAL_BLOCK = {
+    "name": "eval",
+    "image": "eval:latest",
     "inputs": [
-        {"name": "predictor", "container_path": "/input/predictor"},
+        {"name": "checkpoint", "container_path": "/input/checkpoint"},
     ],
     "outputs": [
-        {"name": "prediction",
-         "container_path": "/output/prediction"},
+        {"name": "score", "container_path": "/output/score"},
     ],
-    "implementation": {
-        "python_module": "mypkg.blocks.predict_block",
-        "entry": "run",
-    },
 }
 
 
@@ -68,14 +60,12 @@ artifacts:
     kind: copy
   - name: checkpoint
     kind: copy
-  - name: predictor
-    kind: copy
-  - name: prediction
+  - name: score
     kind: copy
 
 blocks:
   - train
-  - predict
+  - eval
 """
 
 
@@ -89,7 +79,7 @@ def blocks_dir(tmp_path: Path) -> Path:
     blocks = tmp_path / "blocks"
     blocks.mkdir()
     _write_yaml(blocks / "train.yaml", CONTAINER_BLOCK)
-    _write_yaml(blocks / "predict.yaml", INPROCESS_BLOCK)
+    _write_yaml(blocks / "eval.yaml", EVAL_BLOCK)
     return blocks
 
 
@@ -99,36 +89,13 @@ class TestParseBlockDefinition:
         assert block.name == "train"
         assert block.runner == "container"
         assert block.image == "train:latest"
-        assert block.implementation is None
         assert block.runner_justification is None
         assert len(block.inputs) == 1
         assert block.inputs[0].name == "engine"
         assert block.outputs[0].name == "checkpoint"
 
-    def test_inprocess_block_minimum(self):
-        block = parse_block_definition(INPROCESS_BLOCK)
-        assert block.name == "predict"
-        assert block.runner == "inprocess"
-        assert block.image == ""
-        assert block.runner_justification.startswith("Lightweight")
-        assert isinstance(block.implementation, BlockImplementation)
-        assert (block.implementation.python_module
-                == "mypkg.blocks.predict_block")
-        assert block.implementation.entry == "run"
-
-    def test_inprocess_implementation_default_entry(self):
-        body = {
-            **INPROCESS_BLOCK,
-            "implementation": {
-                "python_module": "x.y",
-                # entry omitted; should default to "run".
-            },
-        }
-        block = parse_block_definition(body)
-        assert block.implementation.entry == "run"
-
     def test_unknown_runner_rejected(self):
-        body = {**INPROCESS_BLOCK, "runner": "wasm"}
+        body = {**CONTAINER_BLOCK, "runner": "wasm"}
         with pytest.raises(ValueError, match="unknown runner"):
             parse_block_definition(body)
 
@@ -137,45 +104,6 @@ class TestParseBlockDefinition:
         body.pop("image")
         with pytest.raises(
                 ValueError, match="requires.*non-empty 'image'"):
-            parse_block_definition(body)
-
-    def test_container_forbids_implementation(self):
-        body = {
-            **CONTAINER_BLOCK,
-            "implementation": {"python_module": "x"},
-        }
-        with pytest.raises(
-                ValueError, match="must not declare 'implementation'"):
-            parse_block_definition(body)
-
-    def test_inprocess_forbids_image(self):
-        body = {**INPROCESS_BLOCK, "image": "leaked:latest"}
-        with pytest.raises(
-                ValueError, match="must not declare 'image'"):
-            parse_block_definition(body)
-
-    def test_inprocess_requires_justification(self):
-        body = {**INPROCESS_BLOCK}
-        body.pop("runner_justification")
-        with pytest.raises(
-                ValueError,
-                match="requires 'runner_justification'"):
-            parse_block_definition(body)
-
-    def test_inprocess_requires_implementation(self):
-        body = {**INPROCESS_BLOCK}
-        body.pop("implementation")
-        with pytest.raises(
-                ValueError, match="requires 'implementation'"):
-            parse_block_definition(body)
-
-    def test_implementation_requires_python_module(self):
-        body = {
-            **INPROCESS_BLOCK,
-            "implementation": {"entry": "run"},
-        }
-        with pytest.raises(
-                ValueError, match="missing.*'python_module'"):
             parse_block_definition(body)
 
     def test_duplicate_output_rejected(self):
@@ -214,9 +142,9 @@ class TestLoadBlockFile:
 class TestBlockRegistry:
     def test_from_directory_loads_all(self, blocks_dir: Path):
         registry = BlockRegistry.from_directory(blocks_dir)
-        assert sorted(registry.names()) == ["predict", "train"]
+        assert sorted(registry.names()) == ["eval", "train"]
         assert "train" in registry
-        assert "predict" in registry
+        assert "eval" in registry
         assert registry.get("train").name == "train"
 
     def test_unknown_name_raises(self, blocks_dir: Path):
@@ -233,7 +161,7 @@ class TestBlockRegistry:
         d = tmp_path / "blocks"
         d.mkdir()
         _write_yaml(d / "train.yaml", CONTAINER_BLOCK)
-        _write_yaml(d / "_draft_predict.yaml", INPROCESS_BLOCK)
+        _write_yaml(d / "_draft_eval.yaml", EVAL_BLOCK)
         registry = BlockRegistry.from_directory(d)
         assert registry.names() == ["train"]
 
@@ -277,8 +205,8 @@ class TestTemplateRegistryIntegration:
             tmpl_path, block_registry=registry)
 
         names = [b.name for b in template.blocks]
-        assert names == ["train", "predict"]
-        assert template.blocks[1].runner == "inprocess"
+        assert names == ["train", "eval"]
+        assert template.blocks[1].runner == "container"
 
     def test_string_reference_without_registry_raises(
             self, tmp_path: Path):
