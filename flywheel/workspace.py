@@ -679,6 +679,7 @@ class Workspace:
                     "agent_workspace_dir"),
                 state_dir=entry.get("state_dir"),
                 failure_phase=entry.get("failure_phase"),
+                state_lineage_id=entry.get("state_lineage_id"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -774,6 +775,8 @@ class Workspace:
                     entry["state_dir"] = ex.state_dir
                 if ex.failure_phase is not None:
                     entry["failure_phase"] = ex.failure_phase
+                if ex.state_lineage_id is not None:
+                    entry["state_lineage_id"] = ex.state_lineage_id
                 serialized_executions[eid] = entry
 
             serialized_events = {}

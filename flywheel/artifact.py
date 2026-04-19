@@ -172,6 +172,16 @@ class BlockExecution:
             ``None`` for succeeded / interrupted / running
             executions, and for failed executions that predate
             this field.
+        state_lineage_id: Names the state lineage this execution
+            belongs to.  The state loader matches on
+            ``(block_name, state_lineage_id)`` to find the prior
+            state to restore.  ``None`` means the default
+            (single-lineage) bucket — today's executor always
+            passes ``None``, which gives every block one
+            evolving state chain per workspace.  When multiple
+            lineages become needed (parallel instances, forks),
+            callers can pass distinct IDs without a schema
+            migration.
     """
 
     id: str
@@ -199,6 +209,7 @@ class BlockExecution:
     agent_workspace_dir: str | None = None
     state_dir: str | None = None
     failure_phase: str | None = None
+    state_lineage_id: str | None = None
 
 
 @dataclass(frozen=True)

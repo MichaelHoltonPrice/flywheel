@@ -607,6 +607,29 @@ class TestBlockExecutionStateAndFailurePhase:
         loaded = Workspace.load(ws.path)
         assert loaded.executions["exec1"].state_dir is None
         assert loaded.executions["exec1"].failure_phase is None
+        assert loaded.executions["exec1"].state_lineage_id is None
+
+    def test_round_trip_with_state_lineage_id(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="play", started_at=now,
+            finished_at=now, status="succeeded",
+            state_dir="state/play/exec1",
+            state_lineage_id="branch_a",
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert (
+            loaded.executions["exec1"].state_lineage_id
+            == "branch_a"
+        )
 
 
 class TestLifecycleEvents:

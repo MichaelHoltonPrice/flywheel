@@ -608,6 +608,105 @@ blocks:
             _from_yaml_with_inline_blocks(path)
 
 
+class TestStateField:
+    """``state:`` on a block YAML declares private state support."""
+
+    def test_default_is_false(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "default.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].state is False
+
+    def test_state_true_parses(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    state: true
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "stateful.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].state is True
+
+    def test_non_bool_raises(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    state: "yes"
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="'state' must be a boolean"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_state_rejected_on_non_container(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    runner: lifecycle
+    runner_justification: "test fixture"
+    state: true
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="only valid for runner 'container'",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_state_with_workspace_persistent_rejected(
+        self, tmp_path: Path,
+    ):
+        """Persistent lifecycle preserves state in-memory; declaring
+        state: true alongside addresses the same concern twice and
+        is a config error."""
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecycle: workspace_persistent
+    state: true
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="mutually exclusive",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+
 class TestUnknownBlockKeys:
     """Strict top-level key validation on block YAMLs."""
 

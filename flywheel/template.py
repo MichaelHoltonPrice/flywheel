@@ -94,8 +94,9 @@ class BlockDefinition:
         runner: How the block is physically performed.  One of:
 
             - ``"container"`` (default): launched as a Docker
-              container by ``ContainerExecutor``.  Requires
-              ``image``.
+              container by :class:`flywheel.executor.ProcessExitExecutor`
+              (one-shot) or :class:`flywheel.executor.RequestResponseExecutor`
+              (persistent, when that lands).  Requires ``image``.
             - ``"lifecycle"``: has no body of its own.  The block
               is invoked exclusively through the ``/execution/begin
               + /execution/end`` lifecycle API by an MCP tool.  The
@@ -123,6 +124,15 @@ class BlockDefinition:
             is executor policy.  State — whether a block has
             internal state that must survive across executions —
             is a separate concern, not implied by either value.
+        state: Whether the block has private memory that must
+            survive across executions.  When ``True``, flywheel
+            mounts a ``/state/`` directory in the container,
+            populates it at start with the prior successful
+            execution's captured state, and captures its
+            contents on clean exit.  See
+            ``cyber-root/substrate-contract.md``.  Mutually
+            exclusive with ``lifecycle: workspace_persistent``
+            (that lifecycle preserves state in-memory instead).
     """
 
     name: str
@@ -135,6 +145,7 @@ class BlockDefinition:
     runner_justification: str | None = None
     post_check: str | None = None
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
+    state: bool = False
 
 
 @dataclass(frozen=True)
@@ -378,6 +389,7 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
     "env",
     "post_check",
     "lifecycle",
+    "state",
 })
 
 _BLOCK_LIFECYCLES: tuple[str, ...] = ("one_shot", "workspace_persistent")
@@ -483,6 +495,26 @@ def parse_block_definition(
             f"expected one of {', '.join(_BLOCK_LIFECYCLES)}"
         )
 
+    state = entry.get("state", False)
+    if not isinstance(state, bool):
+        raise ValueError(
+            f"Block {name!r}: 'state' must be a boolean "
+            f"(got {type(state).__name__})"
+        )
+    if state and runner != "container":
+        raise ValueError(
+            f"Block {name!r}: 'state: true' is only valid for "
+            f"runner 'container' (got {runner!r})"
+        )
+    # workspace_persistent preserves state in-memory; having a
+    # `/state/` mount too would address the same concern twice.
+    if state and lifecycle == "workspace_persistent":
+        raise ValueError(
+            f"Block {name!r}: 'state: true' is mutually exclusive "
+            f"with 'lifecycle: workspace_persistent' (persistent "
+            f"containers preserve state in-memory, not on disk)"
+        )
+
     return BlockDefinition(
         name=name,
         image=image,
@@ -495,6 +527,7 @@ def parse_block_definition(
         runner_justification=runner_justification,
         post_check=post_check,
         lifecycle=lifecycle,
+        state=state,
     )
 
 

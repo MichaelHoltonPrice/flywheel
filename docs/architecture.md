@@ -487,11 +487,12 @@ the same ``game_step`` block schema.
 
 All artifact-recording flows ride either
 ``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or
-``ContainerExecutor`` / ``ProcessExecutor`` (``runner:
-container`` and ``runner: process`` blocks).  There is no HTTP
-lifecycle API and no in-container recording proxy — agents
-trigger recordings exclusively through the host-side handoff
-loop (see "Nested block executions from agents" below).
+``ProcessExitExecutor`` / ``ProcessExecutor`` (``runner:
+container`` one-shot blocks and trusted host-local subprocesses
+respectively).  There is no HTTP lifecycle API and no
+in-container recording proxy — agents trigger recordings
+exclusively through the host-side handoff loop (see "Nested
+block executions from agents" below).
 
 ### Project-provided MCP servers
 
