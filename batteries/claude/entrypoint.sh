@@ -45,5 +45,44 @@ if [ "${NETWORK_ISOLATION}" = "1" ]; then
     echo "[entrypoint] network isolation active"
 fi
 
+# --- Auth volume containment ---
+#
+# /home/claude/.claude is a shared Docker volume populated from
+# the operator's host ~/.claude/.  The host directory carries a
+# lot more than the in-container CLI needs: prior session JSONLs
+# (~/.claude/projects/), shell history, plugins, telemetry,
+# operator settings.  Anything we leave in place is reachable by
+# the agent — past sessions become spoiler material, host
+# settings (e.g. effortLevel) silently shape agent behavior.
+#
+# We defend in depth: even if the refresh command copied the
+# whole host ~/.claude/ into the volume, we scrub the
+# container's view at every start and synthesize a known-good
+# settings.json with only the flags the headless CLI requires.
+# The refresh-script-of-the-day is irrelevant; the agent only
+# ever sees the post-entrypoint state.
+#
+# We do NOT touch the host filesystem -- the volume is a
+# Docker-managed named volume separate from the host's
+# ~/.claude/.  Removing files inside the container only removes
+# them from the volume.
+
+# 1. Allowlist scrub: keep only .credentials.json at top level.
+find /home/claude/.claude -mindepth 1 -maxdepth 1 \
+    ! -name '.credentials.json' \
+    -exec rm -rf {} +
+
+# 2. Synthesize the settings the headless CLI needs.
+#    skipDangerousModePermissionPrompt is required so the SDK's
+#    permission_mode=bypassPermissions actually skips the prompt
+#    (otherwise the CLI hangs waiting for input).
+cat > /home/claude/.claude/settings.json <<'JSON'
+{
+  "skipDangerousModePermissionPrompt": true
+}
+JSON
+chown claude:claude /home/claude/.claude/settings.json
+echo "[entrypoint] auth volume scrubbed; settings synthesized"
+
 # Drop to claude user and run agent.
 exec su -s /bin/bash claude -c "python3 /app/agent_runner.py"
