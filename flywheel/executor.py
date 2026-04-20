@@ -2475,7 +2475,7 @@ class RequestResponseExecutor:
             docker_args.extend(extra_docker_args)
 
         mounts: list[tuple[str, str, str]] = [
-            (str(work_area), "/workspace", "rw"),
+            (str(work_area.resolve()), "/workspace", "rw"),
         ]
         if extra_mounts:
             mounts.extend(extra_mounts)
