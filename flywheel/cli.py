@@ -166,6 +166,43 @@ def main(argv: list[str] | None = None) -> None:
     pattern_parser.add_argument(
         "--agent-image", default="flywheel-claude:latest")
 
+    # flywheel container — manage persistent request-response runtimes
+    container_parser = subparsers.add_parser(
+        "container",
+        help=(
+            "Manage long-lived request-response runtimes "
+            "(workspace-persistent containers)."),
+    )
+    container_sub = container_parser.add_subparsers(
+        dest="container_action")
+
+    cstop_parser = container_sub.add_parser(
+        "stop",
+        help=(
+            "Tear down a request-response runtime via the "
+            "/workspace/.stop sentinel, falling back to "
+            "SIGTERM/SIGKILL."),
+    )
+    cstop_parser.add_argument("--workspace", required=True)
+    cstop_parser.add_argument("--template", required=True)
+    cstop_parser.add_argument(
+        "--block", required=True,
+        help="Block name whose runtime should be stopped.")
+    cstop_parser.add_argument(
+        "--reason", default="cli_stop",
+        help=(
+            "Free-form reason string recorded with the teardown "
+            "(default: cli_stop)."),
+    )
+
+    clist_parser = container_sub.add_parser(
+        "list",
+        help=(
+            "List the request-response runtimes Docker reports "
+            "for this workspace."),
+    )
+    clist_parser.add_argument("--workspace", required=True)
+
     # Split on '--' to separate flywheel args from container args
     if argv is None:
         argv = sys.argv[1:]
@@ -195,6 +232,21 @@ def main(argv: list[str] | None = None) -> None:
         run_agent_command(args, extra_container_args)
     elif args.command == "run" and getattr(args, "target", None) == "pattern":
         run_pattern_command(args, extra_container_args)
+    elif (
+        args.command == "container"
+        and getattr(args, "container_action", None) == "stop"
+    ):
+        container_stop_command(
+            workspace=args.workspace,
+            template_name=args.template,
+            block_name=args.block,
+            reason=args.reason,
+        )
+    elif (
+        args.command == "container"
+        and getattr(args, "container_action", None) == "list"
+    ):
+        container_list_command(workspace=args.workspace)
     else:
         parser.print_help()
         sys.exit(1)
@@ -553,3 +605,115 @@ def _parse_overrides(args: list[str]) -> dict[str, str]:
         else:
             i += 1
     return overrides
+
+
+def container_stop_command(
+    *,
+    workspace: str,
+    template_name: str,
+    block_name: str,
+    reason: str,
+) -> None:
+    """Tear down the request-response runtime for a workspace / block.
+
+    Loads the project config to resolve the block registry and
+    template, constructs a :class:`RequestResponseExecutor`
+    against the live workspace, and calls its
+    :meth:`~flywheel.executor.RequestResponseExecutor.shutdown`.
+    Shutdown is best-effort; an absent runtime is a no-op.
+    """
+    from flywheel.executor import RequestResponseExecutor
+
+    ws_path = Path(workspace)
+    ws = Workspace.load(ws_path)
+    template = _load_template_for(ws_path, template_name)
+    executor = RequestResponseExecutor(template)
+    key = RequestResponseExecutor._attachment_key(block_name, ws)
+    handled = executor.shutdown(
+        key, reason=reason,
+        block_name=block_name, workspace=ws,
+    )
+    if handled:
+        print(
+            f"[container stop] block={block_name!r} "
+            f"workspace={ws.name!r} — teardown signalled"
+        )
+    else:
+        print(
+            f"[container stop] block={block_name!r} "
+            f"workspace={ws.name!r} — no matching runtime "
+            f"found (already stopped or never started)"
+        )
+
+
+def container_list_command(*, workspace: str) -> None:
+    """Enumerate request-response runtimes for a workspace.
+
+    Reports whichever runtimes Docker currently has labelled for
+    this workspace, regardless of whether the current flywheel
+    process started them.
+    """
+    import subprocess
+
+    from flywheel.executor import _RUNTIME_LABEL_WORKSPACE
+
+    ws_path = Path(workspace)
+    ws = Workspace.load(ws_path)
+    filter_arg = f"label={_RUNTIME_LABEL_WORKSPACE}={ws.name}"
+    try:
+        result = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", filter_arg,
+                "--format",
+                "{{.Names}}\t{{.Status}}\t{{.Image}}",
+            ],
+            capture_output=True, check=False, text=True,
+        )
+    except FileNotFoundError:
+        print("[container list] docker not found")
+        sys.exit(1)
+    if result.returncode != 0:
+        print(
+            f"[container list] docker ps failed: "
+            f"{result.stderr.strip()}"
+        )
+        sys.exit(1)
+    lines = [
+        line for line in result.stdout.splitlines() if line]
+    if not lines:
+        print(
+            f"[container list] no runtimes labelled for "
+            f"workspace {ws.name!r}")
+        return
+    print(
+        f"[container list] runtimes for workspace "
+        f"{ws.name!r}:"
+    )
+    for line in lines:
+        print(f"  {line}")
+
+
+def _load_template_for(
+    workspace_path: Path, template_name: str,
+) -> Template:
+    """Load the template declared for a given workspace.
+
+    Walks up from the workspace path to find ``flywheel.yaml``,
+    loads the project config, resolves the named template, and
+    returns it with a registered block registry so lifecycle /
+    block lookups work.
+    """
+    project_root = workspace_path.parent
+    for candidate in [project_root, *project_root.parents]:
+        if (candidate / "flywheel.yaml").is_file():
+            project_root = candidate
+            break
+    config = load_project_config(project_root)
+    registry = config.load_block_registry()
+    template_path = (
+        config.foundry_dir / "templates"
+        / f"{template_name}.yaml"
+    )
+    return Template.from_yaml(
+        template_path, block_registry=registry)

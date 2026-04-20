@@ -26,11 +26,23 @@ the container polls for it and exits when it appears.  The full
 container-side path depends on where the workspace is mounted
 (typically ``/workspace/.stop``)."""
 
-RUNTIME_SOCKET_WORKSPACE_RELATIVE: Final[str] = ".runtime.sock"
-"""Workspace-relative path of the Unix domain socket used by the
-request-response protocol.  Persistent containers bind this
-socket; flywheel connects to it to issue per-execution requests.
-Unused by process-exit blocks."""
+REQUEST_TREE_WORKSPACE_RELATIVE: Final[str] = "requests"
+"""Workspace-relative parent directory for request-response
+per-request I/O trees.  For request ``id``, flywheel creates
+``/workspace/requests/<id>/input/<slot>/`` (read-only staged
+inputs) and ``/workspace/requests/<id>/output/<slot>/`` (empty
+write targets) before each ``POST /execute`` call.  Unused by
+process-exit blocks."""
+
+CONTROL_PORT_ENV_VAR: Final[str] = "FLYWHEEL_CONTROL_PORT"
+"""Environment variable used to pass the host-allocated control-
+channel port into a request-response container.  The executor
+picks a free localhost port, binds the container to publish on
+it, and sets this env var so the container's in-process HTTP
+server knows which port to listen on.  Transport choice (today
+TCP; could be a socket path in a future implementation) is an
+executor concern — block-side code reads the relevant env var
+and binds accordingly."""
 
 # ── Failure phases ──────────────────────────────────────────────
 #

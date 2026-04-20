@@ -23,10 +23,20 @@ class TestPathConstants:
         # where the workspace is mounted in the container.
         assert runtime.STOP_SENTINEL_WORKSPACE_RELATIVE == ".stop"
 
-    def test_runtime_socket_relative(self):
+    def test_request_tree_relative(self):
+        # Workspace-relative parent directory for request-response
+        # per-request I/O trees.
         assert (
-            runtime.RUNTIME_SOCKET_WORKSPACE_RELATIVE
-            == ".runtime.sock"
+            runtime.REQUEST_TREE_WORKSPACE_RELATIVE
+            == "requests"
+        )
+
+    def test_control_port_env_var(self):
+        # Executor passes the allocated localhost port via this
+        # env var to the request-response container.
+        assert (
+            runtime.CONTROL_PORT_ENV_VAR
+            == "FLYWHEEL_CONTROL_PORT"
         )
 
 

@@ -25,13 +25,18 @@ container runtime contract these executors implement lives in
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import http.client
 import json
+import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1454,3 +1459,1180 @@ class ProcessExecutor:
             started_at=started_at,
             start_monotonic=time.monotonic(),
         )
+
+
+# ── RequestResponseExecutor ──────────────────────────────────────
+
+REQUEST_RESPONSE_PROTOCOL_VERSION: str = "1"
+"""Bumped when the wire protocol (endpoints, request / response
+shapes) changes in a way that makes older containers incompatible.
+Used as a Docker label on runtimes and checked against the
+running container on reattachment."""
+
+_RUNTIME_LABEL_WORKSPACE: str = "flywheel.workspace"
+_RUNTIME_LABEL_WORKSPACE_PATH: str = "flywheel.workspace_path"
+_RUNTIME_LABEL_BLOCK: str = "flywheel.block"
+_RUNTIME_LABEL_PROTOCOL: str = "flywheel.protocol"
+_RUNTIME_LABEL_LIFECYCLE: str = "flywheel.lifecycle"
+
+_HEALTH_POLL_INTERVAL_S: float = 0.1
+_DEFAULT_STARTUP_TIMEOUT_S: float = 30.0
+
+
+def _allocate_free_port() -> int:
+    """Return an unused localhost TCP port.
+
+    Binds a socket to port 0, reads the kernel-assigned port, and
+    releases the socket.  There is a small window between release
+    and the executor re-binding the port in Docker during which
+    another process could claim it; accepted for a development-
+    grade substrate.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class ControlChannelError(RuntimeError):
+    """Raised by a :class:`ControlChannel` when the transport fails.
+
+    Maps to ``failure_phase=invoke`` on the execution record.
+    """
+
+
+@runtime_checkable
+class ControlChannel(Protocol):
+    """Transport between the executor and a request-response runtime.
+
+    The contract does not mandate a wire format; today's
+    implementation is HTTP over localhost TCP
+    (:class:`HttpControlChannel`).  Tests inject fakes that
+    satisfy this protocol without opening a real socket.
+    """
+
+    def health(self, timeout_s: float) -> bool:
+        """Return ``True`` when the runtime is ready to serve."""
+        ...
+
+    def execute(
+        self, request_id: str, block_name: str, timeout_s: float,
+    ) -> dict[str, Any]:
+        """Send ``POST /execute`` and return the parsed response.
+
+        Raises :class:`ControlChannelError` on transport failure.
+        """
+        ...
+
+    def cancel(self, request_id: str, timeout_s: float) -> None:
+        """Best-effort ``POST /cancel`` for the in-flight request.
+
+        Swallows transport errors — a cancel that can't reach the
+        container still causes the executor to fall back to
+        runtime teardown.
+        """
+        ...
+
+
+class HttpControlChannel:
+    """HTTP-over-localhost-TCP client for a request-response runtime."""
+
+    def __init__(self, host: str, port: int):
+        """Capture the runtime's address.
+
+        ``host`` is usually ``"127.0.0.1"``; ``port`` is the
+        host-side port allocated by :func:`_allocate_free_port`
+        and passed to the container via
+        :data:`flywheel.runtime.CONTROL_PORT_ENV_VAR`.
+        """
+        self._host = host
+        self._port = port
+
+    def _conn(self, timeout_s: float) -> http.client.HTTPConnection:
+        return http.client.HTTPConnection(
+            self._host, self._port, timeout=timeout_s)
+
+    def health(self, timeout_s: float) -> bool:
+        """Return ``True`` on HTTP 200 to ``GET /health``.
+
+        Any connection error, non-200 status, or timeout is
+        treated as "not ready yet" — the caller retries.
+        """
+        try:
+            conn = self._conn(timeout_s)
+            try:
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
+                resp.read()  # drain to allow connection reuse
+                return resp.status == 200
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException):
+            return False
+
+    def execute(
+        self, request_id: str, block_name: str, timeout_s: float,
+    ) -> dict[str, Any]:
+        """Send ``POST /execute`` and parse the JSON response.
+
+        Raises:
+            ControlChannelError: transport or protocol-shape error.
+        """
+        body = json.dumps({
+            "request_id": request_id,
+            "block_name": block_name,
+        })
+        try:
+            conn = self._conn(timeout_s)
+            try:
+                conn.request(
+                    "POST", "/execute",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                raw = resp.read().decode("utf-8")
+                if resp.status != 200:
+                    raise ControlChannelError(
+                        f"POST /execute returned HTTP "
+                        f"{resp.status}: {raw[:200]}"
+                    )
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException) as exc:
+            raise ControlChannelError(
+                f"POST /execute failed: {exc}") from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ControlChannelError(
+                f"POST /execute returned non-JSON body: "
+                f"{raw[:200]}") from exc
+        if not isinstance(payload, dict):
+            raise ControlChannelError(
+                f"POST /execute returned non-object JSON: "
+                f"{type(payload).__name__}")
+        return payload
+
+    def cancel(self, request_id: str, timeout_s: float) -> None:
+        """Send ``POST /cancel`` best-effort, swallowing errors."""
+        body = json.dumps({"request_id": request_id})
+        try:
+            conn = self._conn(timeout_s)
+            try:
+                conn.request(
+                    "POST", "/cancel",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                resp.read()
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException):
+            return
+
+
+@dataclass
+class _RuntimeHandle:
+    """Host-side reference to a running request-response container.
+
+    One per attachment key.  Carries the control channel the
+    executor POSTs requests against, the lock the host uses to
+    serialize requests, and the resources needed for teardown.
+    """
+
+    attachment_key: str
+    container_name: str
+    control_port: int
+    block_def: BlockDefinition
+    workspace: Workspace
+    work_area: Path
+    process: subprocess.Popen | None
+    channel: ControlChannel
+    request_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _workspace_identity(workspace: Workspace) -> str:
+    """Return a short stable identifier for a workspace.
+
+    Used in attachment keys and container names.  The absolute
+    path of the workspace directory is hashed to a fixed-length
+    digest so two workspaces that happen to share a ``name`` but
+    live at different paths cannot collide on the same runtime.
+    The full path is also recorded as a Docker label for operator
+    visibility.
+    """
+    path = str(workspace.path.resolve())
+    digest = hashlib.sha256(
+        path.encode("utf-8")).hexdigest()[:12]
+    return digest
+
+
+def _runtime_container_name(
+    workspace: Workspace, block_name: str,
+) -> str:
+    """Build a stable, collision-resistant Docker container name.
+
+    Names must be 1-64 chars from
+    ``[a-zA-Z0-9][a-zA-Z0-9_.-]*``.  Built from the block name
+    (for operator-legibility when listing Docker containers) and
+    the workspace path digest (so two workspaces with the same
+    ``workspace.name`` at different paths do not collide).
+    """
+    safe_block = "".join(
+        c if (c.isalnum() or c in "_.-") else "-"
+        for c in block_name
+    )
+    return (
+        f"flywheel-runtime-{safe_block}-"
+        f"{_workspace_identity(workspace)}"
+    )[:60]
+
+
+def _runtime_labels(
+    block_def: BlockDefinition,
+    workspace: Workspace,
+) -> dict[str, str]:
+    """Labels flywheel stamps on every request-response runtime.
+
+    Lets the executor recognize its own runtimes on reattachment
+    and distinguish protocol versions.  Foreign containers (same
+    name but wrong labels) are treated as unsafe to attach to.
+    ``workspace_path`` is the absolute workspace directory; the
+    digest lives in the container name and is implicitly carried
+    by the labels together.
+    """
+    return {
+        _RUNTIME_LABEL_WORKSPACE: workspace.name,
+        _RUNTIME_LABEL_WORKSPACE_PATH: str(
+            workspace.path.resolve()),
+        _RUNTIME_LABEL_BLOCK: block_def.name,
+        _RUNTIME_LABEL_PROTOCOL: REQUEST_RESPONSE_PROTOCOL_VERSION,
+        _RUNTIME_LABEL_LIFECYCLE: "workspace_persistent",
+    }
+
+
+def _run_detached_container(
+    config: ContainerConfig,
+    name: str,
+) -> str:
+    """Launch a container in detached mode and return its ID.
+
+    Equivalent of ``docker run -d --rm --name <name> …`` —
+    spawns the container in the background, returns the short
+    container ID Docker prints on stdout, and leaves no
+    ``docker run`` client process hanging around.  Needed for
+    persistent request-response runtimes: the executor's host
+    process must be able to exit without killing the runtime,
+    and the runtime must survive to be reattached to on the
+    next run.
+
+    Raises:
+        ControlChannelError: if ``docker run -d`` returns a
+            non-zero exit code or prints no container id.
+    """
+    cmd = ["docker", "run", "-d", "--rm", "--name", name]
+    cmd.extend(config.docker_args)
+    for key, value in config.env.items():
+        cmd.extend(["-e", f"{key}={value}"])
+    for host_path, container_path, mode in config.mounts:
+        normalized = host_path.replace("\\", "/")
+        cmd.extend(
+            ["-v", f"{normalized}:{container_path}:{mode}"])
+    cmd.append(config.image)
+
+    proc_env = os.environ.copy()
+    proc_env["MSYS_NO_PATHCONV"] = "1"
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, env=proc_env,
+    )
+    if result.returncode != 0:
+        raise ControlChannelError(
+            f"docker run -d failed for {name!r}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    container_id = result.stdout.strip()
+    if not container_id:
+        raise ControlChannelError(
+            f"docker run -d for {name!r} returned no "
+            f"container id"
+        )
+    return container_id
+
+
+def _docker_kill(container_name: str, signal: str) -> None:
+    """Send ``signal`` to a container by name, ignoring errors.
+
+    Parallels :func:`_docker_send_signal` but is semantically
+    "tear this runtime down," not "signal this live execution."
+    ``check=False`` because a container that has already exited
+    between the decision and the call is not an error."""
+    subprocess.run(
+        ["docker", "kill", "--signal", signal, container_name],
+        check=False, capture_output=True,
+    )
+
+
+def _docker_wait_gone(
+    container_name: str, timeout_s: float,
+) -> bool:
+    """Block until the named container is absent from ``docker ps``.
+
+    Returns ``True`` when the container is gone, ``False`` on
+    timeout.  Polls at a modest cadence — teardown latency is
+    not a hot path.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        info = _docker_ps_find(container_name)
+        if info is None or info.get("_running") != "true":
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _docker_ps_find(
+    container_name: str,
+) -> dict[str, str] | None:
+    """Inspect a container by name; return labels dict or ``None``.
+
+    Uses ``docker inspect`` which returns structured JSON; this
+    is tolerant of the container being stopped vs running vs
+    absent.  Returns ``None`` when the container does not exist.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            capture_output=True, check=False, text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not entries:
+        return None
+    entry = entries[0]
+    labels = (
+        entry.get("Config", {}).get("Labels") or {})
+    state = entry.get("State", {}) or {}
+    running = bool(state.get("Running", False))
+    # Return the labels dict, decorated with a synthetic
+    # ``_running`` key so the caller can distinguish "live" from
+    # "exists but stopped".
+    return {"_running": "true" if running else "false", **labels}
+
+
+class _RequestExecutionHandle(ExecutionHandle):
+    """Handle to one ``POST /execute`` call against a runtime.
+
+    Runs the request on a background thread so ``stop()`` can
+    fire ``POST /cancel`` from the main thread while ``wait()``
+    blocks on the response.  ``wait()`` finalizes per-request
+    state (output collection, :class:`BlockExecution` record)
+    and cleans up per-request tempdirs.
+    """
+
+    def __init__(
+        self,
+        *,
+        runtime: _RuntimeHandle,
+        request_id: str,
+        execution_id: str,
+        started_at: datetime,
+        start_monotonic: float,
+        input_bindings: dict[str, str],
+        state_lineage_id: str | None,
+        staged_inputs: dict[str, Path],
+        request_dir: Path,
+        output_dirs: dict[str, Path],
+        execute_timeout_s: float,
+        cancel_timeout_s: float,
+    ):
+        """Capture the per-request state and start the POST thread."""
+        self._runtime = runtime
+        self._request_id = request_id
+        self._execution_id = execution_id
+        self._started_at = started_at
+        self._start_monotonic = start_monotonic
+        self._input_bindings = input_bindings
+        self._state_lineage_id = state_lineage_id
+        self._staged_inputs = staged_inputs
+        self._request_dir = request_dir
+        self._output_dirs = output_dirs
+        self._execute_timeout_s = execute_timeout_s
+        self._cancel_timeout_s = cancel_timeout_s
+
+        self._response: dict[str, Any] | None = None
+        self._transport_error: ControlChannelError | None = None
+        self._stop_reason: str | None = None
+        self._stop_lock = threading.Lock()
+        self._stop_initiated = False
+        self._waited = False
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"flywheel-rr-exec-{execution_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        """Body of the POST thread.  Populates response or error.
+
+        The runtime's request lock is acquired around the POST
+        so only one ``/execute`` flight is in progress against
+        the container at a time.  Holding the lock at thread
+        scope (rather than handle scope) means an abandoned
+        handle cannot strand the lock — the thread always
+        releases it.
+        """
+        with self._runtime.request_lock:
+            try:
+                self._response = (
+                    self._runtime.channel.execute(
+                        self._request_id,
+                        self._runtime.block_def.name,
+                        self._execute_timeout_s,
+                    )
+                )
+            except ControlChannelError as exc:
+                self._transport_error = exc
+
+    def is_alive(self) -> bool:
+        """Return whether the POST thread is still running."""
+        return self._thread.is_alive()
+
+    def stop(self, reason: str = "requested") -> None:
+        """Cancel the in-flight request via ``POST /cancel``.
+
+        Idempotent; a second call is a no-op.  Does not tear
+        down the runtime — use
+        :meth:`RequestResponseExecutor.shutdown` for that.
+        """
+        with self._stop_lock:
+            if self._stop_initiated:
+                return
+            self._stop_initiated = True
+            self._stop_reason = reason
+        # Run the RPC outside the lock so a concurrent stop() is
+        # immediately no-op rather than blocked on the HTTP call.
+        with contextlib.suppress(Exception):
+            self._runtime.channel.cancel(
+                self._request_id, self._cancel_timeout_s)
+
+    def wait(self) -> ExecutionResult:
+        """Block for the request to complete and finalize the execution.
+
+        Joins the POST thread, reads outputs from the per-request
+        directory, writes a :class:`BlockExecution` record, and
+        tears down per-request tempdirs.
+
+        Raises:
+            RuntimeError: If called more than once on the same handle.
+        """
+        if self._waited:
+            raise RuntimeError(
+                "wait() already called on this handle")
+        self._waited = True
+
+        failure_phase: str | None = None
+        error: str | None = None
+        output_bindings: dict[str, str] = {}
+
+        try:
+            self._thread.join()
+
+            finished_at = datetime.now(UTC)
+            elapsed = time.monotonic() - self._start_monotonic
+
+            if self._transport_error is not None:
+                failure_phase = runtime.FAILURE_INVOKE
+                error = (
+                    f"invoke: transport error — "
+                    f"{self._transport_error}"
+                )
+            elif self._response is not None:
+                status = self._response.get("status")
+                if status == "failed":
+                    failure_phase = runtime.FAILURE_INVOKE
+                    error = (
+                        f"invoke: {self._response.get('error') or ''}"
+                    )
+                elif status != "succeeded":
+                    failure_phase = runtime.FAILURE_INVOKE
+                    error = (
+                        f"invoke: unexpected status {status!r}"
+                    )
+            else:
+                failure_phase = runtime.FAILURE_INVOKE
+                error = "invoke: no response from runtime"
+
+            # Output collection runs even on invoke failure; a
+            # container that emits partial outputs before
+            # returning an error is still useful for debugging.
+            try:
+                output_bindings = _collect_outputs(
+                    self._runtime.workspace,
+                    self._runtime.block_def,
+                    self._output_dirs,
+                    self._execution_id,
+                    finished_at,
+                )
+            except Exception as e:
+                if failure_phase is None:
+                    failure_phase = (
+                        runtime.FAILURE_OUTPUT_COLLECT)
+                    error = f"output_collect: {e}"
+        finally:
+            cleanup_staged_inputs(self._staged_inputs)
+            shutil.rmtree(self._request_dir, ignore_errors=True)
+
+        if self._stop_reason is not None:
+            status = "interrupted"
+        elif failure_phase is not None:
+            status = "failed"
+        else:
+            status = "succeeded"
+
+        execution = BlockExecution(
+            id=self._execution_id,
+            block_name=self._runtime.block_def.name,
+            started_at=self._started_at,
+            finished_at=finished_at,
+            status=status,
+            input_bindings=self._input_bindings,
+            output_bindings=output_bindings,
+            exit_code=None,
+            elapsed_s=elapsed,
+            image=self._runtime.block_def.image,
+            runner="container",
+            failure_phase=failure_phase,
+            error=error,
+            state_lineage_id=self._state_lineage_id,
+            stop_reason=self._stop_reason,
+        )
+        self._runtime.workspace.add_execution(execution)
+        self._runtime.workspace.save()
+
+        return ExecutionResult(
+            exit_code=(
+                0 if status == "succeeded"
+                else INVOKE_FAILURE_EXIT_CODE),
+            elapsed_s=elapsed,
+            output_bindings=output_bindings,
+            execution_id=self._execution_id,
+            status=status,
+        )
+
+
+class RequestResponseExecutor:
+    """Request-response protocol executor — one runtime, many requests.
+
+    Implements the container runtime contract for blocks whose
+    lifecycle is ``workspace_persistent``:
+
+    1. On first ``launch()`` for a given ``(block_name, workspace)``
+       attachment key, start a persistent container publishing
+       its control channel on a localhost port.  Probe ``/health``
+       until ready.
+    2. For each request: stage declared inputs into
+       ``<work_area>/requests/<req_id>/input/<slot>/``, create
+       ``<work_area>/requests/<req_id>/output/<slot>/`` dirs,
+       ``POST /execute``, collect outputs from the output dirs,
+       write a :class:`BlockExecution`.
+    3. Requests against the same runtime are serialized on the
+       host side via a per-runtime :class:`threading.Lock`; the
+       container may reject overlapping requests as defense-in-
+       depth but is not the primary scheduler.
+    4. Runtimes persist across ``launch()`` calls until an
+       explicit :meth:`shutdown` (via the CLI or programmatically)
+       or flywheel process exit.  Reattachment to an existing
+       runtime after a host-process restart is matched by labels
+       and confirmed by a ``/health`` probe before routing
+       requests to it.
+
+    Request-response blocks do not use ``/state/`` — state lives
+    in the container's memory for its lifetime.  The schema
+    rejects ``state: true`` with ``lifecycle: workspace_persistent``.
+    """
+
+    def __init__(
+        self,
+        template: Template,
+        overrides: dict[str, Any] | None = None,
+        *,
+        channel_factory: (
+            Callable[[str, int], ControlChannel] | None) = None,
+        startup_timeout_s: float = _DEFAULT_STARTUP_TIMEOUT_S,
+        execute_timeout_s: float = 600.0,
+        cancel_timeout_s: float = 5.0,
+    ):
+        """Initialize with a template and optional dependencies.
+
+        Args:
+            template: The template containing block definitions.
+            overrides: Default CLI flag overrides forwarded to the
+                container on startup.
+            channel_factory: Optional ``(host, port) ->
+                ControlChannel`` factory.  Defaults to
+                :class:`HttpControlChannel`.  Tests inject a fake
+                to avoid opening real sockets.
+            startup_timeout_s: How long to poll ``/health`` after
+                launching a new runtime before giving up.
+            execute_timeout_s: HTTP read timeout for
+                ``POST /execute``.
+            cancel_timeout_s: HTTP read timeout for
+                ``POST /cancel``.
+        """
+        self._template = template
+        self._overrides = overrides
+        self._channel_factory = (
+            channel_factory
+            or (lambda host, port: HttpControlChannel(host, port))
+        )
+        self._startup_timeout_s = startup_timeout_s
+        self._execute_timeout_s = execute_timeout_s
+        self._cancel_timeout_s = cancel_timeout_s
+
+        self._runtimes: dict[str, _RuntimeHandle] = {}
+        self._registry_lock = threading.Lock()
+
+    @staticmethod
+    def _attachment_key(block_name: str, workspace: Workspace) -> str:
+        """Return the registry key for a ``(block, workspace)`` pair.
+
+        The workspace is identified by a digest of its absolute
+        path, not by ``workspace.name``: two distinct workspaces
+        that happen to share a name must not reattach to each
+        other's runtimes.  Kept as a helper so
+        :class:`RequestResponseExecutor` can evolve to per-run
+        or per-session keys without every caller having to
+        update.
+        """
+        return f"{_workspace_identity(workspace)}::{block_name}"
+
+    def launch(
+        self,
+        block_name: str,
+        workspace: Workspace,
+        input_bindings: dict[str, str],
+        *,
+        execution_id: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        allowed_blocks: list[str] | None = None,
+        state_lineage_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
+        extra_docker_args: list[str] | None = None,
+    ) -> ExecutionHandle:
+        """Execute one request against the block's persistent runtime.
+
+        Starts the runtime on first call for a given
+        ``(block_name, workspace)`` pair; reuses it on subsequent
+        calls.  Returns a :class:`_RequestExecutionHandle` whose
+        ``wait()`` blocks on the container's response.
+
+        ``extra_env`` / ``extra_mounts`` / ``extra_docker_args``
+        are consumed on runtime *startup* only — they configure
+        the long-lived container, not individual requests.
+        Re-passing them on a subsequent ``launch()`` for the
+        same attachment key is accepted but ignored.
+
+        Raises:
+            ValueError: If the block is not found, not permitted,
+                or does not declare
+                ``lifecycle: workspace_persistent``.
+        """
+        if allowed_blocks and block_name not in allowed_blocks:
+            raise ValueError(
+                f"Block {block_name!r} not in allowed list: "
+                f"{allowed_blocks}")
+
+        block_def = _find_block(self._template, block_name)
+        if block_def is None:
+            raise ValueError(
+                f"Block {block_name!r} not found in template")
+        if block_def.runner != "container":
+            raise ValueError(
+                f"Block {block_name!r}: "
+                f"RequestResponseExecutor only runs container "
+                f"blocks (got runner {block_def.runner!r})")
+        if block_def.lifecycle != "workspace_persistent":
+            raise ValueError(
+                f"Block {block_name!r}: "
+                f"RequestResponseExecutor requires "
+                f"'lifecycle: workspace_persistent' (got "
+                f"{block_def.lifecycle!r})")
+
+        key = self._attachment_key(block_name, workspace)
+        runtime_handle = self._get_or_start_runtime(
+            key=key,
+            block_def=block_def,
+            workspace=workspace,
+            extra_env=extra_env,
+            extra_mounts=extra_mounts,
+            extra_docker_args=extra_docker_args,
+        )
+
+        exec_id = (
+            execution_id or workspace.generate_execution_id())
+        started_at = datetime.now(UTC)
+        start_monotonic = time.monotonic()
+
+        request_id = uuid.uuid4().hex
+
+        # Stage inputs directly into the per-request input tree,
+        # not into a freelance tempdir, so the container reads
+        # them at the contract path.
+        staged_inputs: dict[str, Path] = {}
+        request_dir = (
+            runtime_handle.work_area
+            / runtime.REQUEST_TREE_WORKSPACE_RELATIVE
+            / request_id
+        )
+        output_dirs: dict[str, Path] = {}
+        try:
+            request_dir.mkdir(parents=True)
+            input_root = request_dir / "input"
+            input_root.mkdir()
+            for slot in block_def.inputs:
+                target = input_root / slot.name
+                staged_inputs[slot.name] = (
+                    _stage_single_input_to_path(
+                        workspace, slot.name,
+                        input_bindings.get(slot.name), target)
+                )
+            output_root = request_dir / "output"
+            output_root.mkdir()
+            for slot in block_def.outputs:
+                out = output_root / slot.name
+                out.mkdir()
+                output_dirs[slot.name] = out
+        except StagingError as e:
+            shutil.rmtree(request_dir, ignore_errors=True)
+            cleanup_staged_inputs(staged_inputs)
+            return _record_pre_container_failure(
+                workspace=workspace,
+                block_def=block_def,
+                exec_id=exec_id,
+                started_at=started_at,
+                input_bindings=input_bindings,
+                state_lineage_id=state_lineage_id,
+                failure_phase=runtime.FAILURE_STAGE_IN,
+                error=f"stage_in: {e}",
+                staged_inputs={},
+                state_mount=None,
+                output_tempdirs={},
+                work_area=None,
+            )
+        except Exception as e:
+            shutil.rmtree(request_dir, ignore_errors=True)
+            cleanup_staged_inputs(staged_inputs)
+            return _record_pre_container_failure(
+                workspace=workspace,
+                block_def=block_def,
+                exec_id=exec_id,
+                started_at=started_at,
+                input_bindings=input_bindings,
+                state_lineage_id=state_lineage_id,
+                failure_phase=runtime.FAILURE_STAGE_IN,
+                error=f"stage_in: {e}",
+                staged_inputs={},
+                state_mount=None,
+                output_tempdirs={},
+                work_area=None,
+            )
+
+        return _RequestExecutionHandle(
+            runtime=runtime_handle,
+            request_id=request_id,
+            execution_id=exec_id,
+            started_at=started_at,
+            start_monotonic=start_monotonic,
+            input_bindings=input_bindings,
+            state_lineage_id=state_lineage_id,
+            staged_inputs=staged_inputs,
+            request_dir=request_dir,
+            output_dirs=output_dirs,
+            execute_timeout_s=self._execute_timeout_s,
+            cancel_timeout_s=self._cancel_timeout_s,
+        )
+
+    def shutdown(
+        self,
+        attachment_key: str,
+        reason: str = "requested",
+        *,
+        block_name: str | None = None,
+        workspace: Workspace | None = None,
+    ) -> bool:
+        """Tear down the runtime for an attachment key.
+
+        Checks the in-process registry first.  When the key is
+        absent — the common fresh-CLI-process case — falls back
+        to finding the container by name via ``docker inspect``
+        and tearing it down directly, provided ``block_name``
+        and ``workspace`` are supplied so the container name can
+        be reconstructed.
+
+        Writes ``/workspace/.stop`` to request cooperative
+        shutdown; if the container does not exit within its
+        ``stop_timeout_s``, sends SIGTERM and then SIGKILL.
+        Idempotent; returns ``False`` when no runtime was found
+        to tear down and ``True`` when teardown was attempted.
+        """
+        with self._registry_lock:
+            runtime_handle = self._runtimes.pop(
+                attachment_key, None)
+        if runtime_handle is not None:
+            self._teardown_runtime(runtime_handle, reason)
+            return True
+
+        # Fresh-process fallback: the container is live in
+        # Docker but not in this process's registry.  Reconstruct
+        # its name from the workspace + block and tear it down.
+        if block_name is None or workspace is None:
+            return False
+        container_name = _runtime_container_name(
+            workspace, block_name)
+        info = _docker_ps_find(container_name)
+        if info is None:
+            return False
+        # Refuse to tear down foreign containers that happen to
+        # share a name — this would be a symptom of a separate
+        # install or a pre-existing container.  Operator should
+        # investigate via ``docker inspect``.
+        if (info.get(_RUNTIME_LABEL_LIFECYCLE)
+                != "workspace_persistent"):
+            return False
+        block_def = _find_block(self._template, block_name)
+        stop_timeout = (
+            block_def.stop_timeout_s if block_def is not None
+            else 30
+        )
+        work_area = (
+            workspace.path / "runtimes" / block_name)
+        self._teardown_container(
+            container_name,
+            work_area=work_area if work_area.is_dir() else None,
+            stop_timeout_s=stop_timeout,
+        )
+        return True
+
+    def attached_keys(self) -> list[str]:
+        """Return the attachment keys with live runtimes."""
+        with self._registry_lock:
+            return list(self._runtimes)
+
+    def _get_or_start_runtime(
+        self,
+        *,
+        key: str,
+        block_def: BlockDefinition,
+        workspace: Workspace,
+        extra_env: dict[str, str] | None,
+        extra_mounts: list[tuple[str, str, str]] | None,
+        extra_docker_args: list[str] | None,
+    ) -> _RuntimeHandle:
+        """Return the runtime for ``key``, starting or attaching if needed."""
+        with self._registry_lock:
+            existing = self._runtimes.get(key)
+            if existing is not None:
+                return existing
+            # Try to reattach to a pre-existing container of the
+            # same name; start a fresh one otherwise.
+            handle = self._attach_existing_runtime(
+                key=key,
+                block_def=block_def,
+                workspace=workspace,
+            )
+            if handle is None:
+                handle = self._start_new_runtime(
+                    key=key,
+                    block_def=block_def,
+                    workspace=workspace,
+                    extra_env=extra_env,
+                    extra_mounts=extra_mounts,
+                    extra_docker_args=extra_docker_args,
+                )
+            self._runtimes[key] = handle
+            return handle
+
+    def _attach_existing_runtime(
+        self,
+        *,
+        key: str,
+        block_def: BlockDefinition,
+        workspace: Workspace,
+    ) -> _RuntimeHandle | None:
+        """Probe for an existing container; attach if healthy.
+
+        Returns the attached handle, ``None`` if no container of
+        the expected name exists, or raises
+        :class:`ControlChannelError` if a container by that name
+        exists but has mismatched labels — we refuse to operate
+        that container and refuse to start a new one with the
+        same name, since Docker would error with a raw name-
+        conflict.  Operator surfaces the problem via
+        ``flywheel container list`` and removes the foreign
+        container by hand.
+        """
+        container_name = _runtime_container_name(
+            workspace, block_def.name)
+        info = _docker_ps_find(container_name)
+        if info is None:
+            return None
+        expected = _runtime_labels(block_def, workspace)
+        for label, value in expected.items():
+            if info.get(label) != value:
+                raise ControlChannelError(
+                    f"Docker container {container_name!r} "
+                    f"exists with foreign labels (expected "
+                    f"{label}={value!r}, got "
+                    f"{info.get(label)!r}); refusing to attach "
+                    f"or overwrite.  Remove the container "
+                    f"manually or rename the workspace."
+                )
+        if info.get("_running") != "true":
+            # Our container, but stopped.  Caller starts a fresh
+            # one; Docker's --rm plus container-name reuse is
+            # fine for the stopped-but-labeled case.
+            return None
+        # Rediscover the published port from docker inspect.
+        port_raw = info.get("flywheel.control_port")
+        if not port_raw:
+            return None
+        try:
+            port = int(port_raw)
+        except ValueError:
+            return None
+        channel = self._channel_factory("127.0.0.1", port)
+        if not self._wait_for_health(
+                channel, timeout_s=self._startup_timeout_s):
+            return None
+        work_area = (
+            workspace.path / "runtimes" / block_def.name)
+        work_area.mkdir(parents=True, exist_ok=True)
+        return _RuntimeHandle(
+            attachment_key=key,
+            container_name=container_name,
+            control_port=port,
+            block_def=block_def,
+            workspace=workspace,
+            work_area=work_area,
+            process=None,
+            channel=channel,
+        )
+
+    def _start_new_runtime(
+        self,
+        *,
+        key: str,
+        block_def: BlockDefinition,
+        workspace: Workspace,
+        extra_env: dict[str, str] | None,
+        extra_mounts: list[tuple[str, str, str]] | None,
+        extra_docker_args: list[str] | None,
+    ) -> _RuntimeHandle:
+        """Allocate a port, start the container detached, wait for health.
+
+        The container is started with ``docker run -d`` so the
+        host process can exit without taking the runtime down
+        with it.  Reattachment after a host-process restart
+        requires this.
+        """
+        container_name = _runtime_container_name(
+            workspace, block_def.name)
+        port = _allocate_free_port()
+
+        work_area = (
+            workspace.path / "runtimes" / block_def.name)
+        work_area.mkdir(parents=True, exist_ok=True)
+        (work_area
+         / runtime.REQUEST_TREE_WORKSPACE_RELATIVE).mkdir(
+            parents=True, exist_ok=True)
+
+        labels = _runtime_labels(block_def, workspace)
+        labels["flywheel.control_port"] = str(port)
+
+        env = dict(block_def.env)
+        env[runtime.CONTROL_PORT_ENV_VAR] = str(port)
+        if extra_env:
+            env.update(extra_env)
+
+        docker_args = list(block_def.docker_args)
+        for label, value in labels.items():
+            docker_args.extend(["--label", f"{label}={value}"])
+        # Publish the chosen port to localhost only.
+        docker_args.extend([
+            "-p", f"127.0.0.1:{port}:{port}",
+        ])
+        if extra_docker_args:
+            docker_args.extend(extra_docker_args)
+
+        mounts: list[tuple[str, str, str]] = [
+            (str(work_area), "/workspace", "rw"),
+        ]
+        if extra_mounts:
+            mounts.extend(extra_mounts)
+
+        cc = ContainerConfig(
+            image=block_def.image,
+            docker_args=docker_args,
+            env=env,
+            mounts=mounts,
+        )
+        _run_detached_container(cc, container_name)
+
+        channel = self._channel_factory("127.0.0.1", port)
+        if not self._wait_for_health(
+                channel, timeout_s=self._startup_timeout_s):
+            # Health probe failed — tear down the container we
+            # just started so we don't leave a stuck runtime.
+            _docker_kill(container_name, "TERM")
+            if not _docker_wait_gone(
+                    container_name,
+                    timeout_s=_TERM_TO_KILL_GRACE_S):
+                _docker_kill(container_name, "KILL")
+                _docker_wait_gone(
+                    container_name, timeout_s=30.0)
+            shutil.rmtree(work_area, ignore_errors=True)
+            raise ControlChannelError(
+                f"Runtime {container_name!r} did not report "
+                f"ready within {self._startup_timeout_s}s"
+            )
+
+        return _RuntimeHandle(
+            attachment_key=key,
+            container_name=container_name,
+            control_port=port,
+            block_def=block_def,
+            workspace=workspace,
+            work_area=work_area,
+            process=None,
+            channel=channel,
+        )
+
+    def _wait_for_health(
+        self, channel: ControlChannel, *, timeout_s: float,
+    ) -> bool:
+        """Poll ``channel.health()`` until ready or ``timeout_s`` elapses."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if channel.health(
+                    timeout_s=_HEALTH_POLL_INTERVAL_S):
+                return True
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        return False
+
+    def _teardown_runtime(
+        self,
+        handle: _RuntimeHandle,
+        reason: str,
+    ) -> None:
+        """Two-phase teardown: sentinel, then TERM, then KILL.
+
+        Mirrors :meth:`ContainerExecutionHandle.stop` semantics
+        for the request-response runtime: write
+        ``/workspace/.stop`` first, poll for container exit up
+        to ``stop_timeout_s``, escalate if the container doesn't
+        exit on its own.  Best-effort; transport or docker
+        errors do not raise.  The runtime is detached so there
+        is no Popen to wait on; we track liveness via
+        ``docker inspect``.
+        """
+        self._teardown_container(
+            handle.container_name,
+            work_area=handle.work_area,
+            stop_timeout_s=handle.block_def.stop_timeout_s,
+        )
+
+    def _teardown_container(
+        self,
+        container_name: str,
+        *,
+        work_area: Path | None,
+        stop_timeout_s: int,
+    ) -> None:
+        """Sentinel + TERM + KILL for a named runtime container.
+
+        Factored out so :meth:`shutdown` can tear down a
+        runtime found in Docker but not in the in-process
+        registry (the fresh-CLI-process case).  ``work_area``
+        may be ``None`` when the caller didn't discover it
+        (e.g. CLI-driven teardown of a runtime whose work_area
+        layout matches the workspace conventions but the caller
+        doesn't want to guess).
+        """
+        if work_area is not None:
+            sentinel = (
+                work_area
+                / runtime.STOP_SENTINEL_WORKSPACE_RELATIVE
+            )
+            with contextlib.suppress(OSError):
+                sentinel.touch()
+
+        cooperative = max(0, stop_timeout_s)
+        if cooperative > 0:
+            if _docker_wait_gone(
+                    container_name, timeout_s=cooperative):
+                if work_area is not None:
+                    shutil.rmtree(
+                        work_area, ignore_errors=True)
+                return
+
+        _docker_kill(container_name, "TERM")
+        if not _docker_wait_gone(
+                container_name,
+                timeout_s=_TERM_TO_KILL_GRACE_S):
+            _docker_kill(container_name, "KILL")
+            _docker_wait_gone(
+                container_name, timeout_s=30.0)
+
+        if work_area is not None:
+            shutil.rmtree(work_area, ignore_errors=True)
+
+
+def _stage_single_input_to_path(
+    workspace: Workspace,
+    slot_name: str,
+    instance_id: str | None,
+    target: Path,
+) -> Path:
+    """Stage one artifact instance into a specific target path.
+
+    Unlike :func:`stage_artifact_instances` (which allocates
+    tempdirs), this reuses a caller-supplied path — used by the
+    request-response executor to stage directly under the
+    per-request tree.  Returns ``target`` so callers can track
+    it for cleanup.
+
+    Raises:
+        StagingError: if the instance does not exist or cannot
+            be staged.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    if instance_id is None:
+        return target
+    bindings = {slot_name: instance_id}
+    # Delegate to the existing staging helper to keep copy /
+    # incremental semantics identical; then move its output
+    # into the target path.
+    staged = stage_artifact_instances(workspace, bindings)
+    src = staged.get(slot_name)
+    if src is None:
+        return target
+    try:
+        for child in src.iterdir():
+            dest = target / child.name
+            if child.is_dir():
+                shutil.copytree(child, dest)
+            else:
+                shutil.copy2(child, dest)
+    finally:
+        cleanup_staged_inputs(staged)
+    return target
