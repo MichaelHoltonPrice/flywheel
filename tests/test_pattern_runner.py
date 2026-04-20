@@ -10,15 +10,20 @@ raise) so failures point at exactly which behavior regressed.
 
 from __future__ import annotations
 
+import functools
+import json
+import shutil
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
-from flywheel.artifact import BlockExecution
+from flywheel.agent_handoff import HandoffContext, HandoffResult, ToolRouter
+from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.pattern import (
     BlockInstance,
     ContinuousTrigger,
@@ -29,8 +34,16 @@ from flywheel.pattern import (
     Pattern,
     Role,
 )
-from flywheel.pattern_runner import PatternRunner
-from flywheel.template import Template
+from flywheel.pattern_runner import (
+    InstanceRuntimeConfig,
+    PatternRunner,
+)
+from flywheel.template import (
+    ArtifactDeclaration,
+    BlockDefinition,
+    InputSlot,
+    Template,
+)
 
 # ── Fakes ────────────────────────────────────────────────────────
 
@@ -46,9 +59,45 @@ class _FakeWorkspace:
     def __init__(self, project_root: Path):
         self.path = project_root
         self.executions: dict[str, BlockExecution] = {}
+        self.artifacts: dict[str, ArtifactInstance] = {}
+        self.artifact_declarations: dict[str, str] = {}
 
     def instances_for(self, _name: str) -> list:  # noqa: D401
         return []
+
+    def register_artifact(
+        self,
+        name: str,
+        tempdir: Path,
+        *,
+        source: str | None = None,
+    ) -> ArtifactInstance:
+        """Copy ``tempdir`` contents into ``<ws>/artifacts/<id>/``.
+
+        Matches the shape of
+        :meth:`flywheel.workspace.Workspace.register_artifact` just
+        enough for the on_tool bridge tests: the returned instance has
+        a stable ``copy_path`` and the files land where tests expect.
+        """
+        artifact_id = f"{name}@{uuid.uuid4().hex[:8]}"
+        dest = self.path / "artifacts" / artifact_id
+        dest.mkdir(parents=True, exist_ok=True)
+        for child in Path(tempdir).iterdir():
+            target = dest / child.name
+            if child.is_dir():
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+        instance = ArtifactInstance(
+            id=artifact_id,
+            name=name,
+            kind="copy",
+            created_at=datetime.now(UTC),
+            source=source,
+            copy_path=artifact_id,
+        )
+        self.artifacts[artifact_id] = instance
+        return instance
 
     def add_succeeded(self, block_name: str) -> None:
         idx = len(self.executions)
@@ -430,9 +479,11 @@ class TestInstancesGrammar:
     Regression guard: the runner previously iterated
     ``pattern.roles`` to seed the continuous triggers at
     ``run()`` start, leaving ``instances:``-only patterns with
-    no launches at all.  These tests fix the shape by asserting
-    the continuous instance actually fires and the on_tool
-    instance does not get launched by the runner.
+    no launches at all.  These tests also pin the new
+    ``on_tool`` router plumbing — continuous launches happen,
+    ``on_tool`` instances are not launched by the runner, and
+    the pattern-derived block_runner lands in ``launch_fn``'s
+    kwargs.
     """
 
     def test_continuous_instance_fires(
@@ -460,6 +511,25 @@ class TestInstancesGrammar:
             ],
         )
 
+        # ExecuteAction block needed in the template so the
+        # pattern-router builder can look up its input slot.
+        tmpl = Template(
+            name="t",
+            artifacts=[],
+            blocks=[
+                BlockDefinition(
+                    name="ExecuteAction",
+                    image="dummy:latest",
+                    runner="container",
+                    lifecycle="workspace_persistent",
+                    inputs=[InputSlot(
+                        name="action",
+                        container_path="/input/action",
+                    )],
+                ),
+            ],
+        )
+
         launches: list[_FakeHandle] = []
 
         def launch_fn(**kwargs):
@@ -468,24 +538,157 @@ class TestInstancesGrammar:
             handle.finish()
             return handle
 
+        class _StubExecutor:
+            def launch(self, **_):
+                raise AssertionError(
+                    "executor.launch must not run in this test")
+
+        def executor_factory(block_def):
+            return _StubExecutor()
+
         ws = _FakeWorkspace(tmp_path)
+        base = _base_config(tmp_path, ws)
+        # Swap in a template that carries ExecuteAction so the
+        # router builder can resolve it.
+        base = AgentBlockConfig(
+            workspace=base.workspace,
+            template=tmpl,
+            project_root=base.project_root,
+            prompt=base.prompt,
+        )
         result = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
+            base_config=base,
             launch_fn=launch_fn,
             poll_interval_s=0.01,
             max_total_runtime_s=1.0,
+            executor_factory=executor_factory,
+            per_instance_runtime_config={
+                "execute_action": InstanceRuntimeConfig(),
+            },
         ).run()
 
         # Exactly one launch: the continuous ``play`` instance.
         # The on_tool ``execute_action`` instance does not get
-        # launched by the runner — dispatch is host-side.
+        # launched by the runner.
         assert len(launches) == 1
         assert result.agents_launched == 1
-        # The launch carried the instance's block name
-        # (``play``), not the instance's own name (also ``play``
-        # here, but the mechanism would differ if they did).
         assert launches[0].kwargs["block_name"] == "play"
+        # The pattern runner wrapped launch_fn so the call
+        # carries a merged block_runner.
+        assert (
+            "block_runner" in launches[0].kwargs
+        ), "pattern runner must inject block_runner"
+
+    def test_on_tool_without_executor_factory_raises(
+        self, tmp_path: Path,
+    ):
+        prompt = _write_prompt(tmp_path, "p.md", "play body")
+        pattern = Pattern(
+            name="needs-factory",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=prompt,
+                ),
+                BlockInstance(
+                    name="ea",
+                    block="ExecuteAction",
+                    trigger=OnToolTrigger(
+                        instance="play",
+                        tool="mcp__arc__take_action",
+                    ),
+                ),
+            ],
+        )
+        ws = _FakeWorkspace(tmp_path)
+        with pytest.raises(
+            ValueError, match="no ``executor_factory``",
+        ):
+            PatternRunner(
+                pattern,
+                base_config=_base_config(tmp_path, ws),
+                launch_fn=lambda **k: _FakeHandle(k),
+                poll_interval_s=0.01,
+                max_total_runtime_s=0.1,
+            )
+
+    def test_on_tool_collides_with_existing_router_raises(
+        self, tmp_path: Path,
+    ):
+        prompt = _write_prompt(tmp_path, "p.md", "play body")
+        pattern = Pattern(
+            name="collide",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=prompt,
+                ),
+                BlockInstance(
+                    name="ea",
+                    block="ExecuteAction",
+                    trigger=OnToolTrigger(
+                        instance="play",
+                        tool="mcp__arc__take_action",
+                    ),
+                ),
+            ],
+        )
+        tmpl = Template(
+            name="t",
+            artifacts=[],
+            blocks=[BlockDefinition(
+                name="ExecuteAction",
+                image="dummy:latest",
+                runner="container",
+                lifecycle="workspace_persistent",
+                inputs=[InputSlot(
+                    name="action",
+                    container_path="/input/action",
+                )],
+            )],
+        )
+        # Pre-bind a router that ALSO claims take_action.
+        existing = ToolRouter({
+            "mcp__arc__take_action":
+                lambda ctx: None,
+        })
+        base_launch = lambda **k: None  # noqa: E731
+        pre_bound = functools.partial(
+            base_launch, block_runner=existing)
+
+        def executor_factory(block_def):
+            class _E:
+                def launch(self, **_):
+                    raise AssertionError("unreached")
+            return _E()
+
+        ws = _FakeWorkspace(tmp_path)
+        base = AgentBlockConfig(
+            workspace=ws,
+            template=tmpl,
+            project_root=tmp_path,
+            prompt="",
+        )
+        with pytest.raises(
+            ValueError,
+            match=(
+                "declared by both the pattern's on_tool "
+                "instances and the caller-supplied "
+                "block_runner"),
+        ):
+            PatternRunner(
+                pattern,
+                base_config=base,
+                launch_fn=pre_bound,
+                executor_factory=executor_factory,
+            )
 
     def test_instance_launches_correct_block_when_names_differ(
         self, tmp_path: Path,
@@ -525,3 +728,259 @@ class TestInstancesGrammar:
         # BlockInstance.name.
         assert len(captured) == 1
         assert captured[0]["block_name"] == "play"
+
+
+class TestOnToolBridge:
+    """Direct coverage for the pattern's generic on_tool bridge.
+
+    The docker-gated integration tests exercise the whole path
+    end-to-end; these tests target the specific invariants the
+    generic bridge adds on top of ``BlockExecutor.launch``:
+    construction-time shape checks, JSON serialisation
+    convention, per-instance runtime config forwarding, and
+    error handling for inputs that the bridge cannot handle.
+    """
+
+    def _pattern(
+        self,
+        *,
+        prompt: Path,
+        trigger_tool: str = "mcp__arc__take_action",
+    ) -> Pattern:
+        return Pattern(
+            name="on-tool-bridge",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=str(prompt),
+                ),
+                BlockInstance(
+                    name="execute_action",
+                    block="TARGET",
+                    trigger=OnToolTrigger(
+                        instance="play",
+                        tool=trigger_tool,
+                    ),
+                ),
+            ],
+        )
+
+    def _template(
+        self, *, input_count: int = 1,
+        input_kind: str = "copy",
+    ):
+        inputs = [
+            InputSlot(
+                name=f"slot{i}",
+                container_path=f"/input/slot{i}",
+            )
+            for i in range(input_count)
+        ]
+        artifacts = [
+            ArtifactDeclaration(
+                name=f"slot{i}", kind=input_kind)
+            for i in range(input_count)
+        ]
+        return Template(
+            name="t",
+            artifacts=artifacts,
+            blocks=[BlockDefinition(
+                name="TARGET",
+                image="dummy:latest",
+                runner="container",
+                lifecycle="workspace_persistent",
+                inputs=inputs,
+            )],
+        )
+
+    def _make_runner(
+        self,
+        *,
+        tmp_path: Path,
+        project_setup=None,
+        template=None,
+        launch_fn=None,
+        executor=None,
+        runtime_config=None,
+    ):
+        prompt = _write_prompt(tmp_path, "p.md", "body")
+        pattern = self._pattern(prompt=prompt)
+        tmpl = template or self._template()
+        ws = _FakeWorkspace(tmp_path)
+        # Mirror the workspace's normal contract: declarations are
+        # lifted from the template at construction.  The on_tool
+        # bridge reads this map to verify the target slot is a copy
+        # artifact before trying to serialise tool_input to JSON.
+        for art in tmpl.artifacts:
+            ws.artifact_declarations[art.name] = art.kind
+        base = AgentBlockConfig(
+            workspace=ws,  # type: ignore[arg-type]
+            template=tmpl,
+            project_root=tmp_path,
+            prompt="",
+        )
+
+        def _default_launch(**kw):
+            handle = _FakeHandle(kw)
+            handle.finish()
+            return handle
+
+        # Preserve the exact callable the test supplied so
+        # ``PatternRunner`` can introspect ``functools.partial``
+        # to find any pre-bound ``block_runner``.
+        final_launch = (
+            launch_fn if launch_fn is not None else _default_launch)
+
+        class _CapturingExecutor:
+            def __init__(self):
+                self.calls: list[dict] = []
+
+            def launch(self, **kwargs):
+                self.calls.append(kwargs)
+                result_ns = type("R", (), {})()
+                result_ns.status = "succeeded"
+                result_ns.execution_id = "exec-test"
+                result_ns.exit_code = 0
+                result_ns.elapsed_s = 0.01
+                result_ns.output_bindings = {}
+                handle = type("H", (), {})()
+                handle.wait = lambda: result_ns
+                return handle
+
+        exe = executor or _CapturingExecutor()
+        rt = runtime_config or {
+            "execute_action": InstanceRuntimeConfig(),
+        }
+        runner = PatternRunner(
+            pattern,
+            base_config=base,
+            launch_fn=final_launch,
+            executor_factory=lambda block_def: exe,
+            per_instance_runtime_config=rt,
+            poll_interval_s=0.01,
+            max_total_runtime_s=0.1,
+        )
+        return runner, exe, ws
+
+    def test_construction_rejects_block_with_multiple_inputs(
+        self, tmp_path: Path,
+    ):
+        tmpl = self._template(input_count=2)
+        with pytest.raises(
+            ValueError, match="exactly one declared input",
+        ):
+            self._make_runner(
+                tmp_path=tmp_path, template=tmpl)
+
+    def test_construction_rejects_block_with_zero_inputs(
+        self, tmp_path: Path,
+    ):
+        tmpl = self._template(input_count=0)
+        with pytest.raises(
+            ValueError, match="exactly one declared input",
+        ):
+            self._make_runner(
+                tmp_path=tmp_path, template=tmpl)
+
+    def test_construction_rejects_incremental_input_slot(
+        self, tmp_path: Path,
+    ):
+        tmpl = self._template(
+            input_count=1, input_kind="incremental")
+        with pytest.raises(
+            ValueError,
+            match="tool-input bridge only supports ``copy``",
+        ):
+            self._make_runner(
+                tmp_path=tmp_path, template=tmpl)
+
+    def test_bridge_writes_tool_input_as_slot_json(
+        self, tmp_path: Path,
+    ):
+        runner, executor, ws = self._make_runner(
+            tmp_path=tmp_path,
+            runtime_config={
+                "execute_action": InstanceRuntimeConfig(
+                    extra_env={"A": "1"},
+                    extra_mounts=[("host", "/ctr", "ro")],
+                ),
+            },
+        )
+        # Fire the pattern router's tool-input bridge
+        # directly.
+        router = runner._pattern_tool_router
+        assert router is not None
+
+        ctx = HandoffContext(
+            tool_name="mcp__arc__take_action",
+            tool_input={"action": 6, "x": 1, "y": 2},
+            session_id="s",
+            tool_use_id="t",
+            iteration=0,
+        )
+        out = router(ctx)
+        assert out.content == "OK"
+
+        # Exactly one executor.launch call with the declared
+        # runtime config forwarded and an action-binding for
+        # slot0.
+        assert len(executor.calls) == 1
+        kw = executor.calls[0]
+        assert kw["block_name"] == "TARGET"
+        assert kw["extra_env"] == {"A": "1"}
+        assert kw["extra_mounts"] == [
+            ("host", "/ctr", "ro")]
+        aid = kw["input_bindings"]["slot0"]
+
+        # Artifact was registered with the slot's name and the
+        # file content on disk is the JSON-serialised
+        # tool_input.
+        instance = ws.artifacts[aid]
+        artifact_dir = (
+            ws.path / "artifacts" / instance.copy_path)
+        payload = json.loads(
+            (artifact_dir / "slot0.json").read_text(
+                encoding="utf-8"))
+        assert payload == {
+            "action": 6, "x": 1, "y": 2}
+
+    def test_bridge_converts_non_serialisable_input_to_error(
+        self, tmp_path: Path,
+    ):
+        runner, _executor, _ws = self._make_runner(
+            tmp_path=tmp_path)
+        router = runner._pattern_tool_router
+        assert router is not None
+        ctx = HandoffContext(
+            tool_name="mcp__arc__take_action",
+            # ``set`` is not JSON-serialisable.
+            tool_input={"nope": {1, 2, 3}},
+            session_id="s",
+            tool_use_id="t",
+            iteration=0,
+        )
+        out = router(ctx)
+        assert out.is_error
+        assert (
+            "cannot serialize tool_input" in out.content)
+
+    def test_opaque_block_runner_rejected_when_on_tool_present(
+        self, tmp_path: Path,
+    ):
+        def opaque_runner(_ctx):
+            return HandoffResult(content="OK")
+
+        opaque_launch = functools.partial(
+            lambda **_: None, block_runner=opaque_runner)
+
+        with pytest.raises(
+            ValueError,
+            match="not a ``ToolRouter``",
+        ):
+            self._make_runner(
+                tmp_path=tmp_path,
+                launch_fn=opaque_launch,
+            )

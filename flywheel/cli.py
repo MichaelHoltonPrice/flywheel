@@ -564,6 +564,17 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         # loop (e.g. cyberarc) inject ``launch_agent_with_handoffs``
         # here.  Default is ``launch_agent_block``.
         runner_kwargs["launch_fn"] = overrides["launch_fn"]
+    if "executor_factory" in overrides:
+        # Pattern ``on_tool`` dispatch uses this to look up the
+        # right executor per target block.
+        runner_kwargs["executor_factory"] = (
+            overrides["executor_factory"])
+    if "per_instance_runtime_config" in overrides:
+        # Per-instance env / mount knobs the pattern runner
+        # forwards to the executor on the on_tool dispatch
+        # path.
+        runner_kwargs["per_instance_runtime_config"] = (
+            overrides["per_instance_runtime_config"])
 
     try:
         runner = PatternRunner(

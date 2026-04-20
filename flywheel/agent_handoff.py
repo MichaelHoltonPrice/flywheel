@@ -797,55 +797,61 @@ def launch_agent_with_handoffs(
     )
 
 
-def make_tool_router(
-    routes: dict[str, BlockRunner],
-) -> BlockRunner:
-    """Compose per-tool ``BlockRunner``s into one dispatcher.
+class ToolRouter:
+    """Dispatch a :class:`HandoffContext` by tool name.
 
-    Use this when a single agent run intercepts more than one
-    handoff tool (e.g. cyberarc's ``mcp__arc__take_action`` and
-    ``mcp__arc__predict_action``).  The returned callable
-    satisfies the :data:`BlockRunner` protocol and is the
-    ``block_runner`` you pass to
-    :func:`launch_agent_with_handoffs` /
-    :func:`run_agent_with_handoffs`.
+    Composes per-tool :data:`BlockRunner`s into a single callable
+    the handoff loop can consume.  Exposes ``tools()`` so callers
+    that need to compose routers (e.g.
+    :class:`flywheel.pattern_runner.PatternRunner` merging its
+    pattern-declared on_tool routes with a project-hooks-provided
+    fallback router) can detect tool-name collisions statically
+    instead of discovering them mid-run.
 
-    The router is intentionally a thin dict lookup: every runner
-    in ``routes`` keeps its own state, construction args, and
-    error contract.  Adding a new handoff tool is just one more
-    entry here plus one more ``HANDOFF_TOOLS`` listing.
-
-    Args:
-        routes: Mapping from the fully qualified MCP tool name
-            the agent runner's ``PreToolUse`` hook intercepts
-            (e.g. ``"mcp__arc__take_action"``) to the runner
-            that should handle it.  The mapping is snapshotted
-            so later mutation of the original dict does not
-            affect dispatch.
-
-    Returns:
-        A :data:`BlockRunner` that dispatches each
-        :class:`HandoffContext` to the matching runner by
-        ``ctx.tool_name``.  When the tool is not in ``routes``
-        the router returns
-        ``HandoffResult(content="ERROR: ...", is_error=True)``
-        rather than raising, so a single misregistered tool
-        cannot crash the whole handoff loop — the agent sees
-        an explicit error and can adapt or terminate.
+    The routes dict is snapshotted at construction; later mutation
+    of the caller's dict does not affect dispatch.
     """
-    snapshot = dict(routes)
 
-    def _router(ctx: HandoffContext) -> HandoffResult:
-        runner = snapshot.get(ctx.tool_name)
+    def __init__(self, routes: dict[str, BlockRunner]):
+        """Capture the tool → runner mapping."""
+        self._routes: dict[str, BlockRunner] = dict(routes)
+
+    def tools(self) -> set[str]:
+        """Return the set of tool names this router handles."""
+        return set(self._routes)
+
+    def __call__(
+        self, ctx: HandoffContext,
+    ) -> HandoffResult:
+        """Dispatch ``ctx`` to the runner for its ``tool_name``.
+
+        Returns an ``is_error=True`` :class:`HandoffResult` when
+        no runner is registered for the tool, so a single
+        misrouted call cannot crash the whole handoff loop.
+        """
+        runner = self._routes.get(ctx.tool_name)
         if runner is None:
             return HandoffResult(
                 content=(
                     f"ERROR: no handoff runner registered for "
-                    f"tool {ctx.tool_name!r}; registered tools: "
-                    f"{sorted(snapshot)}"
+                    f"tool {ctx.tool_name!r}; registered "
+                    f"tools: {sorted(self._routes)}"
                 ),
                 is_error=True,
             )
         return runner(ctx)
 
-    return _router
+
+def make_tool_router(
+    routes: dict[str, BlockRunner],
+) -> ToolRouter:
+    """Compose per-tool :data:`BlockRunner`s into one dispatcher.
+
+    Use when a single agent run intercepts more than one handoff
+    tool.  The returned :class:`ToolRouter` satisfies the
+    :data:`BlockRunner` callable protocol and is the
+    ``block_runner`` you pass to
+    :func:`launch_agent_with_handoffs` /
+    :func:`run_agent_with_handoffs`.
+    """
+    return ToolRouter(routes)
