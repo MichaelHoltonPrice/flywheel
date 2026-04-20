@@ -27,7 +27,6 @@ import json
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +38,6 @@ from flywheel.executor import (
 )
 from flywheel.template import Template
 from flywheel.workspace import Workspace
-
 
 # Default total timeout for an agent launch (4 hours).
 DEFAULT_TOTAL_TIMEOUT = 14400
@@ -95,16 +93,10 @@ class AgentBlockConfig:
         model: Model name (e.g., ``"claude-sonnet-4-6"``).
         max_turns: Maximum agent conversation turns.
         total_timeout: Maximum wall-clock seconds for the run.
-        allowed_blocks: Reserved; not consulted on the launch
-            path anymore (the executor validates at the
-            substrate boundary).  Kept for API compatibility.
         source_dirs: Project source directories to mount
             read-only into the container.
         input_artifacts: Maps input slot names to artifact
             instance IDs.  Passed straight to the executor.
-        output_names: Reserved; block-declared outputs are the
-            substrate's single source of truth.  Kept for API
-            compatibility with pattern-runner wiring.
         overrides: Per-launch CLI flag overrides forwarded to
             the executor.
         mcp_servers: Comma-separated MCP server names enabled
@@ -116,8 +108,6 @@ class AgentBlockConfig:
         extra_mounts: Additional bind mounts appended to the
             substrate's mount list (auth volume, source dirs,
             MCP servers, ...).
-        pre_launch_hook: Reserved; retained for pattern-runner
-            API stability.  The substrate does not invoke it.
         isolated_network: When ``True``, add
             ``--cap-add=NET_ADMIN`` and set
             ``NETWORK_ISOLATION=1`` in the container env so the
@@ -128,7 +118,6 @@ class AgentBlockConfig:
         predecessor_id: Execution ID of a previous agent run
             this launch resumes from.  Recorded on the
             :class:`BlockExecution` for chain traversal.
-        post_checks: Reserved; kept for API compatibility.
         prompt_substitutions: ``{{KEY}} -> value`` substitutions
             applied by the pattern runner to the role's prompt
             text before launch.
@@ -143,20 +132,16 @@ class AgentBlockConfig:
     model: str | None = None
     max_turns: int | None = None
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT
-    allowed_blocks: list[str] | None = None
     source_dirs: list[str] | None = None
     input_artifacts: dict[str, str] | None = None
-    output_names: list[str] | None = None
     overrides: dict[str, Any] | None = None
     mcp_servers: str | None = None
     allowed_tools: str | None = None
     extra_env: dict[str, str] | None = None
     extra_mounts: list[tuple[str, str, str]] | None = None
-    pre_launch_hook: Callable[[Path], None] | None = None
     isolated_network: bool = False
     agent_workspace_dir: str | None = None
     predecessor_id: str | None = None
-    post_checks: dict[str, Any] | None = None
     prompt_substitutions: dict[str, str] | None = None
 
 
@@ -174,7 +159,6 @@ def _build_agent_env(
     max_turns: int | None,
     mcp_servers: str | None,
     allowed_tools: str | None,
-    allowed_blocks: list[str] | None,
     isolated_network: bool,
     extra_env: dict[str, str] | None,
 ) -> dict[str, str]:
@@ -187,8 +171,6 @@ def _build_agent_env(
     collision so a per-role override always takes effect.
     """
     env: dict[str, str] = {
-        "EVAL_BLOCK": (
-            allowed_blocks[0] if allowed_blocks else "eval_bot"),
         "MCP_SERVERS": mcp_servers or "eval",
         "ALLOWED_TOOLS": (
             allowed_tools or "Read,Write,Edit,Glob,Grep"),
@@ -403,20 +385,16 @@ def launch_agent_block(
     model: str | None = None,
     max_turns: int | None = None,
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT,
-    allowed_blocks: list[str] | None = None,
     source_dirs: list[str] | None = None,
     input_artifacts: dict[str, str] | None = None,
-    output_names: list[str] | None = None,
     overrides: dict[str, Any] | None = None,
     mcp_servers: str | None = None,
     allowed_tools: str | None = None,
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str, str]] | None = None,
-    pre_launch_hook: Callable[[Path], None] | None = None,
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
-    post_checks: dict[str, Any] | None = None,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -448,17 +426,14 @@ def launch_agent_block(
         max_turns: Optional turn budget.
         total_timeout: Wall-clock cap.  Enforced by the
             substrate's watchdog thread.
-        allowed_blocks: Reserved.
         source_dirs: Project source dirs to mount read-only.
         input_artifacts: Block input slot bindings.
-        output_names: Reserved; outputs are block-declared.
         overrides: CLI flag overrides forwarded to the executor.
         mcp_servers: Comma-separated MCP server names.
         allowed_tools: Comma-separated tool whitelist.
         extra_env: Additional env merged into the container's env.
         extra_mounts: Additional bind mounts appended to the
             substrate mount list.
-        pre_launch_hook: Reserved.
         isolated_network: When ``True``, adds
             ``--cap-add=NET_ADMIN`` and sets
             ``NETWORK_ISOLATION=1``.
@@ -468,14 +443,12 @@ def launch_agent_block(
             Callers that chain executions — the handoff loop —
             are responsible for writing ``predecessor_id`` onto
             the :class:`BlockExecution` record after wait().
-        post_checks: Reserved.
 
     Returns:
         An :class:`AgentHandle` for monitoring and controlling
         the agent.
     """
-    del (overrides, post_checks, output_names,
-         agent_workspace_dir, pre_launch_hook, allowed_blocks,
+    del (overrides, agent_workspace_dir,
          agent_image, predecessor_id)
 
     # Pattern runners pass ``total_timeout=None`` to mean "no
@@ -502,7 +475,6 @@ def launch_agent_block(
         max_turns=max_turns,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
-        allowed_blocks=None,
         isolated_network=isolated_network,
         extra_env=extra_env,
     )

@@ -27,14 +27,12 @@ class AgentGroupMember:
         agent_workspace_dir: Distinct workspace subdirectory name.
         input_artifacts: Override input artifacts for this member.
         extra_env: Additional env vars merged on top of the base.
-        output_names: Override output names for this member.
     """
 
     prompt: str
     agent_workspace_dir: str
     input_artifacts: dict[str, str] | None = None
     extra_env: dict[str, str] | None = None
-    output_names: list[str] | None = None
 
     def to_block_member(self) -> BlockGroupMember:
         """Convert to a BlockGroupMember."""
@@ -44,8 +42,6 @@ class AgentGroupMember:
         }
         if self.input_artifacts is not None:
             overrides["input_artifacts"] = self.input_artifacts
-        if self.output_names is not None:
-            overrides["output_names"] = self.output_names
         return BlockGroupMember(
             overrides=overrides,
             merge_env=self.extra_env,

@@ -290,26 +290,20 @@ The single-launch lifecycle inside ``launch_agent_block``:
    with artifact data.  Fresh launches start with an empty
    workspace; relaunches reuse whatever the agent itself wrote
    to it during the previous cycle (notes, intermediate
-   scripts, the SDK's own session state).  Artifact data
-   reaches the agent exclusively through input mounts (see
-   "Per-mount input staging").
-2. Run the optional ``pre_launch_hook`` callback.  Projects use
-   this for non-data setup that must run on every relaunch
-   (typically nothing in current projects).  It must not stage
-   artifact data into the workspace; that path is reserved
-   for cold-start seeding into the appropriate incremental
-   artifact via :meth:`Workspace.append_to_incremental`.
-3. Launch the agent container with the workspace, source mounts,
+   scripts).  The SDK session lives in ``/state/``, not in the
+   workspace; artifact data reaches the agent exclusively
+   through input mounts (see "Per-mount input staging").
+2. Launch the agent container with the workspace, source mounts,
    the auth volume, and the configured environment variables
    (model, ``MAX_TURNS``, ``HANDOFF_TOOLS``, ``MCP_SERVERS``,
-   ``RESUME_SESSION_FILE`` for relaunches, etc.).  Stderr is
-   drained in a background thread to prevent pipe deadlocks.
-4. Stream JSON events from the agent's stdout and log them.
-5. On exit (clean, timeout, ``.agent_stop``, or handoff), record
-   the agent itself as a ``BlockExecution`` under the
+   etc.).  Stderr is drained in a background thread to prevent
+   pipe deadlocks.
+3. Stream JSON events from the agent's stdout and log them.
+4. On exit (clean, timeout, cooperative stop, or handoff),
+   record the agent itself as a ``BlockExecution`` under the
    caller-supplied ``block_name`` (typically the role name such
-   as ``play``), collect output artifacts by matching filenames
-   in the workspace to declared output names, and return an
+   as ``play``), register each declared output artifact from
+   the block's ``/output/<name>/`` directory, and return an
    ``AgentResult``.
 
 A total timeout (default 4 hours) kills the container if
@@ -327,11 +321,11 @@ the cycle structure explicitly.
 ``launch_agent_block()`` returns an ``AgentHandle`` immediately,
 allowing the caller to control the container while it runs:
 
-- ``handle.stop(reason)`` — terminate the container by writing
-  ``/workspace/.agent_stop`` via ``docker exec`` (Docker
-  Desktop's bind mounts on Windows do not reliably propagate
-  host writes into the container).  The optional ``reason`` is
-  recorded on the resulting execution record.
+- ``handle.stop(reason)`` — trigger cooperative shutdown by
+  writing ``/workspace/.stop`` (the substrate sentinel the
+  container runtime polls); a forced TERM/KILL follows on
+  timeout.  The optional ``reason`` is recorded on the resulting
+  execution record.
 - ``handle.wait()`` — block until exit, join the stdout/stderr
   drain threads, collect output artifacts, and return
   ``AgentResult``.  Must be called exactly once, even after
@@ -344,22 +338,15 @@ calls ``launch_agent_block()`` then ``handle.wait()``.  Code
 that needs nested-block support uses
 ``run_agent_with_handoffs()`` instead.
 
-### Agent session artifacts
+### Agent session storage
 
-The agent runner exports the Claude SDK session history as
-``agent_session.jsonl`` to the workspace on exit (including on
-SIGTERM from ``docker stop``). If ``output_names`` includes
-``agent_session``, flywheel collects this as a regular copy
-artifact.
-
-To resume a session in a new container, pass the session artifact
-as an input artifact and set ``RESUME_SESSION_FILE`` in
-``extra_env`` pointing to the mounted file path. The agent runner
-copies the session to the SDK's expected location and passes
-``resume=session_id`` to the SDK client.
-
-This enables cross-container session resume without persistent
-volumes — the session round-trips through the artifact system.
+The agent runner stores the Claude SDK session history under
+``/state/`` (see ``substrate-contract.md`` for the ``state:
+true`` mount contract).  Flywheel populates ``/state/`` from the
+most recent prior execution's captured state on launch and
+captures it back on exit, so a subsequent launch resumes from
+the same session without round-tripping through the artifact
+graph.  There is no separate ``agent_session`` artifact.
 
 ### Agent pause and resume
 
@@ -395,20 +382,12 @@ stores session JSONLs at
 ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` inside
 the container, and those files die with the container.
 
-**Cross-container resume via session artifacts.**  When the
-container has to die — total-timeout, a graceful
-``.agent_stop``, or a nested-block handoff — the runner exports
-the SDK session JSONL to the workspace as
-``agent_session.jsonl`` before exiting.  If ``output_names``
-includes ``agent_session``, flywheel registers that file as a
-regular copy artifact with full provenance.  A subsequent
-launch can resume from it by passing the artifact as an input
-mount and setting ``RESUME_SESSION_FILE`` in ``extra_env`` to
-the mounted path; the agent runner copies the file into the
-SDK's expected location and passes ``resume=session_id`` to the
-SDK client on startup.  This makes the session round-trip
-through the artifact system rather than through a persistent
-volume.
+**Cross-container resume.**  When the container has to die —
+total-timeout, a cooperative stop, or a nested-block handoff —
+the runner captures its SDK session to ``/state/`` before
+exiting.  On the next launch flywheel populates ``/state/`` from
+that captured snapshot and the runner resumes the same session.
+See ``substrate-contract.md`` for the ``/state/`` contract.
 
 **Handoff resume (nested blocks).**  The host-side handoff loop
 (:func:`flywheel.agent_handoff.run_agent_with_handoffs`) drives
@@ -418,10 +397,9 @@ runner's ``PreToolUse`` hook denies the call, captures the
 intended ``tool_use`` blocks into ``pending_tool_calls.json``,
 sets ``.agent_state.json`` to ``status="tool_handoff"``, and
 exits cleanly so the host can run the blocks out-of-band and
-splice the real ``tool_result`` back into ``agent_session.jsonl``
-before relaunching.  This is the same session-artifact resume
-path as above, with the extra splice step in between.  See
-"Nested block executions from agents" for the full mechanism.
+splice the real ``tool_result`` into the captured session in
+``/state/`` before relaunching.  See "Nested block executions
+from agents" for the full mechanism.
 
 ### Recording nested block executions
 
@@ -473,18 +451,20 @@ relaunch the agent if a relevant directive is present, which is
 how a project signals "stop this run, the work it produced
 crossed a policy threshold."
 
-Host-side block runners (``cyberarc.game_step_block.GameStepRunner``,
-``PredictActionRunner``, ``BrainstormRequestRunner``,
-``ExplorationRequestRunner``) all use the recorder this way:
-they are plain ``BlockRunner`` callables registered with the
-handoff loop, invoked when the agent's ``PreToolUse`` hook
-intercepts the corresponding tool, and they wrap their work in
-``recorder.begin(...)`` so the resulting execution record, artifacts, and
-post-check are recorded under the same workspace lock as every
-other execution.  The same pattern applies outside the agent
-loop: ``cyberarc/tools/play_server.py`` uses a
-``LocalBlockRecorder`` to record human play sessions against
-the same ``game_step`` block schema.
+Host-side block runners (``PredictActionRunner``,
+``BrainstormRequestRunner``, ``ExplorationRequestRunner``) all
+use the recorder this way: they are plain ``BlockRunner``
+callables registered with the handoff loop, invoked when the
+agent's ``PreToolUse`` hook intercepts the corresponding tool,
+and they wrap their work in ``recorder.begin(...)`` so the
+resulting execution record, artifacts, and post-check are
+recorded under the same workspace lock as every other execution.
+The same pattern applies outside the agent loop:
+``cyberarc/tools/play_server.py`` uses a ``LocalBlockRecorder``
+to record human play sessions.  ``take_action`` dispatch lives
+in a different path — the pattern runner's ``on_tool`` trigger
+routes it to the ``ExecuteAction`` container block rather than
+a host-side runner.
 
 All artifact-recording flows ride either
 ``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or
@@ -717,8 +697,9 @@ roles:
   artifacts (e.g., ``game_history``) are bound the same way and
   re-staged per launch, so each cycle of a handoff loop sees
   every entry appended through the previous cycle.
-- ``outputs`` — artifact names the role registers.  Falls back
-  to ``base_config.output_names`` when omitted.
+- ``outputs`` — artifact names the role registers.  Declared on
+  the role for documentation; the substrate treats block-declared
+  outputs as the single source of truth.
 - ``extra_env`` — per-role env vars merged on top of the
   project's ``extra_env``.  Use sparingly; most env vars belong
   in project hooks.

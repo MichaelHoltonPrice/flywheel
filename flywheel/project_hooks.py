@@ -57,8 +57,8 @@ class ProjectHooks(Protocol):
             A mapping of :class:`flywheel.agent.AgentBlockConfig`
             field overrides.  The runner merges this on top of the
             CLI flags before launching agents.  Common keys:
-            ``extra_env``, ``extra_mounts``, ``pre_launch_hook``,
-            ``isolated_network``, ``mcp_servers``, ``allowed_tools``.
+            ``extra_env``, ``extra_mounts``, ``isolated_network``,
+            ``mcp_servers``, ``allowed_tools``.
 
             One non-config key is also recognised:
             ``launch_fn`` — a callable with the

@@ -105,14 +105,8 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--auth-volume", default="claude-auth")
     agent_parser.add_argument("--agent-image", default="flywheel-claude:latest")
     agent_parser.add_argument(
-        "--allowed-block", action="append", default=[],
-        help="Block the agent can invoke (repeatable; default: all).")
-    agent_parser.add_argument(
         "--source-dir", action="append", default=[],
         help="Source directory to mount read-only (repeatable).")
-    agent_parser.add_argument(
-        "--output", action="append", default=[],
-        help="Artifact name to collect from agent workspace (repeatable).")
     agent_parser.add_argument(
         "--mcp-servers", default=None,
         help="Comma-separated MCP server names (default: eval).")
@@ -449,16 +443,13 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         model=args.model,
         max_turns=args.max_turns,
         total_timeout=args.total_timeout,
-        allowed_blocks=args.allowed_block or None,
         source_dirs=args.source_dir or None,
         input_artifacts=input_artifacts or None,
-        output_names=args.output or None,
         overrides=overrides or None,
         mcp_servers=args.mcp_servers,
         allowed_tools=args.allowed_tools,
         extra_env=extra_env or None,
         extra_mounts=extra_mounts or None,
-        post_checks=block_registry.post_checks or None,
     )
     print(
         f"Agent completed: exit_code={result.exit_code}, "
@@ -545,15 +536,12 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         max_turns=overrides.get("max_turns", args.max_turns),
         total_timeout=overrides.get(
             "total_timeout", args.total_timeout),
-        output_names=overrides.get("output_names"),
         mcp_servers=overrides.get("mcp_servers"),
         allowed_tools=overrides.get("allowed_tools"),
         extra_env=overrides.get("extra_env"),
         extra_mounts=overrides.get("extra_mounts"),
-        pre_launch_hook=overrides.get("pre_launch_hook"),
         isolated_network=overrides.get(
             "isolated_network", True),
-        post_checks=block_registry.post_checks or None,
         prompt_substitutions=overrides.get(
             "prompt_substitutions"),
     )

@@ -417,11 +417,8 @@ class PatternRunner:
                 if role.total_timeout is not None
                 else self._base.total_timeout
             ),
-            "allowed_blocks": self._base.allowed_blocks,
             "source_dirs": self._base.source_dirs,
             "input_artifacts": self._collect_inputs(role),
-            "output_names": (
-                role.outputs or self._base.output_names),
             "overrides": self._base.overrides,
             "mcp_servers": (
                 role.mcp_servers or self._base.mcp_servers),
@@ -429,14 +426,12 @@ class PatternRunner:
                 role.allowed_tools or self._base.allowed_tools),
             "extra_env": self._merge_env(role),
             "extra_mounts": self._base.extra_mounts,
-            "pre_launch_hook": self._base.pre_launch_hook,
             "isolated_network": self._base.isolated_network,
             "agent_workspace_dir": self._workspace_dir_for(
                 role,
                 cohort_index=cohort_index,
                 member_index=member_index,
             ),
-            "post_checks": self._base.post_checks,
         }
         return kwargs
 
