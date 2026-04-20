@@ -20,10 +20,12 @@ import pytest
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.artifact import BlockExecution
 from flywheel.pattern import (
+    BlockInstance,
     ContinuousTrigger,
     EveryNExecutionsTrigger,
     OnEventTrigger,
     OnRequestTrigger,
+    OnToolTrigger,
     Pattern,
     Role,
 )
@@ -337,7 +339,9 @@ class TestRejectsBadPatterns:
                     of_block="take_action", n=5),
             )],
         )
-        with pytest.raises(ValueError, match="continuous role"):
+        with pytest.raises(
+            ValueError, match="continuous instance",
+        ):
             PatternRunner(
                 pattern,
                 base_config=_base_config(
@@ -418,3 +422,106 @@ class TestTermination:
         assert len(launched) == 1
         assert result.agents_launched == 1
         assert launched[0]._waited
+
+
+class TestInstancesGrammar:
+    """PatternRunner drives ``instances:`` patterns.
+
+    Regression guard: the runner previously iterated
+    ``pattern.roles`` to seed the continuous triggers at
+    ``run()`` start, leaving ``instances:``-only patterns with
+    no launches at all.  These tests fix the shape by asserting
+    the continuous instance actually fires and the on_tool
+    instance does not get launched by the runner.
+    """
+
+    def test_continuous_instance_fires(
+        self, tmp_path: Path,
+    ):
+        prompt = _write_prompt(tmp_path, "p.md", "play body")
+        pattern = Pattern(
+            name="just-play-instances",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=prompt,
+                ),
+                BlockInstance(
+                    name="execute_action",
+                    block="ExecuteAction",
+                    trigger=OnToolTrigger(
+                        instance="play",
+                        tool="mcp__arc__take_action",
+                    ),
+                ),
+            ],
+        )
+
+        launches: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            launches.append(handle)
+            handle.finish()
+            return handle
+
+        ws = _FakeWorkspace(tmp_path)
+        result = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=1.0,
+        ).run()
+
+        # Exactly one launch: the continuous ``play`` instance.
+        # The on_tool ``execute_action`` instance does not get
+        # launched by the runner — dispatch is host-side.
+        assert len(launches) == 1
+        assert result.agents_launched == 1
+        # The launch carried the instance's block name
+        # (``play``), not the instance's own name (also ``play``
+        # here, but the mechanism would differ if they did).
+        assert launches[0].kwargs["block_name"] == "play"
+
+    def test_instance_launches_correct_block_when_names_differ(
+        self, tmp_path: Path,
+    ):
+        prompt = _write_prompt(tmp_path, "p.md", "body")
+        pattern = Pattern(
+            name="rename",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="main",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=prompt,
+                ),
+            ],
+        )
+
+        captured: list[dict] = []
+
+        def launch_fn(**kwargs):
+            captured.append(kwargs)
+            handle = _FakeHandle(kwargs)
+            handle.finish()
+            return handle
+
+        ws = _FakeWorkspace(tmp_path)
+        PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=1.0,
+        ).run()
+
+        # Block name must come from BlockInstance.block, not
+        # BlockInstance.name.
+        assert len(captured) == 1
+        assert captured[0]["block_name"] == "play"

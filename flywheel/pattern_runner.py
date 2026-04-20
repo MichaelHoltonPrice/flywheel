@@ -47,10 +47,12 @@ from flywheel.agent import (
     launch_agent_block,
 )
 from flywheel.pattern import (
+    BlockInstance,
     ContinuousTrigger,
     EveryNExecutionsTrigger,
     OnEventTrigger,
     OnRequestTrigger,
+    OnToolTrigger,
     Pattern,
     Role,
 )
@@ -142,9 +144,29 @@ class PatternRunner:
         self._poll = poll_interval_s
         self._max_runtime = max_total_runtime_s
 
-        # Reject reactive triggers up front; we will add support
-        # role-by-role rather than silently dropping them.
-        for role in pattern.roles:
+        # ``Pattern.instances`` is the canonical topology list
+        # — populated for both grammars.  The runner drives
+        # everything off of it; ``pattern.roles`` is preserved
+        # only for legacy callers.  Each launchable instance
+        # gets a synthesized :class:`Role` so the existing
+        # agent-launch plumbing keeps working.
+        # ``on_tool`` instances are not launched by the runner's
+        # trigger loop — their dispatch is handled host-side by
+        # whatever tool router the caller's ``launch_fn`` has
+        # bound (project hooks today; the pattern runner itself
+        # in a follow-up slice).  They are preserved on
+        # ``self._on_tool_instances`` for inspection.
+        synthesized_roles: list[Role] = []
+        self._on_tool_instances: list[BlockInstance] = []
+        for inst in pattern.iter_instances():
+            if isinstance(inst.trigger, OnToolTrigger):
+                self._on_tool_instances.append(inst)
+                continue
+            synthesized_roles.append(
+                _role_from_instance(inst))
+
+        # Reject reactive triggers we don't yet implement.
+        for role in synthesized_roles:
             if isinstance(
                     role.trigger,
                     (OnRequestTrigger, OnEventTrigger)):
@@ -159,28 +181,30 @@ class PatternRunner:
                 )
 
         if not any(isinstance(r.trigger, ContinuousTrigger)
-                   for r in pattern.roles):
+                   for r in synthesized_roles):
             raise ValueError(
                 f"Pattern {pattern.name!r} has no continuous "
-                f"role; nothing would drive the run.  Add at "
-                f"least one role with `trigger: {{kind: "
-                f"continuous}}`."
+                f"instance; nothing would drive the run.  Add "
+                f"at least one instance with "
+                f"`trigger: {{kind: continuous}}`."
             )
 
         self._state: dict[str, _RoleState] = {
-            r.name: _RoleState(role=r) for r in pattern.roles
+            r.name: _RoleState(role=r)
+            for r in synthesized_roles
         }
         self._results: dict[str, list[AgentResult]] = {
-            r.name: [] for r in pattern.roles
+            r.name: [] for r in synthesized_roles
         }
 
     def run(self) -> PatternRunResult:
         """Drive the pattern to completion and return a summary."""
         start = time.monotonic()
 
-        for role in self._pattern.roles:
-            if isinstance(role.trigger, ContinuousTrigger):
-                self._fire_role(role)
+        for state in self._state.values():
+            if isinstance(
+                    state.role.trigger, ContinuousTrigger):
+                self._fire_role(state.role)
 
         try:
             while True:
@@ -295,15 +319,17 @@ class PatternRunner:
             prompt = prompt.replace("{{" + key + "}}", value)
 
         # A role's name is the block name this launch represents.
-        # When the pattern DSL moves to explicit block instances
-        # (step 6 of the reshape) this becomes a per-instance
-        # override; for now, role.name == block_name.
+        # A role's ``block_name`` is either explicitly set (when
+        # the role was synthesized from an ``instances:`` spec
+        # whose ``block:`` differs from its instance name) or
+        # falls back to the role's own name (legacy ``roles:``
+        # grammar where role-name and block-name are the same).
         kwargs: dict[str, Any] = {
             "workspace": self._base.workspace,
             "template": self._base.template,
             "project_root": self._base.project_root,
             "prompt": prompt,
-            "block_name": role.name,
+            "block_name": role.block_name or role.name,
             "agent_image": self._base.agent_image,
             "auth_volume": self._base.auth_volume,
             "model": role.model or self._base.model,
@@ -447,3 +473,36 @@ class PatternRunner:
         return PatternRunner(
             pattern, base_config=base_config, **runner_kwargs,
         )
+
+
+def _role_from_instance(inst: BlockInstance) -> Role:
+    """Synthesise a :class:`Role` equivalent of an instance.
+
+    The runner's launch / trigger plumbing is driver-by-role
+    today.  For patterns that declare an ``instances:`` topology
+    we build a ``Role`` carrying the instance's agent-specific
+    config alongside an explicit ``block_name`` so the launcher
+    runs the right block even when its name differs from the
+    instance name.
+
+    ``prompt`` is required on the generated role (the agent
+    launcher needs it); instances without a prompt are only
+    meaningful with triggers this helper never sees
+    (``on_tool``), so an empty prompt here indicates a bug
+    upstream.
+    """
+    return Role(
+        name=inst.name,
+        prompt=inst.prompt or "",
+        trigger=inst.trigger,
+        model=inst.model,
+        cardinality=inst.cardinality,
+        inputs=list(inst.inputs),
+        outputs=list(inst.outputs),
+        mcp_servers=inst.mcp_servers,
+        allowed_tools=inst.allowed_tools,
+        max_turns=inst.max_turns,
+        total_timeout=inst.total_timeout,
+        extra_env=dict(inst.extra_env),
+        block_name=inst.block,
+    )

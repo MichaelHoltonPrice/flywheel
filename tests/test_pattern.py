@@ -15,10 +15,12 @@ import pytest
 
 from flywheel.blocks.registry import BlockRegistry
 from flywheel.pattern import (
+    BlockInstance,
     ContinuousTrigger,
     EveryNExecutionsTrigger,
     OnEventTrigger,
     OnRequestTrigger,
+    OnToolTrigger,
     Pattern,
     Role,
     discover_patterns,
@@ -272,7 +274,9 @@ class TestPatternValidation:
     def test_missing_roles_raises(self, tmp_path: Path):
         path = _write(tmp_path, "bad", "description: nope\n")
         with pytest.raises(
-                ValueError, match="'roles' must be a non-empty"):
+                ValueError,
+                match="must declare either 'instances'",
+        ):
             Pattern.from_yaml(path)
 
     def test_empty_roles_raises(self, tmp_path: Path):
@@ -335,3 +339,112 @@ class TestDiscoverPatterns:
 
     def test_missing_directory_returns_empty(self, tmp_path: Path):
         assert discover_patterns(tmp_path / "nope") == {}
+
+
+class TestInstancesGrammar:
+    """Patterns may declare topology as ``instances:`` referencing
+    blocks, with ``on_tool`` triggers for reactive dispatch."""
+
+    def test_instances_parses_with_continuous_trigger(
+        self, tmp_path: Path,
+    ):
+        body = (
+            "instances:\n"
+            "  play:\n"
+            "    block: play\n"
+            "    trigger: {kind: continuous}\n"
+            "    cardinality: 1\n"
+            "    prompt: workforce/prompts/arc.md\n"
+        )
+        path = _write(tmp_path, "inst", body)
+        pattern = Pattern.from_yaml(path)
+        assert len(pattern.instances) == 1
+        assert len(pattern.roles) == 0
+        inst = pattern.instances[0]
+        assert inst.name == "play"
+        assert inst.block == "play"
+        assert inst.cardinality == 1
+        assert isinstance(
+            inst.trigger, ContinuousTrigger)
+        assert inst.prompt == "workforce/prompts/arc.md"
+
+    def test_on_tool_trigger_parses(self, tmp_path: Path):
+        body = (
+            "instances:\n"
+            "  play:\n"
+            "    block: play\n"
+            "    trigger: {kind: continuous}\n"
+            "    prompt: p.md\n"
+            "  execute_action:\n"
+            "    block: ExecuteAction\n"
+            "    trigger:\n"
+            "      kind: on_tool\n"
+            "      instance: play\n"
+            "      tool: mcp__arc__take_action\n"
+        )
+        path = _write(tmp_path, "ontool", body)
+        pattern = Pattern.from_yaml(path)
+        ea = next(
+            i for i in pattern.instances
+            if i.name == "execute_action")
+        assert isinstance(ea.trigger, OnToolTrigger)
+        assert ea.trigger.instance == "play"
+        assert (
+            ea.trigger.tool == "mcp__arc__take_action")
+
+    def test_on_tool_unknown_instance_raises(
+        self, tmp_path: Path,
+    ):
+        body = (
+            "instances:\n"
+            "  play:\n"
+            "    block: play\n"
+            "    trigger: {kind: continuous}\n"
+            "    prompt: p.md\n"
+            "  ea:\n"
+            "    block: ExecuteAction\n"
+            "    trigger:\n"
+            "      kind: on_tool\n"
+            "      instance: nope\n"
+            "      tool: mcp__arc__take_action\n"
+        )
+        path = _write(tmp_path, "bad", body)
+        with pytest.raises(
+            ValueError,
+            match=(
+                "on_tool trigger references unknown "
+                "instance 'nope'"),
+        ):
+            Pattern.from_yaml(path)
+
+    def test_both_roles_and_instances_raises(
+        self, tmp_path: Path,
+    ):
+        body = (
+            "roles:\n"
+            "  a: {prompt: p.md, trigger: {kind: continuous}}\n"
+            "instances:\n"
+            "  a:\n"
+            "    block: a\n"
+            "    trigger: {kind: continuous}\n"
+        )
+        path = _write(tmp_path, "bad", body)
+        with pytest.raises(
+            ValueError, match="not both",
+        ):
+            Pattern.from_yaml(path)
+
+    def test_instance_missing_block_raises(
+        self, tmp_path: Path,
+    ):
+        body = (
+            "instances:\n"
+            "  play:\n"
+            "    trigger: {kind: continuous}\n"
+        )
+        path = _write(tmp_path, "bad", body)
+        with pytest.raises(
+            ValueError,
+            match="'block' must be a non-empty string",
+        ):
+            Pattern.from_yaml(path)

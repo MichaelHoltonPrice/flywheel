@@ -131,11 +131,38 @@ class OnEventTrigger:
     kind: Literal["on_event"] = "on_event"
 
 
+@dataclass(frozen=True)
+class OnToolTrigger:
+    """Fire when a named instance invokes a named MCP tool.
+
+    Declares handoff dispatch at pattern scope: ``instance``
+    names another launchable instance in the same pattern
+    (typically the continuous agent driving the run); ``tool``
+    is the fully qualified MCP tool whose invocation is meant
+    to trigger one execution of this instance's block.
+
+    Load-bearing-ness caveat: the runner parses and validates
+    this trigger, but runtime dispatch for matching tool calls
+    still lives in whatever ``BlockRunner`` the caller's
+    ``launch_fn`` supplies (today, the project-hooks tool
+    router).  A follow-up slice moves that routing into
+    :class:`flywheel.pattern_runner.PatternRunner` so the
+    pattern's declaration becomes authoritative.  Until then,
+    patterns must still arrange for the host-side router to
+    cover every tool named in an ``on_tool`` trigger.
+    """
+
+    instance: str
+    tool: str
+    kind: Literal["on_tool"] = "on_tool"
+
+
 Trigger = (
     ContinuousTrigger
     | EveryNExecutionsTrigger
     | OnRequestTrigger
     | OnEventTrigger
+    | OnToolTrigger
 )
 
 
@@ -203,17 +230,91 @@ class Role:
     max_turns: int | None = None
     total_timeout: int | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Name of the block this role launches.  ``None`` means
+    # ``block_name == name`` (the legacy ``roles:`` grammar's
+    # implicit 1:1 mapping); synthesized roles produced from
+    # ``instances:`` specs set this explicitly so the runner
+    # launches the right block under the instance's name.
+    block_name: str | None = None
+
+
+@dataclass(frozen=True)
+class BlockInstance:
+    """One instance of a block inside a pattern.
+
+    Patterns declare topology as a mapping of named instances,
+    each referencing a block definition by name and carrying a
+    trigger describing when it fires.  Agent-specific config
+    (``prompt``, ``model``, ``inputs``, ``outputs``, etc.) may
+    be supplied inline on the instance for the transitional
+    period; a future revision will move that config onto the
+    block YAML itself.
+
+    Attributes:
+        name: Instance identifier, unique within the pattern.
+        block: Name of the block this instance launches.  Must
+            resolve against the project's :class:`BlockRegistry`.
+        trigger: When the instance fires.  For non-agent blocks
+            (e.g., a ``workspace_persistent`` ``ExecuteAction``
+            container), ``on_tool`` is the usual choice.
+        cardinality: How many parallel launches per trigger
+            firing.  Must be ``>= 1``.  Defaults to ``1``.
+        prompt: Agent-specific.  Project-relative path to the
+            system-prompt file; ``None`` for non-agent blocks.
+        model: Agent-specific.  Model identifier passed to the
+            launcher.
+        inputs: Artifact names the instance reads at launch
+            time.  Resolved against the workspace on fire.
+        outputs: Artifact names the instance is expected to
+            register.  Informational today; the block's own
+            declared outputs are the substrate source of truth.
+        mcp_servers: Agent-specific.  Comma-separated MCP
+            server names.
+        allowed_tools: Agent-specific.  Comma-separated tool
+            whitelist.
+        max_turns: Agent-specific.  Per-launch turn cap.
+        total_timeout: Agent-specific.  Per-launch wall-clock
+            cap in seconds.
+        extra_env: Per-instance environment variables merged
+            into the project-wide launch env.
+    """
+
+    name: str
+    block: str
+    trigger: Trigger
+    cardinality: int = 1
+    prompt: str | None = None
+    model: str | None = None
+    inputs: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    mcp_servers: str | None = None
+    allowed_tools: str | None = None
+    max_turns: int | None = None
+    total_timeout: int | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Pattern:
     """A parsed agent pattern.
 
+    ``instances`` is the canonical topology list the pattern
+    runner consumes; it is always populated.  ``roles`` is a
+    backward-compat view that is populated only when the YAML
+    used the legacy ``roles:`` grammar — callers who still
+    iterate it keep working during the transition.  The
+    ``Pattern.from_yaml`` loader synthesises an equivalent
+    ``BlockInstance`` for every legacy role (with
+    ``block == role.name`` per the implicit 1:1 mapping),
+    so consumers that iterate ``instances`` see both grammars.
+
     Attributes:
         name: Pattern identifier (the YAML file's stem).
-        roles: The pattern's roles.  Order is the YAML order;
-            the runner is free to launch them in any order, but
-            tests and docs benefit from determinism.
+        roles: Legacy-grammar view.  Empty for ``instances:``
+            patterns; populated from ``roles:`` YAML for
+            backward compatibility.
+        instances: Canonical topology list.  Always populated,
+            regardless of which YAML grammar the pattern used.
         description: Optional human-readable description (kept
             verbatim from YAML).
     """
@@ -221,6 +322,22 @@ class Pattern:
     name: str
     roles: list[Role]
     description: str = ""
+    instances: list[BlockInstance] = field(default_factory=list)
+
+    def iter_instances(self) -> list[BlockInstance]:
+        """Return the pattern's canonical instances.
+
+        When ``instances`` is already populated (the common case
+        — ``Pattern.from_yaml`` always fills it for both
+        grammars), that list is returned.  When a caller has
+        constructed a :class:`Pattern` directly with only
+        ``roles=[...]`` (tests, legacy code), this synthesises
+        equivalent :class:`BlockInstance` objects on demand so
+        the pattern runner sees one shape either way.
+        """
+        if self.instances:
+            return self.instances
+        return [_instance_from_role(r) for r in self.roles]
 
     @classmethod
     def from_yaml(
@@ -275,31 +392,87 @@ class Pattern:
             )
 
         roles_raw = data.get("roles")
-        if not isinstance(roles_raw, dict) or not roles_raw:
+        instances_raw = data.get("instances")
+
+        if instances_raw is not None and roles_raw is not None:
             raise ValueError(
-                f"Pattern {name!r}: 'roles' must be a non-empty "
-                f"mapping of role-name to role-spec"
+                f"Pattern {name!r}: declare either 'roles' "
+                f"(legacy) or 'instances' (current), not both"
+            )
+        if instances_raw is None and roles_raw is None:
+            raise ValueError(
+                f"Pattern {name!r}: must declare either "
+                f"'instances' (current grammar) or 'roles' "
+                f"(legacy grammar)"
             )
 
-        seen: set[str] = set()
         roles: list[Role] = []
-        for role_name, role_spec in roles_raw.items():
-            if role_name in seen:
-                raise ValueError(
-                    f"Pattern {name!r}: duplicate role "
-                    f"{role_name!r}"
-                )
-            seen.add(role_name)
-            roles.append(
-                _parse_role(
-                    role_name,
-                    role_spec,
-                    pattern_name=name,
-                    block_registry=block_registry,
-                )
-            )
+        instances: list[BlockInstance] = []
 
-        return cls(name=name, roles=roles, description=description)
+        if instances_raw is not None:
+            if (not isinstance(instances_raw, dict)
+                    or not instances_raw):
+                raise ValueError(
+                    f"Pattern {name!r}: 'instances' must be a "
+                    f"non-empty mapping of instance-name to "
+                    f"instance-spec"
+                )
+            seen: set[str] = set()
+            for inst_name, inst_spec in instances_raw.items():
+                if inst_name in seen:
+                    raise ValueError(
+                        f"Pattern {name!r}: duplicate instance "
+                        f"{inst_name!r}"
+                    )
+                seen.add(inst_name)
+                instances.append(
+                    _parse_instance(
+                        inst_name,
+                        inst_spec,
+                        pattern_name=name,
+                        block_registry=block_registry,
+                    )
+                )
+            _validate_on_tool_cross_refs(
+                instances, pattern_name=name)
+        else:
+            if (not isinstance(roles_raw, dict)
+                    or not roles_raw):
+                raise ValueError(
+                    f"Pattern {name!r}: 'roles' must be a "
+                    f"non-empty mapping of role-name to "
+                    f"role-spec"
+                )
+            seen = set()
+            for role_name, role_spec in roles_raw.items():
+                if role_name in seen:
+                    raise ValueError(
+                        f"Pattern {name!r}: duplicate role "
+                        f"{role_name!r}"
+                    )
+                seen.add(role_name)
+                roles.append(
+                    _parse_role(
+                        role_name,
+                        role_spec,
+                        pattern_name=name,
+                        block_registry=block_registry,
+                    )
+                )
+            # Populate the canonical ``instances`` list by
+            # synthesising one :class:`BlockInstance` per
+            # legacy role: role name becomes the block name
+            # (legacy 1:1 mapping) and the agent-specific
+            # fields carry across verbatim.
+            instances = [
+                _instance_from_role(r) for r in roles]
+
+        return cls(
+            name=name,
+            roles=roles,
+            description=description,
+            instances=instances,
+        )
 
 
 def _parse_role(
@@ -548,11 +721,258 @@ def _parse_trigger(
             )
         return OnEventTrigger(event=event)
 
+    if kind == "on_tool":
+        instance = raw.get("instance")
+        tool = raw.get("tool")
+        if not isinstance(instance, str) or not instance:
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"on_tool trigger requires 'instance' (string)"
+            )
+        if not isinstance(tool, str) or not tool:
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"on_tool trigger requires 'tool' (string)"
+            )
+        return OnToolTrigger(instance=instance, tool=tool)
+
     raise ValueError(
         f"Pattern {pattern_name!r} role {role_name!r}: unknown "
         f"trigger kind {kind!r}.  Known kinds: continuous, "
-        f"every_n_executions, on_request, on_event"
+        f"every_n_executions, on_request, on_event, on_tool"
     )
+
+
+def _parse_instance(
+    inst_name: str,
+    spec: object,
+    *,
+    pattern_name: str,
+    block_registry: "BlockRegistry | None",
+) -> BlockInstance:
+    """Parse one entry of the ``instances:`` mapping.
+
+    Instances reference a block by name and carry a trigger.
+    Agent-specific fields (``prompt``, ``model``, ``inputs``,
+    etc.) are accepted as optional inline overrides during the
+    transition — they will migrate onto the block YAML itself
+    in a later commit.
+    """
+    _validate_name(inst_name, "Instance")
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: spec must be a mapping, got "
+            f"{type(spec).__name__}"
+        )
+
+    block = spec.get("block")
+    if not isinstance(block, str) or not block:
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'block' must be a non-empty "
+            f"string (name of a declared block)"
+        )
+    if (block_registry is not None
+            and block not in block_registry):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: references unknown block "
+            f"{block!r}.  Known blocks: "
+            f"{sorted(block_registry.names())}"
+        )
+
+    trigger_raw = spec.get("trigger")
+    if (not isinstance(trigger_raw, dict)
+            or "kind" not in trigger_raw):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'trigger' must be a mapping with "
+            f"a 'kind' field"
+        )
+    trigger = _parse_trigger(
+        trigger_raw,
+        role_name=inst_name,
+        pattern_name=pattern_name,
+        block_registry=block_registry,
+    )
+
+    cardinality = spec.get("cardinality", 1)
+    if not isinstance(cardinality, int) or cardinality < 1:
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'cardinality' must be a "
+            f"positive integer, got {cardinality!r}"
+        )
+
+    prompt = spec.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'prompt' must be a string or "
+            f"omitted"
+        )
+
+    model = spec.get("model")
+    if model is not None and not isinstance(model, str):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'model' must be a string or "
+            f"omitted"
+        )
+
+    inputs = _parse_string_list(
+        spec.get("inputs", []),
+        role_name=inst_name,
+        pattern_name=pattern_name,
+        field_name="inputs",
+    )
+    outputs = _parse_string_list(
+        spec.get("outputs", []),
+        role_name=inst_name,
+        pattern_name=pattern_name,
+        field_name="outputs",
+    )
+
+    mcp_servers = spec.get("mcp_servers")
+    if (mcp_servers is not None
+            and not isinstance(mcp_servers, str)):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'mcp_servers' must be a string "
+            f"or omitted"
+        )
+
+    allowed_tools = spec.get("allowed_tools")
+    if (allowed_tools is not None
+            and not isinstance(allowed_tools, str)):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'allowed_tools' must be a string "
+            f"or omitted"
+        )
+
+    max_turns = spec.get("max_turns")
+    if max_turns is not None and (
+            not isinstance(max_turns, int) or max_turns < 1):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'max_turns' must be a positive "
+            f"integer or omitted"
+        )
+
+    total_timeout = spec.get("total_timeout")
+    if total_timeout is not None and (
+            not isinstance(total_timeout, int)
+            or total_timeout < 1):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'total_timeout' must be a "
+            f"positive integer or omitted"
+        )
+
+    extra_env_raw = spec.get("extra_env", {})
+    if not isinstance(extra_env_raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} instance "
+            f"{inst_name!r}: 'extra_env' must be a mapping "
+            f"of string keys to string values"
+        )
+    extra_env: dict[str, str] = {}
+    for k, v in extra_env_raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r} instance "
+                f"{inst_name!r}: 'extra_env' entries must be "
+                f"string→string"
+            )
+        extra_env[k] = v
+
+    return BlockInstance(
+        name=inst_name,
+        block=block,
+        trigger=trigger,
+        cardinality=cardinality,
+        prompt=prompt,
+        model=model,
+        inputs=inputs,
+        outputs=outputs,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        max_turns=max_turns,
+        total_timeout=total_timeout,
+        extra_env=extra_env,
+    )
+
+
+def _instance_from_role(role: Role) -> BlockInstance:
+    """Build a :class:`BlockInstance` matching a legacy role.
+
+    Legacy ``roles:`` grammar declares role-name == block-name
+    implicitly.  The loader builds the canonical ``instances``
+    list by turning each role into a one-for-one instance so
+    the pattern runner can read a single shape regardless of
+    which grammar the YAML used.  Agent-specific fields carry
+    across verbatim.
+    """
+    return BlockInstance(
+        name=role.name,
+        block=role.name,
+        trigger=role.trigger,
+        cardinality=role.cardinality,
+        prompt=role.prompt,
+        model=role.model,
+        inputs=list(role.inputs),
+        outputs=list(role.outputs),
+        mcp_servers=role.mcp_servers,
+        allowed_tools=role.allowed_tools,
+        max_turns=role.max_turns,
+        total_timeout=role.total_timeout,
+        extra_env=dict(role.extra_env),
+    )
+
+
+def _validate_on_tool_cross_refs(
+    instances: list[BlockInstance], *, pattern_name: str,
+) -> None:
+    """Cross-ref checks for every ``on_tool`` trigger.
+
+    1. The referenced instance name must exist in this pattern.
+    2. The referenced instance's trigger must be one the runner
+       actually launches (``continuous`` or
+       ``every_n_executions``) — dispatching a tool call to an
+       instance that itself only fires on a tool call has no
+       launchable caller and is almost certainly a typo.  Caught
+       at load time so the author sees a clear error rather than
+       a silent never-fires-at-runtime.
+    """
+    by_name: dict[str, BlockInstance] = {
+        inst.name: inst for inst in instances}
+    for inst in instances:
+        if not isinstance(inst.trigger, OnToolTrigger):
+            continue
+        target_name = inst.trigger.instance
+        if target_name not in by_name:
+            raise ValueError(
+                f"Pattern {pattern_name!r} instance "
+                f"{inst.name!r}: on_tool trigger references "
+                f"unknown instance {target_name!r}.  Known "
+                f"instances: {sorted(by_name)}"
+            )
+        target = by_name[target_name]
+        if not isinstance(
+            target.trigger,
+            (ContinuousTrigger, EveryNExecutionsTrigger),
+        ):
+            raise ValueError(
+                f"Pattern {pattern_name!r} instance "
+                f"{inst.name!r}: on_tool trigger references "
+                f"{target_name!r}, whose trigger kind "
+                f"{target.trigger.kind!r} cannot be a caller "
+                f"(on_tool dispatch requires a launchable "
+                f"source — ``continuous`` or "
+                f"``every_n_executions``)"
+            )
 
 
 def discover_patterns(directory: Path) -> dict[str, Path]:
