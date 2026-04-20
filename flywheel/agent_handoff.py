@@ -81,7 +81,7 @@ handoff loop splices tool results into that file between
 iterations; the next launch's state-populate copies the spliced
 contents into the new execution's ``/state/`` mount."""
 
-DEFAULT_MAX_ITERATIONS = 16
+DEFAULT_MAX_ITERATIONS = 500
 
 DEFAULT_RESUME_PROMPT = (
     "The previous tool call returned its result.  "

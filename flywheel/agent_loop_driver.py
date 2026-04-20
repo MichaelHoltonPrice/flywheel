@@ -233,7 +233,7 @@ def run_with_handoffs(
     ) = None,
     resume_env_var: str = "RESUME_SESSION_FILE",
     resume_artifact_name: str = SESSION_ARTIFACT_NAME,
-    max_iterations: int = 16,
+    max_iterations: int = 500,
     stdout_log: Path | None = None,
     stderr_log: Path | None = None,
 ) -> LoopResult:
