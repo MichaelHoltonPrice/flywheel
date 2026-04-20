@@ -3,9 +3,14 @@
 #
 # When NETWORK_ISOLATION=1, configures iptables to allow only:
 #   - Anthropic API (api.anthropic.com, port 443)
-#   - Host machine (host.docker.internal, any port)
 #   - DNS (port 53, for API IP rotation)
 #   - Loopback (MCP servers, internal comms)
+#   - host.docker.internal TCP ports listed in
+#     ``HOST_WHITELIST_PORTS`` (comma-separated).  Default is
+#     empty, i.e. no host access at all.  Projects that need
+#     a specific host-side port declare it per-instance via
+#     ``extra_env: HOST_WHITELIST_PORTS: <ports>`` in the
+#     pattern YAML.
 #
 # Then drops to the non-root 'claude' user and runs the agent.
 # The claude user cannot modify the iptables rules.
@@ -34,9 +39,27 @@ if [ "${NETWORK_ISOLATION}" = "1" ]; then
         iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT
     done
 
-    # Allow host machine (game server + project MCP servers).
-    if [ -n "$HOST_IP" ]; then
-        iptables -A OUTPUT -d "$HOST_IP" -j ACCEPT
+    # Allow host machine on explicitly whitelisted TCP ports only.
+    # Unset/empty ``HOST_WHITELIST_PORTS`` means no host access;
+    # that is the intended default and closes the accidental
+    # host-reachability channel the blanket host ACCEPT used to
+    # open.  Non-numeric entries abort container start so
+    # operator typos surface loudly instead of silently dropping
+    # a rule.
+    if [ -n "$HOST_IP" ] && [ -n "${HOST_WHITELIST_PORTS}" ]; then
+        IFS=',' read -ra _ports <<< "$HOST_WHITELIST_PORTS"
+        for _port in "${_ports[@]}"; do
+            _port=$(echo "$_port" | tr -d '[:space:]')
+            if [ -z "$_port" ]; then
+                continue
+            fi
+            if ! [[ "$_port" =~ ^[0-9]+$ ]]; then
+                echo "[entrypoint] HOST_WHITELIST_PORTS contains non-numeric entry: $_port" >&2
+                exit 1
+            fi
+            iptables -A OUTPUT -d "$HOST_IP" -p tcp --dport "$_port" -j ACCEPT
+            echo "[entrypoint] host.docker.internal:$_port allowed"
+        done
     fi
 
     # Explicit final drop.

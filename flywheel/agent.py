@@ -111,7 +111,14 @@ class AgentBlockConfig:
         isolated_network: When ``True``, add
             ``--cap-add=NET_ADMIN`` and set
             ``NETWORK_ISOLATION=1`` in the container env so the
-            in-container firewall script drops outbound traffic.
+            in-container firewall script drops outbound traffic
+            by default, allowing only Anthropic API, DNS,
+            loopback, and the host ports named in
+            ``HOST_WHITELIST_PORTS`` (empty by default — i.e. no
+            host access).  Projects that need a specific host-side
+            port declare it per-instance via ``extra_env:
+            HOST_WHITELIST_PORTS: <port,port,...>`` in the pattern
+            YAML.
         agent_workspace_dir: Reserved; no-op under the substrate.
             The /workspace bind is always the executor's per-
             execution scratch tempdir.
@@ -436,7 +443,8 @@ def launch_agent_block(
             substrate mount list.
         isolated_network: When ``True``, adds
             ``--cap-add=NET_ADMIN`` and sets
-            ``NETWORK_ISOLATION=1``.
+            ``NETWORK_ISOLATION=1``.  See :class:`AgentBlockConfig`
+            for the whitelist contract (``HOST_WHITELIST_PORTS``).
         agent_workspace_dir: Reserved; no-op.
         predecessor_id: Not passed to the executor today (the
             substrate does not accept a predecessor on launch).
