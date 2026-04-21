@@ -112,6 +112,19 @@ class BlockDefinition:
             ``None`` means no post-execution check is configured
             for this block.  Resolved eagerly at registry-load
             time (a typo fails startup, not the run).
+        output_builder: Optional dotted Python path to a callable
+            invoked on the host after the container exits and
+            before flywheel's standard artifact collection reads
+            the per-execution output directories.  The callback
+            reads whatever the container wrote (raw, human-
+            readable, agent-authored) and writes the canonical
+            artifact files in place — e.g., collapsing two
+            markdown files into a single ``entries.jsonl`` line
+            for an incremental slot.  See
+            :mod:`flywheel.output_builder`.  ``None`` means the
+            standard "whatever is in the output dir becomes the
+            artifact" contract applies.  Resolved eagerly at
+            registry-load time.
         lifecycle: Container-lifetime model.  One of:
 
             - ``"one_shot"``: container lifetime equals one
@@ -152,6 +165,7 @@ class BlockDefinition:
     runner: Literal["container", "lifecycle"] = "container"
     runner_justification: str | None = None
     post_check: str | None = None
+    output_builder: str | None = None
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
     state: bool = False
     stop_timeout_s: int = 30
@@ -397,6 +411,7 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
     "docker_args",
     "env",
     "post_check",
+    "output_builder",
     "lifecycle",
     "state",
     "stop_timeout_s",
@@ -489,6 +504,23 @@ def parse_block_definition(
             f"Python path string (got {type(post_check).__name__})"
         )
 
+    output_builder = entry.get("output_builder")
+    if (output_builder is not None
+            and not isinstance(output_builder, str)):
+        raise ValueError(
+            f"Block {name!r}: 'output_builder' must be a dotted "
+            f"Python path string (got "
+            f"{type(output_builder).__name__})"
+        )
+    if output_builder is not None and runner != "container":
+        raise ValueError(
+            f"Block {name!r}: 'output_builder' is only valid for "
+            f"runner 'container' (got {runner!r}).  Lifecycle "
+            f"blocks write their outputs directly via the local "
+            f"recorder; no post-execution host-side rebuild step "
+            f"is needed or supported."
+        )
+
     # ``lifecycle`` is only meaningful for container blocks.
     # Reject the key entirely on non-container runners, even when
     # its value is the default ``one_shot`` — the point is to flag
@@ -559,6 +591,7 @@ def parse_block_definition(
         runner=runner,
         runner_justification=runner_justification,
         post_check=post_check,
+        output_builder=output_builder,
         lifecycle=lifecycle,
         state=state,
         stop_timeout_s=stop_timeout_s,

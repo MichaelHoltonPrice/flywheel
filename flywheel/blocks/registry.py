@@ -37,6 +37,10 @@ from pathlib import Path
 
 import yaml
 
+from flywheel.output_builder import (
+    OutputBuilderCallable,
+    resolve_dotted_path as resolve_output_builder,
+)
 from flywheel.post_check import (
     PostCheckCallable,
     resolve_dotted_path,
@@ -68,6 +72,11 @@ class BlockRegistry:
     # meaningfully serializable / comparable.
     post_checks: dict[str, PostCheckCallable] = field(
         default_factory=dict)
+    # Pre-resolved output_builder callables keyed by block name.
+    # Same registry-load-time resolution contract as post_checks
+    # so a typo fails startup, not the run.
+    output_builders: dict[str, OutputBuilderCallable] = field(
+        default_factory=dict)
 
     def __contains__(self, name: str) -> bool:
         return name in self.blocks
@@ -97,6 +106,17 @@ class BlockRegistry:
         """
         return self.post_checks.get(name)
 
+    def output_builder_for(
+        self, name: str,
+    ) -> OutputBuilderCallable | None:
+        """Return the resolved output_builder callable for ``name``.
+
+        ``None`` if the block declared no ``output_builder`` or
+        is not registered.  Consumed by the executor's post-
+        container, pre-artifact-collection lifecycle step.
+        """
+        return self.output_builders.get(name)
+
     def names(self) -> list[str]:
         """Return all registered block names, sorted."""
         return sorted(self.blocks)
@@ -125,6 +145,7 @@ class BlockRegistry:
         blocks: dict[str, BlockDefinition] = {}
         sources: dict[str, Path] = {}
         post_checks: dict[str, PostCheckCallable] = {}
+        output_builders: dict[str, OutputBuilderCallable] = {}
         for path in files:
             block = load_block_file(path)
             if path.stem != block.name:
@@ -147,10 +168,19 @@ class BlockRegistry:
                 except ValueError as exc:
                     raise ValueError(
                         f"Block file {path}: {exc}") from exc
+            if block.output_builder is not None:
+                try:
+                    output_builders[block.name] = (
+                        resolve_output_builder(
+                            block.output_builder))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Block file {path}: {exc}") from exc
         return cls(
             blocks=blocks,
             sources=sources,
             post_checks=post_checks,
+            output_builders=output_builders,
         )
 
     @classmethod

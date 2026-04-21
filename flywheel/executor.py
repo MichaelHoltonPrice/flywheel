@@ -559,6 +559,29 @@ class ContainerExecutionHandle(ExecutionHandle):
                             runtime.FAILURE_STATE_CAPTURE)
                         error = f"state_capture: {e}"
 
+            # Host-side output builder (if any).  Runs after the
+            # container exited and before flywheel's standard
+            # artifact collection reads the output tempdirs,
+            # giving the block author a place to collapse
+            # human-readable intermediate files into the
+            # canonical artifact shape.  Builder failures map to
+            # ``FAILURE_OUTPUT_COLLECT`` — same phase as a
+            # broken collection pass, since conceptually they
+            # are both "getting the outputs into artifacts."
+            if (failure_phase is None
+                    and self._block_def.output_builder
+                    is not None):
+                try:
+                    _run_output_builder(
+                        self._block_def,
+                        self._output_tempdirs,
+                        self._workspace,
+                        self._execution_id,
+                    )
+                except Exception as e:
+                    failure_phase = runtime.FAILURE_OUTPUT_COLLECT
+                    error = f"output_builder: {e}"
+
             # Output collection.
             try:
                 output_bindings = _collect_outputs(
@@ -1082,6 +1105,45 @@ def capture_state(
         else:
             shutil.copy2(child, target)
     return rel
+
+
+def _run_output_builder(
+    block_def: BlockDefinition,
+    output_tempdirs: dict[str, Path],
+    workspace: Workspace,
+    exec_id: str,
+) -> None:
+    """Invoke the block's ``output_builder`` on its output tempdirs.
+
+    Re-resolves the dotted path at each execution rather than
+    threading the registry-cached callable through every
+    call site.  Python's import cache makes the re-resolution
+    effectively free after the first call, and the block
+    registry has already validated the path at startup — so a
+    typo surfaces there, not here.
+
+    The builder may mutate files under ``output_tempdirs`` in
+    place.  It MUST NOT write outside those directories.  Any
+    exception propagates to the caller, which maps it to
+    ``FAILURE_OUTPUT_COLLECT``.
+    """
+    from flywheel.output_builder import (
+        OutputBuilderContext,
+        resolve_dotted_path,
+    )
+    path = block_def.output_builder
+    assert path is not None  # caller checked
+    builder = resolve_dotted_path(path)
+    ctx = OutputBuilderContext(
+        block=block_def.name,
+        execution_id=exec_id,
+        outputs={
+            name: tempdir
+            for name, tempdir in output_tempdirs.items()
+        },
+        workspace=workspace,
+    )
+    builder(ctx)
 
 
 def _collect_outputs(
