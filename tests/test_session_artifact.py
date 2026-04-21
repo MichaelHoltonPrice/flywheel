@@ -1,13 +1,17 @@
-"""Tests for session artifact helpers in agent_runner.py.
+"""Tests for session-related helpers in agent_runner.py.
 
-Tests the cwd encoding, session path construction, and session
-export logic in isolation (without the Claude SDK or Docker).
+Tests the cwd encoding and session path construction in
+isolation (without the Claude SDK or Docker).  The
+runner-side persistence flow (read/write of
+``/flywheel/state/session.jsonl``) is owned by ``entrypoint.sh``
+under the privilege-split model — ``agent_runner`` no longer
+touches that path, so there is nothing to unit-test on the
+Python side.
 """
 
 from __future__ import annotations
 
 import importlib
-import shutil
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -63,7 +67,7 @@ _runner = _import_helpers()
 
 
 class TestEncodeCwd:
-    def test_workspace(self):
+    def test_scratch(self):
         assert _runner._encode_cwd("/scratch") == "-scratch"
 
     def test_home_path(self):
@@ -92,106 +96,6 @@ class TestSdkSessionPath:
         assert result.name == "sess1.jsonl"
 
 
-class TestExportSession:
-    def test_copies_session_file(self, tmp_path: Path):
-        """Session JSONL is copied to workspace output file."""
-        # Create a fake SDK session file.
-        sdk_dir = tmp_path / ".claude" / "projects" / "-scratch"
-        sdk_dir.mkdir(parents=True)
-        session_file = sdk_dir / "test-session.jsonl"
-        session_file.write_text('{"role": "user"}\n')
-
-        output_file = tmp_path / "agent_session.jsonl"
-
-        with (
-            patch.object(_runner, "SDK_PROJECTS_DIR",
-                         tmp_path / ".claude" / "projects"),
-            patch.object(_runner, "SESSION_FILE",
-                         output_file),
-        ):
-            _runner._export_session("test-session")
-
-        assert output_file.exists()
-        assert output_file.read_text() == '{"role": "user"}\n'
-
-    def test_empty_session_id_is_noop(self, tmp_path: Path):
-        output_file = tmp_path / "agent_session.jsonl"
-        with patch.object(_runner, "SESSION_FILE",
-                          output_file):
-            _runner._export_session("")
-        assert not output_file.exists()
-
-    def test_missing_source_is_safe(self, tmp_path: Path):
-        """No error when SDK session file doesn't exist."""
-        output_file = tmp_path / "agent_session.jsonl"
-        with (
-            patch.object(_runner, "SDK_PROJECTS_DIR",
-                         tmp_path / "nonexistent"),
-            patch.object(_runner, "SESSION_FILE",
-                         output_file),
-        ):
-            _runner._export_session("missing-session")
-        assert not output_file.exists()
-
-    def test_export_creates_parent_dir(self, tmp_path: Path):
-        """Parent directory of output file is created if missing."""
-        sdk_dir = tmp_path / ".claude" / "projects" / "-scratch"
-        sdk_dir.mkdir(parents=True)
-        session_file = sdk_dir / "sess1.jsonl"
-        session_file.write_text('{"role": "user"}\n')
-
-        # Output in a subdirectory that doesn't exist yet.
-        output_file = tmp_path / "deep" / "nested" / "agent_session.jsonl"
-
-        with (
-            patch.object(_runner, "SDK_PROJECTS_DIR",
-                         tmp_path / ".claude" / "projects"),
-            patch.object(_runner, "SESSION_FILE",
-                         output_file),
-        ):
-            _runner._export_session("sess1")
-
-        assert output_file.exists()
-
-
-class TestSessionImport:
-    def test_copies_to_sdk_path(self, tmp_path: Path):
-        """RESUME_SESSION_FILE is copied to the SDK expected path."""
-        source = tmp_path / "agent_session.jsonl"
-        source.write_text('{"role": "user"}\n')
-
-        sdk_projects = tmp_path / ".claude" / "projects"
-
-        with patch.object(_runner, "SDK_PROJECTS_DIR", sdk_projects):
-            dest = _runner._sdk_session_path("agent_session")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest)
-
-        expected = sdk_projects / "-scratch" / "agent_session.jsonl"
-        assert expected.exists()
-        assert expected.read_text() == '{"role": "user"}\n'
-
-    def test_sdk_session_path_uses_encode_cwd(self):
-        """_sdk_session_path encodes the cwd and appends session ID."""
-        result = _runner._sdk_session_path("my-session", "/home/user")
-        assert result.name == "my-session.jsonl"
-        assert "-home-user" in str(result)
-
-    def test_export_skips_non_jsonl_suffix(self, tmp_path: Path):
-        """_export_session only copies .jsonl files via _sdk_session_path."""
-        sdk_projects = tmp_path / ".claude" / "projects"
-        output_file = tmp_path / "agent_session.jsonl"
-
-        with (
-            patch.object(_runner, "SDK_PROJECTS_DIR", sdk_projects),
-            patch.object(_runner, "SESSION_FILE", output_file),
-        ):
-            # Non-existent session -> no file created.
-            _runner._export_session("nonexistent-id")
-
-        assert not output_file.exists()
-
-
 class TestStopFile:
     def test_stop_file_matches_substrate_sentinel(self):
         """STOP_FILE is the contract's ``/scratch/.stop`` sentinel.
@@ -203,3 +107,20 @@ class TestStopFile:
         """
         assert _runner.STOP_FILE.name == ".stop"
         assert str(_runner.STOP_FILE).endswith(".stop")
+
+
+class TestSessionPersistenceIsExternal:
+    """The runner module no longer reaches /flywheel/state/.
+
+    Pass 2's privilege split moves session staging + sync into
+    ``entrypoint.sh`` (root).  This is a guard test: if a future
+    edit reintroduces a runner-side ``SESSION_FILE`` constant or
+    an ``_export_session`` function, we want a loud failure
+    rather than a silent regression of the privilege boundary.
+    """
+
+    def test_no_session_file_constant(self):
+        assert not hasattr(_runner, "SESSION_FILE")
+
+    def test_no_export_session_function(self):
+        assert not hasattr(_runner, "_export_session")

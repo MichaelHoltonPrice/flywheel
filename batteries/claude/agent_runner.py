@@ -19,11 +19,11 @@ Pause/resume
 
 - **Rate limit**: Detected from RateLimitEvent; auto-retries with
   exponential backoff (60s, 120s, 300s, 300s, 300s).  Falls back
-  to .agent_resume after exhausting retries.
+  to ``/flywheel/control/.agent_resume`` after exhausting retries.
 - **Auth error**: Detected from error messages; pauses and waits
-  for .agent_resume file.
-- **External resume**: Write a prompt (or empty) to .agent_resume
-  in the workspace to continue after a pause.
+  for ``/flywheel/control/.agent_resume``.
+- **External resume**: Write a prompt (or empty) to
+  ``/flywheel/control/.agent_resume`` to continue after a pause.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
@@ -56,14 +56,18 @@ Environment variables:
                       to ``handoff_to_flywheel``.
 
     Session resume:
-        The runner reads ``/flywheel/state/session.jsonl`` on
-        startup if flywheel populated one from a prior execution's
-        captured state; otherwise it starts a fresh conversation.
-        The session is written back to
-        ``/flywheel/state/session.jsonl`` in a ``finally:`` at
-        exit so flywheel captures it regardless of how the run
-        ended.  No env var governs this — the presence or absence
-        of the file is the whole signal.
+        ``entrypoint.sh`` runs as root and stages the persisted
+        session from ``/flywheel/state/session.jsonl`` (locked
+        root:700) into ``~/.claude/projects/-scratch/<sid>.jsonl``
+        before this process starts.  The runner discovers that
+        staged file and tells the SDK to resume from it; absence
+        of any staged session means "first execution in this
+        lineage".  After the runner exits, ``entrypoint.sh``
+        copies the SDK's working session back to
+        ``/flywheel/state/session.jsonl`` as root.  This process
+        never reads or writes ``/flywheel/state/`` directly —
+        that's the privilege boundary that keeps the persisted
+        session unreadable to the agent.
     COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
                       compaction. Overrides the default percentage-
                       based calculation. Use for large-context models
@@ -80,7 +84,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
 from datetime import UTC, datetime
@@ -125,14 +128,15 @@ COMPACT_THRESHOLD = 0.20
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Session persistence: the SDK session JSONL is the container's
-# private memory across restarts.  It lives at
-# ``/flywheel/state/session.jsonl`` — flywheel populates
-# ``/flywheel/state/`` from the prior execution's captured state
-# at launch and captures its final contents after the container
-# exits.  Not an artifact; not in the artifact graph.  See
+# private memory across restarts, kept at the SDK's standard
+# location under ``~/.claude/projects/<encoded_cwd>/<sid>.jsonl``.
+# The entrypoint stages the persisted file from
+# ``/flywheel/state/session.jsonl`` (root-owned, mode 700) into
+# the SDK's location before this process starts, and copies the
+# updated working file back as root after this process exits.
+# We never read or write ``/flywheel/state/`` from here — it's
+# unreadable to the claude user by design.  See
 # ``cyber-root/substrate-contract.md`` for the runtime contract.
-STATE_DIR = Path("/flywheel/state")
-SESSION_FILE = STATE_DIR / "session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Prompt delivery: the pattern runner renders the prompt into a
@@ -178,44 +182,6 @@ def _sdk_session_path(
     """Return the path where the Claude SDK stores session history."""
     encoded = _encode_cwd(cwd)
     return SDK_PROJECTS_DIR / encoded / f"{session_id}.jsonl"
-
-
-def _export_session(session_id: str) -> None:
-    """Copy the SDK session JSONL into ``/flywheel/state/session.jsonl``.
-
-    Called in a finally block on exit.  Flywheel captures the
-    contents of ``/flywheel/state/`` after the container exits and
-    populates it from that capture on the next execution's launch,
-    so this single file is enough to resume the conversation in a
-    fresh container.
-
-    Must not raise — it runs during teardown and a failure here
-    shouldn't mask the real exit reason.
-    """
-    if not session_id:
-        return
-    try:
-        src = _sdk_session_path(session_id)
-        if src.exists():
-            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, SESSION_FILE)
-            _emit({
-                "type": "session_export",
-                "session_id": session_id,
-                "path": str(SESSION_FILE),
-            })
-        else:
-            _emit({
-                "type": "session_export_skip",
-                "session_id": session_id,
-                "reason": f"SDK session file not found: {src}",
-            })
-    except Exception as exc:
-        _emit({
-            "type": "session_export_error",
-            "session_id": session_id,
-            "message": str(exc),
-        })
 
 
 # ------------------------------------------------------------------
@@ -599,35 +565,33 @@ async def main() -> None:
     if max_turns:
         options.max_turns = max_turns
 
-    # --- Session resume from /flywheel/state/ ---
-    # Flywheel populates ``/flywheel/state/`` with the prior execution's
-    # captured state before launching us.  If a session file is
-    # present, extract the SDK session id from its first line and
-    # hand it to the SDK so the conversation continues.  Absence
-    # of the file means "first execution in this lineage";
-    # nothing to resume.
+    # --- Session resume ---
+    # The entrypoint runs as root, reads the persisted session
+    # from ``/flywheel/state/session.jsonl`` (which is locked
+    # to root-only after staging), and writes it to
+    # ``~/.claude/projects/<encoded_cwd>/<sid>.jsonl`` where the
+    # SDK looks for it.  We just discover whatever's there and
+    # tell the SDK to resume.  No persisted-state file is
+    # readable from inside the agent process; that's the
+    # privilege boundary the entrypoint enforces.
     session_id = ""
-    if SESSION_FILE.exists():
-        resume_sid = SESSION_FILE.stem
-        try:
-            first_line = SESSION_FILE.read_text(
-                encoding="utf-8").split("\n", 1)[0]
-            entry = json.loads(first_line)
-            sid_from_file = entry.get("sessionId", "")
-            if sid_from_file:
-                resume_sid = sid_from_file
-        except Exception:
-            pass  # Fall back to filename stem.
-        sdk_dest = _sdk_session_path(resume_sid)
-        sdk_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(SESSION_FILE, sdk_dest)
-        options.resume = resume_sid
-        session_id = resume_sid
-        _emit({
-            "type": "session_resume",
-            "session_id": resume_sid,
-            "source": str(SESSION_FILE),
-        })
+    encoded_dir = SDK_PROJECTS_DIR / _encode_cwd("/scratch")
+    if encoded_dir.is_dir():
+        candidates = sorted(
+            encoded_dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            staged = candidates[0]
+            resume_sid = staged.stem
+            options.resume = resume_sid
+            session_id = resume_sid
+            _emit({
+                "type": "session_resume",
+                "session_id": resume_sid,
+                "source": str(staged),
+            })
 
     # --- Connect and run ---
     last_input_tokens = 0
@@ -874,10 +838,11 @@ async def main() -> None:
             return
         _emit({"type": "error", "message": str(e)})
         _save_state(session_id, "paused", "error")
-    finally:
-        # Export the session JSONL for artifact collection, regardless
-        # of how the agent exited (success, error, SIGTERM).
-        _export_session(session_id)
+    # The entrypoint copies the SDK's working session back to
+    # ``/flywheel/state/session.jsonl`` after this process
+    # returns.  We don't touch ``/flywheel/state/`` from here —
+    # it's locked to root after the entrypoint stages the SDK
+    # session into ``~/.claude/projects/``.
 
 
 if __name__ == "__main__":
