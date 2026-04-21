@@ -29,6 +29,7 @@ from flywheel.artifact import (
     RunRecord,
 )
 from flywheel.pattern import (
+    AutorestartTrigger,
     BlockInstance,
     ContinuousTrigger,
     EveryNExecutionsTrigger,
@@ -196,6 +197,34 @@ class _FakeWorkspace:
         )
         self.executions[ex.id] = ex
 
+    def add_run_halt(
+        self,
+        block_name: str = "ExecuteAction",
+        *,
+        reason: str = "terminal",
+        run_id: str | None = None,
+    ) -> None:
+        """Append a succeeded execution carrying a scope='run' halt.
+
+        Lets autorestart-trigger tests simulate a post-check
+        that asked the pattern runner to stop — the same thing
+        :class:`cyberarc.checks.execute_action` does on
+        ``GAME_OVER``/``WIN``.
+        """
+        idx = len(self.executions)
+        ex = BlockExecution(
+            id=f"ex_{idx:04d}",
+            block_name=block_name,
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="succeeded",
+            run_id=(
+                run_id if run_id is not None
+                else self._active_run_id()),
+            halt_directive={"scope": "run", "reason": reason},
+        )
+        self.executions[ex.id] = ex
+
 
 class _FakeHandle:
     """Programmable handle: stays alive until ``finish()`` is called."""
@@ -351,6 +380,161 @@ class TestContinuous:
         assert k["allowed_tools"] == "Read,Write"
         assert k["max_turns"] == 5
         assert k["total_timeout"] == 120
+
+
+class TestAutorestart:
+    """``AutorestartTrigger`` drives the role until a run halt.
+
+    First-launch firing mirrors ``ContinuousTrigger``.  When the
+    handle exits, the runner relaunches unless a ``scope="run"``
+    halt has been queued for the current run via a post-check.
+    The trigger is the right choice for roles whose pattern
+    relies on an out-of-role signal (e.g., terminal engine state)
+    to end the run rather than on the agent's own judgment.
+    """
+
+    def test_relaunches_after_handle_finishes(
+            self, tmp_path: Path):
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "p.md", "play prompt")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=AutorestartTrigger(),
+                cardinality=1,
+            )],
+        )
+
+        launches: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs, name="play")
+            launches.append(handle)
+            # First two launches exit quickly; the third one
+            # gets paired with a run halt so the runner stops.
+            my_index = len(launches)
+
+            def _finisher():
+                time.sleep(0.05)
+                if my_index >= 3:
+                    ws.add_run_halt(reason="terminal in test")
+                handle.finish()
+            threading.Thread(target=_finisher).start()
+            return handle
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        )
+        result = runner.run()
+
+        # At least 3 launches: 2 re-fires + 1 final.  The halt
+        # queued on the third launch's finish stops further
+        # refires on the next tick.
+        assert len(launches) >= 3
+        assert result.cohorts_by_role["play"] == len(launches)
+
+    def test_run_halt_prevents_relaunch(
+            self, tmp_path: Path):
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "p.md")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=AutorestartTrigger(),
+                cardinality=1,
+            )],
+        )
+
+        launches: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs, name="play")
+            launches.append(handle)
+            # Halt lands synchronously with the first launch.
+            ws.add_run_halt(reason="immediate terminal")
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(0.05), handle.finish())).start()
+            return handle
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        )
+        result = runner.run()
+
+        # Only the initial firing; the halt stops refiring.
+        assert len(launches) == 1
+        assert result.cohorts_by_role["play"] == 1
+
+    def test_cardinality_greater_than_one_rejected(
+            self, tmp_path: Path):
+        prompt = _write_prompt(tmp_path, "p.md")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=AutorestartTrigger(),
+                cardinality=2,
+            )],
+        )
+        with pytest.raises(
+            ValueError, match="cardinality=1",
+        ):
+            PatternRunner(
+                pattern,
+                base_config=_base_config(
+                    tmp_path, _FakeWorkspace(tmp_path)),
+            )
+
+    def test_autorestart_alone_drives_run(
+            self, tmp_path: Path):
+        """A pattern with only autorestart drivers is accepted.
+
+        No continuous role is required; autorestart counts as a
+        driver on its own.
+        """
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "p.md")
+        pattern = Pattern(
+            name="p",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=AutorestartTrigger(),
+                cardinality=1,
+            )],
+        )
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs, name="play")
+            ws.add_run_halt(reason="stop immediately")
+
+            def _finisher():
+                time.sleep(0.05)
+                handle.finish()
+            threading.Thread(target=_finisher).start()
+            return handle
+
+        # Construction doesn't raise on "no continuous role"
+        # and run returns after the halt propagates.
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        )
+        runner.run()
 
 
 class TestEveryNExecutions:
@@ -699,7 +883,8 @@ class TestRejectsBadPatterns:
             )],
         )
         with pytest.raises(
-            ValueError, match="continuous instance",
+            ValueError,
+            match="continuous or autorestart instance",
         ):
             PatternRunner(
                 pattern,

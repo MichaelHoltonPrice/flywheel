@@ -178,12 +178,35 @@ class OnToolTrigger:
     kind: Literal["on_tool"] = "on_tool"
 
 
+@dataclass(frozen=True)
+class AutorestartTrigger:
+    """Fire at run start and re-fire when the instance exits.
+
+    Like :class:`ContinuousTrigger` in that the role fires once
+    at run start, but the runner relaunches the role whenever
+    its single handle finishes — unless a ``scope="run"`` halt
+    has been queued by a post-check, in which case the run ends
+    normally.  Cardinality must be ``1`` for this trigger.
+
+    Use when the role should drive the run until an
+    out-of-role signal (terminal game state, post-check halt)
+    tells the runner to stop — not when the agent decides to
+    exit the conversation.  Typical home is a "play" role whose
+    pattern relies on a state post-check (e.g.,
+    ``GAME_OVER``/``WIN`` on the underlying engine block) rather
+    than on the agent's own judgment to end the run.
+    """
+
+    kind: Literal["autorestart"] = "autorestart"
+
+
 Trigger = (
     ContinuousTrigger
     | EveryNExecutionsTrigger
     | OnRequestTrigger
     | OnEventTrigger
     | OnToolTrigger
+    | AutorestartTrigger
 )
 
 
@@ -703,6 +726,9 @@ def _parse_trigger(
     if kind == "continuous":
         return ContinuousTrigger()
 
+    if kind == "autorestart":
+        return AutorestartTrigger()
+
     if kind == "every_n_executions":
         of_block = raw.get("of_block")
         n = raw.get("n")
@@ -784,7 +810,8 @@ def _parse_trigger(
     raise ValueError(
         f"Pattern {pattern_name!r} role {role_name!r}: unknown "
         f"trigger kind {kind!r}.  Known kinds: continuous, "
-        f"every_n_executions, on_request, on_event, on_tool"
+        f"autorestart, every_n_executions, on_request, "
+        f"on_event, on_tool"
     )
 
 

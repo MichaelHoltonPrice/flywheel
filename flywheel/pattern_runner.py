@@ -58,6 +58,7 @@ from flywheel.agent_handoff import (
 )
 from flywheel.executor import BlockExecutor
 from flywheel.pattern import (
+    AutorestartTrigger,
     BlockInstance,
     ContinuousTrigger,
     EveryNExecutionsTrigger,
@@ -251,14 +252,28 @@ class PatternRunner:
                     f"depend on it."
                 )
 
-        if not any(isinstance(r.trigger, ContinuousTrigger)
+        driver_triggers = (
+            ContinuousTrigger, AutorestartTrigger)
+        if not any(isinstance(r.trigger, driver_triggers)
                    for r in synthesized_roles):
             raise ValueError(
-                f"Pattern {pattern.name!r} has no continuous "
-                f"instance; nothing would drive the run.  Add "
-                f"at least one instance with "
-                f"`trigger: {{kind: continuous}}`."
+                f"Pattern {pattern.name!r} has no continuous or "
+                f"autorestart instance; nothing would drive the "
+                f"run.  Add at least one instance with "
+                f"``trigger: {{kind: continuous}}`` or "
+                f"``trigger: {{kind: autorestart}}``."
             )
+
+        for r in synthesized_roles:
+            if (isinstance(r.trigger, AutorestartTrigger)
+                    and r.cardinality != 1):
+                raise ValueError(
+                    f"Pattern {pattern.name!r} role {r.name!r}: "
+                    f"autorestart trigger requires "
+                    f"cardinality=1 (got {r.cardinality}).  The "
+                    f"role represents a single long-running "
+                    f"instance that the runner keeps relaunching."
+                )
 
         self._state: dict[str, _RoleState] = {
             r.name: _RoleState(role=r)
@@ -311,12 +326,14 @@ class PatternRunner:
         try:
             for state in self._state.values():
                 if isinstance(
-                        state.role.trigger, ContinuousTrigger):
+                        state.role.trigger,
+                        (ContinuousTrigger, AutorestartTrigger),
+                ):
                     self._fire_role(state.role)
 
             try:
                 while True:
-                    if self._all_continuous_done():
+                    if self._all_drivers_done():
                         break
                     if (self._max_runtime is not None
                             and time.monotonic() - start
@@ -329,6 +346,7 @@ class PatternRunner:
                         timed_out = True
                         break
                     self._evaluate_ledger_triggers()
+                    self._refire_autorestart_if_ready()
                     time.sleep(self._poll)
             finally:
                 self._drain_all_handles()
@@ -365,6 +383,82 @@ class PatternRunner:
                 if handle.is_alive():
                     return False
         return True
+
+    def _run_halted(self) -> bool:
+        """Return True if any execution in this run queued a run halt.
+
+        Scans the workspace's persisted ``BlockExecution``
+        records for ``halt_directive={"scope": "run", ...}``
+        stamped with the current ``run_id``.  Used to short-
+        circuit the autorestart trigger — once a post-check
+        asks the run to stop, we do not relaunch the role.
+        """
+        ws = self._base.workspace
+        for ex in ws.executions.values():
+            if ex.run_id != self._run_id:
+                continue
+            hd = getattr(ex, "halt_directive", None)
+            if isinstance(hd, dict) and hd.get("scope") == "run":
+                return True
+        return False
+
+    def _all_drivers_done(self) -> bool:
+        """Return True once every driving-role handle is finished.
+
+        "Driving" roles are the ones whose liveness keeps the
+        run alive: continuous and autorestart.  An autorestart
+        role's current handle being finished is not enough — the
+        runner will relaunch it next tick unless the run has
+        been halted.  So autorestart roles count as "done" only
+        when (a) the current handle is finished AND (b)
+        :meth:`_run_halted` is True.
+        """
+        run_halted = self._run_halted()
+        for state in self._state.values():
+            trigger = state.role.trigger
+            if isinstance(trigger, ContinuousTrigger):
+                for handle in state.handles:
+                    if handle.is_alive():
+                        return False
+                continue
+            if isinstance(trigger, AutorestartTrigger):
+                # Still-running handle keeps the run alive.
+                for handle in state.handles:
+                    if handle.is_alive():
+                        return False
+                # All handles done; only "finished" if halted.
+                if not run_halted:
+                    return False
+        return True
+
+    def _refire_autorestart_if_ready(self) -> None:
+        """Relaunch autorestart roles whose handle just finished.
+
+        Called once per main-loop tick.  For each autorestart
+        role, if the most recent handle is done and no
+        run-scoped halt has been queued, fire the role again.
+        The re-fire reuses :meth:`_fire_role`, which appends a
+        new handle to ``state.handles`` and bumps
+        ``cohorts_fired``.
+        """
+        if self._run_halted():
+            return
+        for state in self._state.values():
+            if not isinstance(
+                    state.role.trigger, AutorestartTrigger):
+                continue
+            if not state.handles:
+                continue
+            latest = state.handles[-1]
+            if latest.is_alive():
+                continue
+            print(
+                f"  [pattern-runner] autorestart role "
+                f"{state.role.name!r} handle finished; "
+                f"relaunching (restart "
+                f"#{state.cohorts_fired})"
+            )
+            self._fire_role(state.role)
 
     def _evaluate_ledger_triggers(self) -> None:
         """Fire ``every_n_executions`` cohorts that are due.
@@ -693,7 +787,10 @@ class PatternRunner:
         cross-contamination.
         """
         if (self._base.agent_workspace_dir is not None
-                and isinstance(role.trigger, ContinuousTrigger)
+                and isinstance(
+                    role.trigger,
+                    (ContinuousTrigger, AutorestartTrigger),
+                )
                 and role.cardinality == 1):
             return self._base.agent_workspace_dir
         return None
