@@ -25,7 +25,7 @@ Python orchestration framework for measurable AI improvement loops. Wires Docker
 ## Batteries (solve-once capabilities)
 
 - Computer use agent (CUA) -- X11 session management, screenshot loop
-- Claude Code agent wrapper (`batteries/claude/`) -- Dockerfile and agent runner with pause/resume support. Nested block invocations are handled by a `PreToolUse` hook that intercepts handoff tools, exits the container, and lets the host-side handoff loop run the blocks before relaunching with the spliced session. Projects mount MCP servers at `/workspace/.mcp_servers/`. See `docs/architecture.md` "Agent pause and resume" for the mechanism.
+- Claude Code agent wrapper (`batteries/claude/`) -- Dockerfile and agent runner with pause/resume support. Nested block invocations are handled by a `PreToolUse` hook that intercepts handoff tools, exits the container, and lets the host-side handoff loop run the blocks before relaunching with the spliced session. Projects mount MCP servers at `/flywheel/mcp_servers/`. See `docs/architecture.md` "Agent pause and resume" for the mechanism.
 
 ## Build and test
 

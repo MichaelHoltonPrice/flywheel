@@ -133,6 +133,6 @@ class TestScanMountedServers:
             os.environ.pop("MCP_SERVER_MOUNT_DIR", None)
             servers = _scan_mounted_servers()
 
-        # Default is /workspace/.mcp_servers which won't exist on
+        # Default is /flywheel/mcp_servers which won't exist on
         # the host, so this should return empty — not crash.
         assert servers == {}

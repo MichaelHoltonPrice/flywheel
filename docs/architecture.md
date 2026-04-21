@@ -478,7 +478,7 @@ block executions from agents" below).
 ### Project-provided MCP servers
 
 Projects can provide custom MCP servers by mounting a directory
-into the agent container at ``/workspace/.mcp_servers/``. The
+into the agent container at ``/flywheel/mcp_servers/``. The
 agent runner scans this directory on startup for files matching
 ``*_mcp_server.py`` and registers each one by name (derived by
 stripping the ``_mcp_server.py`` suffix).
