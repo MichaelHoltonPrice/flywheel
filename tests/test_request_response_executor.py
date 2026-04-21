@@ -381,6 +381,121 @@ class TestRuntimeStartup:
         assert executor.attached_keys() == []
 
 
+class TestEnsureRuntime:
+    """``ensure_runtime`` boots a runtime without firing a request.
+
+    Returns the control port so callers can HTTP directly against
+    read-only endpoints on the runtime (e.g., bootstrap queries
+    from project hooks before the first ``launch``).  Subsequent
+    calls for the same key reattach instead of restarting.
+    """
+
+    def test_returns_control_port_and_registers_runtime(
+        self, workspace: Workspace, template: Template,
+    ):
+        work_area = workspace.path / "runtimes" / "arc_engine"
+        harness = _ExecutorTestHarness(
+            template, work_area=work_area,
+            health_ready_after=0,
+        )
+
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            port = harness.executor.ensure_runtime(
+                "arc_engine", workspace)
+
+        assert isinstance(port, int)
+        assert port > 0
+        # A runtime is registered — the same one ``launch`` would
+        # reattach to.
+        keys = harness.executor.attached_keys()
+        assert len(keys) == 1
+        assert keys[0].endswith("::arc_engine")
+
+    def test_second_call_reattaches_same_runtime(
+        self, workspace: Workspace, template: Template,
+    ):
+        work_area = workspace.path / "runtimes" / "arc_engine"
+        harness = _ExecutorTestHarness(
+            template, work_area=work_area,
+            health_ready_after=0,
+        )
+
+        start_calls: list[str] = []
+
+        def _fake_start(cc, name):
+            start_calls.append(name)
+            return "cid"
+
+        with patch(
+            "flywheel.executor._run_detached_container",
+            side_effect=_fake_start,
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            p1 = harness.executor.ensure_runtime(
+                "arc_engine", workspace)
+            p2 = harness.executor.ensure_runtime(
+                "arc_engine", workspace)
+
+        assert p1 == p2
+        # Only one container start — the second call reattached.
+        assert len(start_calls) == 1
+
+    def test_unknown_block_raises(self, workspace: Workspace):
+        template = _make_template(block_name="arc_engine")
+        executor = RequestResponseExecutor(template)
+        with pytest.raises(ValueError, match="not found"):
+            executor.ensure_runtime("bogus", workspace)
+
+    def test_one_shot_block_rejected(
+        self, workspace: Workspace,
+    ):
+        block = BlockDefinition(
+            name="step",
+            image="test:latest",
+            runner="container",
+            lifecycle="one_shot",
+            inputs=[],
+            outputs=[],
+        )
+        template = Template(
+            name="t", artifacts=[], blocks=[block])
+        executor = RequestResponseExecutor(template)
+        with pytest.raises(
+            ValueError, match="workspace_persistent",
+        ):
+            executor.ensure_runtime("step", workspace)
+
+    def test_lifecycle_runner_rejected(
+        self, workspace: Workspace,
+    ):
+        block = BlockDefinition(
+            name="logical",
+            runner="lifecycle",
+            runner_justification="test fixture",
+        )
+        template = Template(
+            name="t", artifacts=[], blocks=[block])
+        executor = RequestResponseExecutor(template)
+        with pytest.raises(
+            ValueError, match="only runs container blocks",
+        ):
+            executor.ensure_runtime("logical", workspace)
+
+
 class TestRequestSerialization:
     def test_attachment_key_reused_across_requests(
         self, workspace: Workspace, template: Template,

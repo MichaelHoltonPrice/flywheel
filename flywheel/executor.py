@@ -2363,6 +2363,77 @@ class RequestResponseExecutor:
         with self._registry_lock:
             return list(self._runtimes)
 
+    def ensure_runtime(
+        self,
+        block_name: str,
+        workspace: Workspace,
+        *,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
+        extra_docker_args: list[str] | None = None,
+    ) -> int:
+        """Start (or attach to) a runtime without firing a request.
+
+        Returns the runtime's ``control_port``, suitable for
+        direct HTTP access — e.g., read-only bootstrap endpoints
+        invoked by host-side pre-launch work (project hooks
+        seeding incremental artifacts from the runtime's current
+        state).  For request/response work the caller should
+        still go through :meth:`launch`.
+
+        Validation mirrors :meth:`launch`: the block must exist
+        in the template, have ``runner: container``, and declare
+        ``lifecycle: workspace_persistent``.  ``extra_env`` /
+        ``extra_mounts`` / ``extra_docker_args`` are consumed on
+        first-start only; later calls for the same
+        ``(block_name, workspace)`` reattach to the existing
+        runtime and ignore the kwargs.
+
+        Args:
+            block_name: Name of the block to ensure.
+            workspace: Workspace the runtime is scoped to.
+            extra_env: First-start env additions.
+            extra_mounts: First-start bind mounts
+                (``(host, container, mode)`` tuples).
+            extra_docker_args: First-start raw docker args.
+
+        Returns:
+            The TCP port the runtime's control channel listens on
+            (bound to ``host.docker.internal`` from the container
+            and ``localhost`` from the host).
+
+        Raises:
+            ValueError: If the block is missing from the template,
+                has a non-container runner, or is not declared
+                ``lifecycle: workspace_persistent``.
+        """
+        block_def = _find_block(self._template, block_name)
+        if block_def is None:
+            raise ValueError(
+                f"Block {block_name!r} not found in template")
+        if block_def.runner != "container":
+            raise ValueError(
+                f"Block {block_name!r}: "
+                f"RequestResponseExecutor only runs container "
+                f"blocks (got runner {block_def.runner!r})")
+        if block_def.lifecycle != "workspace_persistent":
+            raise ValueError(
+                f"Block {block_name!r}: "
+                f"RequestResponseExecutor requires "
+                f"'lifecycle: workspace_persistent' (got "
+                f"{block_def.lifecycle!r})")
+
+        key = self._attachment_key(block_name, workspace)
+        handle = self._get_or_start_runtime(
+            key=key,
+            block_def=block_def,
+            workspace=workspace,
+            extra_env=extra_env,
+            extra_mounts=extra_mounts,
+            extra_docker_args=extra_docker_args,
+        )
+        return handle.control_port
+
     def _get_or_start_runtime(
         self,
         *,
