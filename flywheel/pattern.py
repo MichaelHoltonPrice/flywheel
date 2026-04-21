@@ -1034,7 +1034,11 @@ def _validate_on_tool_cross_refs(
         target = by_name[target_name]
         if not isinstance(
             target.trigger,
-            (ContinuousTrigger, EveryNExecutionsTrigger),
+            (
+                ContinuousTrigger,
+                AutorestartTrigger,
+                EveryNExecutionsTrigger,
+            ),
         ):
             raise ValueError(
                 f"Pattern {pattern_name!r} instance "
@@ -1042,8 +1046,8 @@ def _validate_on_tool_cross_refs(
                 f"{target_name!r}, whose trigger kind "
                 f"{target.trigger.kind!r} cannot be a caller "
                 f"(on_tool dispatch requires a launchable "
-                f"source — ``continuous`` or "
-                f"``every_n_executions``)"
+                f"source — ``continuous``, ``autorestart``, "
+                f"or ``every_n_executions``)"
             )
 
 
