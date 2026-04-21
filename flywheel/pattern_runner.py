@@ -353,10 +353,28 @@ class PatternRunner:
         )
 
     def _fire_role(self, role: Role) -> None:
-        """Launch ``role.cardinality`` agents for one trigger firing."""
+        """Launch ``role.cardinality`` agents for one trigger firing.
+
+        When the triggering role's ``pause`` list is non-empty the
+        firing is serialised against the named instances: each is
+        stopped and drained (so ``/state/`` is captured), the
+        cohort runs to completion, and the paused instances are
+        relaunched with ``predecessor_id`` pointing at their
+        stopped execution so the session chain continues.
+        """
         state = self._state[role.name]
         cohort_index = state.cohorts_fired
 
+        pause_names: tuple[str, ...] = ()
+        if isinstance(role.trigger, EveryNExecutionsTrigger):
+            pause_names = role.trigger.pause
+
+        stopped_prev_id = self._pause_and_drain(
+            pause_names=pause_names,
+            reason=f"pause-for-cohort:{role.name}",
+        )
+
+        cohort_handles: list[_Handle] = []
         for member_index in range(role.cardinality):
             kwargs = self._kwargs_for(
                 role, cohort_index=cohort_index,
@@ -369,8 +387,132 @@ class PatternRunner:
             )
             handle = self._launch_fn(**kwargs)
             state.handles.append(handle)
+            cohort_handles.append(handle)
 
         state.cohorts_fired += 1
+
+        if not pause_names:
+            return
+
+        # Pause mode: the firing blocks the outer loop until the
+        # cohort finishes and the paused instances are back up.
+        # This is deliberate — while a paused instance is down
+        # the ledger cannot grow (no new ``of_block`` executions
+        # happen), so there is nothing meaningful to poll.
+        self._drain_cohort(role.name, cohort_handles)
+        self._relaunch_paused(
+            pause_names=pause_names,
+            stopped_prev_id=stopped_prev_id,
+        )
+
+    def _pause_and_drain(
+        self,
+        *,
+        pause_names: tuple[str, ...],
+        reason: str,
+    ) -> dict[str, str | None]:
+        """Stop every live handle for the named instances, wait.
+
+        Returns a map from instance name to the execution id of
+        the handle that was actually stopped, so the caller can
+        set ``predecessor_id`` on the relaunch and keep the
+        session chain intact.  Instances without a live handle
+        (already finished naturally) are simply skipped; the
+        returned map only contains names the caller should
+        relaunch.
+        """
+        stopped_prev_id: dict[str, str | None] = {}
+        for name in pause_names:
+            paused = self._state.get(name)
+            if paused is None:
+                continue
+            alive = [
+                h for h in paused.handles if h.is_alive()]
+            if not alive:
+                continue
+            for handle in alive:
+                try:
+                    handle.stop(reason=reason)
+                except Exception as exc:
+                    print(
+                        f"  [pattern-runner] pause stop() for "
+                        f"{name!r} raised: {exc!r}"
+                    )
+            last_execution_id: str | None = None
+            for handle in list(paused.handles):
+                try:
+                    result = handle.wait()
+                except Exception as exc:
+                    print(
+                        f"  [pattern-runner] pause wait() for "
+                        f"{name!r} raised: {exc!r}"
+                    )
+                    continue
+                self._results[name].append(result)
+                last_execution_id = getattr(
+                    result, "execution_id", None)
+            paused.handles.clear()
+            stopped_prev_id[name] = last_execution_id
+        return stopped_prev_id
+
+    def _drain_cohort(
+        self,
+        role_name: str,
+        cohort_handles: list[_Handle],
+    ) -> None:
+        """Wait for each just-launched cohort handle; record results."""
+        state = self._state[role_name]
+        for handle in cohort_handles:
+            try:
+                result = handle.wait()
+            except Exception as exc:
+                print(
+                    f"  [pattern-runner] cohort wait() for "
+                    f"{role_name!r} raised: {exc!r}"
+                )
+                continue
+            self._results[role_name].append(result)
+        for handle in cohort_handles:
+            if handle in state.handles:
+                state.handles.remove(handle)
+
+    def _relaunch_paused(
+        self,
+        *,
+        pause_names: tuple[str, ...],
+        stopped_prev_id: dict[str, str | None],
+    ) -> None:
+        """Relaunch each instance stopped by the pause phase.
+
+        Only instances present in ``stopped_prev_id`` are
+        relaunched — the dict was built from whatever actually
+        had a live handle to stop, so an instance that had
+        already finished naturally stays finished.
+        """
+        for name in pause_names:
+            if name not in stopped_prev_id:
+                continue
+            paused = self._state.get(name)
+            if paused is None:
+                continue
+            prev_id = stopped_prev_id[name]
+            for member_index in range(paused.role.cardinality):
+                kwargs = self._kwargs_for(
+                    paused.role,
+                    cohort_index=0,
+                    member_index=member_index,
+                )
+                if prev_id is not None:
+                    kwargs["predecessor_id"] = prev_id
+                print(
+                    f"  [pattern-runner] relaunching paused "
+                    f"{name!r} member "
+                    f"{member_index + 1}/"
+                    f"{paused.role.cardinality} "
+                    f"(predecessor={prev_id})"
+                )
+                handle = self._launch_fn(**kwargs)
+                paused.handles.append(handle)
 
     def _kwargs_for(
         self,

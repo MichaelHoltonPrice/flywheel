@@ -96,11 +96,32 @@ class EveryNExecutionsTrigger:
     once (``status == "succeeded"`` and not synthetic).  ``n``
     must be a positive integer.  The block name must resolve
     against the project's :class:`BlockRegistry`.
+
+    Attributes:
+        of_block: The block whose successful executions drive
+            the trigger.
+        n: Cadence.
+        pause: Names of other instances to pause while the
+            cohort fires.  Empty (the default) keeps the
+            historical behaviour — the cohort runs in parallel
+            with every other live instance.  When non-empty the
+            runner stops each named instance before firing the
+            cohort, waits for them to exit cleanly (so ``/state/``
+            is captured), runs the cohort to completion, then
+            relaunches each paused instance with
+            ``predecessor_id`` set to its stopped execution so
+            the session chain continues.  Useful when the cohort
+            should see a quiescent workspace snapshot and the
+            paused instance should resume with the cohort's
+            outputs materialised.  Instance names are validated
+            at pattern-parse time against the other instances in
+            the same pattern.
     """
 
     of_block: str
     n: int
     kind: Literal["every_n_executions"] = "every_n_executions"
+    pause: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -435,6 +456,8 @@ class Pattern:
                 )
             _validate_on_tool_cross_refs(
                 instances, pattern_name=name)
+            _validate_pause_cross_refs(
+                instances, pattern_name=name)
         else:
             if (not isinstance(roles_raw, dict)
                     or not roles_raw):
@@ -466,6 +489,8 @@ class Pattern:
             # fields carry across verbatim.
             instances = [
                 _instance_from_role(r) for r in roles]
+            _validate_pause_cross_refs(
+                instances, pattern_name=name)
 
         return cls(
             name=name,
@@ -701,7 +726,27 @@ def _parse_trigger(
                 f"block {of_block!r}.  Known blocks: "
                 f"{sorted(block_registry.names())}"
             )
-        return EveryNExecutionsTrigger(of_block=of_block, n=n)
+        pause_raw = raw.get("pause", [])
+        if not isinstance(pause_raw, list):
+            raise ValueError(
+                f"Pattern {pattern_name!r} role {role_name!r}: "
+                f"every_n_executions trigger 'pause' must be a "
+                f"list of instance names, got "
+                f"{type(pause_raw).__name__}"
+            )
+        for entry in pause_raw:
+            if not isinstance(entry, str) or not entry:
+                raise ValueError(
+                    f"Pattern {pattern_name!r} role "
+                    f"{role_name!r}: every_n_executions trigger "
+                    f"'pause' entries must be non-empty strings; "
+                    f"got {entry!r}"
+                )
+        return EveryNExecutionsTrigger(
+            of_block=of_block,
+            n=n,
+            pause=tuple(pause_raw),
+        )
 
     if kind == "on_request":
         tool = raw.get("tool")
@@ -973,6 +1018,37 @@ def _validate_on_tool_cross_refs(
                 f"source — ``continuous`` or "
                 f"``every_n_executions``)"
             )
+
+
+def _validate_pause_cross_refs(
+    instances: list[BlockInstance], *, pattern_name: str,
+) -> None:
+    """Cross-ref checks for every ``every_n_executions`` pause list.
+
+    Each name in ``pause`` must refer to another instance in the
+    same pattern.  Pausing an instance that doesn't exist is a
+    silent no-op at runtime; catching it at load time turns a
+    typo into a clear error.
+    """
+    by_name = {inst.name for inst in instances}
+    for inst in instances:
+        trigger = inst.trigger
+        if not isinstance(trigger, EveryNExecutionsTrigger):
+            continue
+        for target in trigger.pause:
+            if target not in by_name:
+                raise ValueError(
+                    f"Pattern {pattern_name!r} instance "
+                    f"{inst.name!r}: trigger 'pause' references "
+                    f"unknown instance {target!r}.  Known "
+                    f"instances: {sorted(by_name)}"
+                )
+            if target == inst.name:
+                raise ValueError(
+                    f"Pattern {pattern_name!r} instance "
+                    f"{inst.name!r}: trigger 'pause' cannot "
+                    f"reference the cohort itself"
+                )
 
 
 def discover_patterns(directory: Path) -> dict[str, Path]:

@@ -214,6 +214,105 @@ roles:
             Pattern.from_yaml(path)
 
 
+class TestPauseField:
+    """``pause`` on ``every_n_executions`` — parser + validation."""
+
+    _INSTANCES_YAML = """\
+instances:
+  play:
+    block: play
+    trigger: {{kind: continuous}}
+    prompt: p.md
+  brainstorm:
+    block: brainstorm
+    trigger:
+      kind: every_n_executions
+      of_block: play
+      n: 20
+      pause: {pause_list}
+    prompt: b.md
+"""
+
+    def test_default_empty_tuple(self):
+        trigger = EveryNExecutionsTrigger(of_block="play", n=5)
+        assert trigger.pause == ()
+
+    def test_parses_list_of_names(self, tmp_path: Path):
+        path = _write(
+            tmp_path, "p",
+            self._INSTANCES_YAML.format(pause_list="[play]"))
+        pattern = Pattern.from_yaml(path)
+        brainstorm = next(
+            i for i in pattern.instances if i.name == "brainstorm")
+        assert brainstorm.trigger.pause == ("play",)
+
+    def test_empty_list_parses_as_empty_tuple(
+            self, tmp_path: Path):
+        path = _write(
+            tmp_path, "p",
+            self._INSTANCES_YAML.format(pause_list="[]"))
+        pattern = Pattern.from_yaml(path)
+        brainstorm = next(
+            i for i in pattern.instances if i.name == "brainstorm")
+        assert brainstorm.trigger.pause == ()
+
+    def test_rejects_non_list(self, tmp_path: Path):
+        path = _write(
+            tmp_path, "bad",
+            self._INSTANCES_YAML.format(pause_list="'play'"))
+        with pytest.raises(
+                ValueError, match="'pause' must be a list"):
+            Pattern.from_yaml(path)
+
+    def test_rejects_empty_entry(self, tmp_path: Path):
+        path = _write(
+            tmp_path, "bad",
+            self._INSTANCES_YAML.format(pause_list="['']"))
+        with pytest.raises(
+                ValueError,
+                match="'pause' entries must be non-empty"):
+            Pattern.from_yaml(path)
+
+    def test_rejects_unknown_instance(self, tmp_path: Path):
+        path = _write(
+            tmp_path, "bad",
+            self._INSTANCES_YAML.format(
+                pause_list="[no_such_instance]"))
+        with pytest.raises(
+                ValueError,
+                match="'pause' references unknown instance"):
+            Pattern.from_yaml(path)
+
+    def test_rejects_self_reference(self, tmp_path: Path):
+        path = _write(
+            tmp_path, "bad",
+            self._INSTANCES_YAML.format(pause_list="[brainstorm]"))
+        with pytest.raises(
+                ValueError,
+                match="'pause' cannot reference the cohort itself"):
+            Pattern.from_yaml(path)
+
+    def test_validation_applies_to_roles_grammar(
+            self, tmp_path: Path):
+        path = _write(tmp_path, "bad", """\
+roles:
+  play:
+    prompt: p.md
+    trigger: {kind: continuous}
+  cohort:
+    prompt: c.md
+    trigger:
+      kind: every_n_executions
+      of_block: play
+      n: 5
+      pause: [no_such_role]
+""")
+        with pytest.raises(
+                ValueError,
+                match="'pause' references unknown instance"):
+            Pattern.from_yaml(path)
+
+
 class TestRoleValidation:
     def test_missing_prompt_raises(self, tmp_path: Path):
         path = _write(tmp_path, "bad", """\

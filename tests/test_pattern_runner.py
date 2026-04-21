@@ -126,25 +126,46 @@ class _FakeWorkspace:
 class _FakeHandle:
     """Programmable handle: stays alive until ``finish()`` is called."""
 
-    def __init__(self, kwargs: dict, name: str = ""):
+    def __init__(
+        self,
+        kwargs: dict,
+        name: str = "",
+        *,
+        execution_id: str | None = None,
+    ):
         self.kwargs = kwargs
         self.name = name
         self._alive = True
         self._waited = False
+        self._stop_calls: list[str] = []
         self._result = AgentResult(
             exit_code=0, elapsed_s=0.1, evals_run=0,
             exit_reason="completed",
+            execution_id=execution_id,
         )
 
     def is_alive(self) -> bool:
         return self._alive
 
-    def finish(self, *, exit_reason: str = "completed") -> None:
+    def finish(
+        self,
+        *,
+        exit_reason: str = "completed",
+        execution_id: str | None = None,
+    ) -> None:
         self._alive = False
         self._result = AgentResult(
             exit_code=0, elapsed_s=0.1, evals_run=0,
             exit_reason=exit_reason,
+            execution_id=(
+                execution_id if execution_id is not None
+                else self._result.execution_id),
         )
+
+    def stop(self, reason: str = "requested") -> None:
+        """Record the stop request; caller flips ``_alive`` via wait()."""
+        self._stop_calls.append(reason)
+        self._alive = False
 
     def wait(self):  # noqa: ANN201
         self._waited = True
@@ -984,3 +1005,186 @@ class TestOnToolBridge:
                 tmp_path=tmp_path,
                 launch_fn=opaque_launch,
             )
+
+
+class TestPauseAndRelaunch:
+    """``every_n_executions`` with ``pause`` stops + relaunches.
+
+    Drives a tiny pattern in a helper thread: play role continuous
+    (and already launched), brainstorm cohort fires every 2
+    take_action executions with ``pause: [play]``.  The test
+    asserts the dance in order — play stopped, its wait()
+    drained, cohort launched and drained, play relaunched with
+    ``predecessor_id`` matching the stopped execution.
+    """
+
+    def _pattern(self, *, play_prompt: str, bs_prompt: str) -> Pattern:
+        return Pattern(
+            name="pause-demo",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=play_prompt,
+                ),
+                BlockInstance(
+                    name="brainstorm",
+                    block="brainstorm",
+                    trigger=EveryNExecutionsTrigger(
+                        of_block="take_action",
+                        n=2,
+                        pause=("play",),
+                    ),
+                    prompt=bs_prompt,
+                    cardinality=2,
+                ),
+            ],
+        )
+
+    def test_stops_drains_cohort_relaunches_with_chain(
+        self, tmp_path: Path,
+    ):
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "bs")
+        pattern = self._pattern(
+            play_prompt=play_prompt, bs_prompt=bs_prompt)
+
+        # One continuous play handle the runner launches at start;
+        # we keep a reference so we can finish() it after the
+        # pause dance completes and the runner drains on exit.
+        launches: list[_FakeHandle] = []
+        play_exec_id = "play-exec-1"
+
+        def launch_fn(**kwargs):
+            prompt = kwargs.get("prompt", "")
+            if prompt.startswith("play"):
+                exec_id = (
+                    play_exec_id
+                    if kwargs.get("predecessor_id") is None
+                    else "play-exec-2"
+                )
+                handle = _FakeHandle(
+                    kwargs, name="play",
+                    execution_id=exec_id,
+                )
+                # Second play launch (post-pause) finishes
+                # immediately so the overall run terminates.
+                if kwargs.get("predecessor_id") is not None:
+                    handle.finish(execution_id="play-exec-2")
+            else:
+                handle = _FakeHandle(
+                    kwargs, name="brainstorm",
+                    execution_id="bs-exec",
+                )
+                handle.finish(execution_id="bs-exec")
+            launches.append(handle)
+            return handle
+
+        # Driver: grow the ledger enough to trigger the cohort,
+        # then wait for the pause dance and let the relaunch
+        # finish naturally (the second play handle above).
+        def driver():
+            for _ in range(2):
+                time.sleep(0.03)
+                ws.add_succeeded("take_action")
+
+        threading.Thread(target=driver, daemon=True).start()
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=2.0,
+        )
+        result = runner.run()
+
+        # Expected launches in order:
+        #   [0] initial play
+        #   [1,2] brainstorm cohort (cardinality=2)
+        #   [3] play relaunch (predecessor_id set)
+        assert [h.name for h in launches] == [
+            "play", "brainstorm", "brainstorm", "play",
+        ]
+
+        initial_play = launches[0]
+        assert initial_play._stop_calls == [
+            "pause-for-cohort:brainstorm"]
+        assert initial_play._waited  # drained before cohort fired
+
+        relaunched_play = launches[3]
+        assert (
+            relaunched_play.kwargs["predecessor_id"]
+            == play_exec_id
+        )
+        assert (
+            relaunched_play.kwargs["block_name"] == "play")
+        # Cohort drained: both brainstorm handles waited.
+        assert launches[1]._waited
+        assert launches[2]._waited
+
+        # Summary: cohorts_fired for brainstorm is 1; play's
+        # cohorts_fired stays at 1 (the relaunch is not a new
+        # cohort, just a resume).
+        assert result.cohorts_by_role["play"] == 1
+        assert result.cohorts_by_role["brainstorm"] == 1
+
+    def test_no_pause_preserves_parallel_behaviour(
+        self, tmp_path: Path,
+    ):
+        """Without ``pause``, the cohort runs in parallel as before."""
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "bs")
+        pattern = Pattern(
+            name="no-pause",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=play_prompt,
+                ),
+                BlockInstance(
+                    name="brainstorm",
+                    block="brainstorm",
+                    trigger=EveryNExecutionsTrigger(
+                        of_block="take_action", n=2),
+                    prompt=bs_prompt,
+                ),
+            ],
+        )
+        play_handle_ref: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            if kwargs.get("prompt", "").startswith("play"):
+                play_handle_ref.append(handle)
+            else:
+                handle.finish()
+            return handle
+
+        def driver():
+            for _ in range(2):
+                time.sleep(0.02)
+                ws.add_succeeded("take_action")
+            time.sleep(0.05)
+            play_handle_ref[0].finish()
+
+        threading.Thread(target=driver, daemon=True).start()
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=2.0,
+        )
+        runner.run()
+
+        # Play was never stopped — no pause field.
+        assert play_handle_ref[0]._stop_calls == []
