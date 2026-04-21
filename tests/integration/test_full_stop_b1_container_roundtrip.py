@@ -170,7 +170,7 @@ def _docker_command(workspace: Path) -> list[str]:
         "docker", "run", "--rm", "-i",
         "--name", container_name,
         "-v", f"{AUTH_VOLUME}:/home/claude/.claude",
-        "-v", f"{host_ws}:/workspace",
+        "-v", f"{host_ws}:/scratch",
         "-e", f"MODEL={HAIKU_MODEL}",
         "-e", "MCP_SERVERS=splicedemo",
         "-e", f"HANDOFF_TOOLS={TEST_TOOL}",
@@ -206,7 +206,7 @@ def test_container_handoff_roundtrip_with_haiku(
         verification token the model has no other way to know.
     6.  Splice rewrites the deny tool_result.
     7.  Driver relaunches the container with
-        ``RESUME_SESSION_FILE=/workspace/agent_session.jsonl``.
+        ``RESUME_SESSION_FILE=/scratch/agent_session.jsonl``.
     8.  Resumed agent emits a message that contains the token,
         which proves the spliced content reached the model
         (not just sat silently in the JSONL).

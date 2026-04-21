@@ -452,7 +452,7 @@ def test_single_handoff_round_trip(
             encoding="utf-8"))
     assert observed["iteration_index"] == 1
     assert observed["RESUME_SESSION_FILE"] == (
-        "/workspace/agent_session.jsonl")
+        "/scratch/agent_session.jsonl")
 
 
 # --------------------------------------------------------------------

@@ -102,7 +102,7 @@ from claude_agent_sdk.types import (
 # Paths
 # ------------------------------------------------------------------
 
-WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
+WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/scratch"))
 STOP_FILE = WORKSPACE / ".stop"
 # Framework-owned control files live under ``/flywheel/control/``
 # so they don't clutter the agent's scratchpad namespace or the
@@ -167,13 +167,13 @@ def _encode_cwd(cwd: str) -> str:
     """Encode a cwd path the way the Claude SDK does internally.
 
     Every non-alphanumeric character is replaced with a hyphen.
-    For cwd="/workspace", the result is "-workspace".
+    For cwd="/scratch", the result is "-scratch".
     """
     return "".join(c if c.isalnum() else "-" for c in cwd)
 
 
 def _sdk_session_path(
-    session_id: str, cwd: str = "/workspace",
+    session_id: str, cwd: str = "/scratch",
 ) -> Path:
     """Return the path where the Claude SDK stores session history."""
     encoded = _encode_cwd(cwd)
@@ -181,11 +181,11 @@ def _sdk_session_path(
 
 
 def _export_session(session_id: str) -> None:
-    """Copy the SDK session JSONL into ``/state/session.jsonl``.
+    """Copy the SDK session JSONL into ``/flywheel/state/session.jsonl``.
 
     Called in a finally block on exit.  Flywheel captures the
-    contents of ``/state/`` after the container exits and
-    populates ``/state/`` from it on the next execution's launch,
+    contents of ``/flywheel/state/`` after the container exits and
+    populates it from that capture on the next execution's launch,
     so this single file is enough to resume the conversation in a
     fresh container.
 
@@ -584,7 +584,7 @@ async def main() -> None:
 
     # --- Build options ---
     options = ClaudeAgentOptions(
-        cwd="/workspace",
+        cwd="/scratch",
         allowed_tools=allowed_tools,
         permission_mode="bypassPermissions",
     )
@@ -599,8 +599,8 @@ async def main() -> None:
     if max_turns:
         options.max_turns = max_turns
 
-    # --- Session resume from /state/ ---
-    # Flywheel populates ``/state/`` with the prior execution's
+    # --- Session resume from /flywheel/state/ ---
+    # Flywheel populates ``/flywheel/state/`` with the prior execution's
     # captured state before launching us.  If a session file is
     # present, extract the SDK session id from its first line and
     # hand it to the SDK so the conversation continues.  Absence

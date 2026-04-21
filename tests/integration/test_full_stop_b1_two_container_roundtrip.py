@@ -200,7 +200,7 @@ def _docker_command(workspace: Path) -> list[str]:
         "docker", "run", "--rm", "-i",
         "--name", container_name,
         "-v", f"{AUTH_VOLUME}:/home/claude/.claude",
-        "-v", f"{host_ws}:/workspace",
+        "-v", f"{host_ws}:/scratch",
         "-e", f"MODEL={HAIKU_MODEL}",
         "-e", "MCP_SERVERS=splicedemo",
         "-e", f"HANDOFF_TOOLS={TEST_TOOL}",

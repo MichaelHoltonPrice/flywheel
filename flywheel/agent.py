@@ -141,7 +141,7 @@ class AgentBlockConfig:
             HOST_WHITELIST_PORTS: <port,port,...>`` in the pattern
             YAML.
         agent_workspace_dir: Reserved; no-op under the substrate.
-            The /workspace bind is always the executor's per-
+            The /scratch bind is always the executor's per-
             execution scratch tempdir.
         predecessor_id: Execution ID of a previous agent run
             this launch resumes from.  Recorded on the
@@ -231,7 +231,7 @@ def _build_agent_mounts(
     forwarded to :meth:`ProcessExitExecutor.launch` as the
     ``extra_mounts`` kwarg; the executor appends it to the
     substrate-reserved mount list (``/input/*``, ``/output/*``,
-    ``/state``, ``/workspace``).  ``docker_args`` extends
+    ``/state``, ``/scratch``).  ``docker_args`` extends
     ``block_def.docker_args`` for network-isolation runs.
     """
     mounts: list[tuple[str, str, str]] = [

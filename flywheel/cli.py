@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> None:
         "stop",
         help=(
             "Tear down a request-response runtime via the "
-            "/workspace/.stop sentinel, falling back to "
+            "/scratch/.stop sentinel, falling back to "
             "SIGTERM/SIGKILL."),
     )
     cstop_parser.add_argument("--workspace", required=True)

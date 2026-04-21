@@ -39,13 +39,13 @@ STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 sentinel.  Flywheel writes this file to request a clean shutdown;
 the container polls for it and exits when it appears.  The full
 container-side path depends on where the workspace is mounted
-(typically ``/workspace/.stop``)."""
+(typically ``/scratch/.stop``)."""
 
 REQUEST_TREE_WORKSPACE_RELATIVE: Final[str] = "requests"
 """Workspace-relative parent directory for request-response
 per-request I/O trees.  For request ``id``, flywheel creates
-``/workspace/requests/<id>/input/<slot>/`` (read-only staged
-inputs) and ``/workspace/requests/<id>/output/<slot>/`` (empty
+``/scratch/requests/<id>/input/<slot>/`` (read-only staged
+inputs) and ``/scratch/requests/<id>/output/<slot>/`` (empty
 write targets) before each ``POST /execute`` call.  Unused by
 process-exit blocks."""
 

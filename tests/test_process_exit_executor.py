@@ -151,7 +151,7 @@ def _fake_run_success(
                 if state_contents:
                     for fname, content in state_contents.items():
                         (host_p / fname).write_text(content)
-            elif container == "/workspace":
+            elif container == "/scratch":
                 # The work-area mount; no files expected here
                 # for the success path.
                 continue
@@ -979,7 +979,7 @@ def _start_cancellable(
         # Locate the work-area mount (host path for /workspace).
         work_area = None
         for host, container, _mode in config.mounts:
-            if container == "/workspace":
+            if container == "/scratch":
                 work_area = Path(host)
                 break
         sentinel_path = (
@@ -1265,7 +1265,7 @@ class TestExtraEnvAndMounts:
             handle.wait()
 
         # Contract mounts still present (work-area).
-        assert any(m[1] == "/workspace" for m in captured["mounts"])
+        assert any(m[1] == "/scratch" for m in captured["mounts"])
         # Extra mount landed at the requested container path.
         assert (str(src), "/prompt", "ro") in captured["mounts"]
 
@@ -1419,7 +1419,7 @@ class TestWatchdogTimeout:
         def _factory(config, args=None, name=None, **_):
             work_area = None
             for host, container, _mode in config.mounts:
-                if container == "/workspace":
+                if container == "/scratch":
                     work_area = Path(host)
                     break
             assert work_area is not None

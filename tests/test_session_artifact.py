@@ -64,7 +64,7 @@ _runner = _import_helpers()
 
 class TestEncodeCwd:
     def test_workspace(self):
-        assert _runner._encode_cwd("/workspace") == "-workspace"
+        assert _runner._encode_cwd("/scratch") == "-scratch"
 
     def test_home_path(self):
         assert _runner._encode_cwd("/home/user/project") == (
@@ -84,7 +84,7 @@ class TestSdkSessionPath:
     def test_default_cwd(self):
         result = _runner._sdk_session_path("abc123")
         assert result.name == "abc123.jsonl"
-        assert "-workspace" in str(result)
+        assert "-scratch" in str(result)
 
     def test_custom_cwd(self):
         result = _runner._sdk_session_path("sess1", "/home/user/proj")
@@ -96,7 +96,7 @@ class TestExportSession:
     def test_copies_session_file(self, tmp_path: Path):
         """Session JSONL is copied to workspace output file."""
         # Create a fake SDK session file.
-        sdk_dir = tmp_path / ".claude" / "projects" / "-workspace"
+        sdk_dir = tmp_path / ".claude" / "projects" / "-scratch"
         sdk_dir.mkdir(parents=True)
         session_file = sdk_dir / "test-session.jsonl"
         session_file.write_text('{"role": "user"}\n')
@@ -135,7 +135,7 @@ class TestExportSession:
 
     def test_export_creates_parent_dir(self, tmp_path: Path):
         """Parent directory of output file is created if missing."""
-        sdk_dir = tmp_path / ".claude" / "projects" / "-workspace"
+        sdk_dir = tmp_path / ".claude" / "projects" / "-scratch"
         sdk_dir.mkdir(parents=True)
         session_file = sdk_dir / "sess1.jsonl"
         session_file.write_text('{"role": "user"}\n')
@@ -167,7 +167,7 @@ class TestSessionImport:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, dest)
 
-        expected = sdk_projects / "-workspace" / "agent_session.jsonl"
+        expected = sdk_projects / "-scratch" / "agent_session.jsonl"
         assert expected.exists()
         assert expected.read_text() == '{"role": "user"}\n'
 
@@ -194,7 +194,7 @@ class TestSessionImport:
 
 class TestStopFile:
     def test_stop_file_matches_substrate_sentinel(self):
-        """STOP_FILE is the contract's ``/workspace/.stop`` sentinel.
+        """STOP_FILE is the contract's ``/scratch/.stop`` sentinel.
 
         The agent runner watches the same path the substrate
         writes for cooperative cancellation, so

@@ -4,7 +4,7 @@
 
    This module is a legacy handoff driver that predates the
    substrate contract.  It still uses the pre-substrate
-   ``RESUME_SESSION_FILE`` / ``/workspace/agent_session.jsonl``
+   ``RESUME_SESSION_FILE`` / ``/scratch/agent_session.jsonl``
    convention, a durable agent workspace directory, and
    ``.agent_stop`` as the cancellation sentinel — none of which
    match the contract implemented by
@@ -327,7 +327,7 @@ def run_with_handoffs(
                     f"missing: {session_path}"
                 )
             resume_path = session_path
-            iter_extra_env[resume_env_var] = "/workspace/" + (
+            iter_extra_env[resume_env_var] = "/scratch/" + (
                 resume_artifact_name
             )
         if extra_env_per_iteration is not None:

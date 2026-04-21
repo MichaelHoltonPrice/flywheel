@@ -444,7 +444,7 @@ class ContainerExecutionHandle(ExecutionHandle):
 
         Phase 1 — *cooperative.*  Write the stop sentinel file at
         ``<work_area>/.stop`` (visible inside the container as
-        ``/workspace/.stop``) and wait up to the block's
+        ``/scratch/.stop``) and wait up to the block's
         ``stop_timeout_s`` for the container to exit on its own.
 
         Phase 2 — *forced.*  If cooperative times out, send
@@ -736,7 +736,7 @@ class ProcessExitExecutor:
                 mount list.  Each entry is ``(host_path,
                 container_path, mode)``.  Mount paths must not
                 collide with the contract-reserved ``/input/*``,
-                ``/output/*``, ``/state``, or ``/workspace`` —
+                ``/output/*``, ``/state``, or ``/scratch`` —
                 collision surfaces as a Docker error.
             extra_docker_args: Per-launch Docker CLI flags
                 appended to ``block_def.docker_args``.  Used for
@@ -848,7 +848,7 @@ class ProcessExitExecutor:
                     tempfile.mkdtemp(
                         prefix=f"flywheel-output-{slot.name}-"))
 
-            # Allocate the /workspace/ work-area tempdir where
+            # Allocate the /scratch/ work-area tempdir where
             # flywheel and the container communicate (stop
             # sentinel, future runtime socket).
             work_area = Path(tempfile.mkdtemp(
@@ -1195,7 +1195,7 @@ def _build_mounts(
 
     Never includes a canonical workspace path — every mount
     points at a per-execution staged tempdir.  The ``work_area``
-    is mounted rw at ``/workspace/`` so flywheel and the
+    is mounted rw at ``/scratch/`` so flywheel and the
     container can exchange control signals (the stop sentinel,
     and later the runtime socket for request-response blocks).
     """
@@ -1213,7 +1213,7 @@ def _build_mounts(
     if state_mount is not None:
         mounts.append(
             (str(state_mount), runtime.STATE_MOUNT_PATH, "rw"))
-    mounts.append((str(work_area), "/workspace", "rw"))
+    mounts.append((str(work_area), "/scratch", "rw"))
     return mounts
 
 
@@ -2279,7 +2279,7 @@ class RequestResponseExecutor:
         and ``workspace`` are supplied so the container name can
         be reconstructed.
 
-        Writes ``/workspace/.stop`` to request cooperative
+        Writes ``/scratch/.stop`` to request cooperative
         shutdown; if the container does not exit within its
         ``stop_timeout_s``, sends SIGTERM and then SIGKILL.
         Idempotent; returns ``False`` when no runtime was found
@@ -2475,7 +2475,7 @@ class RequestResponseExecutor:
             docker_args.extend(extra_docker_args)
 
         mounts: list[tuple[str, str, str]] = [
-            (str(work_area.resolve()), "/workspace", "rw"),
+            (str(work_area.resolve()), "/scratch", "rw"),
         ]
         if extra_mounts:
             mounts.extend(extra_mounts)
@@ -2538,7 +2538,7 @@ class RequestResponseExecutor:
 
         Mirrors :meth:`ContainerExecutionHandle.stop` semantics
         for the request-response runtime: write
-        ``/workspace/.stop`` first, poll for container exit up
+        ``/scratch/.stop`` first, poll for container exit up
         to ``stop_timeout_s``, escalate if the container doesn't
         exit on its own.  Best-effort; transport or docker
         errors do not raise.  The runtime is detached so there

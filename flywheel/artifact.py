@@ -148,7 +148,7 @@ class BlockExecution:
             ``None`` when no callback was configured or it
             completed normally.
         agent_workspace_dir: Workspace-relative path to the
-            ``/workspace`` bind mount used by this agent (e.g.,
+            ``/scratch`` bind mount used by this agent (e.g.,
             ``"agent_workspaces/abc12345"``).  Recorded so an
             operator looking at a workspace directory can find
             the execution that produced it (and vice versa) without
