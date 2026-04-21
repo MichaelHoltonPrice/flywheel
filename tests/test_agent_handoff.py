@@ -29,14 +29,12 @@ What this file covers:
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from flywheel.agent_handoff import (
     DEFAULT_RESUME_PROMPT,
-    PENDING_FILE_NAME,
     SESSION_FILE_NAME,
     BlockRunner,
     HandoffContext,
@@ -313,11 +311,12 @@ class TestSingleHandoffRoundTrip:
             **_base_kwargs(workspace),
         )
 
-        agent_ws = workspace.path / "agent_workspaces/handoff_test"
-        assert not (agent_ws / PENDING_FILE_NAME).exists(), (
-            "pending file should be removed after handoff is "
-            "resolved so a leftover cannot trigger a phantom cycle"
-        )
+        # Control files live under the launcher's per-execution
+        # tempdir and are cleaned up in ``AgentHandle.wait``; they
+        # never touch the agent's workspace directory, so there
+        # is nothing to assert-not-present here.  The property the
+        # old test was guarding against (stale pending file in the
+        # scratchpad) is closed by construction in the new shape.
 
     def test_custom_resume_prompt_is_used(
         self, workspace: _FakeWorkspace,
@@ -772,7 +771,7 @@ class TestErrorPaths:
 
         with pytest.raises(
             HandoffLoopError,
-            match="pending_tool_calls artifact is missing or empty",
+            match="AgentResult.pending_tool_calls is empty",
         ):
             run_agent_with_handoffs(
                 block_runner=_br,

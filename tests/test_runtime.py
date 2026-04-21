@@ -14,9 +14,23 @@ from flywheel import runtime
 
 class TestPathConstants:
     def test_state_mount_path(self):
-        # The container-side mount where /state/ lives.  Block
-        # authors look for this path; the executor mounts there.
-        assert runtime.STATE_MOUNT_PATH == "/state"
+        # Block authors look for this path; the executor mounts
+        # there when a block declares ``state: true``.
+        assert runtime.STATE_MOUNT_PATH == "/flywheel/state"
+
+    def test_flywheel_control_mount(self):
+        # Agent-specific framework-owned control files; the agent
+        # launcher mounts a host tempdir here.
+        assert (
+            runtime.FLYWHEEL_CONTROL_MOUNT == "/flywheel/control"
+        )
+
+    def test_flywheel_mcp_servers_mount(self):
+        # Agent-specific MCP server code mount path.
+        assert (
+            runtime.FLYWHEEL_MCP_SERVERS_MOUNT
+            == "/flywheel/mcp_servers"
+        )
 
     def test_stop_sentinel_relative(self):
         # Workspace-relative path; absolute location depends on

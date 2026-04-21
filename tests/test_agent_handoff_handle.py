@@ -51,8 +51,6 @@ import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.agent_handoff import (
-    PENDING_ARTIFACT_NAME,
-    PENDING_FILE_NAME,
     SESSION_FILE_NAME,
     HandoffAgentHandle,
     HandoffContext,
@@ -144,30 +142,6 @@ class _FakeAgentHandle:
                 state_dir_path.relative_to(self._workspace_root)
             ).replace("\\", "/")
 
-        output_bindings: dict[str, str] = {}
-        if self._script.exit_reason == "tool_handoff":
-            aid = f"pending-{self._script.execution_id}"
-            artifact_dir = (
-                self._workspace_root / "artifacts" / aid)
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            envelope = {
-                "schema_version": 2,
-                "session_id": "sess-fake",
-                "pending": list(self._script.pending),
-            }
-            (artifact_dir / PENDING_FILE_NAME).write_text(
-                json.dumps(envelope), encoding="utf-8")
-            if self._workspace is not None:
-                self._workspace.artifacts[aid] = ArtifactInstance(
-                    id=aid,
-                    name=PENDING_ARTIFACT_NAME,
-                    kind="copy",
-                    copy_path=aid,
-                    created_at=datetime.now(UTC),
-                    source="fake",
-                )
-            output_bindings[PENDING_ARTIFACT_NAME] = aid
-
         if self._workspace is not None:
             now = datetime.now(UTC)
             self._workspace.executions[
@@ -179,8 +153,18 @@ class _FakeAgentHandle:
                 finished_at=now,
                 status="succeeded",
                 state_dir=state_dir_rel,
-                output_bindings=output_bindings,
+                output_bindings={},
             )
+
+        pending_tool_calls: list[dict[str, Any]] | None = None
+        exit_state: dict[str, Any] | None = None
+        if self._script.exit_reason == "tool_handoff":
+            pending_tool_calls = list(self._script.pending)
+            exit_state = {
+                "session_id": "sess-fake",
+                "status": "tool_handoff",
+                "reason": "",
+            }
 
         return AgentResult(
             exit_code=0,
@@ -189,6 +173,8 @@ class _FakeAgentHandle:
             execution_id=self._script.execution_id,
             stop_reason=None,
             exit_reason=self._script.exit_reason,
+            exit_state=exit_state,
+            pending_tool_calls=pending_tool_calls,
         )
 
 

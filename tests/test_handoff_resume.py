@@ -56,7 +56,6 @@ from pathlib import Path
 import pytest
 
 from flywheel.agent_handoff import (
-    PENDING_FILE_NAME,
     SESSION_FILE_NAME,
     HandoffContext,
     HandoffLoopError,
@@ -108,33 +107,6 @@ def _read_session(
     return (
         _session_path(workspace, execution_id)
     ).read_text(encoding="utf-8")
-
-
-def _pending_path(
-    workspace: _FakeWorkspace, execution_id: str = "exec-0",
-) -> Path:
-    """Resolve the pending-tool-calls artifact path for a cycle.
-
-    Each handoff cycle produces its own ``pending_tool_calls``
-    artifact instance bound to that cycle's
-    :class:`BlockExecution`.  The path persists for the life of
-    the workspace (the artifact graph is append-only); "stale"
-    pending files from a prior cycle cannot leak into a later
-    one because each cycle reads its own artifact binding.
-    """
-    execution = workspace.executions.get(execution_id)
-    if execution is None:
-        return (
-            workspace.path / "artifacts" / "missing"
-            / PENDING_FILE_NAME)
-    binding = execution.output_bindings.get("pending_tool_calls")
-    if not binding:
-        return (
-            workspace.path / "artifacts" / "missing"
-            / PENDING_FILE_NAME)
-    return (
-        workspace.path / "artifacts" / binding
-        / PENDING_FILE_NAME)
 
 
 def _session_path(
@@ -215,10 +187,6 @@ class TestBlockRunnerFailure:
                 **_base_kwargs(workspace),
             )
 
-        assert _pending_path(workspace).is_file(), (
-            "pending file must remain so the operator can see "
-            "which tool calls were not resolved"
-        )
         deny_ids = find_pending_deny_tool_use_ids(
             _session_path(workspace))
         assert deny_ids == ids, (
@@ -255,7 +223,6 @@ class TestBlockRunnerFailure:
                 **_base_kwargs(workspace),
             )
 
-        assert _pending_path(workspace).is_file()
         spliced = _read_session(workspace)
         assert "real-result-for-a" in spliced, (
             "entry 0's splice must have completed before the crash"
@@ -306,7 +273,6 @@ class TestBlockRunnerFailure:
         assert out.cycles[0].handoffs[0]["is_error"] is True
         # Pending file removed because the batch fully resolved
         # (an error result is still a result — splice happened).
-        assert not _pending_path(workspace).exists()
         spliced = _read_session(workspace)
         assert "block raised: exact reason here" in spliced
         # The spliced tool_result block's is_error flag flipped.
@@ -405,8 +371,6 @@ class TestSpliceFailureMidBatch:
         # Runner saw the first two entries; the third never ran
         # because the second entry's splice crashed the cycle.
         assert runner_calls == ["toolu_a", "toolu_zzz"]
-        assert _pending_path(workspace).is_file()
-
         # A is spliced (real result lives in the JSONL); C is not
         # (still carries the deny marker).
         spliced = _read_session(workspace)
@@ -421,46 +385,40 @@ class TestSpliceFailureMidBatch:
 # --------------------------------------------------------------------
 
 
-class TestPendingFileShape:
-    """A truncated or malformed ``pending_tool_calls.json`` is the
-    most plausible "agent crashed mid-write" surface.  The loop's
-    contract is to refuse to proceed rather than silently treat
-    the broken file as "no handoff" and relaunch fresh.
+class TestEmptyPendingOnHandoff:
+    """``exit_reason == 'tool_handoff'`` but no pending payload is a
+    contract violation — the loop refuses to proceed rather than
+    relaunching with nothing to dispatch.  The on-disk malformed-
+    JSON cases are handled defensively inside
+    :func:`flywheel.agent._read_pending_list` (which returns
+    ``None``/``[]`` on parse failure); by the time the payload
+    reaches the loop it's always a well-formed list.  This
+    covers the empty-list boundary.
     """
 
-    def test_truncated_json_treated_as_empty_pending(
+    def test_empty_pending_raises(
         self, workspace: _FakeWorkspace,
     ) -> None:
-        """A truncated pending file decodes to nothing.  The loop's
-        defensive ``_read_json`` returns ``{}`` on parse failure
-        and ``_normalize_pending`` returns ``[]``; the loop then
-        raises ``no tool calls`` rather than relaunching with no
-        pending payload.
-
-        This is intentional: a truncated pending file means the
-        previous container exited with handoff intent but the
-        evidence is corrupt; silently treating it as "no
-        handoff" would lose the agent's tool calls.
-        """
         scripts = [
             _CycleScript(
                 exit_reason="tool_handoff",
+                pending=[],
                 write_session=True,
                 session_jsonl_text=_build_session_jsonl(
-                    session_id="sess-trunc",
+                    session_id="sess-empty",
                     tool_use_ids=["toolu_x"]),
-                pending_text='{"schema_version": 2, "pending": [{"tool_',
             ),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
+        launch = _make_launch_fn(
+            workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
             raise AssertionError("runner should not be called")
 
         with pytest.raises(
             HandoffLoopError,
-            match="pending_tool_calls artifact is missing or empty",
+            match="AgentResult.pending_tool_calls is empty",
         ):
             run_agent_with_handoffs(
                 block_runner=_br,
@@ -468,79 +426,41 @@ class TestPendingFileShape:
                 **_base_kwargs(workspace),
             )
 
-    def test_garbage_pending_file_treated_as_empty_pending(
+    def test_extra_keys_in_entries_tolerated(
         self, workspace: _FakeWorkspace,
     ) -> None:
-        """Non-JSON garbage in the pending file decodes to nothing
-        and the loop refuses to proceed for the same reason as the
-        truncated case.
-        """
-        scripts = [
-            _CycleScript(
-                exit_reason="tool_handoff",
-                write_session=True,
-                session_jsonl_text=_build_session_jsonl(
-                    session_id="sess-junk",
-                    tool_use_ids=["toolu_x"]),
-                pending_text="this is not json at all\n",
-            ),
-        ]
-        record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
+        """Per-entry extra keys are a forward-compat pin.
 
-        def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
-            raise AssertionError("runner should not be called")
-
-        with pytest.raises(
-            HandoffLoopError,
-            match="pending_tool_calls artifact is missing or empty",
-        ):
-            run_agent_with_handoffs(
-                block_runner=_br,
-                launch_fn=launch,
-                **_base_kwargs(workspace),
-            )
-
-    def test_pending_with_extra_keys_still_parses(
-        self, workspace: _FakeWorkspace,
-    ) -> None:
-        """Extra keys at envelope level or per entry are tolerated.
-
-        Future schema additions (e.g., per-entry ``target_block``
-        or ``params`` fields the host derived later) must not
-        require a new ``schema_version`` so long as the existing
-        keys keep their meaning.  This test pins forward-compat.
+        Future schema additions (e.g. ``target_block``) must not
+        require a loop change so long as existing keys keep their
+        meaning.  The loop reads ``tool_use_id``, ``tool_name``,
+        and ``tool_input`` by key; unknown keys flow through the
+        dict unmodified.
         """
         ids = ["toolu_p"]
-        envelope = {
-            "schema_version": 2,
-            "session_id": "sess-extra",
-            "future_field": "future-value",
-            "pending": [
-                {
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
                     "tool_use_id": "toolu_p",
                     "tool_name": "mcp__demo__handoff_me",
                     "tool_input": {"k": 1},
                     "captured_at": "2026-04-17T00:00:00Z",
                     "future_per_entry_field": ["a", "b"],
-                },
-            ],
-        }
-        scripts = [
-            _CycleScript(
-                exit_reason="tool_handoff",
+                }],
                 write_session=True,
                 session_jsonl_text=_build_session_jsonl(
                     session_id="sess-extra", tool_use_ids=ids),
-                pending_text=json.dumps(envelope),
             ),
             _CycleScript(exit_reason="completed"),
         ]
         record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
+        launch = _make_launch_fn(
+            workspace.path, scripts, record, workspace=workspace)
 
         def _br(ctx: HandoffContext) -> HandoffResult:
-            return HandoffResult(content=f"real-{ctx.tool_use_id}")
+            return HandoffResult(
+                content=f"real-{ctx.tool_use_id}")
 
         out = run_agent_with_handoffs(
             block_runner=_br,
@@ -569,62 +489,6 @@ class TestStaleArtifactsTolerated:
     pre-existing leftovers before the loop starts and verify that
     the loop only consults what the *current* cycle wrote.
     """
-
-    def test_stale_pending_file_overwritten_by_handoff_cycle(
-        self, workspace: _FakeWorkspace,
-    ) -> None:
-        """A pending file from a previous crashed run is sitting in
-        the workspace before the loop starts.  The fresh container
-        produces its own pending file (overwriting the stale
-        one), and the loop processes only the fresh entries.
-
-        Pins the contract that stale pending files cannot cause
-        spurious tool calls to fire after a host-side restart.
-        """
-        agent_ws = _agent_ws(workspace)
-        agent_ws.mkdir(parents=True, exist_ok=True)
-        # Pre-seed a stale pending file pointing at a tool call
-        # the loop must NOT execute.
-        (agent_ws / PENDING_FILE_NAME).write_text(
-            json.dumps({
-                "schema_version": 2,
-                "session_id": "sess-from-prior-crash",
-                "pending": [{
-                    "tool_use_id": "toolu_stale",
-                    "tool_name": "mcp__should__never_run",
-                    "tool_input": {"poison": True},
-                }],
-            }),
-            encoding="utf-8",
-        )
-
-        ids = ["toolu_fresh"]
-        scripts = [
-            _multi_pending_script(
-                session_id="sess-fresh", tool_use_ids=ids),
-            _CycleScript(exit_reason="completed"),
-        ]
-        record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
-
-        runner_seen: list[str] = []
-
-        def _br(ctx: HandoffContext) -> HandoffResult:
-            runner_seen.append(ctx.tool_use_id)
-            return HandoffResult(content="ok")
-
-        out = run_agent_with_handoffs(
-            block_runner=_br,
-            launch_fn=launch,
-            **_base_kwargs(workspace),
-        )
-
-        assert runner_seen == ["toolu_fresh"], (
-            f"runner must only see the fresh container's pending "
-            f"entries, never the stale ones; got {runner_seen}"
-        )
-        assert out.final_result.exit_reason == "completed"
-        assert not _pending_path(workspace).exists()
 
     def test_stale_session_jsonl_overwritten_by_fresh_launch(
         self, workspace: _FakeWorkspace,
@@ -667,61 +531,6 @@ class TestStaleArtifactsTolerated:
         spliced = _read_session(workspace)
         assert "STALE_CONTENT_FROM_PRIOR_RUN" not in spliced
         assert "real-after" in spliced
-
-    def test_stale_pending_ignored_when_agent_exits_clean(
-        self, workspace: _FakeWorkspace,
-    ) -> None:
-        """A stale pending file is sitting in the workspace and the
-        fresh container exits with a non-handoff status (and does
-        not write a new pending file).  The loop must respect the
-        ``exit_reason``, not the on-disk pending file: a
-        non-handoff exit terminates the loop cleanly without
-        invoking the runner.
-
-        This is the "Before step 3" failure-mode execution: the new
-        container's PreToolUse hook never fired, so even though
-        leftover state suggests pending work, the *current*
-        agent reports nothing pending.
-        """
-        agent_ws = _agent_ws(workspace)
-        agent_ws.mkdir(parents=True, exist_ok=True)
-        (agent_ws / PENDING_FILE_NAME).write_text(
-            json.dumps({
-                "schema_version": 2,
-                "session_id": "sess-stale-only",
-                "pending": [{
-                    "tool_use_id": "toolu_stale",
-                    "tool_name": "mcp__should__never_run",
-                    "tool_input": {},
-                }],
-            }),
-            encoding="utf-8",
-        )
-
-        scripts = [
-            _CycleScript(
-                exit_reason="completed",
-                # Don't write pending or session — emulates an
-                # agent that ran fresh, did its job, and exited
-                # without ever triggering PreToolUse.
-            ),
-        ]
-        record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
-
-        def _br(ctx: HandoffContext) -> HandoffResult:  # pragma: no cover
-            raise AssertionError(
-                "runner must not be called for a non-handoff exit")
-
-        out = run_agent_with_handoffs(
-            block_runner=_br,
-            launch_fn=launch,
-            **_base_kwargs(workspace),
-        )
-
-        assert out.final_result.exit_reason == "completed"
-        assert len(out.cycles) == 1
-        assert out.cycles[0].handoffs == []
 
 
 # --------------------------------------------------------------------
@@ -799,41 +608,6 @@ class TestPendingFileLifecycle:
     expected to exist on disk.
     """
 
-    def test_pending_present_during_runner_calls(
-        self, workspace: _FakeWorkspace,
-    ) -> None:
-        """The pending file must be on disk while the runner is
-        executing — that's how an external observer can see
-        progress mid-cycle.  It is removed only after every
-        entry in the batch has been spliced.
-        """
-        ids = ["toolu_x", "toolu_y"]
-        scripts = [
-            _multi_pending_script(
-                session_id="sess-life", tool_use_ids=ids),
-            _CycleScript(exit_reason="completed"),
-        ]
-        record: list[_LaunchCall] = []
-        launch = _make_launch_fn(workspace.path, scripts, record, workspace=workspace)
-
-        present_during_runner: list[bool] = []
-
-        def _br(ctx: HandoffContext) -> HandoffResult:
-            present_during_runner.append(
-                _pending_path(workspace).is_file())
-            return HandoffResult(content=f"real-{ctx.tool_use_id}")
-
-        out = run_agent_with_handoffs(
-            block_runner=_br,
-            launch_fn=launch,
-            **_base_kwargs(workspace),
-        )
-        assert present_during_runner == [True, True]
-        assert out.final_result.exit_reason == "completed"
-        assert not _pending_path(workspace).exists(), (
-            "pending file must be removed before the relaunch"
-        )
-
     def test_pending_removed_even_if_loop_terminates_immediately(
         self, workspace: _FakeWorkspace,
     ) -> None:
@@ -860,8 +634,6 @@ class TestPendingFileLifecycle:
             launch_fn=launch,
             **_base_kwargs(workspace),
         )
-        assert not _pending_path(workspace).exists()
-
     def test_halt_after_splice_preserves_pending_artifact(
         self, workspace: _FakeWorkspace,
     ) -> None:
@@ -891,8 +663,6 @@ class TestPendingFileLifecycle:
         assert out.halts == [{"reason": "stop"}]
         # Splice did happen.
         assert "real-h" in _read_session(workspace)
-        # The cycle's pending artifact persists as provenance.
-        assert _pending_path(workspace).is_file()
 
 
 # --------------------------------------------------------------------
@@ -946,7 +716,6 @@ class TestRedriveAfterFailure:
             )
         # Pre-condition for the redrive: pending file present,
         # session partially spliced.
-        assert _pending_path(workspace).is_file()
         assert "real-a-from-run-1" in _read_session(workspace)
 
         # --- Second run: fresh container, healthy runner ---
@@ -982,4 +751,3 @@ class TestRedriveAfterFailure:
         # container wrote its own JSONL.
         assert "real-toolu_redrive" in spliced
         assert "real-a-from-run-1" not in spliced
-        assert not _pending_path(workspace).exists()

@@ -14,10 +14,25 @@ from typing import Final
 
 # ── Filesystem conventions ──────────────────────────────────────
 
-STATE_MOUNT_PATH: Final[str] = "/state"
-"""Container-side path where flywheel mounts `/state/` for blocks
-that declare ``state: true``.  Populated at container start from
-the prior execution's state dir; captured at container exit."""
+STATE_MOUNT_PATH: Final[str] = "/flywheel/state"
+"""Container-side path where flywheel mounts state for blocks that
+declare ``state: true``.  Populated at container start from the
+prior execution's state dir; captured at container exit.  Lives
+under ``/flywheel/`` so every flywheel-owned mount is under a
+single namespace distinct from the block body's inputs/outputs."""
+
+FLYWHEEL_CONTROL_MOUNT: Final[str] = "/flywheel/control"
+"""Container-side path where agent-style blocks receive
+framework-owned control files (e.g. ``pending_tool_calls.json``,
+``agent_exit_state.json``, ``.agent_resume``).  Agent-specific —
+not written by the generic executor.  The agent launcher mounts
+a host tempdir here and reads any control files the block wrote
+after exit.  Not in the artifact graph."""
+
+FLYWHEEL_MCP_SERVERS_MOUNT: Final[str] = "/flywheel/mcp_servers"
+"""Container-side path where projects mount MCP server code.
+Agent-specific; read-only.  The agent runner discovers
+``*_mcp_server.py`` files here at startup."""
 
 STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 """Workspace-relative path of the cooperative cancellation

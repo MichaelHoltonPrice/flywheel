@@ -4,15 +4,22 @@ The agent runner inside the container raises a ``tool_handoff``
 state when its ``PreToolUse`` hook intercepts one or more handoff
 tool calls in a single assistant turn (see
 ``batteries/claude/agent_runner.py``).  On that exit the runner
-writes two declared outputs:
+writes two control files into the launcher-owned mount at
+``/flywheel/control/``:
 
-* ``agent_exit_state`` — JSON with ``status == "tool_handoff"``
-  and a reason summary;
-* ``pending_tool_calls`` (schema_version 2) — every intercepted
-  ``tool_use`` in the order the SDK emitted them.
+* ``agent_exit_state.json`` — ``{status: "tool_handoff", ...}``;
+* ``pending_tool_calls.json`` — ``{schema_version: 2, pending: [...]}``
+  with every intercepted ``tool_use`` in SDK emission order.
 
-The SDK session JSONL (at ``/state/session.jsonl`` inside the
-container, captured into
+Neither file is an artifact.  The launcher reads both from the
+host side of the ``/flywheel/control/`` mount after
+``handle.wait()`` and surfaces their parsed contents on
+:class:`flywheel.agent.AgentResult` (``exit_state`` and
+``pending_tool_calls`` fields).  The control tempdir is then
+cleaned up.
+
+The SDK session JSONL (at ``/flywheel/state/session.jsonl``
+inside the container, captured into
 ``<workspace>/state/<block>/<exec_id>/session.jsonl``) carries
 the conversation with synthetic deny ``tool_result`` entries for
 each ``tool_use_id``.
@@ -21,23 +28,21 @@ This module's :func:`run_agent_with_handoffs` closes the loop:
 
 1. Launch the agent (via :func:`flywheel.agent.launch_agent_block`).
 2. Wait for it to exit.
-3. If ``exit_reason == "tool_handoff"``: look up the
-   ``pending_tool_calls`` artifact bound to this execution,
-   invoke the caller-supplied ``block_runner`` once per entry
-   (preserving SDK emission order), and splice each real result
-   into the captured state_dir's ``session.jsonl`` via
+3. If ``exit_reason == "tool_handoff"``: read
+   ``AgentResult.pending_tool_calls``, invoke the caller-supplied
+   ``block_runner`` once per entry (preserving SDK emission
+   order), and splice each real result into the captured
+   state_dir's ``session.jsonl`` via
    :func:`flywheel.session_splice.splice_tool_result`.  The
-   next execution's ``/state/`` populate picks up the mutated
-   state_dir automatically.
+   next execution's ``/flywheel/state/`` populate picks up the
+   mutated state_dir automatically.
 4. Repeat until the agent exits without a handoff (or
    ``max_iterations`` is hit).
 
-Because each cycle's control outputs live in the workspace
-artifact graph — tied to that cycle's :class:`BlockExecution` —
-there is no durable per-agent workspace directory; ``/workspace``
-is the substrate's per-execution scratch, torn down by
-:class:`flywheel.executor.ContainerExecutionHandle` on exit.  No
-stale pending file can leak into a later launch.
+Each cycle's control files live in a per-launch host tempdir
+and are discarded after the parsed payload is attached to
+:class:`AgentResult`.  No stale pending file can leak into a
+later launch.
 
 The function returns the *terminal* :class:`flywheel.agent.AgentResult`
 plus a list of :class:`HandoffCycle` records describing each
@@ -60,16 +65,6 @@ from flywheel import runtime
 from flywheel.agent import AgentResult, launch_agent_block
 from flywheel.session_splice import SpliceError, splice_tool_result
 
-PENDING_ARTIFACT_NAME = "pending_tool_calls"
-"""Declared-output slot name the agent runner writes on handoff.
-
-The runner emits the pending file to
-``/output/pending_tool_calls/pending_tool_calls.json``; the
-substrate registers the artifact instance and binds it to the
-cycle's :class:`BlockExecution` under this slot name.  The loop
-reads it back via that binding."""
-
-PENDING_FILE_NAME = "pending_tool_calls.json"
 SESSION_FILE_NAME = "session.jsonl"
 """Name of the session JSONL inside a captured state directory.
 
@@ -229,64 +224,6 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _normalize_pending(doc: Any) -> list[dict[str, Any]]:
-    """Return the list of pending tool calls from the on-disk doc.
-
-    Mirrors :func:`flywheel.agent_loop_driver._normalize_pending`
-    so the same defensive parsing is in force whichever entry
-    point the host uses.  Accepts:
-
-    * ``{"schema_version": 2, "pending": [...]}`` — canonical;
-    * a bare ``list`` of pending dicts;
-    * a bare single pending dict (legacy schema_version 1).
-    """
-    if isinstance(doc, list):
-        return [p for p in doc if isinstance(p, dict)]
-    if not isinstance(doc, dict):
-        return []
-    pending = doc.get("pending")
-    if isinstance(pending, list):
-        return [p for p in pending if isinstance(p, dict)]
-    if "tool_use_id" in doc and "tool_name" in doc:
-        return [doc]
-    return []
-
-
-def _read_pending_artifact(
-    workspace: Any,
-    execution_id: str,
-) -> tuple[dict[str, Any], Path | None]:
-    """Resolve the ``pending_tool_calls`` artifact for an execution.
-
-    Returns ``(parsed_json, artifact_file_path)``.  ``parsed_json``
-    is ``{}`` when the artifact is missing or malformed;
-    ``artifact_file_path`` is the on-disk location of
-    ``pending_tool_calls.json`` inside the captured artifact
-    directory (returned so error messages can show it).
-    """
-    execution = workspace.executions.get(execution_id)
-    if execution is None:
-        return {}, None
-    binding = execution.output_bindings.get(
-        PENDING_ARTIFACT_NAME)
-    if not binding:
-        return {}, None
-    instance = workspace.artifacts.get(binding)
-    if instance is None:
-        return {}, None
-    artifact_dir = (
-        workspace.path / "artifacts" / instance.copy_path)
-    pending_file = artifact_dir / PENDING_FILE_NAME
-    if not pending_file.is_file():
-        return {}, pending_file
-    try:
-        return (
-            json.loads(
-                pending_file.read_text(encoding="utf-8")),
-            pending_file,
-        )
-    except (OSError, json.JSONDecodeError):
-        return {}, pending_file
 
 
 def run_agent_with_handoffs(
@@ -443,16 +380,14 @@ def run_agent_with_handoffs(
                 / SESSION_FILE_NAME
             )
 
-        pending_doc, pending_file_path = _read_pending_artifact(
-            workspace, agent_result.execution_id)
-        pending_list = _normalize_pending(pending_doc)
+        pending_list = list(
+            agent_result.pending_tool_calls or [])
         if not pending_list:
             raise HandoffLoopError(
                 f"agent (iteration={iteration}) exited with "
-                f"exit_reason='tool_handoff' but the "
-                f"pending_tool_calls artifact is missing or "
-                f"empty (file={pending_file_path!r}, "
-                f"doc={pending_doc!r})"
+                f"exit_reason='tool_handoff' but "
+                f"AgentResult.pending_tool_calls is empty "
+                f"(runner did not write any handoff payload)"
             )
         if session_path is None or not session_path.is_file():
             raise HandoffLoopError(
@@ -464,9 +399,10 @@ def run_agent_with_handoffs(
 
         siblings = len(pending_list)
         session_id_fallback = ""
-        if isinstance(pending_doc, dict):
-            session_id_fallback = str(pending_doc.get(
-                "session_id", "") or "")
+        if agent_result.exit_state is not None:
+            session_id_fallback = str(
+                agent_result.exit_state.get("session_id", "")
+                or "")
 
         handoff_records: list[dict[str, Any]] = []
         for idx, pending in enumerate(pending_list):

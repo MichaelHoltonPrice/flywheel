@@ -30,11 +30,19 @@ COPY entrypoint.sh /app/entrypoint.sh
 # Claude Code refuses --dangerously-skip-permissions as root.
 RUN useradd -m claude \
     && mkdir -p /home/claude/.claude /workspace \
-    && chown -R claude:claude /home/claude /workspace /app \
+                /flywheel/state /flywheel/control /flywheel/mcp_servers \
+    && chown -R claude:claude /home/claude /workspace /app /flywheel \
     && chmod +x /app/entrypoint.sh
 
 # Don't set USER here — entrypoint runs as root to configure
 # iptables, then drops to claude via su.
+# ``/flywheel/`` is the single namespace for framework-owned
+# runtime data — state (``/flywheel/state/session.jsonl``),
+# control files (``/flywheel/control/*.json``), project-mounted
+# MCP server code (``/flywheel/mcp_servers/``).  Kept distinct
+# from the block body's ``/input`` / ``/output`` / ``/workspace``
+# mounts so it's easy to tell framework-owned files apart from
+# the agent's own working directory.
 WORKDIR /workspace
 
 ENTRYPOINT ["/app/entrypoint.sh"]

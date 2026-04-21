@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from flywheel.agent import AgentHandle, AgentResult
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import BlockExecution
 from flywheel.executor import ExecutionResult
 
 
@@ -65,35 +65,15 @@ def _make_workspace(
     execution_id: str = "exec-1",
     exit_code: int = 0,
     stop_reason: str | None = None,
-    exit_state: dict | None = None,
     executions_before: int = 0,
 ) -> tuple[MagicMock, ExecutionResult]:
     """Build a MagicMock workspace holding the right execution record.
 
-    Optionally writes an ``agent_exit_state`` artifact under
-    ``<tmp_path>/artifacts/<aid>/agent_exit_state.json`` and binds
-    it to the execution's output_bindings so the adapter's
-    exit-reason classifier can read it.
+    The agent-exit-state JSON that used to live as a copy artifact
+    now lives in the launcher-owned control tempdir instead;
+    tests write it via the ``exit_state`` / ``pending`` args to
+    :func:`_make_handle`.
     """
-    artifacts: dict[str, ArtifactInstance] = {}
-    output_bindings: dict[str, str] = {}
-
-    if exit_state is not None:
-        aid = f"aid-{execution_id}"
-        artifact_dir = tmp_path / "artifacts" / aid
-        artifact_dir.mkdir(parents=True)
-        (artifact_dir / "agent_exit_state.json").write_text(
-            json.dumps(exit_state), encoding="utf-8")
-        artifacts[aid] = ArtifactInstance(
-            id=aid,
-            name="agent_exit_state",
-            kind="copy",
-            copy_path=aid,
-            created_at=datetime.now(UTC),
-            source="test",
-        )
-        output_bindings["agent_exit_state"] = aid
-
     execution = BlockExecution(
         id=execution_id,
         block_name="play",
@@ -104,20 +84,20 @@ def _make_workspace(
             else "succeeded" if exit_code == 0 else "failed"),
         exit_code=exit_code,
         elapsed_s=1.0,
-        output_bindings=output_bindings,
+        output_bindings={},
         stop_reason=stop_reason,
     )
 
     workspace = MagicMock()
     workspace.path = tmp_path
     workspace.executions = {execution_id: execution}
-    workspace.artifacts = artifacts
+    workspace.artifacts = {}
     workspace.generate_event_id = MagicMock(return_value="ev-1")
 
     result = ExecutionResult(
         exit_code=exit_code,
         elapsed_s=1.0,
-        output_bindings=output_bindings,
+        output_bindings={},
         execution_id=execution_id,
         status=execution.status,
     )
@@ -130,16 +110,47 @@ def _make_handle(
     result: ExecutionResult,
     tmp_path: Path,
     executions_before: int = 0,
+    exit_state: dict | None = None,
+    pending: list[dict] | None = None,
+    control_tempdir: Path | None = None,
 ) -> tuple[AgentHandle, _FakeInner]:
-    """Build an AgentHandle over a _FakeInner and a prompt tempdir."""
+    """Build an AgentHandle over a _FakeInner and a prompt tempdir.
+
+    ``exit_state`` / ``pending`` populate the launcher's control
+    tempdir the same way the real agent runner does — the handle
+    reads them back in ``wait()``.  Pass ``control_tempdir=None``
+    (different from omitting) to simulate the pre-container
+    failure path where no control mount was set up.
+    """
     inner = _FakeInner(result=result)
     prompt_tempdir = Path(tempfile.mkdtemp(
         prefix="flywheel-test-prompt-", dir=tmp_path))
+    if control_tempdir is None and (
+            exit_state is not None or pending is not None):
+        control_tempdir = Path(tempfile.mkdtemp(
+            prefix="flywheel-test-control-", dir=tmp_path))
+    if control_tempdir is not None:
+        if exit_state is not None:
+            (control_tempdir
+                / "agent_exit_state.json").write_text(
+                json.dumps(exit_state), encoding="utf-8")
+        if pending is not None:
+            (control_tempdir
+                / "pending_tool_calls.json").write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "session_id": exit_state.get(
+                        "session_id", "") if exit_state else "",
+                    "pending": pending,
+                }),
+                encoding="utf-8",
+            )
     handle = AgentHandle(
         inner=inner,
         workspace=workspace,
         executions_before=executions_before,
         prompt_tempdir=prompt_tempdir,
+        control_tempdir=control_tempdir,
     )
     return handle, inner
 
@@ -171,6 +182,7 @@ class TestAgentHandleBasics:
             executions_before=0,
             prompt_tempdir=Path(tempfile.mkdtemp(
                 prefix="t-", dir=tmp_path)),
+            control_tempdir=None,
         )
         assert handle.is_alive() is True
 
@@ -194,6 +206,7 @@ class TestAgentHandleBasics:
             workspace=ws,
             executions_before=0,
             prompt_tempdir=prompt_dir,
+            control_tempdir=None,
         )
         assert prompt_dir.is_dir()
         handle.wait()
@@ -206,68 +219,63 @@ class TestExitReasonClassification:
     def test_handoff_status_maps_to_tool_handoff(
         self, tmp_path: Path,
     ):
-        ws, result = _make_workspace(
-            tmp_path,
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
             exit_state={"status": "tool_handoff",
                         "reason": "take_action"},
         )
-        handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "tool_handoff"
 
     def test_complete_status_maps_to_completed(
         self, tmp_path: Path,
     ):
-        ws, result = _make_workspace(
-            tmp_path,
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
             exit_state={"status": "complete", "reason": ""},
         )
-        handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "completed"
 
     def test_auth_reason_maps_to_auth_failure(
         self, tmp_path: Path,
     ):
-        ws, result = _make_workspace(
-            tmp_path,
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
             exit_state={"status": "paused",
                         "reason": "auth_error"},
         )
-        handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "auth_failure"
 
     def test_rate_limit_reason_maps_to_rate_limit(
         self, tmp_path: Path,
     ):
-        ws, result = _make_workspace(
-            tmp_path,
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
             exit_state={"status": "paused",
                         "reason": "rate_limit"},
         )
-        handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "rate_limit"
 
     def test_max_turns_reason_maps_to_max_turns(
         self, tmp_path: Path,
     ):
-        ws, result = _make_workspace(
-            tmp_path,
+        ws, result = _make_workspace(tmp_path)
+        handle, _ = _make_handle(
+            workspace=ws, result=result, tmp_path=tmp_path,
             exit_state={"status": "complete",
                         "reason": "max_turns"},
         )
-        handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "max_turns"
 
-    def test_stop_reason_takes_precedence_over_artifact(
+    def test_stop_reason_takes_precedence_over_exit_state(
         self, tmp_path: Path,
     ):
         """When the execution record has ``stop_reason`` set, the
@@ -276,34 +284,139 @@ class TestExitReasonClassification:
         ws, result = _make_workspace(
             tmp_path,
             stop_reason="operator_requested",
-            exit_state={"status": "complete", "reason": ""},
         )
         handle, _ = _make_handle(
-            workspace=ws, result=result, tmp_path=tmp_path)
+            workspace=ws, result=result, tmp_path=tmp_path,
+            exit_state={"status": "complete", "reason": ""},
+        )
         out = handle.wait()
         assert out.exit_reason == "stopped"
         assert out.stop_reason == "operator_requested"
 
-    def test_missing_artifact_defaults_to_exit_code(
+    def test_missing_exit_state_defaults_to_exit_code(
         self, tmp_path: Path,
     ):
-        """No ``agent_exit_state`` artifact + zero exit_code
-        means natural completion; non-zero means crashed."""
-        ws, result = _make_workspace(tmp_path, exit_state=None)
+        """No exit-state file + zero exit_code means natural
+        completion; non-zero means crashed."""
+        ws, result = _make_workspace(tmp_path)
         handle, _ = _make_handle(
             workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "completed"
 
-    def test_missing_artifact_nonzero_exit_is_crashed(
+    def test_missing_exit_state_nonzero_exit_is_crashed(
         self, tmp_path: Path,
     ):
         ws, result = _make_workspace(
-            tmp_path, exit_code=1, exit_state=None)
+            tmp_path, exit_code=1)
         handle, _ = _make_handle(
             workspace=ws, result=result, tmp_path=tmp_path)
         out = handle.wait()
         assert out.exit_reason == "crashed"
+
+
+class TestMalformedControlFiles:
+    """Malformed control JSON collapses to ``None`` but is preserved.
+
+    ``agent_runner`` normally writes well-formed JSON, but a
+    truncated write (container killed mid-write, disk full, etc.)
+    can leave a partial file.  The launcher's helpers swallow
+    parse errors and return ``None`` / empty so the runner's
+    generic "no handoff payload" error fires; the raw bytes are
+    copied to the execution's log dir so an operator can
+    post-mortem after the control tempdir is cleaned up.
+    """
+
+    def _preserve_dir(
+        self, tmp_path: Path, execution_id: str = "exec-1",
+    ) -> Path:
+        return (
+            tmp_path / "logs" / "play"
+            / f"{execution_id}-control")
+
+    def test_truncated_exit_state_becomes_none(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(tmp_path)
+        control_dir = Path(tempfile.mkdtemp(
+            prefix="ctrl-", dir=tmp_path))
+        (control_dir / "agent_exit_state.json").write_text(
+            '{"status": "compl', encoding="utf-8")
+        log_dir = tmp_path / "logs" / "play"
+        inner = _FakeInner(result=result)
+        handle = AgentHandle(
+            inner=inner,
+            workspace=ws,
+            executions_before=0,
+            prompt_tempdir=Path(tempfile.mkdtemp(
+                prefix="p-", dir=tmp_path)),
+            control_tempdir=control_dir,
+            log_dir=log_dir,
+        )
+        out = handle.wait()
+        assert out.exit_state is None
+        # Falls back to exit_code-based classification.
+        assert out.exit_reason == "completed"
+        preserved = (
+            self._preserve_dir(tmp_path)
+            / "agent_exit_state.json.malformed")
+        assert preserved.is_file()
+        assert preserved.read_text(encoding="utf-8") == (
+            '{"status": "compl')
+
+    def test_garbage_pending_becomes_none(
+        self, tmp_path: Path,
+    ):
+        ws, result = _make_workspace(tmp_path)
+        control_dir = Path(tempfile.mkdtemp(
+            prefix="ctrl-", dir=tmp_path))
+        (control_dir / "pending_tool_calls.json").write_text(
+            "not json at all", encoding="utf-8")
+        log_dir = tmp_path / "logs" / "play"
+        inner = _FakeInner(result=result)
+        handle = AgentHandle(
+            inner=inner,
+            workspace=ws,
+            executions_before=0,
+            prompt_tempdir=Path(tempfile.mkdtemp(
+                prefix="p-", dir=tmp_path)),
+            control_tempdir=control_dir,
+            log_dir=log_dir,
+        )
+        out = handle.wait()
+        assert out.pending_tool_calls is None
+        preserved = (
+            self._preserve_dir(tmp_path)
+            / "pending_tool_calls.json.malformed")
+        assert preserved.is_file()
+        assert preserved.read_text(encoding="utf-8") == (
+            "not json at all")
+
+    def test_wrong_top_level_type_preserved(
+        self, tmp_path: Path,
+    ):
+        """A valid-JSON non-dict top level still preserves the file."""
+        ws, result = _make_workspace(tmp_path)
+        control_dir = Path(tempfile.mkdtemp(
+            prefix="ctrl-", dir=tmp_path))
+        (control_dir / "agent_exit_state.json").write_text(
+            '["not", "a", "dict"]', encoding="utf-8")
+        log_dir = tmp_path / "logs" / "play"
+        inner = _FakeInner(result=result)
+        handle = AgentHandle(
+            inner=inner,
+            workspace=ws,
+            executions_before=0,
+            prompt_tempdir=Path(tempfile.mkdtemp(
+                prefix="p-", dir=tmp_path)),
+            control_tempdir=control_dir,
+            log_dir=log_dir,
+        )
+        handle.wait()
+        preserved = (
+            self._preserve_dir(tmp_path)
+            / "agent_exit_state.json.malformed")
+        assert preserved.is_file()
 
 
 class TestEvalsRunCount:
@@ -452,6 +565,7 @@ class TestWaitFailurePaths:
             workspace=workspace,
             executions_before=0,
             prompt_tempdir=prompt_dir,
+            control_tempdir=None,
         )
         assert prompt_dir.is_dir()
         with pytest.raises(RuntimeError, match="boom"):
@@ -510,6 +624,7 @@ class TestPreContainerSyncHandle:
             workspace=workspace,
             executions_before=0,
             prompt_tempdir=prompt_dir,
+            control_tempdir=None,
         )
         out = handle.wait()
         assert out.exit_reason == "crashed"
@@ -537,6 +652,7 @@ class TestRunAgentBlockKeyboardInterrupt:
             workspace=workspace,
             executions_before=0,
             prompt_tempdir=prompt_dir,
+            control_tempdir=None,
         )
 
         def _fake_launch(**_):

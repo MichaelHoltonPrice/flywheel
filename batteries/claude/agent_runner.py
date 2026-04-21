@@ -31,37 +31,39 @@ Environment variables:
     MAX_TURNS       — Total turn budget for the agent (optional)
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
                       Projects mount servers at
-                      /workspace/.mcp_servers/.
+                      /flywheel/mcp_servers/.
     HANDOFF_TOOLS   — Comma-separated MCP tool names to intercept
                       via a PreToolUse hook.  When the agent calls
                       one or more in a single assistant turn, the
                       hook denies each (recording deny tool_results
                       in the session), captures every intercepted
-                      call into ``/output/pending_tool_calls/
+                      call into ``/flywheel/control/
                       pending_tool_calls.json``, sets the exit
-                      state in ``/output/agent_exit_state/
+                      state in ``/flywheel/control/
                       agent_exit_state.json`` to status
                       ``tool_handoff``, and signals the runner to
                       exit cleanly so a host-side driver can run
                       the blocks out-of-band, splice every real
                       result into the captured state_dir's
                       session.jsonl, and let the next launch pick
-                      it up via the ``/state/`` populate.  Both
-                      files are declared outputs of the agent
-                      block; the handoff loop reads them as
-                      workspace artifacts.
+                      it up via the ``/flywheel/state/`` populate.
+                      Neither file is an artifact — they are
+                      framework-owned runtime data the agent
+                      launcher reads from the control tempdir
+                      after the container exits.
     HANDOFF_DENY_MARKER — Substring that the splice helper uses to
                       locate the deny tool_result on disk.  Defaults
                       to ``handoff_to_flywheel``.
 
     Session resume:
-        The runner reads ``/state/session.jsonl`` on startup if
-        flywheel populated one from a prior execution's captured
-        state; otherwise it starts a fresh conversation.  The
-        session is written back to ``/state/session.jsonl`` in a
-        ``finally:`` at exit so flywheel captures it regardless
-        of how the run ended.  No env var governs this — the
-        presence or absence of the file is the whole signal.
+        The runner reads ``/flywheel/state/session.jsonl`` on
+        startup if flywheel populated one from a prior execution's
+        captured state; otherwise it starts a fresh conversation.
+        The session is written back to
+        ``/flywheel/state/session.jsonl`` in a ``finally:`` at
+        exit so flywheel captures it regardless of how the run
+        ended.  No env var governs this — the presence or absence
+        of the file is the whole signal.
     COMPACT_TOKEN_LIMIT — Explicit token count at which to trigger
                       compaction. Overrides the default percentage-
                       based calculation. Use for large-context models
@@ -102,7 +104,15 @@ from claude_agent_sdk.types import (
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
 STOP_FILE = WORKSPACE / ".stop"
-RESUME_FILE = WORKSPACE / ".agent_resume"
+# Framework-owned control files live under ``/flywheel/control/``
+# so they don't clutter the agent's scratchpad namespace or the
+# ``/output/<slot>/`` mounts that carry real artifact outputs.
+# Flywheel mounts a host tempdir here; the runner reads/writes
+# the files listed below and flywheel collects them after exit
+# via :class:`flywheel.agent.AgentHandle.wait`.  Nothing under
+# ``/flywheel/control/`` is an artifact.
+CONTROL_DIR = Path("/flywheel/control")
+RESUME_FILE = CONTROL_DIR / ".agent_resume"
 POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Rate limit auto-retry: sleep with exponential backoff before
@@ -115,13 +125,13 @@ COMPACT_THRESHOLD = 0.20
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Session persistence: the SDK session JSONL is the container's
-# private memory across restarts.  It lives at ``/state/session.jsonl``
-# — flywheel populates ``/state/`` from the prior execution's
-# captured state at launch and captures its final contents after
-# the container exits.  Not an artifact; not in the artifact
-# graph.  See ``cyber-root/substrate-contract.md`` for the
-# runtime contract.
-STATE_DIR = Path("/state")
+# private memory across restarts.  It lives at
+# ``/flywheel/state/session.jsonl`` — flywheel populates
+# ``/flywheel/state/`` from the prior execution's captured state
+# at launch and captures its final contents after the container
+# exits.  Not an artifact; not in the artifact graph.  See
+# ``cyber-root/substrate-contract.md`` for the runtime contract.
+STATE_DIR = Path("/flywheel/state")
 SESSION_FILE = STATE_DIR / "session.jsonl"
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -132,14 +142,14 @@ SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # file mounts" convention.
 PROMPT_FILE = Path("/prompt/prompt.md")
 
-# Orchestration control outputs.  Both files are declared outputs
-# of the agent block and appear as artifact instances in the
-# workspace after capture.  The host-side handoff loop reads them
-# by artifact ID rather than scanning a durable agent workspace.
-PENDING_TOOL_CALLS_FILE = Path(
-    "/output/pending_tool_calls/pending_tool_calls.json")
-EXIT_STATE_FILE = Path(
-    "/output/agent_exit_state/agent_exit_state.json")
+# Orchestration control outputs.  The runner writes them to
+# ``/flywheel/control/`` and flywheel's agent launcher reads them
+# back from the host-side mount after the container exits.
+# Neither file is an artifact — they are framework-owned runtime
+# data consumed by the host handoff loop.
+PENDING_TOOL_CALLS_FILE = (
+    CONTROL_DIR / "pending_tool_calls.json")
+EXIT_STATE_FILE = CONTROL_DIR / "agent_exit_state.json"
 PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
 
@@ -310,7 +320,7 @@ def _persist_handoff(session_id: str) -> None:
 _MCP_REGISTRY: dict[str, tuple[str, Any]] = {}
 
 # Default directory where project-provided MCP servers are mounted.
-MCP_SERVER_MOUNT_DIR = "/workspace/.mcp_servers"
+MCP_SERVER_MOUNT_DIR = "/flywheel/mcp_servers"
 
 
 def _scan_mounted_servers() -> dict:

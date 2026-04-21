@@ -4,13 +4,21 @@ Runs a Claude Code agent as a one-shot container block via
 :class:`flywheel.executor.ProcessExitExecutor`.  The agent reads
 its prompt from a bind-mounted ``/prompt/prompt.md``, writes
 declared outputs to ``/output/<slot>/``, and persists its
-conversation session through the ``/state/`` mount.  Cancellation
-(operator, watchdog, natural exit) lives in
+conversation session through the ``/flywheel/state/`` mount.
+Framework-owned runtime files (``pending_tool_calls.json``,
+``agent_exit_state.json``) live under ``/flywheel/control/`` —
+the launcher mounts a host tempdir, reads those files after the
+container exits, and surfaces the parsed payloads on
+:class:`AgentResult`.  Nothing under ``/flywheel/`` enters the
+artifact graph.
+
+Cancellation (operator, watchdog, natural exit) lives in
 :class:`flywheel.executor.ContainerExecutionHandle`; this module's
 :class:`AgentHandle` is a thin wrapper that translates the
 container's :class:`flywheel.executor.ExecutionResult` into an
 :class:`AgentResult` carrying agent-specific fields
-(``exit_reason``, ``evals_run``).
+(``exit_reason``, ``evals_run``, ``exit_state``,
+``pending_tool_calls``).
 
 Two APIs are provided:
 
@@ -31,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from flywheel import runtime
 from flywheel.artifact import LifecycleEvent
 from flywheel.executor import (
     ContainerExecutionHandle,
@@ -59,9 +68,19 @@ class AgentResult:
         exit_reason: Semantic classification of why the agent
             exited.  One of: ``"completed"``, ``"auth_failure"``,
             ``"rate_limit"``, ``"max_turns"``, ``"stopped"``,
-            ``"crashed"``, ``"tool_handoff"``.  Derived from the
-            ``agent_exit_state`` artifact the agent runner wrote
-            on exit.
+            ``"crashed"``, ``"tool_handoff"``.  Derived from
+            ``exit_state`` below.
+        exit_state: The parsed ``agent_exit_state.json`` the agent
+            runner wrote under ``/flywheel/control/`` before exit.
+            ``None`` when the container never produced one (pre-
+            container failure, runner crash before it could
+            write).  When set, carries ``session_id``, ``status``,
+            ``reason``, ``timestamp``.
+        pending_tool_calls: The parsed ``pending_tool_calls.json``
+            the agent runner wrote when a handoff fired.  Empty
+            list on a clean non-handoff exit; ``None`` when the
+            container never produced the file at all (pre-
+            container failure or handoff that bypassed the runner).
     """
 
     exit_code: int
@@ -70,6 +89,8 @@ class AgentResult:
     execution_id: str | None = None
     stop_reason: str | None = None
     exit_reason: str | None = None
+    exit_state: dict[str, Any] | None = None
+    pending_tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -235,16 +256,96 @@ def _build_agent_mounts(
     return mounts, docker_args
 
 
+def _preserve_malformed(
+    path: Path, preserve_dir: Path | None,
+) -> None:
+    """Copy a malformed control file into ``preserve_dir`` for post-mortem.
+
+    Control files live in a per-execution tempdir that the
+    launcher cleans up in ``AgentHandle.wait``'s finally, so a
+    malformed payload would otherwise vanish before an operator
+    could inspect it.  Copy the raw bytes out before the cleanup
+    erases them.  Best-effort: if the copy itself fails we
+    silently skip — the cleanup is more important than the
+    forensic trail.
+    """
+    if preserve_dir is None:
+        return
+    try:
+        preserve_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            path, preserve_dir / f"{path.name}.malformed")
+    except OSError:
+        pass
+
+
+def _read_control_json(
+    path: Path, *, preserve_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Read a JSON object from a control file or return ``None``.
+
+    Used to pick up ``agent_exit_state.json`` after the container
+    exits.  Returns ``None`` when the file is absent (container
+    crashed before writing) or malformed (treat as "no signal"
+    rather than raising during post-exit cleanup).  Malformed
+    files are copied into ``preserve_dir`` before the caller's
+    tempdir cleanup erases them.
+    """
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _preserve_malformed(path, preserve_dir)
+        return None
+    if not isinstance(data, dict):
+        _preserve_malformed(path, preserve_dir)
+        return None
+    return data
+
+
+def _read_pending_list(
+    path: Path, *, preserve_dir: Path | None = None,
+) -> list[dict[str, Any]] | None:
+    """Read the ``pending_tool_calls.json`` payload.
+
+    The on-disk shape is ``{"pending": [...]}`` (with a schema
+    version wrapper).  Returns the inner list, or ``None`` when
+    the file is absent or malformed.  Malformed files are copied
+    into ``preserve_dir`` before the caller's tempdir cleanup
+    erases them.
+    """
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _preserve_malformed(path, preserve_dir)
+        return None
+    if not isinstance(payload, dict):
+        _preserve_malformed(path, preserve_dir)
+        return None
+    pending = payload.get("pending", [])
+    if not isinstance(pending, list):
+        _preserve_malformed(path, preserve_dir)
+        return None
+    return [p for p in pending if isinstance(p, dict)]
+
+
 def _classify_exit(
     workspace: Workspace,
     execution_id: str | None,
+    exit_state: dict[str, Any] | None,
 ) -> tuple[str, str | None]:
-    """Classify an agent exit from the ``agent_exit_state`` artifact.
+    """Classify an agent exit from the parsed exit-state dict.
 
-    Reads the JSON the agent runner wrote into
-    ``/output/agent_exit_state/agent_exit_state.json`` (now a
-    first-class artifact instance) and maps its
-    ``status`` / ``reason`` fields to a semantic ``exit_reason``.
+    ``exit_state`` is the parsed ``agent_exit_state.json`` the
+    agent runner wrote under ``/flywheel/control/`` before exit;
+    ``None`` when the container never produced one (pre-container
+    failure or crash before the finally block ran).  The dict
+    carries ``status``, ``reason``, and is mapped here to a
+    semantic ``exit_reason``.
+
     Returns ``(exit_reason, stop_reason)`` — ``stop_reason`` is
     the :class:`BlockExecution` field populated by the executor
     when a :meth:`ContainerExecutionHandle.stop` call caused the
@@ -259,32 +360,19 @@ def _classify_exit(
     if stop_reason:
         return "stopped", stop_reason
 
-    binding = execution.output_bindings.get("agent_exit_state")
-    if binding:
-        instance = workspace.artifacts.get(binding)
-        if instance is not None:
-            artifact_dir = (
-                workspace.path / "artifacts" / instance.copy_path)
-            state_file = (
-                artifact_dir / "agent_exit_state.json")
-            if state_file.is_file():
-                try:
-                    state = json.loads(
-                        state_file.read_text(encoding="utf-8"))
-                    status = state.get("status", "")
-                    reason = state.get("reason", "")
-                    if status == "tool_handoff":
-                        return "tool_handoff", None
-                    if "auth" in reason:
-                        return "auth_failure", None
-                    if "rate_limit" in reason:
-                        return "rate_limit", None
-                    if reason == "max_turns":
-                        return "max_turns", None
-                    if status == "complete":
-                        return "completed", None
-                except (OSError, json.JSONDecodeError):
-                    pass
+    if exit_state is not None:
+        status = exit_state.get("status", "")
+        reason = exit_state.get("reason", "")
+        if status == "tool_handoff":
+            return "tool_handoff", None
+        if "auth" in reason:
+            return "auth_failure", None
+        if "rate_limit" in reason:
+            return "rate_limit", None
+        if reason == "max_turns":
+            return "max_turns", None
+        if status == "complete":
+            return "completed", None
 
     if execution.exit_code == 0:
         return "completed", None
@@ -296,13 +384,16 @@ class AgentHandle:
 
     ``is_alive`` / ``stop`` delegate directly to the inner
     handle.  ``wait`` blocks on the inner handle's post-exit
-    pipeline, then reads the agent exit-state artifact to
-    classify ``exit_reason`` and counts the workspace-execution
-    delta for ``evals_run``.
+    pipeline, reads the control files the agent runner wrote
+    under ``/flywheel/control/`` (parsed into
+    :class:`AgentResult`'s ``exit_state`` and
+    ``pending_tool_calls`` fields), classifies ``exit_reason``
+    from the parsed exit state, and counts the workspace-
+    execution delta for ``evals_run``.
 
     The caller **must** call ``wait()`` exactly once.  Failing to
-    call it leaks the prompt tempdir and the inner handle's
-    thread resources.
+    call it leaks the prompt tempdir, the control tempdir, and
+    the inner handle's thread resources.
     """
 
     def __init__(
@@ -312,12 +403,30 @@ class AgentHandle:
         workspace: Workspace,
         executions_before: int,
         prompt_tempdir: Path,
+        control_tempdir: Path | None,
+        log_dir: Path | None = None,
     ) -> None:
-        """Capture references the adapter needs to build AgentResult."""
+        """Capture references the adapter needs to build AgentResult.
+
+        ``control_tempdir`` is the host-side directory that was
+        bind-mounted into the container at
+        :data:`runtime.FLYWHEEL_CONTROL_MOUNT`.  ``None`` when the
+        launcher skipped the mount (pre-container failure path
+        where the inner handle is synchronous).  :meth:`wait`
+        reads ``pending_tool_calls.json`` and
+        ``agent_exit_state.json`` from it before cleanup.
+
+        ``log_dir`` is the per-block log directory.  If a control
+        file is present but malformed, :meth:`wait` copies it here
+        before erasing the control tempdir so an operator can
+        still post-mortem a truncated / garbage payload.
+        """
         self._inner = inner
         self._workspace = workspace
         self._executions_before = executions_before
         self._prompt_tempdir = prompt_tempdir
+        self._control_tempdir = control_tempdir
+        self._log_dir = log_dir
         self._waited = False
 
     def is_alive(self) -> bool:
@@ -331,8 +440,9 @@ class AgentHandle:
     def wait(self) -> AgentResult:
         """Block for container exit and return :class:`AgentResult`.
 
-        Cleans up the prompt tempdir in a ``finally`` so a raise
-        during the inner wait doesn't leak it.
+        Reads the control files before cleaning up the tempdirs.
+        Both tempdirs are removed in a ``finally`` so a raise
+        during the inner wait doesn't leak them.
 
         Raises:
             RuntimeError: If called more than once.
@@ -341,11 +451,32 @@ class AgentHandle:
             raise RuntimeError(
                 "wait() already called on this AgentHandle")
         self._waited = True
+        exit_state: dict[str, Any] | None = None
+        pending_tool_calls: list[dict[str, Any]] | None = None
         try:
             result = self._inner.wait()
+            if self._control_tempdir is not None:
+                preserve_dir: Path | None = None
+                if self._log_dir is not None:
+                    exec_id = result.execution_id or "unknown"
+                    preserve_dir = (
+                        self._log_dir / f"{exec_id}-control")
+                exit_state = _read_control_json(
+                    self._control_tempdir
+                    / "agent_exit_state.json",
+                    preserve_dir=preserve_dir,
+                )
+                pending_tool_calls = _read_pending_list(
+                    self._control_tempdir
+                    / "pending_tool_calls.json",
+                    preserve_dir=preserve_dir,
+                )
         finally:
             shutil.rmtree(
                 self._prompt_tempdir, ignore_errors=True)
+            if self._control_tempdir is not None:
+                shutil.rmtree(
+                    self._control_tempdir, ignore_errors=True)
 
         # +1 for the agent's own execution record.
         evals_run = max(
@@ -355,7 +486,7 @@ class AgentHandle:
         )
 
         exit_reason, stop_reason = _classify_exit(
-            self._workspace, result.execution_id)
+            self._workspace, result.execution_id, exit_state)
 
         if stop_reason:
             execution = self._workspace.executions.get(
@@ -378,6 +509,8 @@ class AgentHandle:
             execution_id=result.execution_id,
             stop_reason=stop_reason,
             exit_reason=exit_reason,
+            exit_state=exit_state,
+            pending_tool_calls=pending_tool_calls,
         )
 
 
@@ -469,12 +602,27 @@ def launch_agent_block(
     (prompt_tempdir / "prompt.md").write_text(
         prompt, encoding="utf-8")
 
+    # Host-side control dir mounted at ``/flywheel/control`` so
+    # the agent runner can drop exit-state JSONs and handoff
+    # payloads somewhere the launcher reads after wait().  These
+    # files are intentionally not artifacts — they're
+    # framework-owned runtime data consumed by the handoff loop.
+    control_tempdir = Path(tempfile.mkdtemp(
+        prefix=f"flywheel-control-{block_name}-"))
+    control_mount = (
+        str(control_tempdir),
+        runtime.FLYWHEEL_CONTROL_MOUNT,
+        "rw",
+    )
+    effective_mounts = list(extra_mounts or [])
+    effective_mounts.append(control_mount)
+
     mounts, docker_args = _build_agent_mounts(
         project_root=project_root,
         auth_volume=auth_volume,
         source_dirs=source_dirs,
         prompt_dir=prompt_tempdir,
-        extra_mounts=extra_mounts,
+        extra_mounts=effective_mounts,
         isolated_network=isolated_network,
     )
 
@@ -506,6 +654,7 @@ def launch_agent_block(
         )
     except BaseException:
         shutil.rmtree(prompt_tempdir, ignore_errors=True)
+        shutil.rmtree(control_tempdir, ignore_errors=True)
         raise
 
     if not isinstance(inner, ContainerExecutionHandle):
@@ -513,12 +662,16 @@ def launch_agent_block(
         # :class:`SyncExecutionHandle`.  Still wrap it so the
         # caller's wait/stop/is_alive protocol works uniformly;
         # wait() will get back a pre-completed ExecutionResult
-        # and classify exit_reason as "crashed".
+        # and classify exit_reason as "crashed".  The control
+        # tempdir is handed through so wait() can clean it up,
+        # but there's nothing to read — the container never ran.
         return AgentHandle(
             inner=inner,  # type: ignore[arg-type]
             workspace=workspace,
             executions_before=executions_before,
             prompt_tempdir=prompt_tempdir,
+            control_tempdir=control_tempdir,
+            log_dir=log_dir,
         )
 
     return AgentHandle(
@@ -526,6 +679,8 @@ def launch_agent_block(
         workspace=workspace,
         executions_before=executions_before,
         prompt_tempdir=prompt_tempdir,
+        control_tempdir=control_tempdir,
+        log_dir=log_dir,
     )
 
 
