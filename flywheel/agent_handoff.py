@@ -112,6 +112,12 @@ class HandoffContext:
         siblings: Total number of pending tool calls in this
             iteration; ``index_in_iteration < siblings`` always.
             ``siblings == 1`` is the single-tool-use case.
+        run_id: :class:`flywheel.artifact.RunRecord` id of the
+            outer run that launched the agent, or ``None`` for
+            ad-hoc invocations.  Block runners forward this into
+            :meth:`flywheel.local_block.LocalBlockRecorder.begin`
+            so nested executions inherit the agent's run_id and
+            pattern-level cadence counters can scope correctly.
     """
 
     tool_name: str
@@ -121,6 +127,7 @@ class HandoffContext:
     iteration: int
     index_in_iteration: int = 0
     siblings: int = 1
+    run_id: str | None = None
 
 
 @dataclass
@@ -307,6 +314,11 @@ def run_agent_with_handoffs(
     """
     workspace = launch_kwargs["workspace"]
     base_kwargs = dict(launch_kwargs)
+    # Inherited from the outer pattern runner (or ``None`` for
+    # ad-hoc callers).  Every HandoffContext this loop builds
+    # carries this id so nested block runners can stamp their
+    # LocalBlockRecorder.begin() calls with it.
+    run_id: str | None = base_kwargs.get("run_id")
 
     cycles: list[HandoffCycle] = []
     last_execution_id: str | None = base_kwargs.get("predecessor_id")
@@ -428,6 +440,7 @@ def run_agent_with_handoffs(
                 iteration=iteration,
                 index_in_iteration=idx,
                 siblings=siblings,
+                run_id=run_id,
             )
 
             block_result = block_runner(ctx)

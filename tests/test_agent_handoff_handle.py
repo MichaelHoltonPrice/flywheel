@@ -720,9 +720,38 @@ class TestPatternRunnerIntegration:
             path: Path
             executions: dict[str, Any] = field(default_factory=dict)
             artifacts: dict[str, Any] = field(default_factory=dict)
+            runs: dict[str, Any] = field(default_factory=dict)
 
             def instances_for(self, name: str) -> list[Any]:
                 return []
+
+            def begin_run(
+                self,
+                *,
+                kind: str,
+                config_snapshot: dict[str, Any] | None = None,
+            ) -> Any:
+                from flywheel.artifact import RunRecord
+                run_id = f"run_{len(self.runs) + 1}"
+                record = RunRecord(
+                    id=run_id,
+                    kind=kind,
+                    started_at=datetime.now(UTC),
+                    config_snapshot=config_snapshot,
+                )
+                self.runs[run_id] = record
+                return record
+
+            def end_run(self, run_id: str, *, status: str) -> None:
+                from dataclasses import replace
+                self.runs[run_id] = replace(
+                    self.runs[run_id],
+                    finished_at=datetime.now(UTC),
+                    status=status,
+                )
+
+            def save(self) -> None:
+                return None
 
         ws_path = tmp_path / "ws"
         ws_path.mkdir()

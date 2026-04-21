@@ -645,6 +645,77 @@ class TestExecuteResponseShapes:
         assert "transport error" in (execution.error or "")
 
 
+class TestRunIdStamping:
+    """The real executor stamps ``BlockExecution.run_id``.
+
+    Pattern-level forwarding is covered elsewhere; this pins the
+    executor-side contract that ``ExecuteAction``-style
+    request/response launches carry their caller's ``run_id``
+    onto the ledger record.  The play-brainstorm cadence counter
+    depends on this.
+    """
+
+    def test_run_id_stamped_on_succeeded_execution(
+        self, workspace: Workspace, template: Template,
+    ):
+        def _handler(req_id, block):
+            return {"status": "succeeded"}
+
+        harness = _ExecutorTestHarness(
+            _make_template(outputs=["game_step"]),
+            work_area=workspace.path / "runtimes" / "arc_engine",
+            execute_handler=_handler,
+        )
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            handle = harness.executor.launch(
+                "arc_engine", workspace, input_bindings={},
+                run_id="run_rr_test")
+            result = handle.wait()
+
+        assert result.status == "succeeded"
+        execution = workspace.executions[result.execution_id]
+        assert execution.run_id == "run_rr_test"
+
+    def test_run_id_defaults_to_none(
+        self, workspace: Workspace, template: Template,
+    ):
+        """Ad-hoc launch (no ``run_id`` kwarg) leaves the stamp unset."""
+        def _handler(req_id, block):
+            return {"status": "succeeded"}
+
+        harness = _ExecutorTestHarness(
+            _make_template(outputs=["game_step"]),
+            work_area=workspace.path / "runtimes" / "arc_engine",
+            execute_handler=_handler,
+        )
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            handle = harness.executor.launch(
+                "arc_engine", workspace, input_bindings={})
+            result = handle.wait()
+
+        assert result.status == "succeeded"
+        execution = workspace.executions[result.execution_id]
+        assert execution.run_id is None
+
+
 class TestOutputCollection:
     def test_output_file_committed_as_artifact(
         self, workspace: Workspace, template: Template,

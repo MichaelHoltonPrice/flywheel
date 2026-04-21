@@ -831,6 +831,57 @@ brittleness from the bridge surface to the state-save surface;
 the latter is local, testable by killing the agent at every
 interesting point, and fails loudly rather than silently.
 
+## Runs
+
+A **run** is a durable grouping of :class:`BlockExecution`
+records inside one workspace.  Every pattern invocation opens a
+run; ad-hoc executions (direct ``executor.launch`` calls, human
+play via ``tools/play_server.py``) are ungrouped —
+``BlockExecution.run_id`` is ``None``.
+
+The data model:
+
+- :class:`flywheel.artifact.RunRecord` — one per run; fields
+  ``id``, ``kind`` (e.g. ``"pattern:play-brainstorm"``),
+  ``started_at``, ``finished_at``, ``status``
+  (``running``/``succeeded``/``failed``/``stopped``), and an
+  optional ``config_snapshot``.
+- :attr:`flywheel.workspace.Workspace.runs` — ``dict[str,
+  RunRecord]`` persisted to ``workspace.yaml``.
+- :attr:`flywheel.artifact.BlockExecution.run_id` — stamped on
+  every executor-recorded execution.  ``None`` for ad-hoc.
+
+The :class:`flywheel.pattern_runner.PatternRunner` opens the run
+at :meth:`~flywheel.pattern_runner.PatternRunner.run` start and
+closes it in a ``finally`` block (status = ``succeeded`` on
+clean exit, ``failed`` on exception).  The id is threaded into
+every :meth:`executor.launch` and every
+:class:`flywheel.agent_handoff.HandoffContext` so nested
+host-side runners (predict, brainstorm, exploration) inherit it
+via :meth:`flywheel.local_block.LocalBlockRecorder.begin`.
+
+### Why runs exist
+
+Cadence triggers (``every_n_executions``) have to scope to the
+current run or they count prior runs' executions.  Without runs,
+re-running a pattern in an existing workspace fires nested
+cohorts immediately — the counter sees all historical
+executions.  With runs, the counter filters by
+``ex.run_id == self._run_id`` and starts fresh on each
+invocation.
+
+The same scoping lets one workspace host many pattern runs
+without cross-contamination while sharing workspace-level
+artifacts (e.g., predictor files, game history) across them.
+
+### Workspace run policy
+
+``Workspace.runs`` can hold any number of runs.  Today there is
+no enforced policy — any caller can open as many as it wants,
+though :class:`PatternRunner` only opens one per
+``.run()`` call.  A future ``single``/``multi``/``single_active``
+policy is discussed under "Future work".
+
 ## Future work
 
 ### Default binding policy
@@ -845,35 +896,6 @@ A more sophisticated policy might need per-subclass defaults
 based on an evaluation metric rather than recency. A formal
 `current_bindings` map on the workspace could support these
 patterns, but the right design is not yet clear.
-
-### Runs and ad hoc execution grouping
-
-Today flywheel has workspaces, artifact instances, execution
-records, and lifecycle events, but no first-class notion of a
-**run**.  A plausible future shape is:
-
-- ``Workspace``: the long-lived corpus and capability surface.
-- ``Run``: a durable grouping of related executions inside one
-  workspace.
-- ``BlockExecution``: the atomic unit of work.
-
-Under that model, ad hoc work is not "outside" the run concept;
-it is a run with no pattern contract attached.  Pattern-driven
-work would then be a specialized run shape rather than a separate
-kind of container entirely.
-
-One likely asymmetry is:
-
-- a pattern-governed run may continue with ad hoc executions later
-  (relaxing constraints is safe);
-- an ad hoc run should not be retroactively reclassified as a
-  pattern run, because the prior history may not satisfy the
-  pattern's structural guarantees. At least, this should not be
-  done naively.
-
-The exact data model is still open.  One direction is that every
-execution carries a ``run_id``, and a run optionally carries a
-``pattern_name`` when it is pattern-governed.
 
 ### Artifact scope and transfers between contexts
 
@@ -902,23 +924,22 @@ provenance points at the source instance.  Examples include:
 This keeps provenance honest: movement across contexts is explicit
 and recorded rather than implicit shared mutable state.
 
-### Workspace run policy
+### Enforced workspace run policy
 
-Not every workspace wants the same run semantics.  Some projects
-want one durable thread of work in a workspace; others want many
-parallel or historical runs sharing one corpus.
+Runs exist today (see the "Runs" section above) but flywheel
+does not enforce any policy on how many may open in one
+workspace or whether multiple runs may be active simultaneously.
 
-A future workspace-level policy may be useful, for example:
+A future workspace-level policy declaration may be useful:
 
 - ``single``: one run total;
-- ``multi``: multiple runs allowed;
-- possibly later ``single_active``: multiple historical runs are
-  allowed, but only one may remain open at a time.
+- ``multi``: multiple runs allowed (today's implicit default);
+- ``single_active``: multiple historical runs are allowed but
+  only one may remain open at a time.
 
-This policy would let flywheel enforce operator intent rather
-than relying on convention.  A research-paper workspace, for
-example, might choose ``single``; an experimentation workspace
-or game-playing workspace might choose ``multi``.
+This would let flywheel enforce operator intent rather than
+relying on convention.  A research-paper workspace might choose
+``single``; a game-playing workspace might choose ``multi``.
 
 ### Schema versioning
 

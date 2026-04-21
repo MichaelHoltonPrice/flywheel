@@ -131,6 +131,10 @@ class PatternRunResult:
 
     Attributes:
         pattern_name: The pattern that was run.
+        run_id: The :class:`flywheel.artifact.RunRecord` id the
+            runner opened for this invocation.  Stored on every
+            :class:`BlockExecution` the run produced, so callers
+            can correlate the summary with the workspace ledger.
         cohorts_by_role: How many cohorts fired per role.  For
             ``continuous`` roles the value is always ``1`` (one
             cohort at run start); for ``every_n_executions``
@@ -145,6 +149,7 @@ class PatternRunResult:
     """
 
     pattern_name: str
+    run_id: str
     cohorts_by_role: dict[str, int]
     agents_launched: int
     results_by_role: dict[str, list[AgentResult]]
@@ -271,35 +276,74 @@ class PatternRunner:
             self._launch_fn = self._wrap_launch_fn_with_router(
                 launch_fn, self._pattern_tool_router)
 
-    def run(self) -> PatternRunResult:
-        """Drive the pattern to completion and return a summary."""
-        start = time.monotonic()
+        # Assigned in :meth:`run` — a run is opened exactly when
+        # execution begins, not at construction.  Construction can
+        # raise on trigger / router validation; opening a durable
+        # run record before any of that finishes would leave a
+        # stuck ``running`` run behind.
+        self._run_id: str | None = None
 
-        for state in self._state.values():
-            if isinstance(
-                    state.role.trigger, ContinuousTrigger):
-                self._fire_role(state.role)
+    def run(self) -> PatternRunResult:
+        """Drive the pattern to completion and return a summary.
+
+        Opens a :class:`flywheel.artifact.RunRecord` at start so
+        every execution the runner drives can be tagged with the
+        run id (enabling run-scoped cadence counters and
+        durable per-run grouping on the workspace ledger).
+        Closes the record in the outer ``finally`` regardless of
+        how the body exits; the status written there reflects
+        whether the run finished naturally, hit a hard deadline,
+        or raised.
+        """
+        start = time.monotonic()
+        run_record = self._base.workspace.begin_run(
+            kind=f"pattern:{self._pattern.name}",
+        )
+        self._run_id = run_record.id
+        # Persist the open run immediately.  If the host dies
+        # before any execution finishes and triggers a save, the
+        # run is still durable — a later operator can see the
+        # ``running`` record and decide how to handle it.
+        self._base.workspace.save()
+        status = "failed"
+        timed_out = False
 
         try:
-            while True:
-                if self._all_continuous_done():
-                    break
-                if (self._max_runtime is not None
-                        and time.monotonic() - start
-                        >= self._max_runtime):
-                    print(
-                        f"  [pattern-runner] max runtime "
-                        f"{self._max_runtime:.0f}s reached; "
-                        f"draining handles"
-                    )
-                    break
-                self._evaluate_ledger_triggers()
-                time.sleep(self._poll)
+            for state in self._state.values():
+                if isinstance(
+                        state.role.trigger, ContinuousTrigger):
+                    self._fire_role(state.role)
+
+            try:
+                while True:
+                    if self._all_continuous_done():
+                        break
+                    if (self._max_runtime is not None
+                            and time.monotonic() - start
+                            >= self._max_runtime):
+                        print(
+                            f"  [pattern-runner] max runtime "
+                            f"{self._max_runtime:.0f}s reached; "
+                            f"draining handles"
+                        )
+                        timed_out = True
+                        break
+                    self._evaluate_ledger_triggers()
+                    time.sleep(self._poll)
+            finally:
+                self._drain_all_handles()
+            status = "stopped" if timed_out else "succeeded"
+        except BaseException:
+            status = "failed"
+            raise
         finally:
-            self._drain_all_handles()
+            self._base.workspace.end_run(
+                run_record.id, status=status)
+            self._base.workspace.save()
 
         return PatternRunResult(
             pattern_name=self._pattern.name,
+            run_id=run_record.id,
             cohorts_by_role={
                 name: st.cohorts_fired
                 for name, st in self._state.items()
@@ -343,13 +387,23 @@ class PatternRunner:
                 self._fire_role(state.role)
 
     def _count_succeeded(self, block_name: str) -> int:
-        """Count non-synthetic succeeded executions of ``block_name``."""
+        """Count non-synthetic succeeded executions of ``block_name``.
+
+        Scoped to this runner's own ``run_id``: executions from
+        earlier runs in the same workspace (another invocation
+        of the same pattern, a manual ``flywheel run block``,
+        etc.) do not contribute to the cadence count.  This is
+        the fix for "running play-brainstorm twice in a
+        workspace fires a backlog of cohorts on the second
+        invocation."
+        """
         ws = self._base.workspace
         return sum(
             1 for ex in ws.executions.values()
             if ex.block_name == block_name
             and ex.status == "succeeded"
             and not ex.synthetic
+            and ex.run_id == self._run_id
         )
 
     def _fire_role(self, role: Role) -> None:
@@ -574,6 +628,7 @@ class PatternRunner:
                 cohort_index=cohort_index,
                 member_index=member_index,
             ),
+            "run_id": self._run_id,
         }
         return kwargs
 
@@ -794,6 +849,7 @@ class PatternRunner:
                     workspace=workspace,
                     input_bindings={
                         slot_name: instance.id},
+                    run_id=self._run_id,
                     extra_env=(
                         dict(runtime_cfg.extra_env)
                         if runtime_cfg.extra_env else None),

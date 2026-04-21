@@ -23,7 +23,11 @@ import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
 from flywheel.agent_handoff import HandoffContext, HandoffResult, ToolRouter
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    RunRecord,
+)
 from flywheel.pattern import (
     BlockInstance,
     ContinuousTrigger,
@@ -61,9 +65,60 @@ class _FakeWorkspace:
         self.executions: dict[str, BlockExecution] = {}
         self.artifacts: dict[str, ArtifactInstance] = {}
         self.artifact_declarations: dict[str, str] = {}
+        self.runs: dict[str, RunRecord] = {}
+        self.save_calls: int = 0
+        self.save_calls_by_run_state: list[
+            tuple[str, tuple[str, ...]]] = []
 
     def instances_for(self, _name: str) -> list:  # noqa: D401
         return []
+
+    def begin_run(
+        self,
+        kind: str,
+        config_snapshot: dict | None = None,
+    ) -> RunRecord:
+        rid = f"run_{uuid.uuid4().hex[:8]}"
+        record = RunRecord(
+            id=rid,
+            kind=kind,
+            started_at=datetime.now(UTC),
+            status="running",
+            config_snapshot=dict(
+                config_snapshot) if config_snapshot else None,
+        )
+        self.runs[rid] = record
+        return record
+
+    def end_run(self, run_id: str, status: str) -> RunRecord:
+        current = self.runs[run_id]
+        if current.status != "running":
+            raise ValueError(
+                f"end_run: run {run_id!r} is already terminal "
+                f"(status={current.status!r}); "
+                f"double-close rejected"
+            )
+        from dataclasses import replace
+        updated = replace(
+            current,
+            finished_at=datetime.now(UTC),
+            status=status,
+        )
+        self.runs[run_id] = updated
+        return updated
+
+    def save(self) -> None:  # noqa: D401
+        self.save_calls += 1
+        snapshot = tuple(
+            (rid, r.status) for rid, r in self.runs.items())
+        self.save_calls_by_run_state.append(
+            (f"save#{self.save_calls}", snapshot))
+
+    def _active_run_id(self) -> str | None:
+        for rid, r in self.runs.items():
+            if r.status == "running":
+                return rid
+        return None
 
     def register_artifact(
         self,
@@ -99,7 +154,18 @@ class _FakeWorkspace:
         self.artifacts[artifact_id] = instance
         return instance
 
-    def add_succeeded(self, block_name: str) -> None:
+    def add_succeeded(
+        self, block_name: str, *, run_id: str | None = None,
+    ) -> None:
+        """Append a succeeded execution tagged with the active run.
+
+        Falls back to the workspace's single currently-running
+        :class:`RunRecord` when the caller doesn't supply a
+        ``run_id`` — mirrors the real executor's behaviour of
+        tagging every recorded execution with the caller's
+        ``run_id`` and means cadence tests don't have to know
+        the runner's own id ahead of time.
+        """
         idx = len(self.executions)
         ex = BlockExecution(
             id=f"ex_{idx:04d}",
@@ -107,10 +173,15 @@ class _FakeWorkspace:
             started_at=datetime.now(UTC),
             finished_at=datetime.now(UTC),
             status="succeeded",
+            run_id=(
+                run_id if run_id is not None
+                else self._active_run_id()),
         )
         self.executions[ex.id] = ex
 
-    def add_synthetic_failed(self, block_name: str) -> None:
+    def add_synthetic_failed(
+        self, block_name: str, *, run_id: str | None = None,
+    ) -> None:
         idx = len(self.executions)
         ex = BlockExecution(
             id=f"ex_{idx:04d}",
@@ -119,6 +190,9 @@ class _FakeWorkspace:
             finished_at=datetime.now(UTC),
             status="failed",
             synthetic=True,
+            run_id=(
+                run_id if run_id is not None
+                else self._active_run_id()),
         )
         self.executions[ex.id] = ex
 
@@ -395,6 +469,221 @@ class TestEveryNExecutions:
         ).run()
 
         assert bs_count[0] == 0
+
+    def test_every_n_counter_is_run_scoped(self, tmp_path: Path):
+        """Cadence counter ignores executions from prior runs.
+
+        The play-brainstorm bug: running the pattern twice in a
+        single workspace left the second run's every-N trigger
+        counting prior-run executions too, firing the nested
+        cohort immediately instead of after N executions of the
+        current run.  Runs scope the counter: only executions
+        tagged with the current run's ``run_id`` count.
+        """
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play body")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "brainstorm body")
+
+        # Pre-seed the ledger with 5 succeeded executions from an
+        # earlier run — enough to fire N=3 twice if the counter
+        # were workspace-wide.
+        prior = ws.begin_run(kind="pattern:play-bs")
+        for _ in range(5):
+            ws.add_succeeded("take_action", run_id=prior.id)
+        ws.end_run(prior.id, status="succeeded")
+
+        pattern = Pattern(
+            name="play-bs",
+            roles=[
+                Role(
+                    name="play",
+                    prompt=play_prompt,
+                    trigger=ContinuousTrigger(),
+                ),
+                Role(
+                    name="brainstorm",
+                    prompt=bs_prompt,
+                    trigger=EveryNExecutionsTrigger(
+                        of_block="take_action", n=3),
+                ),
+            ],
+        )
+
+        launches_by_role: dict[str, int] = {
+            "play": 0, "brainstorm": 0}
+        play_handle: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            prompt = kwargs.get("prompt") or ""
+            role = (
+                "brainstorm" if "brainstorm" in prompt else "play")
+            launches_by_role[role] += 1
+            if role == "play":
+                play_handle.append(handle)
+            else:
+                handle.finish()
+            return handle
+
+        def driver():
+            # Only 2 executions in the *current* run — below N=3.
+            for _ in range(2):
+                time.sleep(0.05)
+                ws.add_succeeded("take_action")
+            time.sleep(0.1)
+            play_handle[0].finish()
+
+        threading.Thread(target=driver).start()
+
+        result = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        ).run()
+
+        # Prior run's 5 executions must not count; current run's
+        # 2 < N=3 so brainstorm never fires.
+        assert launches_by_role["brainstorm"] == 0
+        assert result.cohorts_by_role.get("brainstorm", 0) == 0
+
+    def test_begin_run_is_persisted_before_first_execution(
+            self, tmp_path: Path):
+        """Opening the run saves the workspace immediately.
+
+        Without this, a host crash after ``begin_run`` but before
+        the first execution-write-triggered save would leave the
+        run invisible on disk — defeating the "durable grouping"
+        contract.
+        """
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "play.md", "play prompt")
+        pattern = Pattern(
+            name="just-play",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=ContinuousTrigger(),
+            )],
+        )
+
+        # Capture the save-call snapshots available at launch_fn
+        # time.  Every launch_fn call happens *after* at least one
+        # save, so the open run must already be visible in
+        # ``ws.runs`` at that point.
+        snapshots_at_launch: list[tuple[int, tuple]] = []
+
+        def launch_fn(**kwargs):
+            snapshots_at_launch.append(
+                (ws.save_calls,
+                 tuple(
+                     (rid, r.status)
+                     for rid, r in ws.runs.items())))
+            handle = _FakeHandle(kwargs)
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(0.05), handle.finish())).start()
+            return handle
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        )
+        runner.run()
+
+        # At launch time the runner has already invoked save() at
+        # least once and the run is visible as ``running``.
+        assert len(snapshots_at_launch) == 1
+        save_calls, runs_snapshot = snapshots_at_launch[0]
+        assert save_calls >= 1
+        assert any(
+            state == "running" for _, state in runs_snapshot)
+
+    def test_max_runtime_records_stopped_status(
+            self, tmp_path: Path):
+        """Hitting ``max_total_runtime_s`` closes the run as ``stopped``.
+
+        Without this, a timeout-drained pattern records
+        ``succeeded`` — making ``stopped`` dead vocabulary and
+        hiding incomplete runs from downstream analysis.
+        """
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "play.md", "play prompt")
+        pattern = Pattern(
+            name="just-play",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=ContinuousTrigger(),
+            )],
+        )
+
+        play_handles: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(kwargs)
+            play_handles.append(handle)
+            # Auto-finish shortly so the outer drain completes
+            # after the max-runtime break.  The timeout still
+            # triggers first because the 0.05s max_total_runtime
+            # elapses before this timer fires.
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(0.2), handle.finish())).start()
+            return handle
+
+        result = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+            max_total_runtime_s=0.05,
+        ).run()
+
+        assert result.run_id in ws.runs
+        assert ws.runs[result.run_id].status == "stopped"
+
+    def test_run_id_propagated_to_launches(self, tmp_path: Path):
+        """Every launch_fn call receives the current run's ``run_id``.
+
+        The runner's own run_id is visible to launch_fn kwargs so
+        downstream nested executions can inherit it.
+        """
+        ws = _FakeWorkspace(tmp_path)
+        prompt = _write_prompt(tmp_path, "p.md", "play")
+        pattern = Pattern(
+            name="just-play",
+            roles=[Role(
+                name="play",
+                prompt=prompt,
+                trigger=ContinuousTrigger(),
+            )],
+        )
+
+        captured: list[str | None] = []
+
+        def launch_fn(**kwargs):
+            captured.append(kwargs.get("run_id"))
+            handle = _FakeHandle(kwargs)
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(0.05), handle.finish())).start()
+            return handle
+
+        result = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.02,
+        ).run()
+
+        assert len(captured) == 1
+        assert captured[0] is not None
+        assert captured[0] == result.run_id
+        assert result.run_id in ws.runs
+        assert ws.runs[result.run_id].status == "succeeded"
 
 
 class TestRejectsBadPatterns:

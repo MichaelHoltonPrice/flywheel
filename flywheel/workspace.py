@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
     LifecycleEvent,
+    RunRecord,
 )
 from flywheel.template import Template
 from flywheel.validation import validate_name as _validate_name
@@ -47,6 +48,7 @@ class Workspace:
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
+    runs: dict[str, RunRecord] = field(default_factory=dict)
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False,
     )
@@ -185,6 +187,94 @@ class Workspace:
                     f"Event {event.id!r} already exists in workspace"
                 )
             self.events[event.id] = event
+
+    def begin_run(
+        self,
+        kind: str,
+        config_snapshot: dict[str, Any] | None = None,
+    ) -> RunRecord:
+        """Open a new run and append it to the workspace.
+
+        Thread-safe.  Returns the new :class:`RunRecord`; the
+        caller stores the id and tags executions it drives.
+        Status starts as ``"running"``; close with
+        :meth:`end_run`.
+
+        Args:
+            kind: What opened the run.  Convention:
+                ``"pattern:<name>"``.
+            config_snapshot: Optional config mapping recorded
+                for later inspection (model names, budgets,
+                etc.).
+
+        Returns:
+            The newly-created :class:`RunRecord`.
+        """
+        with self._lock:
+            while True:
+                candidate = f"run_{self._short_uuid()}"
+                if candidate not in self.runs:
+                    break
+            record = RunRecord(
+                id=candidate,
+                kind=kind,
+                started_at=datetime.now(UTC),
+                status="running",
+                config_snapshot=(
+                    dict(config_snapshot)
+                    if config_snapshot else None),
+            )
+            self.runs[candidate] = record
+            return record
+
+    def end_run(self, run_id: str, status: str) -> RunRecord:
+        """Close an open run and update its status.
+
+        Thread-safe.  Replaces the existing :class:`RunRecord`
+        with a copy that has ``finished_at`` set to now and
+        ``status`` set to the given value.  Typical statuses:
+        ``"succeeded"``, ``"failed"``, ``"stopped"``.
+
+        Args:
+            run_id: The run to close.
+            status: Terminal status.
+
+        Returns:
+            The updated :class:`RunRecord`.
+
+        Raises:
+            KeyError: If ``run_id`` is not known.
+            ValueError: If ``status`` is not a terminal value, or
+                if the run is already in a terminal state
+                (double-close).
+        """
+        if status not in (
+                "succeeded", "failed", "stopped"):
+            raise ValueError(
+                f"end_run: status {status!r} is not terminal; "
+                f"expected one of "
+                f"('succeeded', 'failed', 'stopped')"
+            )
+        with self._lock:
+            current = self.runs.get(run_id)
+            if current is None:
+                raise KeyError(
+                    f"run {run_id!r} is not known to this "
+                    f"workspace"
+                )
+            if current.status != "running":
+                raise ValueError(
+                    f"end_run: run {run_id!r} is already "
+                    f"terminal (status={current.status!r}); "
+                    f"double-close rejected"
+                )
+            updated = replace(
+                current,
+                finished_at=datetime.now(UTC),
+                status=status,
+            )
+            self.runs[run_id] = updated
+            return updated
 
     def events_for(self, kind: str) -> list[LifecycleEvent]:
         """Return all lifecycle events of a given kind, ordered by timestamp.
@@ -680,6 +770,7 @@ class Workspace:
                 state_dir=entry.get("state_dir"),
                 failure_phase=entry.get("failure_phase"),
                 state_lineage_id=entry.get("state_lineage_id"),
+                run_id=entry.get("run_id"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -692,6 +783,21 @@ class Workspace:
                 detail=entry.get("detail", {}),
             )
 
+        runs: dict[str, RunRecord] = {}
+        for rid, entry in data.get("runs", {}).items():
+            finished = entry.get("finished_at")
+            runs[rid] = RunRecord(
+                id=rid,
+                kind=entry["kind"],
+                started_at=datetime.fromisoformat(
+                    entry["started_at"]),
+                finished_at=(
+                    datetime.fromisoformat(finished)
+                    if finished else None),
+                status=entry.get("status", "running"),
+                config_snapshot=entry.get("config_snapshot"),
+            )
+
         return cls(
             name=data["name"],
             path=path,
@@ -701,6 +807,7 @@ class Workspace:
             artifacts=artifacts,
             executions=executions,
             events=events,
+            runs=runs,
         )
 
     def save(self) -> None:
@@ -777,6 +884,8 @@ class Workspace:
                     entry["failure_phase"] = ex.failure_phase
                 if ex.state_lineage_id is not None:
                     entry["state_lineage_id"] = ex.state_lineage_id
+                if ex.run_id is not None:
+                    entry["run_id"] = ex.run_id
                 serialized_executions[eid] = entry
 
             serialized_events = {}
@@ -791,6 +900,20 @@ class Workspace:
                     entry["detail"] = ev.detail
                 serialized_events[evid] = entry
 
+            serialized_runs = {}
+            for rid, run in self.runs.items():
+                entry = {
+                    "kind": run.kind,
+                    "started_at": run.started_at.isoformat(),
+                    "status": run.status,
+                }
+                if run.finished_at is not None:
+                    entry["finished_at"] = (
+                        run.finished_at.isoformat())
+                if run.config_snapshot is not None:
+                    entry["config_snapshot"] = run.config_snapshot
+                serialized_runs[rid] = entry
+
             data: dict = {
                 "name": self.name,
                 "template_name": self.template_name,
@@ -801,6 +924,8 @@ class Workspace:
             }
             if serialized_events:
                 data["events"] = serialized_events
+            if serialized_runs:
+                data["runs"] = serialized_runs
 
             yaml_path = self.path / "workspace.yaml"
             tmp_path = yaml_path.with_suffix(".yaml.tmp")

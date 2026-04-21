@@ -91,6 +91,12 @@ class HandoffContext:
         siblings: Total number of pending tool calls in this
             iteration; ``index_in_iteration < siblings`` always.
             ``siblings == 1`` is the single-tool-use case.
+        run_id: :class:`flywheel.artifact.RunRecord` id of the
+            outer run that launched the agent, or ``None`` for
+            ad-hoc invocations.  Block runners forward this into
+            :meth:`flywheel.local_block.LocalBlockRecorder.begin`
+            so nested executions inherit the agent's run_id and
+            pattern-level cadence counters can scope correctly.
     """
 
     tool_name: str
@@ -101,6 +107,7 @@ class HandoffContext:
     iteration: int
     index_in_iteration: int = 0
     siblings: int = 1
+    run_id: str | None = None
 
 
 @dataclass
@@ -236,6 +243,7 @@ def run_with_handoffs(
     max_iterations: int = 500,
     stdout_log: Path | None = None,
     stderr_log: Path | None = None,
+    run_id: str | None = None,
 ) -> LoopResult:
     """Drive an agent container through ``tool_handoff`` cycles.
 
@@ -297,6 +305,11 @@ def run_with_handoffs(
         stdout_log: Optional file to append container stdout to;
             one combined log across iterations.
         stderr_log: Same for stderr.
+        run_id: Optional :class:`flywheel.artifact.RunRecord` id
+            stamped onto every :class:`HandoffContext` the driver
+            builds so block runners can forward it into
+            :meth:`flywheel.local_block.LocalBlockRecorder.begin`.
+            ``None`` means ad-hoc (no grouping).
 
     Returns:
         ``LoopResult`` with one ``LoopIteration`` per container
@@ -432,6 +445,7 @@ def run_with_handoffs(
                 iteration=iteration,
                 index_in_iteration=idx,
                 siblings=siblings,
+                run_id=run_id,
             )
 
             block_result = block_runner(ctx)

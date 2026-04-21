@@ -154,6 +154,7 @@ class LocalExecutionContext:
     scratch_dir: str
     params: dict[str, Any]
     parent_execution_id: str | None
+    run_id: str | None = None
     output_root: Path | None = None
     _output_dirs: dict[str, Path] = field(default_factory=dict)
     output_bindings: dict[str, str] = field(default_factory=dict)
@@ -276,6 +277,7 @@ class LocalBlockRecorder:
         caller: dict[str, Any] | None = None,
         runner: str | None = None,
         parent_execution_id: str | None = None,
+        run_id: str | None = None,
     ) -> Iterator[LocalExecutionContext]:
         """Open a logical block execution as a context manager.
 
@@ -293,6 +295,12 @@ class LocalBlockRecorder:
             parent_execution_id: Execution ID of the runner that
                 invoked this block.  For agent-triggered blocks
                 this is the agent's own execution record.
+            run_id: :class:`flywheel.artifact.RunRecord` id this
+                nested execution belongs to.  Host-side runners
+                triggered by an agent inherit the agent's
+                ``run_id`` verbatim so cadence counters and
+                run-level grouping treat the nested execution as
+                part of the same run.
 
         Yields:
             A :class:`LocalExecutionContext` for populating
@@ -353,6 +361,7 @@ class LocalBlockRecorder:
             scratch_dir=str(scratch_dir),
             params=params or {},
             parent_execution_id=parent_execution_id,
+            run_id=run_id,
             output_root=output_root,
             _output_dirs=output_dirs,
         )
@@ -552,6 +561,8 @@ class LocalBlockRecorder:
                 elapsed_s=elapsed_s,
                 image=block_def.image,
                 parent_execution_id=ctx.parent_execution_id,
+
+                run_id=ctx.run_id,
                 runner=runner,
                 caller=caller,
                 params=ctx.params or None,
@@ -573,6 +584,8 @@ class LocalBlockRecorder:
             elapsed_s=elapsed_s,
             image=block_def.image,
             parent_execution_id=ctx.parent_execution_id,
+
+            run_id=ctx.run_id,
             runner=runner,
             caller=caller,
             params=ctx.params or None,
@@ -677,6 +690,8 @@ class LocalBlockRecorder:
             elapsed_s=elapsed_s,
             image=block_def.image,
             parent_execution_id=ctx.parent_execution_id,
+
+            run_id=ctx.run_id,
             runner=runner,
             caller=caller,
             params=ctx.params or None,

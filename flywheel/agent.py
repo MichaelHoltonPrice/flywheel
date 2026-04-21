@@ -170,6 +170,7 @@ class AgentBlockConfig:
     isolated_network: bool = False
     agent_workspace_dir: str | None = None
     predecessor_id: str | None = None
+    run_id: str | None = None
     prompt_substitutions: dict[str, str] | None = None
 
 
@@ -535,6 +536,7 @@ def launch_agent_block(
     isolated_network: bool = False,
     agent_workspace_dir: str | None = None,
     predecessor_id: str | None = None,
+    run_id: str | None = None,
 ) -> AgentHandle:
     """Launch an agent block execution (non-blocking).
 
@@ -584,6 +586,10 @@ def launch_agent_block(
             Callers that chain executions — the handoff loop —
             are responsible for writing ``predecessor_id`` onto
             the :class:`BlockExecution` record after wait().
+        run_id: Optional run grouping id.  When set, the
+            resulting :class:`BlockExecution` record is stamped
+            with this run_id so pattern runners can scope
+            cadence counters to a single run.
 
     Returns:
         An :class:`AgentHandle` for monitoring and controlling
@@ -651,6 +657,7 @@ def launch_agent_block(
             extra_docker_args=docker_args or None,
             log_dir=log_dir,
             total_timeout_s=timeout_s,
+            run_id=run_id,
         )
     except BaseException:
         shutil.rmtree(prompt_tempdir, ignore_errors=True)

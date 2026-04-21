@@ -723,6 +723,97 @@ class TestLifecycleEvents:
         assert "events" not in raw
 
 
+class TestRuns:
+    """Tests for :class:`flywheel.artifact.RunRecord` persistence."""
+
+    def test_begin_and_end_run_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        record = ws.begin_run(
+            kind="pattern:play-bs",
+            config_snapshot={"n": 3},
+        )
+        assert record.id.startswith("run_")
+        assert record.status == "running"
+        assert record.finished_at is None
+
+        ws.end_run(record.id, status="succeeded")
+        assert ws.runs[record.id].status == "succeeded"
+        assert ws.runs[record.id].finished_at is not None
+
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert record.id in loaded.runs
+        assert loaded.runs[record.id].kind == "pattern:play-bs"
+        assert loaded.runs[record.id].config_snapshot == {"n": 3}
+        assert loaded.runs[record.id].status == "succeeded"
+
+    def test_load_without_runs_key(self, tmp_path: Path):
+        """Old workspace.yaml without runs key loads to empty dict."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert "runs" not in raw
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.runs == {}
+
+    def test_end_run_rejects_non_terminal_status(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:x")
+
+        with pytest.raises(ValueError):
+            ws.end_run(record.id, status="running")
+
+    def test_end_run_rejects_double_close(self, tmp_path: Path):
+        """Second ``end_run`` on a terminal run raises.
+
+        Silent overwrite would hide orchestration bugs where two
+        layers race to close the same run.
+        """
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:x")
+        ws.end_run(record.id, status="succeeded")
+
+        with pytest.raises(ValueError, match="double-close"):
+            ws.end_run(record.id, status="failed")
+
+    def test_block_execution_run_id_round_trip(self, tmp_path: Path):
+        """``BlockExecution.run_id`` persists across save / load."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex_tagged = BlockExecution(
+            id="exec_r1", block_name="train", started_at=now,
+            finished_at=now, status="succeeded",
+            run_id="run_abc123",
+        )
+        ex_ad_hoc = BlockExecution(
+            id="exec_ah", block_name="train", started_at=now,
+            finished_at=now, status="succeeded",
+        )
+        ws.add_execution(ex_tagged)
+        ws.add_execution(ex_ad_hoc)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        # run_id persisted only when set.
+        assert raw["executions"]["exec_r1"]["run_id"] == "run_abc123"
+        assert "run_id" not in raw["executions"]["exec_ah"]
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.executions["exec_r1"].run_id == "run_abc123"
+        assert loaded.executions["exec_ah"].run_id is None
+
+
 INCREMENTAL_TEMPLATE_YAML = """\
 artifacts:
   - name: engine

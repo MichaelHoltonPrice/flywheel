@@ -295,6 +295,7 @@ class ContainerExecutionHandle(ExecutionHandle):
         work_area: Path,
         input_bindings: dict[str, str],
         state_lineage_id: str | None,
+        run_id: str | None = None,
         log_dir: Path | None = None,
         total_timeout_s: float | None = None,
         on_stdout_line: Callable[[str], None] | None = None,
@@ -339,6 +340,7 @@ class ContainerExecutionHandle(ExecutionHandle):
         self._work_area = work_area
         self._input_bindings = input_bindings
         self._state_lineage_id = state_lineage_id
+        self._run_id = run_id
         self._log_dir = log_dir
         self._total_timeout_s = total_timeout_s
         self._on_stdout_line = on_stdout_line
@@ -619,6 +621,7 @@ class ContainerExecutionHandle(ExecutionHandle):
             error=error,
             state_lineage_id=self._state_lineage_id,
             stop_reason=self._stop_reason,
+            run_id=self._run_id,
         )
         self._workspace.add_execution(execution)
         self._workspace.save()
@@ -682,6 +685,7 @@ class ProcessExitExecutor:
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
         state_lineage_id: str | None = None,
+        run_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         extra_mounts: list[tuple[str, str, str]] | None = None,
         extra_docker_args: list[str] | None = None,
@@ -727,6 +731,11 @@ class ProcessExitExecutor:
                 bucket — matches every stateful-block use case
                 we support today.  Callers that want parallel or
                 forked state chains can pass distinct IDs.
+            run_id: Optional run grouping id.  When set, the
+                recorded :class:`BlockExecution` is stamped with
+                this run_id so callers can filter cadence
+                counters to a single run.  ``None`` means
+                ad-hoc (no grouping).
             extra_env: Per-launch environment variables to merge
                 into ``block_def.env`` before building the
                 ``ContainerConfig``.  Later writes win, so a
@@ -813,6 +822,8 @@ class ProcessExitExecutor:
                     started_at=started_at,
                     input_bindings=input_bindings,
                     state_lineage_id=state_lineage_id,
+
+                    run_id=run_id,
                     failure_phase=runtime.FAILURE_STAGE_IN,
                     error=f"stage_in: {e}",
                     staged_inputs=staged_inputs,
@@ -834,6 +845,8 @@ class ProcessExitExecutor:
                         started_at=started_at,
                         input_bindings=input_bindings,
                         state_lineage_id=state_lineage_id,
+
+                        run_id=run_id,
                         failure_phase=runtime.FAILURE_STAGE_IN,
                         error=f"stage_in (state): {e}",
                         staged_inputs=staged_inputs,
@@ -894,6 +907,8 @@ class ProcessExitExecutor:
                     started_at=started_at,
                     input_bindings=input_bindings,
                     state_lineage_id=state_lineage_id,
+
+                    run_id=run_id,
                     failure_phase=runtime.FAILURE_INVOKE,
                     error=f"invoke: {e}",
                     staged_inputs=staged_inputs,
@@ -923,6 +938,7 @@ class ProcessExitExecutor:
             work_area=work_area,
             input_bindings=input_bindings,
             state_lineage_id=state_lineage_id,
+            run_id=run_id,
             log_dir=log_dir,
             total_timeout_s=total_timeout_s,
             on_stdout_line=on_stdout_line,
@@ -1231,6 +1247,7 @@ def _record_pre_container_failure(
     state_mount: Path | None,
     output_tempdirs: dict[str, Path],
     work_area: Path | None,
+    run_id: str | None = None,
 ) -> SyncExecutionHandle:
     """Write a failure :class:`BlockExecution` and clean up.
 
@@ -1265,6 +1282,7 @@ def _record_pre_container_failure(
         failure_phase=failure_phase,
         error=error,
         state_lineage_id=state_lineage_id,
+        run_id=run_id,
     )
     workspace.add_execution(execution)
     workspace.save()
@@ -1312,6 +1330,7 @@ class ProcessExecutionHandle(ExecutionHandle):
         execution_id: str,
         started_at: datetime,
         start_monotonic: float,
+        run_id: str | None = None,
     ):
         """Initialize from a running subprocess."""
         self._process = process
@@ -1319,6 +1338,7 @@ class ProcessExecutionHandle(ExecutionHandle):
         self._block_name = block_name
         self._execution_id = execution_id
         self._started_at = started_at
+        self._run_id = run_id
         self._start_monotonic = start_monotonic
         self._stop_reason: str | None = None
         self._waited = False
@@ -1369,6 +1389,7 @@ class ProcessExecutionHandle(ExecutionHandle):
             exit_code=exit_code,
             elapsed_s=elapsed,
             stop_reason=self._stop_reason,
+            run_id=self._run_id,
         )
         self._workspace.add_execution(execution)
         self._workspace.save()
@@ -1402,6 +1423,7 @@ class ProcessExecutor:
         execution_id: str | None = None,
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
+        run_id: str | None = None,
     ) -> ProcessExecutionHandle:
         """Launch a local subprocess.
 
@@ -1417,6 +1439,9 @@ class ProcessExecutor:
             execution_id: Pre-assigned execution ID.
             overrides: Unused (protocol compat).
             allowed_blocks: If set, only these block names allowed.
+            run_id: Optional run grouping id stamped on the
+                resulting :class:`BlockExecution` record.
+                ``None`` means ad-hoc (no grouping).
 
         Returns:
             A ``ProcessExecutionHandle`` for monitoring the
@@ -1458,6 +1483,7 @@ class ProcessExecutor:
             execution_id=exec_id,
             started_at=started_at,
             start_monotonic=time.monotonic(),
+            run_id=run_id,
         )
 
 
@@ -1846,6 +1872,7 @@ class _RequestExecutionHandle(ExecutionHandle):
         start_monotonic: float,
         input_bindings: dict[str, str],
         state_lineage_id: str | None,
+        run_id: str | None,
         staged_inputs: dict[str, Path],
         request_dir: Path,
         output_dirs: dict[str, Path],
@@ -1860,6 +1887,7 @@ class _RequestExecutionHandle(ExecutionHandle):
         self._start_monotonic = start_monotonic
         self._input_bindings = input_bindings
         self._state_lineage_id = state_lineage_id
+        self._run_id = run_id
         self._staged_inputs = staged_inputs
         self._request_dir = request_dir
         self._output_dirs = output_dirs
@@ -2013,6 +2041,7 @@ class _RequestExecutionHandle(ExecutionHandle):
             failure_phase=failure_phase,
             error=error,
             state_lineage_id=self._state_lineage_id,
+            run_id=self._run_id,
             stop_reason=self._stop_reason,
         )
         self._runtime.workspace.add_execution(execution)
@@ -2125,6 +2154,7 @@ class RequestResponseExecutor:
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
         state_lineage_id: str | None = None,
+        run_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         extra_mounts: list[tuple[str, str, str]] | None = None,
         extra_docker_args: list[str] | None = None,
@@ -2222,6 +2252,8 @@ class RequestResponseExecutor:
                 started_at=started_at,
                 input_bindings=input_bindings,
                 state_lineage_id=state_lineage_id,
+
+                run_id=run_id,
                 failure_phase=runtime.FAILURE_STAGE_IN,
                 error=f"stage_in: {e}",
                 staged_inputs={},
@@ -2239,6 +2271,8 @@ class RequestResponseExecutor:
                 started_at=started_at,
                 input_bindings=input_bindings,
                 state_lineage_id=state_lineage_id,
+
+                run_id=run_id,
                 failure_phase=runtime.FAILURE_STAGE_IN,
                 error=f"stage_in: {e}",
                 staged_inputs={},
@@ -2255,6 +2289,7 @@ class RequestResponseExecutor:
             start_monotonic=start_monotonic,
             input_bindings=input_bindings,
             state_lineage_id=state_lineage_id,
+            run_id=run_id,
             staged_inputs=staged_inputs,
             request_dir=request_dir,
             output_dirs=output_dirs,

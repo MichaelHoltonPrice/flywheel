@@ -182,6 +182,18 @@ class BlockExecution:
             lineages become needed (parallel instances, forks),
             callers can pass distinct IDs without a schema
             migration.
+        run_id: Names the :class:`RunRecord` this execution
+            belongs to.  ``None`` means "ad-hoc" — this
+            execution was not started inside a durable grouped
+            run (direct ``flywheel run block`` / ``flywheel run
+            agent`` calls, for example).  ``PatternRunner``
+            opens a run and tags every ``BlockExecution`` it
+            drives with that id; nested executions triggered
+            through the host-side handoff loop inherit the
+            same id from the agent that triggered them.
+            Cadence counters scope by this field so executions
+            from a prior run do not pollute a fresh run's
+            counter.
     """
 
     id: str
@@ -210,6 +222,63 @@ class BlockExecution:
     state_dir: str | None = None
     failure_phase: str | None = None
     state_lineage_id: str | None = None
+    run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """A durable grouping of related block executions.
+
+    Sits between :class:`flywheel.workspace.Workspace` and
+    :class:`BlockExecution`.  Each ``PatternRunner`` invocation
+    opens one run record and tags every execution it drives
+    (including nested executions triggered through the host-side
+    handoff loop) with the run's id.  Cadence triggers like
+    ``every_n_executions`` scope their counters to
+    ``run_id == self._run_id`` so re-running a pattern in an
+    existing workspace does not fire a backlog of cohorts
+    against the prior run's execution count.
+
+    A workspace can hold many runs.  Ad-hoc work (direct
+    ``flywheel run block`` / ``flywheel run agent`` calls, or
+    tests exercising the executor in isolation) produces
+    ``BlockExecution`` records with ``run_id=None``; no
+    ``RunRecord`` is created for them.
+
+    Attributes:
+        id: Unique identifier within the workspace
+            (e.g., ``"run_a3f7b2e1"``).
+        kind: What opened this run.  Convention:
+            ``"pattern:<name>"`` for pattern-driven runs
+            (e.g., ``"pattern:play-brainstorm"``).  Ad-hoc
+            CLI invocations do not open a run, so there is
+            no ``"ad_hoc"`` kind today; future operator-
+            initiated groupings may add their own kinds.
+        started_at: When the run opened.
+        finished_at: When the run closed, or ``None`` if still
+            running.  An interrupted host process leaves the
+            record as ``"running"`` with ``finished_at=None``
+            until a reconciliation or resume command touches
+            it.
+        status: ``"running"``, ``"succeeded"``, ``"failed"``,
+            ``"stopped"``.  Set to ``"running"`` on open; the
+            pattern runner updates it in its outer
+            ``try/finally``.
+        config_snapshot: Optional free-form mapping the caller
+            records alongside the run for later inspection
+            (model names, budgets, pattern overrides, etc.).
+            ``None`` when the caller had nothing worth
+            capturing.  Not inspected by the runner.
+    """
+
+    id: str
+    kind: str
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: Literal[
+        "running", "succeeded", "failed", "stopped"
+    ] = "running"
+    config_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

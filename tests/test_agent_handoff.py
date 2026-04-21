@@ -182,6 +182,111 @@ class TestSingleHandoffRoundTrip:
         assert ctx.siblings == 1
         assert ctx.session_id == "sess-fake"
 
+    def test_run_id_propagates_from_launch_kwargs_to_ctx(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """``launch_kwargs['run_id']`` lands on every HandoffContext.
+
+        Nested host-side runners (predict, brainstorm, exploration)
+        forward ``ctx.run_id`` into ``LocalBlockRecorder.begin`` so
+        pattern-level cadence counters scope to the outer run.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-run",
+            tool_use_ids=["toolu_1", "toolu_2"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[
+                    {
+                        "tool_use_id": "toolu_1",
+                        "tool_name": "mcp__demo__handoff_me",
+                        "tool_input": {},
+                    },
+                    {
+                        "tool_use_id": "toolu_2",
+                        "tool_name": "mcp__demo__handoff_me",
+                        "tool_input": {},
+                    },
+                ],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+                execution_id="exec-0",
+            ),
+            _CycleScript(
+                exit_reason="completed",
+                execution_id="exec-1",
+            ),
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(
+            workspace.path, scripts, record, workspace=workspace)
+
+        captured_run_ids: list[str | None] = []
+
+        def _block_runner(ctx: HandoffContext) -> HandoffResult:
+            captured_run_ids.append(ctx.run_id)
+            return HandoffResult(content="ok")
+
+        run_agent_with_handoffs(
+            block_runner=_block_runner,
+            launch_fn=launch,
+            run_id="run_abc",
+            **_base_kwargs(workspace),
+        )
+
+        # Both pending tool calls in this iteration see the same
+        # outer run_id.
+        assert captured_run_ids == ["run_abc", "run_abc"]
+
+    def test_run_id_defaults_to_none_when_not_supplied(
+        self, workspace: _FakeWorkspace,
+    ) -> None:
+        """Ad-hoc loops without a run_id leave ``ctx.run_id`` as ``None``.
+
+        Matches the "ad-hoc execution" contract: no run grouping,
+        no counter scoping.
+        """
+        session_jsonl = _build_session_jsonl(
+            session_id="sess-ad-hoc",
+            tool_use_ids=["toolu_solo"],
+        )
+        scripts = [
+            _CycleScript(
+                exit_reason="tool_handoff",
+                pending=[{
+                    "tool_use_id": "toolu_solo",
+                    "tool_name": "mcp__demo__handoff_me",
+                    "tool_input": {},
+                }],
+                write_session=True,
+                session_jsonl_text=session_jsonl,
+                execution_id="exec-0",
+            ),
+            _CycleScript(
+                exit_reason="completed",
+                execution_id="exec-1",
+            ),
+        ]
+        record: list[_LaunchCall] = []
+        launch = _make_launch_fn(
+            workspace.path, scripts, record, workspace=workspace)
+
+        captured_run_ids: list[str | None] = []
+
+        def _block_runner(ctx: HandoffContext) -> HandoffResult:
+            captured_run_ids.append(ctx.run_id)
+            return HandoffResult(content="ok")
+
+        run_agent_with_handoffs(
+            block_runner=_block_runner,
+            launch_fn=launch,
+            **_base_kwargs(workspace),
+        )
+
+        assert captured_run_ids == [None]
+
     def test_splice_replaces_deny_with_real_result(
         self, workspace: _FakeWorkspace,
     ) -> None:
