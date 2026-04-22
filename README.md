@@ -8,10 +8,36 @@ visibility into hybrid human+agent workflows, and reusable
 capabilities (computer use agents, LLM agent wrappers) so projects
 can focus on their domain logic.
 
-See [docs/vision.md](docs/vision.md) for the design rationale
-(includes aspirational elements) and
-[docs/architecture.md](docs/architecture.md) for implementation
-decisions (future work is noted separately at the end).
+## Audience
+
+The intended primary user is an **AI agent orchestrator** (Cursor,
+Claude Code, or a custom agent loop) driving flywheel as a CLI.
+The orchestrator invokes small composable subcommands; flywheel
+manages durable workspace state, runs blocks, and records every
+input, output, and execution decision in a workspace ledger the
+orchestrator can read between calls.
+
+Humans use the same surface and read the same workspaces.
+
+## CLI surface
+
+Four user-facing commands:
+
+* `flywheel create workspace` — materialize a fresh workspace from
+  a template.
+  ([docs/cli/create-workspace.md](docs/cli/create-workspace.md))
+* `flywheel import artifact` — register an external file or
+  directory as a workspace artifact instance.
+* `flywheel run block` — execute one block ad hoc against a
+  workspace.
+* `flywheel run pattern` — execute a declarative multi-instance
+  pattern against a workspace.
+
+Per-command reference docs land in [docs/cli/](docs/cli/) as the
+underlying behavior is pinned. AI agents working with flywheel
+should start at [AGENTS.md](AGENTS.md). Design rationale is in
+[docs/vision.md](docs/vision.md); implementation decisions are
+in [docs/architecture.md](docs/architecture.md).
 
 ## Setup
 

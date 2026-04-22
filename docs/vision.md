@@ -30,6 +30,45 @@ data lake. Improvement loops without either are blind iteration.
 While improvement loops are a first-order concern for flywheel,
 it is not a requirement for every workflow.
 
+## Intended use: a CLI for AI agent orchestrators
+
+Flywheel's intended primary user is an AI agent orchestrator —
+Cursor, Claude Code, a custom agent loop — driving flywheel as a
+command-line tool. The orchestrator decides when to create a
+workspace, when to import a starting artifact, when to run a
+block, and when to launch a pattern. Flywheel handles the
+durable side: workspace state, block execution, artifact
+registration, execution records, and the ledger an orchestrator
+reads between invocations to understand what already happened.
+
+This shapes several design choices:
+
+* **Small composable subcommands.** The user-facing surface is a
+  short list of orthogonal commands (`create workspace`,
+  `import artifact`, `run block`, `run pattern`) rather than a
+  monolithic driver. An orchestrator that needs only `run block`
+  is not paying for the rest.
+* **Durable, inspectable workspace state.** Every block execution,
+  artifact instance, and run is persisted to the workspace
+  ledger before the corresponding subcommand returns. An
+  orchestrator that exits between commands sees exactly what the
+  next instance of itself will see, with no in-memory state to
+  reconstruct.
+* **Machine-readable ledger format.** The workspace YAML and the
+  artifact directory layout are stable enough that an
+  orchestrator can read them directly (and many do, alongside
+  any future structured-output flags on the CLI).
+* **Documentation aimed at orchestration agents first.**
+  Per-command docs live in `docs/cli/` and follow a fixed
+  structure (purpose, prerequisites, invocation, what gets
+  changed, failure modes, verification, next steps,
+  implementation pointers) so an agent can locate the section it
+  needs without rereading prose.
+
+Humans use the same surface, read the same workspaces, and
+benefit from the same conventions. The orchestration-agent
+audience is the primary one but not an exclusive one.
+
 ## The foundry
 
 Each project has a **foundry** — a directory managed by flywheel
