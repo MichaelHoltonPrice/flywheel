@@ -396,6 +396,13 @@ class PatternRunner:
                         break
                     self._evaluate_ledger_triggers()
                     self._refire_autorestart_if_ready()
+                    # Honour ``scope="run"`` post_check halts as a
+                    # strong stop: the scope promises "the run is
+                    # over," so drive every alive driving-role
+                    # handle to exit rather than waiting for its
+                    # natural termination.  Symmetric with the
+                    # pause mechanism: stop → wait → done.
+                    self._stop_driving_handles_if_halted()
                     # Block on the event queue instead of a bare
                     # sleep so post-dispatch hooks from HANDOFF
                     # threads wake the main loop immediately.  The
@@ -560,10 +567,20 @@ class PatternRunner:
         ``predecessor_id`` chaining, not via
         :meth:`_relaunch_paused`.
 
+        If a post_check has already queued a run-scoped halt (the
+        dispatch that just returned, or an earlier one whose
+        ledger write lands first), skip cohort firing.  Belt-
+        and-suspenders against a torn-down run: the halted-handle
+        stop sequence in the main loop should already have
+        cancelled the handoff loop before this hook ran, but a
+        defensive check is cheap and keeps the contract local.
+
         The ``try/finally`` guarantees ``event.done`` is always
         set — a raise here must not strand the handoff thread.
         """
         try:
+            if self._run_halted():
+                return
             for state in self._state.values():
                 trigger = state.role.trigger
                 if not isinstance(
@@ -578,6 +595,46 @@ class PatternRunner:
                     self._fire_cohort_inline(state.role)
         finally:
             event.done.set()
+
+    def _stop_driving_handles_if_halted(self) -> None:
+        """Actively stop driving-role handles once the run is halted.
+
+        "Driving" roles are ``continuous`` and ``autorestart`` —
+        their liveness is what keeps the main loop running.  Once
+        a post_check has queued a run-scoped halt, the
+        ``scope="run"`` promise is "stop the run," not "don't
+        relaunch after the current agent finishes naturally."
+        Without this step the current handoff loop can iterate
+        many more times before exiting — burning budget and
+        potentially corrupting measurement (e.g. post-GAME_OVER
+        actions inflating per-run step counts).
+
+        Calls ``handle.stop(reason=)`` on every alive driving
+        handle exactly once per halt (no-op for handles already
+        stopping / dead).  The handle's own ``wait()`` is driven
+        by the outer ``_drain_all_handles`` in ``run()``'s
+        ``finally``.
+        """
+        if not self._run_halted():
+            return
+        for state in self._state.values():
+            trigger = state.role.trigger
+            if not isinstance(
+                    trigger,
+                    (ContinuousTrigger, AutorestartTrigger),
+            ):
+                continue
+            for handle in state.handles:
+                if not handle.is_alive():
+                    continue
+                try:
+                    handle.stop(reason="run_halted")
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [pattern-runner] stop() on "
+                        f"{state.role.name!r} handle after halt "
+                        f"raised: {exc!r}"
+                    )
 
     def _fire_cohort_inline(self, role: Role) -> None:
         """Launch a cohort, drain it, return.  No pause/relaunch.

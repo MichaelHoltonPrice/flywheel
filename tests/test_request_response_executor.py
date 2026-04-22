@@ -200,6 +200,7 @@ class _ExecutorTestHarness:
         work_area: Path,
         execute_handler: Any = None,
         health_ready_after: int = 0,
+        post_checks: dict | None = None,
     ):
         self.channels: list[FakeChannel] = []
         self.popens: list[FakePopen] = []
@@ -222,6 +223,7 @@ class _ExecutorTestHarness:
             startup_timeout_s=1.0,
             execute_timeout_s=2.0,
             cancel_timeout_s=0.5,
+            post_checks=post_checks,
         )
 
 
@@ -1067,3 +1069,122 @@ class TestShutdown:
         # work_area is torn down by shutdown().
         assert not work_area.exists()
         assert harness.executor.attached_keys() == []
+
+
+class TestPostCheckInvocation:
+    """Block-declared ``post_check`` runs on every dispatch.
+
+    The executor contract is: after a block runs, the registered
+    post_check (if any) is invoked and any :class:`HaltDirective`
+    it returns is merged onto the :class:`BlockExecution` record
+    via ``halt_directive`` / ``post_check_error``.  Same shape
+    ``LocalBlockRecorder._run_post_check`` uses for lifecycle
+    blocks, so ``PatternRunner._run_halted()`` sees halts
+    uniformly regardless of which executor ran the block.
+    """
+
+    def test_halt_directive_stamped_on_execution_record(
+        self, workspace: Workspace,
+    ):
+        """A post_check returning HaltDirective writes it to the ledger."""
+        from flywheel.post_check import HaltDirective
+
+        def check(ctx):
+            return HaltDirective(
+                scope="run", reason="test-halt")
+
+        def _handler(req_id, block):
+            return {"status": "succeeded"}
+
+        harness = _ExecutorTestHarness(
+            _make_template(outputs=["game_step"]),
+            work_area=workspace.path / "runtimes" / "arc_engine",
+            execute_handler=_handler,
+            post_checks={"arc_engine": check},
+        )
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            handle = harness.executor.launch(
+                "arc_engine", workspace, input_bindings={})
+            result = handle.wait()
+
+        assert result.status == "succeeded"
+        execution = workspace.executions[result.execution_id]
+        assert execution.halt_directive == {
+            "scope": "run", "reason": "test-halt"}
+        assert execution.post_check_error is None
+
+    def test_no_post_check_leaves_record_unchanged(
+        self, workspace: Workspace,
+    ):
+        """No post_check registered → execution has no halt stamp."""
+        def _handler(req_id, block):
+            return {"status": "succeeded"}
+
+        harness = _ExecutorTestHarness(
+            _make_template(outputs=["game_step"]),
+            work_area=workspace.path / "runtimes" / "arc_engine",
+            execute_handler=_handler,
+            post_checks=None,
+        )
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            handle = harness.executor.launch(
+                "arc_engine", workspace, input_bindings={})
+            result = handle.wait()
+
+        execution = workspace.executions[result.execution_id]
+        assert execution.halt_directive is None
+        assert execution.post_check_error is None
+
+    def test_post_check_exception_captured(
+        self, workspace: Workspace,
+    ):
+        """A raising post_check fills ``post_check_error``, halt None."""
+        def check(ctx):
+            raise RuntimeError("boom")
+
+        def _handler(req_id, block):
+            return {"status": "succeeded"}
+
+        harness = _ExecutorTestHarness(
+            _make_template(outputs=["game_step"]),
+            work_area=workspace.path / "runtimes" / "arc_engine",
+            execute_handler=_handler,
+            post_checks={"arc_engine": check},
+        )
+        with patch(
+            "flywheel.executor._run_detached_container",
+            return_value="cid",
+        ), patch(
+            "flywheel.executor._docker_ps_find",
+            return_value=None,
+        ), patch(
+            "flywheel.executor._docker_wait_gone",
+            return_value=True,
+        ):
+            handle = harness.executor.launch(
+                "arc_engine", workspace, input_bindings={})
+            result = handle.wait()
+
+        execution = workspace.executions[result.execution_id]
+        assert execution.halt_directive is None
+        assert execution.post_check_error is not None
+        assert "RuntimeError" in execution.post_check_error
+        assert "boom" in execution.post_check_error

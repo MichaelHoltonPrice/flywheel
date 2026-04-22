@@ -38,13 +38,18 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from flywheel import runtime
 from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.post_check import (
+    HaltDirective,
+    PostCheckCallable,
+    PostCheckContext,
+)
 from flywheel.container import (
     ContainerConfig,
     start_container,
@@ -1295,6 +1300,84 @@ def _build_mounts(
     return mounts
 
 
+def _apply_post_check(
+    *,
+    post_check: PostCheckCallable | None,
+    execution: BlockExecution,
+    output_dirs: dict[str, Path],
+    workspace_path: Path,
+    error: str | None,
+) -> BlockExecution:
+    """Invoke the block's post_check (if any) and merge the result.
+
+    Returns ``execution`` unchanged when no check is wired.  Otherwise
+    builds a :class:`PostCheckContext` in the same shape
+    ``LocalBlockRecorder._run_post_check`` uses, invokes the
+    callable, and returns a new :class:`BlockExecution` with
+    ``halt_directive`` and / or ``post_check_error`` populated.
+    Mirrors the lifecycle-block contract so the pattern runner's
+    ledger-driven halt logic works uniformly across runner kinds.
+
+    Args:
+        post_check: The callable to invoke, or ``None``.
+        execution: The freshly-built execution record.
+        output_dirs: Map from output slot name to the per-execution
+            directory the container wrote.  Passed into the
+            context's ``outputs`` so checks can inspect what the
+            container produced (e.g. parsing a JSON blob and
+            halting on a terminal-state field).
+        workspace_path: The workspace root — surfaced on the
+            context for checks that want to peek at sibling
+            artifacts / ledger files.
+        error: The ``execution.error`` string (or ``None``), passed
+            through so checks can behave differently on
+            succeeded-but-with-a-note paths.  ``RequestResponseExecutor``
+            does not have a ``caller`` / ``params`` / ``synthetic``
+            / ``parent_execution_id`` concept today; those fields
+            are left as their :class:`PostCheckContext` defaults.
+    """
+    if post_check is None:
+        return execution
+
+    ctx = PostCheckContext(
+        block=execution.block_name,
+        execution_id=execution.id,
+        status=execution.status,  # type: ignore[arg-type]
+        caller=None,
+        params=None,
+        error=error,
+        outputs=output_dirs,
+        parent_execution_id=None,
+        synthetic=False,
+        workspace_path=workspace_path,
+    )
+
+    directive: HaltDirective | None = None
+    post_check_error: str | None = None
+    try:
+        directive = post_check(ctx)
+    except Exception as exc:  # noqa: BLE001
+        post_check_error = f"{type(exc).__name__}: {exc}"
+
+    if directive is not None and not isinstance(
+            directive, HaltDirective):
+        post_check_error = (
+            f"post_check returned "
+            f"{type(directive).__name__}, expected "
+            f"HaltDirective | None")
+        directive = None
+
+    if directive is None and post_check_error is None:
+        return execution
+
+    return replace(
+        execution,
+        halt_directive=(
+            directive.to_dict() if directive is not None else None),
+        post_check_error=post_check_error,
+    )
+
+
 def _record_pre_container_failure(
     *,
     workspace: Workspace,
@@ -1940,6 +2023,7 @@ class _RequestExecutionHandle(ExecutionHandle):
         output_dirs: dict[str, Path],
         execute_timeout_s: float,
         cancel_timeout_s: float,
+        post_check: PostCheckCallable | None = None,
     ):
         """Capture the per-request state and start the POST thread."""
         self._runtime = runtime
@@ -1955,6 +2039,7 @@ class _RequestExecutionHandle(ExecutionHandle):
         self._output_dirs = output_dirs
         self._execute_timeout_s = execute_timeout_s
         self._cancel_timeout_s = cancel_timeout_s
+        self._post_check = post_check
 
         self._response: dict[str, Any] | None = None
         self._transport_error: ControlChannelError | None = None
@@ -2106,6 +2191,19 @@ class _RequestExecutionHandle(ExecutionHandle):
             run_id=self._run_id,
             stop_reason=self._stop_reason,
         )
+        # Run the block-declared post_check (if any) before the
+        # execution record is persisted, so the ``halt_directive``
+        # / ``post_check_error`` fields the ledger reader sees are
+        # the post-check result.  Symmetric with
+        # ``LocalBlockRecorder._run_post_check``: same
+        # ``PostCheckContext`` shape, same merge onto the record.
+        execution = _apply_post_check(
+            post_check=self._post_check,
+            execution=execution,
+            output_dirs=self._output_dirs,
+            workspace_path=self._runtime.workspace.path,
+            error=error,
+        )
         self._runtime.workspace.add_execution(execution)
         self._runtime.workspace.save()
 
@@ -2161,6 +2259,8 @@ class RequestResponseExecutor:
         startup_timeout_s: float = _DEFAULT_STARTUP_TIMEOUT_S,
         execute_timeout_s: float = 600.0,
         cancel_timeout_s: float = 5.0,
+        post_checks: (
+            dict[str, "PostCheckCallable"] | None) = None,
     ):
         """Initialize with a template and optional dependencies.
 
@@ -2178,6 +2278,18 @@ class RequestResponseExecutor:
                 ``POST /execute``.
             cancel_timeout_s: HTTP read timeout for
                 ``POST /cancel``.
+            post_checks: Map from block name to the post-execution
+                callable declared in the block YAML.  When set, the
+                request handle invokes the callable after each
+                execution completes and stamps any returned
+                :class:`~flywheel.post_check.HaltDirective` onto
+                the :class:`BlockExecution` record — same ledger
+                contract ``LocalBlockRecorder`` uses for
+                ``runner: lifecycle`` blocks, so the executor path
+                honours the same policy surface for
+                ``runner: container`` blocks.  Callers pass
+                ``block_registry.post_checks`` here; an empty /
+                ``None`` dict disables the invocation.
         """
         self._template = template
         self._overrides = overrides
@@ -2188,6 +2300,8 @@ class RequestResponseExecutor:
         self._startup_timeout_s = startup_timeout_s
         self._execute_timeout_s = execute_timeout_s
         self._cancel_timeout_s = cancel_timeout_s
+        self._post_checks: dict[str, PostCheckCallable] = (
+            dict(post_checks) if post_checks else {})
 
         self._runtimes: dict[str, _RuntimeHandle] = {}
         self._registry_lock = threading.Lock()
@@ -2357,6 +2471,7 @@ class RequestResponseExecutor:
             output_dirs=output_dirs,
             execute_timeout_s=self._execute_timeout_s,
             cancel_timeout_s=self._cancel_timeout_s,
+            post_check=self._post_checks.get(block_name),
         )
 
     def shutdown(

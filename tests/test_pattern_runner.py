@@ -156,7 +156,11 @@ class _FakeWorkspace:
         return instance
 
     def add_succeeded(
-        self, block_name: str, *, run_id: str | None = None,
+        self,
+        block_name: str,
+        *,
+        run_id: str | None = None,
+        halt_directive: dict | None = None,
     ) -> None:
         """Append a succeeded execution tagged with the active run.
 
@@ -165,7 +169,9 @@ class _FakeWorkspace:
         ``run_id`` — mirrors the real executor's behaviour of
         tagging every recorded execution with the caller's
         ``run_id`` and means cadence tests don't have to know
-        the runner's own id ahead of time.
+        the runner's own id ahead of time.  ``halt_directive``
+        lets tests simulate a post-check halt landing on a
+        specific record without going through a real executor.
         """
         idx = len(self.executions)
         ex = BlockExecution(
@@ -177,6 +183,7 @@ class _FakeWorkspace:
             run_id=(
                 run_id if run_id is not None
                 else self._active_run_id()),
+            halt_directive=halt_directive,
         )
         self.executions[ex.id] = ex
 
@@ -1940,3 +1947,77 @@ class TestEventDrivenCohortFiring:
         bs_launches = [
             h for h in launches if h.name == "brainstorm"]
         assert bs_launches == []
+
+
+class TestActiveStopOnHalt:
+    """``scope="run"`` halt actively stops driving-role handles.
+
+    The pattern contract for ``scope="run"`` is "the run is over" —
+    weaker than pause (which relaunches) but stronger than "refuse
+    to relaunch after natural exit."  This test confirms the main
+    loop calls ``stop()`` on live driving handles as soon as a
+    halt lands in the ledger, rather than waiting for the handle
+    to finish on its own schedule.
+    """
+
+    def test_halt_directive_triggers_handle_stop(
+        self, tmp_path: Path,
+    ):
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        pattern = Pattern(
+            name="halt-stop-demo",
+            roles=[
+                Role(
+                    name="play",
+                    prompt=play_prompt,
+                    trigger=AutorestartTrigger(),
+                ),
+            ],
+        )
+
+        launches: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            handle = _FakeHandle(
+                kwargs, name="play",
+                execution_id=f"play-exec-{len(launches)}",
+            )
+            launches.append(handle)
+            return handle
+
+        # Driver: inject a halt-carrying execution record shortly
+        # after the play role launches, then watch for the main
+        # loop to call stop() on play's handle.
+        def driver():
+            # Wait for the initial play launch.
+            for _ in range(200):
+                if launches:
+                    break
+                time.sleep(0.005)
+            # Simulate a post_check firing by writing a halt
+            # directive onto a fresh execution record.
+            ws.add_succeeded(
+                "SomeBlock",
+                halt_directive={
+                    "scope": "run",
+                    "reason": "test-halt",
+                },
+            )
+
+        threading.Thread(target=driver, daemon=True).start()
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(tmp_path, ws),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=2.0,
+        )
+        runner.run()
+
+        # Exactly one play launch (autorestart did not refire
+        # because the halt landed before the handle finished
+        # naturally), and that launch received a stop() call.
+        assert len(launches) == 1
+        assert launches[0]._stop_calls == ["run_halted"]
