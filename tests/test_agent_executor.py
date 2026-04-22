@@ -757,3 +757,176 @@ class TestHandoffPath:
         # The agent-block kwargs must still be present.
         assert captured["block_name"] == "play"
         assert captured["prompt"] == "p"
+
+
+class TestForPattern:
+    """``for_pattern`` returns a sibling executor wired into a pattern."""
+
+    def test_carries_battery_defaults_to_sibling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        workspace: _FakeWorkspace,
+        project_root: Path,
+        template: Any,
+    ) -> None:
+        """The sibling routes through the handoff loop with the merged router.
+
+        Constructor-level battery defaults (image, auth, model,
+        ``halt_source``, ``resume_prompt``, ``max_iterations``)
+        are carried over verbatim so the sibling is a drop-in
+        replacement for the original on the pattern's launch
+        path.  The merged ``block_runner`` is what the handoff
+        loop receives; ``post_dispatch_fn`` is the adapted
+        handoff-shaped callback that strips the
+        :class:`HandoffContext` to ``tool_name``.
+        """
+        from flywheel.agent_handoff import ToolRouter
+
+        captured = _captured_kwargs()
+        inner = _FakeInnerHandle(
+            result=_agent_result(),
+            workspace=workspace,
+            write_execution=_block_execution(),
+        )
+        _patch_handoff_launcher(
+            monkeypatch, inner=inner, captured=captured)
+
+        def _fallback_runner(_: HandoffContext) -> HandoffResult:
+            return HandoffResult(content="fallback")
+
+        # Use a real ToolRouter so for_pattern's merge succeeds.
+        fallback = ToolRouter({
+            "tool_b": _fallback_runner,
+        })
+
+        def _halt_source() -> list[Any]:
+            return []
+
+        original = AgentExecutor(
+            template=template,
+            project_root=project_root,
+            agent_image="img:custom",
+            auth_volume="vol:custom",
+            model="m",
+            block_runner=fallback,
+            halt_source=_halt_source,
+            resume_prompt="resume!",
+            max_iterations=9,
+        )
+
+        pattern_router = ToolRouter({
+            "tool_a": lambda ctx: HandoffResult(content="A"),
+        })
+        seen_tool_names: list[str] = []
+
+        sibling = original.for_pattern(
+            pattern_router=pattern_router,
+            post_dispatch_fn=seen_tool_names.append,
+        )
+
+        assert sibling is not original
+
+        sibling.launch(
+            block_name="play",
+            workspace=workspace,
+            input_bindings={},
+            overrides={"prompt": "p"},
+        )
+
+        # Battery defaults were carried over.
+        assert captured["agent_image"] == "img:custom"
+        assert captured["auth_volume"] == "vol:custom"
+        assert captured["model"] == "m"
+        # Loop defaults were carried over.
+        assert captured["halt_source"] is _halt_source
+        assert captured["resume_prompt"] == "resume!"
+        assert captured["max_iterations"] == 9
+        # The merged block_runner is not the original fallback —
+        # it must dispatch the pattern's tool first, then fall
+        # through to the original on anything else.
+        merged = captured["block_runner"]
+        assert merged is not fallback
+        assert merged(HandoffContext(
+            tool_name="tool_a",
+            tool_input={},
+            session_id="s",
+            tool_use_id="u",
+            iteration=0,
+        )).content == "A"
+        assert merged(HandoffContext(
+            tool_name="tool_b",
+            tool_input={},
+            session_id="s",
+            tool_use_id="u",
+            iteration=0,
+        )).content == "fallback"
+        # The post_dispatch_fn the sibling forwards is the adapted
+        # handoff-shaped callback that strips ctx → tool_name.
+        adapter = captured["post_dispatch_fn"]
+        adapter(HandoffContext(
+            tool_name="tool_a",
+            tool_input={},
+            session_id="s",
+            tool_use_id="u",
+            iteration=0,
+        ))
+        assert seen_tool_names == ["tool_a"]
+
+    def test_collision_with_existing_router_rejected(
+        self,
+        project_root: Path,
+        template: Any,
+    ) -> None:
+        """Tool names declared by both the executor's runner and the pattern."""
+        from flywheel.agent_handoff import ToolRouter
+
+        fallback = ToolRouter({
+            "tool_a": lambda ctx: HandoffResult(content="X"),
+        })
+        pattern_router = ToolRouter({
+            "tool_a": lambda ctx: HandoffResult(content="Y"),
+        })
+        executor = AgentExecutor(
+            template=template,
+            project_root=project_root,
+            block_runner=fallback,
+        )
+        try:
+            executor.for_pattern(
+                pattern_router=pattern_router,
+                post_dispatch_fn=lambda _: None,
+            )
+        except ValueError as exc:
+            assert "tool_a" in str(exc)
+        else:
+            raise AssertionError(
+                "for_pattern should reject overlapping tool names")
+
+    def test_opaque_existing_runner_rejected(
+        self,
+        project_root: Path,
+        template: Any,
+    ) -> None:
+        """Opaque BlockRunner on the executor cannot host a pattern router."""
+        from flywheel.agent_handoff import ToolRouter
+
+        opaque = lambda ctx: HandoffResult(content="x")  # noqa: E731
+        pattern_router = ToolRouter({
+            "tool_a": lambda ctx: HandoffResult(content="A"),
+        })
+        executor = AgentExecutor(
+            template=template,
+            project_root=project_root,
+            block_runner=opaque,
+        )
+        try:
+            executor.for_pattern(
+                pattern_router=pattern_router,
+                post_dispatch_fn=lambda _: None,
+            )
+        except ValueError as exc:
+            assert "ToolRouter" in str(exc)
+        else:
+            raise AssertionError(
+                "for_pattern should reject opaque pre-bound "
+                "block_runner")

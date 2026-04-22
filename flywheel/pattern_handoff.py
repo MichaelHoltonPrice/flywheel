@@ -34,6 +34,7 @@ from flywheel.agent_handoff import (
     HandoffResult,
     ToolRouter,
 )
+from flywheel.executor import BlockExecutor
 from flywheel.instance_runtime import (
     ExecutorFactory,
     InstanceRuntimeConfig,
@@ -179,39 +180,17 @@ def wrap_launch_fn_with_router(
     existing_router: Any = None
     if isinstance(launch_fn, functools.partial):
         existing_router = launch_fn.keywords.get("block_runner")
-    if (existing_router is not None
-            and not isinstance(existing_router, ToolRouter)):
-        raise ValueError(
-            f"Pattern {pattern_name!r}: declares "
-            f"{on_tool_instance_count} on_tool instance(s) "
-            f"but the caller's ``launch_fn`` has a pre-bound "
-            f"``block_runner`` of type "
-            f"{type(existing_router).__name__!r} that is not "
-            f"a ``ToolRouter``.  Wrap the caller's routing in "
-            f"``make_tool_router(...)`` so the pattern runner "
-            f"can statically detect tool-name collisions and "
-            f"honour the 'pattern is authoritative' guarantee."
-        )
-    if isinstance(existing_router, ToolRouter):
-        overlap = (
-            pattern_router.tools()
-            & existing_router.tools()
-        )
-        if overlap:
-            raise ValueError(
-                f"Pattern {pattern_name!r}: tool(s) "
-                f"{sorted(overlap)} are declared by both the "
-                f"pattern's on_tool instances and the caller-"
-                f"supplied block_runner; refusing to dispatch "
-                f"one silently over the other"
-            )
-    merged = _MergedRouter(
+    merged = merge_block_runners(
         pattern_router=pattern_router,
         fallback=existing_router,
+        context_label=(
+            f"Pattern {pattern_name!r}: declares "
+            f"{on_tool_instance_count} on_tool instance(s) "
+            f"but the caller's ``launch_fn``"
+        ),
+        collision_label=f"Pattern {pattern_name!r}",
     )
-
-    def _adapter(ctx: HandoffContext) -> None:
-        post_dispatch_fn(ctx.tool_name)
+    adapter = adapt_post_dispatch_for_handoff(post_dispatch_fn)
 
     def _wrapped(**kwargs: Any) -> Any:
         kwargs["block_runner"] = merged
@@ -229,10 +208,127 @@ def wrap_launch_fn_with_router(
         except (TypeError, ValueError):
             forward_hook = False
         if forward_hook:
-            kwargs.setdefault("post_dispatch_fn", _adapter)
+            kwargs.setdefault("post_dispatch_fn", adapter)
         return launch_fn(**kwargs)
 
     return _wrapped
+
+
+def merge_block_runners(
+    *,
+    pattern_router: ToolRouter,
+    fallback: BlockRunner | None,
+    context_label: str = "merge_block_runners",
+    collision_label: str = "merge_block_runners",
+) -> BlockRunner:
+    """Layer a pattern's on_tool router over an existing block runner.
+
+    The same collision discipline that gates
+    :func:`wrap_launch_fn_with_router`: if ``fallback`` is non-
+    ``None`` it must be a :class:`ToolRouter`, so every tool
+    name on both sides is statically visible and a tool claimed
+    by both can be rejected at construction time.  Opaque
+    BlockRunner callables are refused — silently shadowing
+    a project-side tool with a pattern-side one would defeat
+    the "pattern is authoritative" guarantee.
+
+    The labels are stitched into the rejection messages so the
+    caller's context (which surface produced the merge) is
+    visible without the caller having to wrap the exception.
+    """
+    if (fallback is not None
+            and not isinstance(fallback, ToolRouter)):
+        raise ValueError(
+            f"{context_label} has a pre-bound "
+            f"``block_runner`` of type "
+            f"{type(fallback).__name__!r} that is not "
+            f"a ``ToolRouter``.  Wrap the project's routing "
+            f"in ``make_tool_router(...)`` so the pattern "
+            f"runner can statically detect tool-name "
+            f"collisions and honour the 'pattern is "
+            f"authoritative' guarantee."
+        )
+    if isinstance(fallback, ToolRouter):
+        overlap = pattern_router.tools() & fallback.tools()
+        if overlap:
+            raise ValueError(
+                f"{collision_label}: tool(s) "
+                f"{sorted(overlap)} are declared by both the "
+                f"pattern's on_tool instances and the caller-"
+                f"supplied block_runner; refusing to dispatch "
+                f"one silently over the other"
+            )
+    return _MergedRouter(
+        pattern_router=pattern_router,
+        fallback=fallback,
+    )
+
+
+def adapt_post_dispatch_for_handoff(
+    post_dispatch_fn: Callable[[str], None],
+) -> Callable[[HandoffContext], None]:
+    """Adapt a ``(tool_name)`` hook into the handoff loop's shape.
+
+    The pattern runner exposes its post-dispatch cadence hook
+    with a tool-name string (the runner has no business knowing
+    about :class:`HandoffContext`); the agent battery's handoff
+    loop calls back with a full :class:`HandoffContext`.  This
+    adapter is the seam: it extracts ``ctx.tool_name`` and
+    forwards exactly the slice the runner consumes.
+    """
+    def _adapter(ctx: HandoffContext) -> None:
+        post_dispatch_fn(ctx.tool_name)
+
+    return _adapter
+
+
+def make_pattern_executor_factory(
+    project_factory: ExecutorFactory,
+    *,
+    pattern_router: ToolRouter,
+    post_dispatch_fn: Callable[[str], None],
+) -> ExecutorFactory:
+    """Wrap a factory so executors integrate the pattern's on_tool router.
+
+    For each :class:`BlockDefinition`, the wrapped factory
+    delegates to ``project_factory`` and then asks the returned
+    executor whether it knows how to integrate a pattern's
+    router (duck-typed via a ``for_pattern`` method, satisfied
+    today by :class:`flywheel.agent_executor.AgentExecutor`).
+    Executors that expose the method receive a sibling instance
+    with ``pattern_router`` merged into their ``block_runner``;
+    every other executor passes through unchanged.
+
+    The wrapped executors are memoised by block name so each
+    on_tool launch reuses the same instance — building a fresh
+    :class:`AgentExecutor` per launch would be wasteful and
+    would defeat any state the executor keeps between launches
+    (e.g. an attached request-response runtime).
+
+    Pattern runners use this when the caller provides a generic
+    ``executor_factory`` *and* the pattern declares ``on_tool``
+    instances.  Patterns without ``on_tool`` instances forward
+    the project factory verbatim — there is nothing to merge.
+    """
+    cache: dict[str, BlockExecutor] = {}
+
+    def _factory(block_def: BlockDefinition) -> BlockExecutor:
+        cached = cache.get(block_def.name)
+        if cached is not None:
+            return cached
+        raw = project_factory(block_def)
+        for_pattern = getattr(raw, "for_pattern", None)
+        if callable(for_pattern):
+            wrapped = for_pattern(
+                pattern_router=pattern_router,
+                post_dispatch_fn=post_dispatch_fn,
+            )
+        else:
+            wrapped = raw
+        cache[block_def.name] = wrapped
+        return wrapped
+
+    return _factory
 
 
 def launch_fn_accepts_post_dispatch(launch_fn: Any) -> bool:

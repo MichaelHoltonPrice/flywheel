@@ -358,6 +358,86 @@ class AgentExecutor:
             predecessor_id=ov.get(OVERRIDE_PREDECESSOR_ID),
         )
 
+    def for_pattern(
+        self,
+        *,
+        pattern_router: Any,
+        post_dispatch_fn: Callable[[str], None],
+    ) -> "AgentExecutor":
+        """Return a sibling executor wired into a pattern's on_tool router.
+
+        The pattern runner builds one router from a pattern's
+        ``on_tool`` instances and asks each agent executor it
+        intends to launch to integrate that router.  This
+        method does the integration: it merges the pattern's
+        router over this executor's existing
+        ``block_runner`` and adapts the runner's
+        ``post_dispatch_fn(tool_name)`` cadence hook into the
+        :class:`HandoffContext`-shaped callback the underlying
+        handoff loop expects.  Every other constructor field
+        (image, auth, model, source_dirs, mcp_servers,
+        ``halt_source``, ...) is carried over verbatim so the
+        sibling is a drop-in replacement for this executor on
+        the pattern's launch path.
+
+        The merge runs through
+        :func:`flywheel.pattern_handoff.merge_block_runners`,
+        so the same collision discipline that gates the
+        runner's launch_fn wrapping applies here: if this
+        executor was constructed with an opaque
+        :class:`BlockRunner` (anything other than ``None`` or a
+        :class:`ToolRouter`) the merge raises immediately.
+
+        Returns a new :class:`AgentExecutor`; ``self`` is not
+        mutated.  Callers that intend to dispatch the same
+        block multiple times under one pattern should cache
+        the sibling rather than calling this on every launch.
+
+        Args:
+            pattern_router: The pattern's on_tool router.  Tools
+                it declares will be handled by it; anything else
+                falls through to this executor's existing
+                ``block_runner``.
+            post_dispatch_fn: Cadence hook fired after each
+                handoff dispatch with the dispatched tool's
+                name.  Used by the pattern runner to drive
+                ``every_n_executions`` cohort firing without
+                holding a reference to the handoff loop's own
+                callback shape.
+        """
+        from flywheel.pattern_handoff import (
+            adapt_post_dispatch_for_handoff,
+            merge_block_runners,
+        )
+        merged = merge_block_runners(
+            pattern_router=pattern_router,
+            fallback=self._block_runner,
+            context_label=(
+                f"AgentExecutor.for_pattern: this executor"),
+            collision_label="AgentExecutor.for_pattern",
+        )
+        return AgentExecutor(
+            template=self._template,
+            project_root=self._project_root,
+            agent_image=self._agent_image,
+            auth_volume=self._auth_volume,
+            model=self._model,
+            max_turns=self._max_turns,
+            total_timeout=self._total_timeout,
+            source_dirs=self._source_dirs,
+            mcp_servers=self._mcp_servers,
+            allowed_tools=self._allowed_tools,
+            extra_env=self._extra_env,
+            extra_mounts=self._extra_mounts,
+            isolated_network=self._isolated_network,
+            block_runner=merged,
+            halt_source=self._halt_source,
+            post_dispatch_fn=adapt_post_dispatch_for_handoff(
+                post_dispatch_fn),
+            resume_prompt=self._resume_prompt,
+            max_iterations=self._max_iterations,
+        )
+
 
 class AgentExecutionHandle(ExecutionHandle):
     """Adapt an agent handle to the :class:`ExecutionHandle` protocol.
