@@ -237,6 +237,7 @@ def run_agent_with_handoffs(
     *,
     block_runner: BlockRunner | None = None,
     halt_source: Callable[[], list[Any]] | None = None,
+    post_dispatch_fn: Callable[[HandoffContext], None] | None = None,
     resume_prompt: str = DEFAULT_RESUME_PROMPT,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     launch_fn: Callable[..., Any] = launch_agent_block,
@@ -277,6 +278,17 @@ def run_agent_with_handoffs(
             handoff can stop the run cleanly.  ``None`` (default)
             disables halt detection entirely; the loop runs
             until ``max_iterations`` or a non-handoff exit.
+        post_dispatch_fn: Optional callback invoked once per
+            resolved handoff (after ``block_runner`` returned and
+            ``splice_tool_result`` succeeded, before the next
+            relaunch).  Production wires this to the pattern
+            runner so event-driven cadence triggers
+            (``every_n_executions`` with ``pause:``) fire at
+            exactly the Nth execution rather than up to
+            ``poll_interval_s`` later.  The callback may block —
+            the handoff loop will not relaunch the calling agent
+            until the callback returns.  Exceptions propagate out
+            of the loop.
         resume_prompt: Stdin payload for relaunch cycles.  The
             agent runner sends this as a new user query *after*
             restoring the spliced session, so it must not
@@ -469,6 +481,16 @@ def run_agent_with_handoffs(
                 "splice_line": splice_line,
             })
 
+            # Event-driven cadence hook: fire after the block has
+            # run and its result is spliced, before the agent
+            # relaunches.  Production wires this to the pattern
+            # runner so ``every_n_executions`` triggers fire at
+            # exactly N rather than on the next poll tick.  The
+            # callback is expected to block for any pause-mode
+            # cohort it dispatches.
+            if post_dispatch_fn is not None and not block_result.is_error:
+                post_dispatch_fn(ctx)
+
         cycles.append(HandoffCycle(
             iteration=iteration,
             agent_result=agent_result,
@@ -551,6 +573,7 @@ class HandoffAgentHandle:
         block_runner: BlockRunner | None,
         launch_kwargs: dict[str, Any],
         halt_source: Callable[[], list[Any]] | None = None,
+        post_dispatch_fn: Callable[[HandoffContext], None] | None = None,
         resume_prompt: str = DEFAULT_RESUME_PROMPT,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         launch_fn: Callable[..., Any] = launch_agent_block,
@@ -570,6 +593,10 @@ class HandoffAgentHandle:
             halt_source: Forwarded to
                 :func:`run_agent_with_handoffs`.  Production
                 passes :meth:`LocalBlockRecorder.drain_halts`.
+            post_dispatch_fn: Forwarded to
+                :func:`run_agent_with_handoffs`.  Production wires
+                this to the pattern runner's event-driven cadence
+                hook.
             resume_prompt: Same as
                 :func:`run_agent_with_handoffs`.
             max_iterations: Same as
@@ -581,6 +608,7 @@ class HandoffAgentHandle:
         """
         self._block_runner = block_runner
         self._halt_source = halt_source
+        self._post_dispatch_fn = post_dispatch_fn
         self._launch_kwargs = launch_kwargs
         self._resume_prompt = resume_prompt
         self._max_iterations = max_iterations
@@ -620,6 +648,7 @@ class HandoffAgentHandle:
             self.loop_result = run_agent_with_handoffs(
                 block_runner=self._block_runner,
                 halt_source=self._halt_source,
+                post_dispatch_fn=self._post_dispatch_fn,
                 resume_prompt=self._resume_prompt,
                 max_iterations=self._max_iterations,
                 launch_fn=self._launch_fn,
@@ -684,6 +713,7 @@ def launch_agent_with_handoffs(
     *,
     block_runner: BlockRunner | None = None,
     halt_source: Callable[[], list[Any]] | None = None,
+    post_dispatch_fn: Callable[[HandoffContext], None] | None = None,
     resume_prompt: str = DEFAULT_RESUME_PROMPT,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     launch_fn: Callable[..., Any] = launch_agent_block,
@@ -725,6 +755,7 @@ def launch_agent_with_handoffs(
     Args:
         block_runner: Forwarded to :class:`HandoffAgentHandle`.
         halt_source: Forwarded to :class:`HandoffAgentHandle`.
+        post_dispatch_fn: Forwarded to :class:`HandoffAgentHandle`.
         resume_prompt: Same.
         max_iterations: Same.
         launch_fn: Same.
@@ -740,6 +771,7 @@ def launch_agent_with_handoffs(
         block_runner=block_runner,
         launch_kwargs=launch_kwargs,
         halt_source=halt_source,
+        post_dispatch_fn=post_dispatch_fn,
         resume_prompt=resume_prompt,
         max_iterations=max_iterations,
         launch_fn=launch_fn,

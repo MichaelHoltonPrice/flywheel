@@ -36,9 +36,12 @@ depend on Docker.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
+import queue
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -91,6 +94,29 @@ class _RoleState:
     role: Role
     handles: list[_Handle] = field(default_factory=list)
     cohorts_fired: int = 0
+
+
+@dataclass
+class _PostDispatchEvent:
+    """One post-dispatch cadence check enqueued by the handoff loop.
+
+    Pushed by :meth:`PatternRunner._post_dispatch_hook` from the
+    HANDOFF thread; drained by the main loop which fires any due
+    cohorts synchronously and then sets :attr:`done` so the
+    handoff loop can relaunch the calling agent.
+
+    Attributes:
+        block_name: The block whose dispatch just completed.  Only
+            triggers with ``of_block == block_name`` are evaluated
+            — avoids scanning irrelevant roles.
+        done: Set by the main loop once cohorts have been fired
+            and drained.  The handoff loop blocks on this event,
+            making it the effective pause mechanism for
+            ``pause:[]`` cohorts.
+    """
+
+    block_name: str
+    done: threading.Event
 
 
 @dataclass(frozen=True)
@@ -283,13 +309,36 @@ class PatternRunner:
             r.name: [] for r in synthesized_roles
         }
 
+        # Event-driven cadence:  ``_post_dispatch_hook`` pushes to
+        # this queue from the HANDOFF thread after a block_runner
+        # dispatch completes; the main loop drains the queue,
+        # fires any due every_n_executions cohorts synchronously,
+        # and signals completion so the caller's handoff loop can
+        # resume.  The queue doubles as the main-loop wake source:
+        # ``queue.Queue.get(timeout=poll_interval_s)`` replaces a
+        # plain ``time.sleep`` so an incoming event wakes the main
+        # loop immediately instead of up to one poll interval late.
+        self._event_queue: queue.Queue[_PostDispatchEvent] = (
+            queue.Queue())
+
         # If the pattern owns tool dispatch, wrap ``launch_fn``
-        # so every call forwards a merged block_runner.  The
-        # merge raises at construction time on any collision
-        # with a ``ToolRouter`` already pre-bound by partial.
+        # so every call forwards a merged block_runner and a
+        # post_dispatch_fn.  The merge raises at construction time
+        # on any collision with a ``ToolRouter`` already pre-bound
+        # by partial.
         if self._pattern_tool_router is not None:
             self._launch_fn = self._wrap_launch_fn_with_router(
                 launch_fn, self._pattern_tool_router)
+
+        # Map block name → whether any every_n_executions trigger
+        # references it.  Used by ``_post_dispatch_hook`` to
+        # skip the event round-trip for dispatches that can't
+        # cause a cohort to fire.
+        self._blocks_watched_for_cadence: set[str] = {
+            state.role.trigger.of_block
+            for state in self._state.values()
+            if isinstance(state.role.trigger, EveryNExecutionsTrigger)
+        }
 
         # Assigned in :meth:`run` — a run is opened exactly when
         # execution begins, not at construction.  Construction can
@@ -347,7 +396,18 @@ class PatternRunner:
                         break
                     self._evaluate_ledger_triggers()
                     self._refire_autorestart_if_ready()
-                    time.sleep(self._poll)
+                    # Block on the event queue instead of a bare
+                    # sleep so post-dispatch hooks from HANDOFF
+                    # threads wake the main loop immediately.  The
+                    # timeout keeps the poll fallback intact for
+                    # triggers that aren't event-driven
+                    # (autorestart on death, max_runtime).
+                    try:
+                        event = self._event_queue.get(
+                            timeout=self._poll)
+                    except queue.Empty:
+                        continue
+                    self._handle_post_dispatch_event(event)
             finally:
                 self._drain_all_handles()
             status = "stopped" if timed_out else "succeeded"
@@ -469,6 +529,11 @@ class PatternRunner:
         :class:`flywheel.local_block.LocalBlockRecorder`; counting
         them here would double-count infrastructure failures as
         "real" progress.
+
+        This is a poll-driven backstop; the event-driven path in
+        :meth:`_handle_post_dispatch_event` handles the common case
+        where a cohort becomes due because an on_tool dispatch just
+        completed.
         """
         for state in self._state.values():
             trigger = state.role.trigger
@@ -479,6 +544,117 @@ class PatternRunner:
             cohorts_due = succeeded // trigger.n
             while state.cohorts_fired < cohorts_due:
                 self._fire_role(state.role)
+
+    def _handle_post_dispatch_event(
+        self, event: _PostDispatchEvent,
+    ) -> None:
+        """Fire any cohort now due for ``event.block_name``, then signal.
+
+        Runs on the main thread after a HANDOFF thread's
+        post-dispatch hook enqueued the event.  The handoff loop
+        is blocked on ``event.done`` — that block IS the pause for
+        ``pause:[]`` cohorts, so this method deliberately skips
+        :meth:`_pause_and_drain` / :meth:`_relaunch_paused`.  The
+        calling agent resumes when we set ``event.done``; it
+        relaunches via its handoff loop's normal
+        ``predecessor_id`` chaining, not via
+        :meth:`_relaunch_paused`.
+
+        The ``try/finally`` guarantees ``event.done`` is always
+        set — a raise here must not strand the handoff thread.
+        """
+        try:
+            for state in self._state.values():
+                trigger = state.role.trigger
+                if not isinstance(
+                        trigger, EveryNExecutionsTrigger):
+                    continue
+                if trigger.of_block != event.block_name:
+                    continue
+                succeeded = self._count_succeeded(
+                    trigger.of_block)
+                cohorts_due = succeeded // trigger.n
+                while state.cohorts_fired < cohorts_due:
+                    self._fire_cohort_inline(state.role)
+        finally:
+            event.done.set()
+
+    def _fire_cohort_inline(self, role: Role) -> None:
+        """Launch a cohort, drain it, return.  No pause/relaunch.
+
+        The event-driven variant of :meth:`_fire_role`: used when
+        the calling agent is already blocked on a
+        :class:`_PostDispatchEvent` (so it's effectively paused
+        without us stopping its handle), and will resume itself
+        via its own handoff loop's ``predecessor_id`` chaining
+        once we return.  Calling :meth:`_pause_and_drain` here
+        would deadlock — the caller's handle is alive (its thread
+        is running, just blocked in the hook); stopping it would
+        forward to an ``is_alive() is None`` inner handle (we are
+        between container launches), and ``handle.wait()`` would
+        block forever because we ARE that thread.
+        """
+        state = self._state[role.name]
+        cohort_index = state.cohorts_fired
+        cohort_handles: list[_Handle] = []
+        for member_index in range(role.cardinality):
+            kwargs = self._kwargs_for(
+                role,
+                cohort_index=cohort_index,
+                member_index=member_index,
+            )
+            print(
+                f"  [pattern-runner] firing role "
+                f"{role.name!r} cohort {cohort_index} member "
+                f"{member_index + 1}/{role.cardinality} "
+                f"(event-driven)"
+            )
+            handle = self._launch_fn(**kwargs)
+            state.handles.append(handle)
+            cohort_handles.append(handle)
+        state.cohorts_fired += 1
+        self._drain_cohort(role.name, cohort_handles)
+
+    def _post_dispatch_hook(
+        self, ctx: HandoffContext,
+    ) -> None:
+        """Called from HANDOFF thread after each successful dispatch.
+
+        Resolves the block name behind the tool, skips if no
+        ``every_n_executions`` trigger watches that block, otherwise
+        enqueues an event and blocks until the main loop has
+        evaluated triggers and signalled completion.
+
+        Blocking here is the pause mechanism for ``pause:[]``
+        cohorts — the agent's handoff loop doesn't relaunch the
+        next container until this hook returns.
+        """
+        block_name = self._block_name_for_tool(ctx.tool_name)
+        if block_name is None:
+            return
+        if block_name not in self._blocks_watched_for_cadence:
+            return
+        event = _PostDispatchEvent(
+            block_name=block_name,
+            done=threading.Event(),
+        )
+        self._event_queue.put(event)
+        event.done.wait()
+
+    def _block_name_for_tool(self, tool_name: str) -> str | None:
+        """Return the block dispatched by ``tool_name``, or None.
+
+        Scans the pattern's ``on_tool`` instances; returns ``None``
+        for tools handled by a project-side fallback runner (those
+        dispatches don't flow through this pattern runner's
+        cohort bookkeeping, so the post-dispatch hook is a no-op).
+        """
+        for inst in self._on_tool_instances:
+            trigger = inst.trigger
+            if (isinstance(trigger, OnToolTrigger)
+                    and trigger.tool == tool_name):
+                return inst.block
+        return None
 
     def _count_succeeded(self, block_name: str) -> int:
         """Count non-synthetic succeeded executions of ``block_name``.
@@ -1043,8 +1219,26 @@ class PatternRunner:
             fallback=existing_router,
         )
 
+        post_dispatch_fn = self._post_dispatch_hook
+
         def _wrapped(**kwargs: Any) -> _Handle:
             kwargs["block_runner"] = merged
+            # Only forward post_dispatch_fn when the callee's
+            # launcher accepts it.  ``launch_agent_with_handoffs``
+            # (production) does; bare ``launch_agent_block`` does
+            # not.  The pattern runner's default ``launch_fn`` is
+            # the latter so tests that don't need handoff loop
+            # semantics keep working; production wires the former
+            # via ``functools.partial`` in
+            # :func:`cyberarc.project.ProjectHooks.init`.
+            try:
+                sig_params = _launch_fn_accepts_post_dispatch(
+                    launch_fn)
+            except (TypeError, ValueError):
+                sig_params = False
+            if sig_params:
+                kwargs.setdefault(
+                    "post_dispatch_fn", post_dispatch_fn)
             return launch_fn(**kwargs)
 
         return _wrapped
@@ -1129,6 +1323,33 @@ class _MergedRouter:
             ),
             is_error=True,
         )
+
+
+def _launch_fn_accepts_post_dispatch(launch_fn: Any) -> bool:
+    """Return True if ``launch_fn`` accepts a ``post_dispatch_fn`` kwarg.
+
+    Handles :class:`functools.partial` by unwrapping to the inner
+    callable.  Inspecting ``inspect.signature`` is safe for
+    production callers (``launch_agent_with_handoffs``,
+    ``launch_agent_block``) and for tests passing plain
+    ``lambda``s with ``**kwargs`` — the latter returns ``True`` on
+    the ``**kwargs`` varkeyword entry.  Unknown callable kinds
+    return ``False`` so the router silently declines to forward
+    the hook rather than crashing at launch time.
+    """
+    target = launch_fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.name == "post_dispatch_fn":
+            return True
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 def _role_from_instance(inst: BlockInstance) -> Role:

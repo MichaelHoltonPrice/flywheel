@@ -279,14 +279,19 @@ class _FakeHandle:
 def _base_config(
     tmp_path: Path,
     workspace: _FakeWorkspace,
+    *,
+    template: Template | None = None,
 ) -> AgentBlockConfig:
     """Build an AgentBlockConfig that points at the fake workspace.
 
     The runner only reads ``project_root``, ``workspace`` and
     ``template`` from this; everything else is forwarded to the
-    fake launch_fn unchanged.
+    fake launch_fn unchanged.  Tests that need the template to
+    declare specific blocks (e.g. for ``on_tool`` instances to
+    resolve against) can pass ``template=`` explicitly.
     """
-    template = Template(name="t", artifacts=[], blocks=[])
+    if template is None:
+        template = Template(name="t", artifacts=[], blocks=[])
     return AgentBlockConfig(
         workspace=workspace,  # type: ignore[arg-type]
         template=template,
@@ -1662,3 +1667,276 @@ class TestPauseAndRelaunch:
 
         # Play was never stopped — no pause field.
         assert play_handle_ref[0]._stop_calls == []
+
+
+class TestEventDrivenCohortFiring:
+    """``post_dispatch_fn`` fires ``every_n_executions`` at exactly N.
+
+    The polling-based path fires up to ``poll_interval_s`` late —
+    on a busy handoff loop that means the Nth cohort can fire
+    after the (N+1)th ``ExecuteAction`` has already completed.  The
+    event-driven hook closes that race: the handoff loop blocks
+    on the hook until the runner has fired any due cohorts.
+
+    These tests exercise the hook at two granularities:
+
+    - :meth:`test_hook_returns_after_cohort_fires_in_main_loop`
+      is the integration path — a fake ``launch_fn`` that
+      simulates the handoff loop by calling the runner's
+      ``post_dispatch_fn`` after each ``ExecuteAction``.
+    - :meth:`test_hook_skips_unwatched_blocks` confirms the hook
+      short-circuits when no ``every_n_executions`` trigger
+      watches the dispatched block (the common no-cadence path
+      shouldn't pay for a queue round-trip).
+    """
+
+    def _pattern(self, play_prompt: str, bs_prompt: str) -> Pattern:
+        """Pattern with play, execute_action on_tool, brainstorm every-2.
+
+        ``of_block`` matches the block dispatched by the on_tool
+        instance (``ExecuteAction``) — the hook resolves the tool
+        name back to this block via
+        :meth:`PatternRunner._block_name_for_tool`.
+        """
+        return Pattern(
+            name="event-cohort-demo",
+            roles=[],
+            instances=[
+                BlockInstance(
+                    name="play",
+                    block="play",
+                    trigger=ContinuousTrigger(),
+                    prompt=play_prompt,
+                ),
+                BlockInstance(
+                    name="execute_action",
+                    block="ExecuteAction",
+                    trigger=OnToolTrigger(
+                        instance="play",
+                        tool="mcp__arc__take_action",
+                    ),
+                ),
+                BlockInstance(
+                    name="brainstorm",
+                    block="brainstorm",
+                    trigger=EveryNExecutionsTrigger(
+                        of_block="ExecuteAction",
+                        n=2,
+                        pause=("play",),
+                    ),
+                    prompt=bs_prompt,
+                    cardinality=1,
+                ),
+            ],
+        )
+
+    def _template(self) -> Template:
+        return Template(
+            name="t",
+            artifacts=[ArtifactDeclaration(
+                name="action", kind="copy")],
+            blocks=[BlockDefinition(
+                name="ExecuteAction",
+                image="dummy:latest",
+                runner="container",
+                lifecycle="workspace_persistent",
+                inputs=[InputSlot(
+                    name="action",
+                    container_path="/input/action",
+                )],
+            )],
+        )
+
+    def test_hook_returns_after_cohort_fires_in_main_loop(
+        self, tmp_path: Path,
+    ):
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "bs")
+        pattern = self._pattern(play_prompt, bs_prompt)
+        template = self._template()
+
+        # Capture the hook the runner injects into play's launch
+        # so the test-side "handoff loop" can call it.
+        captured_hook: list = []
+        launches: list[_FakeHandle] = []
+        cohort_fired_before_action_3 = threading.Event()
+
+        def launch_fn(**kwargs):
+            prompt = kwargs.get("prompt", "")
+            if prompt == "play":
+                hook = kwargs.get("post_dispatch_fn")
+                if hook is not None and not captured_hook:
+                    captured_hook.append(hook)
+                handle = _FakeHandle(
+                    kwargs, name="play",
+                    execution_id="play-exec-1",
+                )
+            else:
+                handle = _FakeHandle(
+                    kwargs, name="brainstorm",
+                    execution_id="bs-exec",
+                )
+                handle.finish(execution_id="bs-exec")
+            launches.append(handle)
+            return handle
+
+        def driver():
+            # Wait until the runner has captured the hook.
+            for _ in range(100):
+                if captured_hook:
+                    break
+                time.sleep(0.01)
+            hook = captured_hook[0]
+
+            # Action 1: record, dispatch hook — no cohort due.
+            ws.add_succeeded("ExecuteAction")
+            ctx1 = HandoffContext(
+                tool_name="mcp__arc__take_action",
+                tool_input={}, session_id="", tool_use_id="t1",
+                iteration=0,
+            )
+            hook(ctx1)
+            ea_count = sum(
+                1 for ex in ws.executions.values()
+                if ex.block_name == "ExecuteAction"
+                and ex.status == "succeeded"
+            )
+            assert ea_count == 1
+
+            # Action 2: record, dispatch hook — cohort MUST fire
+            # and drain BEFORE the hook returns.  Counting
+            # brainstorm launches before hook returns proves the
+            # event-driven path is synchronous.
+            ws.add_succeeded("ExecuteAction")
+            bs_before = sum(
+                1 for h in launches if h.name == "brainstorm")
+            ctx2 = HandoffContext(
+                tool_name="mcp__arc__take_action",
+                tool_input={}, session_id="", tool_use_id="t2",
+                iteration=0,
+            )
+            hook(ctx2)
+            bs_after = sum(
+                1 for h in launches if h.name == "brainstorm")
+            assert bs_after - bs_before == 1, (
+                f"cohort did not fire synchronously in hook "
+                f"(before={bs_before}, after={bs_after})"
+            )
+            cohort_fired_before_action_3.set()
+
+            # Let the play handle finish so the run terminates.
+            launches[0].finish(execution_id="play-exec-1")
+
+        threading.Thread(target=driver, daemon=True).start()
+
+        class _StubExecutor:
+            def launch(self, **_):
+                raise AssertionError(
+                    "executor.launch should not run in this test")
+
+        def executor_factory(block_def):
+            return _StubExecutor()
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(
+                tmp_path, ws, template=template),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=5.0,
+            executor_factory=executor_factory,
+            per_instance_runtime_config={
+                "execute_action": InstanceRuntimeConfig(),
+            },
+        )
+        runner.run()
+
+        # Final check: exactly 1 cohort (brainstorm cardinality 1,
+        # so 1 brainstorm launch).  If the hook had NOT fired the
+        # cohort synchronously, the poll backstop would still fire
+        # it eventually — but the driver's mid-flight assertion
+        # above would have failed first.
+        assert cohort_fired_before_action_3.is_set()
+        bs_launches = [
+            h for h in launches if h.name == "brainstorm"]
+        assert len(bs_launches) == 1
+
+    def test_hook_skips_unwatched_blocks(
+        self, tmp_path: Path,
+    ):
+        """Dispatches for blocks no trigger watches cost no event."""
+        ws = _FakeWorkspace(tmp_path)
+        play_prompt = _write_prompt(tmp_path, "play.md", "play")
+        bs_prompt = _write_prompt(tmp_path, "bs.md", "bs")
+        pattern = self._pattern(play_prompt, bs_prompt)
+        template = self._template()
+
+        captured_hook: list = []
+        launches: list[_FakeHandle] = []
+
+        def launch_fn(**kwargs):
+            prompt = kwargs.get("prompt", "")
+            if prompt == "play":
+                hook = kwargs.get("post_dispatch_fn")
+                if hook is not None and not captured_hook:
+                    captured_hook.append(hook)
+                handle = _FakeHandle(
+                    kwargs, name="play",
+                    execution_id="play-exec-1",
+                )
+            else:
+                handle = _FakeHandle(
+                    kwargs, name="brainstorm",
+                    execution_id="bs-exec",
+                )
+                handle.finish(execution_id="bs-exec")
+            launches.append(handle)
+            return handle
+
+        def driver():
+            for _ in range(100):
+                if captured_hook:
+                    break
+                time.sleep(0.01)
+            hook = captured_hook[0]
+
+            # Dispatch a tool the pattern doesn't route via
+            # every_n_executions — should return immediately and
+            # not enqueue anything.
+            ctx = HandoffContext(
+                tool_name="mcp__some_unrelated__tool",
+                tool_input={}, session_id="",
+                tool_use_id="unrelated",
+                iteration=0,
+            )
+            hook(ctx)
+            launches[0].finish(execution_id="play-exec-1")
+
+        threading.Thread(target=driver, daemon=True).start()
+
+        class _StubExecutor:
+            def launch(self, **_):
+                raise AssertionError("unused")
+
+        def executor_factory(block_def):
+            return _StubExecutor()
+
+        runner = PatternRunner(
+            pattern,
+            base_config=_base_config(
+                tmp_path, ws, template=template),
+            launch_fn=launch_fn,
+            poll_interval_s=0.01,
+            max_total_runtime_s=2.0,
+            executor_factory=executor_factory,
+            per_instance_runtime_config={
+                "execute_action": InstanceRuntimeConfig(),
+            },
+        )
+        runner.run()
+
+        # No brainstorm launches from the unrelated dispatch.
+        bs_launches = [
+            h for h in launches if h.name == "brainstorm"]
+        assert bs_launches == []
