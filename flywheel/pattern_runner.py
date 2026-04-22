@@ -59,7 +59,7 @@ from flywheel.agent_handoff import (
     HandoffResult,
     ToolRouter,
 )
-from flywheel.executor import BlockExecutor
+from flywheel.executor import BlockExecutor, ExecutionResult
 from flywheel.pattern import (
     AutorestartTrigger,
     BlockInstance,
@@ -169,8 +169,11 @@ class PatternRunResult:
         agents_launched: Total number of individual agent
             launches across all roles, summed over cohorts and
             cardinality.
-        results_by_role: Per-role list of agent results, in the
-            order :class:`AgentResult` instances were collected.
+        results_by_role: Per-role list of result objects, in the
+            order they were collected.  Agent-dispatched roles
+            yield :class:`AgentResult`; executor-dispatched
+            (prompt-less) roles yield
+            :class:`flywheel.executor.ExecutionResult`.
             Continuous roles populate this on termination; cohort
             roles populate this as each cohort drains.
     """
@@ -179,7 +182,7 @@ class PatternRunResult:
     run_id: str
     cohorts_by_role: dict[str, int]
     agents_launched: int
-    results_by_role: dict[str, list[AgentResult]]
+    results_by_role: dict[str, list[AgentResult | ExecutionResult]]
 
 
 class PatternRunner:
@@ -305,9 +308,9 @@ class PatternRunner:
             r.name: _RoleState(role=r)
             for r in synthesized_roles
         }
-        self._results: dict[str, list[AgentResult]] = {
-            r.name: [] for r in synthesized_roles
-        }
+        self._results: dict[
+            str, list[AgentResult | ExecutionResult]
+        ] = {r.name: [] for r in synthesized_roles}
 
         # Event-driven cadence:  ``_post_dispatch_hook`` pushes to
         # this queue from the HANDOFF thread after a block_runner
@@ -655,18 +658,17 @@ class PatternRunner:
         cohort_index = state.cohorts_fired
         cohort_handles: list[_Handle] = []
         for member_index in range(role.cardinality):
-            kwargs = self._kwargs_for(
-                role,
-                cohort_index=cohort_index,
-                member_index=member_index,
-            )
             print(
                 f"  [pattern-runner] firing role "
                 f"{role.name!r} cohort {cohort_index} member "
                 f"{member_index + 1}/{role.cardinality} "
                 f"(event-driven)"
             )
-            handle = self._launch_fn(**kwargs)
+            handle = self._launch_role_member(
+                role,
+                cohort_index=cohort_index,
+                member_index=member_index,
+            )
             state.handles.append(handle)
             cohort_handles.append(handle)
         state.cohorts_fired += 1
@@ -757,16 +759,16 @@ class PatternRunner:
 
         cohort_handles: list[_Handle] = []
         for member_index in range(role.cardinality):
-            kwargs = self._kwargs_for(
-                role, cohort_index=cohort_index,
-                member_index=member_index,
-            )
             print(
                 f"  [pattern-runner] firing role "
                 f"{role.name!r} cohort {cohort_index} member "
                 f"{member_index + 1}/{role.cardinality}"
             )
-            handle = self._launch_fn(**kwargs)
+            handle = self._launch_role_member(
+                role,
+                cohort_index=cohort_index,
+                member_index=member_index,
+            )
             state.handles.append(handle)
             cohort_handles.append(handle)
 
@@ -878,13 +880,6 @@ class PatternRunner:
                 continue
             prev_id = stopped_prev_id[name]
             for member_index in range(paused.role.cardinality):
-                kwargs = self._kwargs_for(
-                    paused.role,
-                    cohort_index=0,
-                    member_index=member_index,
-                )
-                if prev_id is not None:
-                    kwargs["predecessor_id"] = prev_id
                 print(
                     f"  [pattern-runner] relaunching paused "
                     f"{name!r} member "
@@ -892,8 +887,180 @@ class PatternRunner:
                     f"{paused.role.cardinality} "
                     f"(predecessor={prev_id})"
                 )
-                handle = self._launch_fn(**kwargs)
+                handle = self._launch_role_member(
+                    paused.role,
+                    cohort_index=0,
+                    member_index=member_index,
+                    predecessor_id=prev_id,
+                )
                 paused.handles.append(handle)
+
+    def _launch_role_member(
+        self,
+        role: Role,
+        *,
+        cohort_index: int,
+        member_index: int,
+        predecessor_id: str | None = None,
+    ) -> _Handle:
+        """Launch one cohort member; pick agent vs. executor dispatch.
+
+        A role with no declared prompt is dispatched directly via
+        ``executor_factory(block_def).launch(...)`` — the agent
+        battery is not in the picture.  This is how pure-container
+        patterns (continuous or autorestart roles whose target
+        block is, e.g., a one-shot training container) drive a
+        run without inheriting any agent surface.
+
+        A role with a prompt is dispatched through the legacy
+        agent launch path (``launch_fn`` + ``_kwargs_for``).  The
+        agent path stays unchanged in this slice; a follow-up
+        slice replaces it with an :class:`AgentExecutor` invoked
+        through the same factory.
+
+        Predecessor chaining (``predecessor_id``) is honoured for
+        the agent path (session restore).  The executor path
+        silently drops it: the
+        :class:`flywheel.executor.BlockExecutor` protocol does not
+        declare a chaining concept, and probing executor-specific
+        kwarg tolerance is too magical for a protocol boundary.
+        See :meth:`_dispatch_role_via_executor` for the rationale
+        and the migration path.
+        """
+        if self._role_uses_executor_dispatch(role):
+            return self._dispatch_role_via_executor(
+                role,
+                cohort_index=cohort_index,
+                member_index=member_index,
+                predecessor_id=predecessor_id,
+            )
+        kwargs = self._kwargs_for(
+            role,
+            cohort_index=cohort_index,
+            member_index=member_index,
+        )
+        if predecessor_id is not None:
+            kwargs["predecessor_id"] = predecessor_id
+        return self._launch_fn(**kwargs)
+
+    def _role_uses_executor_dispatch(self, role: Role) -> bool:
+        """Return True iff ``role`` is dispatched via the executor seam.
+
+        Today the discriminator is "no prompt declared on the
+        instance" — agents always declare a prompt; pure-container
+        instances never do.  A future slice introduces an explicit
+        ``battery:`` field on :class:`BlockDefinition` so the
+        discriminator becomes a property of the block, not the
+        instance.
+
+        The runner-synthesized ``Role`` carries the empty string
+        when an instance had no prompt (see
+        :func:`_role_from_instance`); the dataclass default for
+        the legacy ``roles:`` grammar is also ``""``-ish at
+        construction, but the YAML loader requires a non-empty
+        value there, so an empty prompt only ever reaches this
+        method for instance-grammar pure-container roles.
+        """
+        return role.prompt == ""
+
+    def _dispatch_role_via_executor(
+        self,
+        role: Role,
+        *,
+        cohort_index: int,
+        member_index: int,
+        predecessor_id: str | None = None,
+    ) -> _Handle:
+        """Launch one cohort member via the executor factory.
+
+        Builds the protocol-level launch arguments
+        (``block_name``, ``workspace``, ``input_bindings``,
+        ``run_id``) plus the well-known executor extras
+        (``extra_env``, ``extra_mounts``) and calls
+        ``executor_factory(block_def).launch(...)``.  The returned
+        handle satisfies the runner's :class:`_Handle` protocol —
+        :class:`flywheel.executor.ExecutionHandle` instances do —
+        so the rest of the runner (drain, stop-on-halt, result
+        recording) is handle-shape agnostic.
+
+        ``cohort_index`` / ``member_index`` are accepted for
+        signature parity with :meth:`_kwargs_for` but unused
+        today: container blocks differentiate parallel members
+        through the executor's own per-launch state (e.g.,
+        unique scratch dirs), not via runner-driven naming.
+
+        ``predecessor_id`` is intentionally **dropped** on this
+        path.  The :class:`flywheel.executor.BlockExecutor`
+        protocol does not declare a chaining concept — that
+        belongs to the agent battery, where it threads session
+        restore between handoff iterations.  Container
+        executors have no equivalent semantics, so silently
+        suppressing it here keeps the runner inside the
+        protocol contract instead of probing executor-specific
+        kwarg tolerance.  An explicit chaining concept on the
+        protocol is the right home for "yes, this block can
+        chain" in the future; until then,
+        :meth:`_relaunch_paused` is a no-op for the chain part
+        when the paused role is executor-dispatched.
+
+        Per-instance runtime knobs are layered on top of
+        ``role.extra_env`` from
+        ``self._per_instance_runtime_config[role.name]`` (same
+        source the on_tool dispatch path consumes), so a
+        prompt-less continuous role can declare
+        ``extra_env`` / ``extra_mounts`` from the project hook
+        without going through the agent surface.  Role-declared
+        env wins over the runtime config on key collision —
+        symmetric with :meth:`_merge_env`.
+
+        Raises:
+            ValueError: When no ``executor_factory`` was supplied
+                to the runner, or when the role's target block
+                cannot be resolved against the template.
+        """
+        del cohort_index, member_index, predecessor_id
+        if self._executor_factory is None:
+            raise ValueError(
+                f"Pattern {self._pattern.name!r} role "
+                f"{role.name!r}: instance has no prompt and is "
+                f"dispatched via the executor seam, but no "
+                f"``executor_factory`` was supplied to "
+                f"PatternRunner.  Provide an ``executor_factory`` "
+                f"that returns a BlockExecutor for block "
+                f"{role.block_name or role.name!r}."
+            )
+        block_name = role.block_name or role.name
+        block_def = self._find_block(block_name)
+        if block_def is None:
+            raise ValueError(
+                f"Pattern {self._pattern.name!r} role "
+                f"{role.name!r}: target block {block_name!r} is "
+                f"not declared in the template."
+            )
+        bindings = self._collect_inputs(role) or {}
+
+        runtime_cfg = self._per_instance_runtime_config.get(
+            role.name, InstanceRuntimeConfig())
+        merged_env: dict[str, str] = dict(
+            runtime_cfg.extra_env or {})
+        if role.extra_env:
+            merged_env.update(role.extra_env)
+
+        extras: dict[str, Any] = {}
+        if merged_env:
+            extras["extra_env"] = merged_env
+        if runtime_cfg.extra_mounts:
+            extras["extra_mounts"] = list(
+                runtime_cfg.extra_mounts)
+
+        executor = self._executor_factory(block_def)
+        return executor.launch(
+            block_name=block_name,
+            workspace=self._base.workspace,
+            input_bindings=bindings,
+            run_id=self._run_id,
+            **extras,
+        )
 
     def _kwargs_for(
         self,
@@ -1419,11 +1586,17 @@ def _role_from_instance(inst: BlockInstance) -> Role:
     runs the right block even when its name differs from the
     instance name.
 
-    ``prompt`` is required on the generated role (the agent
-    launcher needs it); instances without a prompt are only
-    meaningful with triggers this helper never sees
-    (``on_tool``), so an empty prompt here indicates a bug
-    upstream.
+    ``prompt`` is the discriminator for the runner's two
+    dispatch paths: a non-empty prompt routes to the agent
+    launcher (the legacy path); an empty prompt — produced
+    here when the instance declared no ``prompt:`` field — is
+    the bridge signal for executor-seam dispatch (continuous
+    or autorestart roles whose target block is a one-shot
+    container, a workspace-persistent runtime, etc.).  A
+    future ``BlockDefinition.battery`` field replaces this
+    heuristic.  ``on_tool`` instances skip this helper
+    entirely; their dispatch is built directly from the
+    pattern's tool router.
     """
     return Role(
         name=inst.name,
