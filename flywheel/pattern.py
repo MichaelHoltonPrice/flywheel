@@ -17,15 +17,15 @@ Conceptual shape::
     roles:
       play:
         prompt: workforce/prompts/arc_predict_play.md
-        model: claude-sonnet-4-6
         cardinality: 1
         trigger:
           kind: continuous
         inputs: [predictor, mechanics_summary]
         outputs: [game_log]
+        overrides:
+          model: claude-sonnet-4-6
       brainstorm:
         prompt: workforce/prompts/arc_brainstorm.md
-        model: claude-sonnet-4-6
         cardinality: 6
         trigger:
           kind: every_n_executions
@@ -33,6 +33,17 @@ Conceptual shape::
           n: 20
         inputs: [game_history, mechanics_summary]
         outputs: [brainstorm_result]
+        overrides:
+          model: claude-sonnet-4-6
+
+Per-role / per-instance executor knobs (``model``,
+``mcp_servers``, ``allowed_tools``, ``max_turns``,
+``total_timeout``, ...) live under the free-form
+``overrides:`` mapping; the runner forwards them verbatim into
+the executor's ``overrides`` dict and each executor reads what
+it cares about.  The schema deliberately does not type these
+fields so adding a new battery-specific knob does not require
+a substrate change.
 
 Triggers are a small declarative vocabulary intentionally kept
 narrow:
@@ -59,7 +70,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
@@ -212,48 +223,54 @@ Trigger = (
 
 @dataclass(frozen=True)
 class Role:
-    """A role in a pattern: one logical kind of agent.
+    """A role in a pattern: one logical kind of launchable block.
 
-    A role launches one or more identical agent instances when
-    its trigger fires (``cardinality`` agents per firing).  All
-    instances see the same prompt and model; per-instance
+    A role launches one or more identical block instances when
+    its trigger fires (``cardinality`` per firing).  Per-instance
     differentiation is the runner's responsibility (e.g., a
     cohort index in the input artifacts).
 
     Attributes:
         name: Role identifier, unique within the pattern.
-        prompt: Project-relative path to the system-prompt file
-            (read as text by the runner; no templating here).
-        model: Model identifier passed through to the agent
-            launcher (e.g., ``"claude-sonnet-4-6"``).  None lets
-            the runner / project default decide.
-        cardinality: How many parallel agents to launch per
-            firing.  Must be ``>= 1``.  Defaults to ``1``.
+        prompt: Project-relative path to a prompt file the
+            runner reads as text and forwards via
+            ``overrides["prompt"]``.  Empty string means the
+            role does not carry a prompt (typical for non-agent
+            blocks such as a ``workspace_persistent`` container);
+            in that case the runner does not set the override
+            and the executor falls back to its own defaults.
+        cardinality: How many parallel launches per firing.
+            Must be ``>= 1``.  Defaults to ``1``.
         trigger: When the role fires.  Exactly one trigger per
             role; complex schedules are expressed by adding more
             roles, not by combining triggers.
-        inputs: Names of artifacts the agent reads.  Validated
-            against the workspace template at runner-launch time
-            (not at pattern-load time, since a single pattern
-            may be reused across templates).
-        outputs: Names of artifacts the agent is expected to
+        inputs: Names of artifacts the role reads at launch
+            time.  Validated against the workspace template at
+            runner-launch time (not at pattern-load time, since
+            a single pattern may be reused across templates).
+        outputs: Names of artifacts the role is expected to
             register.  Same scoping as ``inputs``.
-        mcp_servers: Comma-separated MCP server names enabled
-            for this role's agent (passed through to the
-            launcher).  None means the launcher's default.
-        allowed_tools: Comma-separated tool whitelist (passed
-            through unchanged).
-        max_turns: Per-agent turn cap; ``None`` defers to the
-            launcher default.
-        total_timeout: Per-agent wall-clock cap in seconds;
-            ``None`` defers to the launcher default.
-        extra_env: Per-role environment variables merged on top
-            of the project-wide ``extra_env`` from
-            :class:`AgentBlockConfig`.  Use sparingly — most env
-            vars belong in the project hooks since they apply to
-            every role; this is for cases like
-            ``PREDICTOR_PATH`` that only the escalator and play
-            roles in a predict pattern care about.
+        overrides: Free-form per-launch knobs forwarded into the
+            executor's ``overrides`` dict.  Keys are
+            executor-specific (the agent battery honors
+            ``model``, ``max_turns``, ``total_timeout``,
+            ``mcp_servers``, ``allowed_tools``, ...; container
+            executors honor whatever they document; unknown
+            keys are silently ignored per the
+            :class:`flywheel.executor.BlockExecutor` protocol).
+            The runner merges this on top of the run-level
+            defaults bag and below the protocol-level keys it
+            sets itself (``prompt``, ``predecessor_id``).
+        extra_env: Per-role environment variables passed to the
+            executor as the ``extra_env`` launch kwarg per the
+            substrate's container-extras convention.  Use
+            sparingly; most env vars belong in project hooks.
+        block_name: Name of the block this role launches.
+            ``None`` means ``block_name == name`` (the legacy
+            ``roles:`` grammar's implicit 1:1 mapping);
+            synthesized roles produced from ``instances:``
+            specs set this explicitly so the runner launches
+            the right block under the instance's name.
 
     Roles that need step-by-step history list the canonical
     incremental artifact (e.g., ``game_history``) in their
@@ -265,20 +282,11 @@ class Role:
     name: str
     prompt: str
     trigger: Trigger
-    model: str | None = None
     cardinality: int = 1
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
-    mcp_servers: str | None = None
-    allowed_tools: str | None = None
-    max_turns: int | None = None
-    total_timeout: int | None = None
+    overrides: dict[str, Any] = field(default_factory=dict)
     extra_env: dict[str, str] = field(default_factory=dict)
-    # Name of the block this role launches.  ``None`` means
-    # ``block_name == name`` (the legacy ``roles:`` grammar's
-    # implicit 1:1 mapping); synthesized roles produced from
-    # ``instances:`` specs set this explicitly so the runner
-    # launches the right block under the instance's name.
     block_name: str | None = None
 
 
@@ -288,11 +296,11 @@ class BlockInstance:
 
     Patterns declare topology as a mapping of named instances,
     each referencing a block definition by name and carrying a
-    trigger describing when it fires.  Agent-specific config
-    (``prompt``, ``model``, ``inputs``, ``outputs``, etc.) may
-    be supplied inline on the instance for the transitional
-    period; a future revision will move that config onto the
-    block YAML itself.
+    trigger describing when it fires.  Per-launch knobs the
+    block's executor honors (model, MCP server selection,
+    runtime caps, ...) live in the free-form :attr:`overrides`
+    map; the runner merges them into the per-launch overrides
+    dict and the executor reads what it cares about.
 
     Attributes:
         name: Instance identifier, unique within the pattern.
@@ -303,24 +311,21 @@ class BlockInstance:
             container), ``on_tool`` is the usual choice.
         cardinality: How many parallel launches per trigger
             firing.  Must be ``>= 1``.  Defaults to ``1``.
-        prompt: Agent-specific.  Project-relative path to the
-            system-prompt file; ``None`` for non-agent blocks.
-        model: Agent-specific.  Model identifier passed to the
-            launcher.
+        prompt: Project-relative path to a prompt file; ``None``
+            when the block is not prompt-driven.  Read as text
+            by the runner and forwarded via
+            ``overrides["prompt"]``.
         inputs: Artifact names the instance reads at launch
             time.  Resolved against the workspace on fire.
         outputs: Artifact names the instance is expected to
             register.  Informational today; the block's own
             declared outputs are the substrate source of truth.
-        mcp_servers: Agent-specific.  Comma-separated MCP
-            server names.
-        allowed_tools: Agent-specific.  Comma-separated tool
-            whitelist.
-        max_turns: Agent-specific.  Per-launch turn cap.
-        total_timeout: Agent-specific.  Per-launch wall-clock
-            cap in seconds.
-        extra_env: Per-instance environment variables merged
-            into the project-wide launch env.
+        overrides: Free-form per-launch knobs forwarded into
+            the executor's ``overrides`` dict; see :class:`Role`
+            for the full contract.
+        extra_env: Per-instance environment variables passed to
+            the executor as the ``extra_env`` launch kwarg per
+            the substrate's container-extras convention.
     """
 
     name: str
@@ -328,13 +333,9 @@ class BlockInstance:
     trigger: Trigger
     cardinality: int = 1
     prompt: str | None = None
-    model: str | None = None
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
-    mcp_servers: str | None = None
-    allowed_tools: str | None = None
-    max_turns: int | None = None
-    total_timeout: int | None = None
+    overrides: dict[str, Any] = field(default_factory=dict)
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -523,6 +524,146 @@ class Pattern:
         )
 
 
+_BATTERY_OVERRIDE_KEYS = (
+    "model",
+    "max_turns",
+    "total_timeout",
+    "mcp_servers",
+    "allowed_tools",
+)
+
+
+# Keys the runner itself owns inside the per-launch ``overrides``
+# dict (``prompt`` / ``prompt_substitutions``: read from disk and
+# layered in by ``PatternRunner._build_overrides``;
+# ``predecessor_id``: managed by the runner for paused-instance
+# session chaining) or that ride the explicit container-extras
+# launch-kwarg seam (``extra_env`` / ``extra_mounts``).  Authoring
+# them under a pattern's ``overrides:`` map either has no effect
+# (the runner-owned keys are clobbered or unconditionally set
+# per launch) or routes a value through the wrong seam
+# (container extras would never reach the executor's declared
+# kwarg).  Reject them at parse time so the YAML cannot quietly
+# disagree with the runner about who owns the key.
+_RESERVED_OVERRIDE_KEYS = (
+    "prompt",
+    "prompt_substitutions",
+    "predecessor_id",
+    "extra_env",
+    "extra_mounts",
+)
+
+
+def _reject_legacy_battery_keys(
+    spec: dict,
+    *,
+    pattern_name: str,
+    role_name: str,
+    scope: str,
+) -> None:
+    """Refuse top-level battery-shaped keys that now live in ``overrides:``.
+
+    These keys used to be typed fields on :class:`Role` and
+    :class:`BlockInstance`; they have moved into the free-form
+    :attr:`Role.overrides` map so the schema stays
+    executor-agnostic.  Catching them at parse time turns a
+    silent no-op (the runner would never see them) into a
+    pointed error explaining the migration.
+    """
+    offenders = [k for k in _BATTERY_OVERRIDE_KEYS if k in spec]
+    if not offenders:
+        return
+    listed = ", ".join(repr(k) for k in offenders)
+    raise ValueError(
+        f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+        f"top-level key(s) {listed} are no longer supported "
+        f"on a pattern {scope}.  Move them under an "
+        f"``overrides:`` mapping so the runner forwards them "
+        f"to the executor as opaque per-launch overrides "
+        f"(executors read what they understand and ignore the "
+        f"rest)."
+    )
+
+
+def _parse_overrides(
+    spec: dict,
+    *,
+    pattern_name: str,
+    role_name: str,
+    scope: str,
+) -> dict[str, Any]:
+    """Parse the optional ``overrides:`` mapping.
+
+    The mapping is forwarded verbatim to the executor (no value
+    coercion here — the executor owns its key contract).  Only
+    the outer shape is validated: a mapping with non-empty
+    string keys.
+    """
+    raw = spec.get("overrides", {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+            f"'overrides' must be a mapping of override-name to "
+            f"value, got {type(raw).__name__}"
+        )
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k:
+            raise ValueError(
+                f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+                f"'overrides' keys must be non-empty strings"
+            )
+        if k in _RESERVED_OVERRIDE_KEYS:
+            raise ValueError(
+                f"Pattern {pattern_name!r} {scope} "
+                f"{role_name!r}: 'overrides.{k}' is reserved.  "
+                f"'prompt' / 'prompt_substitutions' / "
+                f"'predecessor_id' are set by the pattern runner "
+                f"itself; 'extra_env' / 'extra_mounts' ride the "
+                f"explicit container-extras launch kwargs (use the "
+                f"top-level ``extra_env:`` field for env vars).  "
+                f"Authoring them under ``overrides:`` would either "
+                f"be silently overwritten or routed through the "
+                f"wrong seam."
+            )
+        out[k] = v
+    return out
+
+
+def _parse_extra_env(
+    spec: dict,
+    *,
+    pattern_name: str,
+    role_name: str,
+    scope: str,
+) -> dict[str, str]:
+    """Parse the optional ``extra_env:`` mapping (string→string)."""
+    raw = spec.get("extra_env", {})
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+            f"'extra_env' must be a mapping of name to string "
+            f"value, got {type(raw).__name__}"
+        )
+    out: dict[str, str] = {}
+    for env_name, env_value in raw.items():
+        if not isinstance(env_name, str) or not env_name:
+            raise ValueError(
+                f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+                f"'extra_env' keys must be non-empty strings"
+            )
+        if not isinstance(env_value, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r} {scope} {role_name!r}: "
+                f"'extra_env.{env_name}' must be a string, got "
+                f"{type(env_value).__name__}"
+            )
+        out[env_name] = env_value
+    return out
+
+
 def _parse_role(
     role_name: str,
     spec: object,
@@ -543,6 +684,13 @@ def _parse_role(
             f"spec must be a mapping, got "
             f"{type(spec).__name__}"
         )
+
+    _reject_legacy_battery_keys(
+        spec,
+        pattern_name=pattern_name,
+        role_name=role_name,
+        scope="role",
+    )
 
     prompt = spec.get("prompt")
     if not isinstance(prompt, str) or not prompt:
@@ -572,13 +720,6 @@ def _parse_role(
         block_registry=block_registry,
     )
 
-    model = spec.get("model")
-    if model is not None and not isinstance(model, str):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'model' must be a string or omitted"
-        )
-
     inputs = _parse_string_list(
         spec.get("inputs", []),
         role_name=role_name,
@@ -592,61 +733,18 @@ def _parse_role(
         field_name="outputs",
     )
 
-    mcp_servers = spec.get("mcp_servers")
-    if mcp_servers is not None and not isinstance(mcp_servers, str):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'mcp_servers' must be a comma-separated string or "
-            f"omitted"
-        )
-
-    allowed_tools = spec.get("allowed_tools")
-    if allowed_tools is not None and not isinstance(
-            allowed_tools, str):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'allowed_tools' must be a comma-separated string "
-            f"or omitted"
-        )
-
-    max_turns = spec.get("max_turns")
-    if max_turns is not None and (
-            not isinstance(max_turns, int) or max_turns < 1):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'max_turns' must be a positive integer or omitted"
-        )
-
-    total_timeout = spec.get("total_timeout")
-    if total_timeout is not None and (
-            not isinstance(total_timeout, int) or total_timeout < 1):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'total_timeout' must be a positive integer or "
-            f"omitted"
-        )
-
-    extra_env_raw = spec.get("extra_env", {})
-    if not isinstance(extra_env_raw, dict):
-        raise ValueError(
-            f"Pattern {pattern_name!r} role {role_name!r}: "
-            f"'extra_env' must be a mapping of name to string "
-            f"value, got {type(extra_env_raw).__name__}"
-        )
-    extra_env: dict[str, str] = {}
-    for env_name, env_value in extra_env_raw.items():
-        if not isinstance(env_name, str) or not env_name:
-            raise ValueError(
-                f"Pattern {pattern_name!r} role {role_name!r}: "
-                f"'extra_env' keys must be non-empty strings"
-            )
-        if not isinstance(env_value, str):
-            raise ValueError(
-                f"Pattern {pattern_name!r} role {role_name!r}: "
-                f"'extra_env.{env_name}' must be a string, got "
-                f"{type(env_value).__name__}"
-            )
-        extra_env[env_name] = env_value
+    overrides = _parse_overrides(
+        spec,
+        pattern_name=pattern_name,
+        role_name=role_name,
+        scope="role",
+    )
+    extra_env = _parse_extra_env(
+        spec,
+        pattern_name=pattern_name,
+        role_name=role_name,
+        scope="role",
+    )
 
     if "materialize" in spec:
         raise ValueError(
@@ -662,14 +760,10 @@ def _parse_role(
         name=role_name,
         prompt=prompt,
         trigger=trigger,
-        model=model,
         cardinality=cardinality,
         inputs=inputs,
         outputs=outputs,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        max_turns=max_turns,
-        total_timeout=total_timeout,
+        overrides=overrides,
         extra_env=extra_env,
     )
 
@@ -825,10 +919,10 @@ def _parse_instance(
     """Parse one entry of the ``instances:`` mapping.
 
     Instances reference a block by name and carry a trigger.
-    Agent-specific fields (``prompt``, ``model``, ``inputs``,
-    etc.) are accepted as optional inline overrides during the
-    transition — they will migrate onto the block YAML itself
-    in a later commit.
+    Per-launch executor knobs (model, MCP server selection,
+    runtime caps, ...) live in the free-form ``overrides:``
+    map; the runner forwards them verbatim into the executor's
+    ``overrides`` dict.
     """
     _validate_name(inst_name, "Instance")
     if not isinstance(spec, dict):
@@ -837,6 +931,13 @@ def _parse_instance(
             f"{inst_name!r}: spec must be a mapping, got "
             f"{type(spec).__name__}"
         )
+
+    _reject_legacy_battery_keys(
+        spec,
+        pattern_name=pattern_name,
+        role_name=inst_name,
+        scope="instance",
+    )
 
     block = spec.get("block")
     if not isinstance(block, str) or not block:
@@ -885,14 +986,6 @@ def _parse_instance(
             f"omitted"
         )
 
-    model = spec.get("model")
-    if model is not None and not isinstance(model, str):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'model' must be a string or "
-            f"omitted"
-        )
-
     inputs = _parse_string_list(
         spec.get("inputs", []),
         role_name=inst_name,
@@ -906,59 +999,18 @@ def _parse_instance(
         field_name="outputs",
     )
 
-    mcp_servers = spec.get("mcp_servers")
-    if (mcp_servers is not None
-            and not isinstance(mcp_servers, str)):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'mcp_servers' must be a string "
-            f"or omitted"
-        )
-
-    allowed_tools = spec.get("allowed_tools")
-    if (allowed_tools is not None
-            and not isinstance(allowed_tools, str)):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'allowed_tools' must be a string "
-            f"or omitted"
-        )
-
-    max_turns = spec.get("max_turns")
-    if max_turns is not None and (
-            not isinstance(max_turns, int) or max_turns < 1):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'max_turns' must be a positive "
-            f"integer or omitted"
-        )
-
-    total_timeout = spec.get("total_timeout")
-    if total_timeout is not None and (
-            not isinstance(total_timeout, int)
-            or total_timeout < 1):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'total_timeout' must be a "
-            f"positive integer or omitted"
-        )
-
-    extra_env_raw = spec.get("extra_env", {})
-    if not isinstance(extra_env_raw, dict):
-        raise ValueError(
-            f"Pattern {pattern_name!r} instance "
-            f"{inst_name!r}: 'extra_env' must be a mapping "
-            f"of string keys to string values"
-        )
-    extra_env: dict[str, str] = {}
-    for k, v in extra_env_raw.items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            raise ValueError(
-                f"Pattern {pattern_name!r} instance "
-                f"{inst_name!r}: 'extra_env' entries must be "
-                f"string→string"
-            )
-        extra_env[k] = v
+    overrides = _parse_overrides(
+        spec,
+        pattern_name=pattern_name,
+        role_name=inst_name,
+        scope="instance",
+    )
+    extra_env = _parse_extra_env(
+        spec,
+        pattern_name=pattern_name,
+        role_name=inst_name,
+        scope="instance",
+    )
 
     return BlockInstance(
         name=inst_name,
@@ -966,13 +1018,9 @@ def _parse_instance(
         trigger=trigger,
         cardinality=cardinality,
         prompt=prompt,
-        model=model,
         inputs=inputs,
         outputs=outputs,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        max_turns=max_turns,
-        total_timeout=total_timeout,
+        overrides=overrides,
         extra_env=extra_env,
     )
 
@@ -993,13 +1041,9 @@ def _instance_from_role(role: Role) -> BlockInstance:
         trigger=role.trigger,
         cardinality=role.cardinality,
         prompt=role.prompt,
-        model=role.model,
         inputs=list(role.inputs),
         outputs=list(role.outputs),
-        mcp_servers=role.mcp_servers,
-        allowed_tools=role.allowed_tools,
-        max_turns=role.max_turns,
-        total_timeout=role.total_timeout,
+        overrides=dict(role.overrides),
         extra_env=dict(role.extra_env),
     )
 

@@ -193,10 +193,12 @@ class PatternRunner:
         max_total_runtime_s: Hard wall-clock cap.  ``None`` means
             wait until all driving handles finish naturally.
         per_instance_runtime_config: Per-instance ``extra_env`` /
-            ``extra_mounts`` knobs.  Forwarded into per-launch
-            ``overrides`` so the executor can see them; the
-            ``on_tool`` dispatch path consumes the same map for
-            its tool-input bridge launches.
+            ``extra_mounts`` knobs.  Passed to the executor as
+            explicit ``extra_env`` / ``extra_mounts`` launch
+            kwargs per the substrate's container-extras
+            convention (see :meth:`_collect_runtime_extras`);
+            the ``on_tool`` dispatch path consumes the same map
+            for its tool-input bridge launches.
 
     The runner is single-shot: call :meth:`run` exactly once.
     """
@@ -994,24 +996,34 @@ class PatternRunner:
     ) -> dict[str, Any]:
         """Assemble the per-launch ``overrides`` dict for one role.
 
-        Layers the role's own protocol-level knobs (prompt
-        body, model, max_turns, ...) on top of the run-level
-        ``defaults`` bag.  Container runtime knobs
-        (``extra_env`` / ``extra_mounts``) are *not* placed
-        here; they flow as explicit launch kwargs per the
-        substrate's container-extras convention — see
+        Layers, in increasing precedence:
+
+        1. Run-level defaults bag (:attr:`RunDefaults.defaults`).
+        2. The role's own free-form :attr:`Role.overrides` map
+           (battery-specific keys the pattern author wants
+           applied to every launch of this role).
+        3. Protocol-level keys the runner sets itself:
+           ``prompt`` (read from disk when ``role.prompt`` is
+           set), ``prompt_substitutions`` (when carried in
+           defaults), and ``predecessor_id`` (for session
+           chaining across paused-and-resumed launches).
+
+        Container runtime knobs (``extra_env`` /
+        ``extra_mounts``) are *not* placed here; they flow as
+        explicit launch kwargs per the substrate's
+        container-extras convention — see
         :meth:`_collect_runtime_extras`.
 
         The dict is intentionally free-form: each executor
         reads the keys it cares about and ignores the rest
         (per the :class:`flywheel.executor.BlockExecutor`
-        protocol contract).  Empty entries (e.g. an unset
-        ``role.model``) are omitted so executors can fall back
-        to their constructor defaults rather than seeing
-        ``None`` and overwriting them.
+        protocol contract).
         """
         defaults_bag = dict(self._defaults.defaults or {})
         overrides: dict[str, Any] = dict(defaults_bag)
+
+        if role.overrides:
+            overrides.update(role.overrides)
 
         if role.prompt:
             prompt_path = (
@@ -1024,17 +1036,6 @@ class PatternRunner:
             if substitutions:
                 overrides["prompt_substitutions"] = (
                     substitutions)
-
-        if role.model is not None:
-            overrides["model"] = role.model
-        if role.max_turns is not None:
-            overrides["max_turns"] = role.max_turns
-        if role.total_timeout is not None:
-            overrides["total_timeout"] = role.total_timeout
-        if role.mcp_servers is not None:
-            overrides["mcp_servers"] = role.mcp_servers
-        if role.allowed_tools is not None:
-            overrides["allowed_tools"] = role.allowed_tools
 
         if predecessor_id is not None:
             overrides["predecessor_id"] = predecessor_id
@@ -1159,14 +1160,10 @@ def _role_from_instance(inst: BlockInstance) -> Role:
         name=inst.name,
         prompt=inst.prompt or "",
         trigger=inst.trigger,
-        model=inst.model,
         cardinality=inst.cardinality,
         inputs=list(inst.inputs),
         outputs=list(inst.outputs),
-        mcp_servers=inst.mcp_servers,
-        allowed_tools=inst.allowed_tools,
-        max_turns=inst.max_turns,
-        total_timeout=inst.total_timeout,
+        overrides=dict(inst.overrides),
         extra_env=dict(inst.extra_env),
         block_name=inst.block,
     )

@@ -498,11 +498,13 @@ class TestContinuous:
                 name="play",
                 prompt=prompt,
                 trigger=ContinuousTrigger(),
-                model="claude-sonnet-4-6",
-                mcp_servers="arc",
-                allowed_tools="Read,Write",
-                max_turns=5,
-                total_timeout=120,
+                overrides={
+                    "model": "claude-sonnet-4-6",
+                    "mcp_servers": "arc",
+                    "allowed_tools": "Read,Write",
+                    "max_turns": 5,
+                    "total_timeout": 120,
+                },
             )],
         )
 

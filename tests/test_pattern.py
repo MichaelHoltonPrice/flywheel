@@ -48,13 +48,14 @@ description: One play agent and a periodic brainstorm cohort.
 roles:
   play:
     prompt: workforce/prompts/play.md
-    model: claude-sonnet-4-6
     cardinality: 1
     trigger:
       kind: continuous
     inputs: [predictor, mechanics_summary]
     outputs: [game_log]
-    mcp_servers: arc
+    overrides:
+      model: claude-sonnet-4-6
+      mcp_servers: arc
   brainstorm:
     prompt: workforce/prompts/brainstorm.md
     cardinality: 6
@@ -88,12 +89,14 @@ class TestValidPattern:
 
         assert isinstance(play, Role)
         assert play.prompt == "workforce/prompts/play.md"
-        assert play.model == "claude-sonnet-4-6"
         assert play.cardinality == 1
         assert isinstance(play.trigger, ContinuousTrigger)
         assert play.inputs == ["predictor", "mechanics_summary"]
         assert play.outputs == ["game_log"]
-        assert play.mcp_servers == "arc"
+        assert play.overrides == {
+            "model": "claude-sonnet-4-6",
+            "mcp_servers": "arc",
+        }
 
     def test_brainstorm_role_trigger(self, tmp_path: Path):
         path = _write(
@@ -106,8 +109,7 @@ class TestValidPattern:
         assert isinstance(brainstorm.trigger, EveryNExecutionsTrigger)
         assert brainstorm.trigger.of_block == "take_action"
         assert brainstorm.trigger.n == 20
-        assert brainstorm.model is None
-        assert brainstorm.mcp_servers is None
+        assert brainstorm.overrides == {}
 
     def test_no_block_registry_skips_trigger_validation(
             self, tmp_path: Path):
@@ -355,6 +357,132 @@ roles:
       kind: continuous
 """)
         with pytest.raises(ValueError, match="Role name"):
+            Pattern.from_yaml(path)
+
+
+class TestOverridesField:
+    """The free-form ``overrides:`` map carries battery-specific knobs.
+
+    Top-level keys that used to be typed (``model``,
+    ``mcp_servers``, ``allowed_tools``, ``max_turns``,
+    ``total_timeout``) are no longer accepted directly on a
+    role / instance; the parser rejects them with a pointed
+    error so a stale YAML fails loudly instead of silently
+    losing the value.  Their replacement is the free-form
+    ``overrides:`` mapping the runner forwards verbatim into
+    each launch's ``overrides`` dict.
+    """
+
+    @pytest.mark.parametrize("legacy_key,legacy_value", [
+        ("model", "claude-sonnet-4-6"),
+        ("mcp_servers", "arc"),
+        ("allowed_tools", "Read,Write"),
+        ("max_turns", 10),
+        ("total_timeout", 60),
+    ])
+    def test_role_rejects_legacy_battery_key(
+            self, tmp_path: Path,
+            legacy_key: str, legacy_value: object):
+        path = _write(tmp_path, "bad", f"""\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    {legacy_key}: {legacy_value!r}
+""")
+        with pytest.raises(
+                ValueError,
+                match=r"no longer supported.*overrides:"):
+            Pattern.from_yaml(path)
+
+    def test_instance_rejects_legacy_battery_key(
+            self, tmp_path: Path):
+        path = _write(tmp_path, "bad", """\
+instances:
+  play:
+    block: play
+    trigger: {kind: continuous}
+    prompt: p.md
+    model: claude-sonnet-4-6
+""")
+        with pytest.raises(
+                ValueError,
+                match=r"no longer supported.*overrides:"):
+            Pattern.from_yaml(path)
+
+    def test_role_overrides_round_trip(self, tmp_path: Path):
+        path = _write(tmp_path, "p", """\
+roles:
+  play:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    overrides:
+      model: claude-sonnet-4-6
+      max_turns: 12
+      custom_executor_knob: hello
+""")
+        pattern = Pattern.from_yaml(path)
+        assert pattern.roles[0].overrides == {
+            "model": "claude-sonnet-4-6",
+            "max_turns": 12,
+            "custom_executor_knob": "hello",
+        }
+
+    def test_instance_overrides_round_trip(self, tmp_path: Path):
+        path = _write(tmp_path, "p", """\
+instances:
+  play:
+    block: play
+    trigger: {kind: continuous}
+    prompt: p.md
+    overrides:
+      model: claude-sonnet-4-6
+      whatever: 123
+""")
+        pattern = Pattern.from_yaml(path)
+        inst = pattern.instances[0]
+        assert inst.overrides == {
+            "model": "claude-sonnet-4-6",
+            "whatever": 123,
+        }
+
+    @pytest.mark.parametrize("reserved_key,reserved_value", [
+        ("prompt", "'other.md'"),
+        ("prompt_substitutions", "{foo: bar}"),
+        ("predecessor_id", "'exec_123'"),
+        ("extra_env", "{FOO: bar}"),
+        ("extra_mounts", "[]"),
+    ])
+    def test_overrides_rejects_runner_owned_keys(
+            self, tmp_path: Path,
+            reserved_key: str, reserved_value: str):
+        path = _write(tmp_path, "bad", f"""\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    overrides:
+      {reserved_key}: {reserved_value}
+""")
+        with pytest.raises(
+                ValueError,
+                match=rf"'overrides\.{reserved_key}' is reserved"):
+            Pattern.from_yaml(path)
+
+    def test_overrides_must_be_mapping(self, tmp_path: Path):
+        path = _write(tmp_path, "bad", """\
+roles:
+  r:
+    prompt: p.md
+    trigger:
+      kind: continuous
+    overrides: not-a-mapping
+""")
+        with pytest.raises(
+                ValueError, match="'overrides' must be a mapping"):
             Pattern.from_yaml(path)
 
 
