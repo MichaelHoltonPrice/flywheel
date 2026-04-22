@@ -50,6 +50,7 @@ from typing import Any
 import pytest
 
 from flywheel.agent import AgentBlockConfig, AgentResult
+from flywheel.agent_executor import AgentExecutionHandle
 from flywheel.agent_handoff import (
     SESSION_FILE_NAME,
     HandoffAgentHandle,
@@ -61,6 +62,7 @@ from flywheel.agent_handoff import (
 from flywheel.artifact import ArtifactInstance, BlockExecution
 from flywheel.pattern import ContinuousTrigger, Pattern, Role
 from flywheel.pattern_runner import PatternRunner
+from flywheel.run_defaults import RunDefaults
 
 _TEST_BLOCK_NAME = "play"
 """Default block name the fake agent records its executions
@@ -757,11 +759,26 @@ class TestPatternRunnerIntegration:
         ws_path.mkdir()
         ws = _MiniWS(path=ws_path)
 
-        cfg = AgentBlockConfig(
+        @dataclass
+        class _BlockStub:
+            name: str
+
+        @dataclass
+        class _TemplateStub:
+            """Minimal :class:`Template` stand-in.
+
+            The runner's ``_block_def_for`` requires every
+            block a pattern references to be declared in the
+            template; the test pattern launches the ``solo``
+            block, so we register a single matching stub.
+            """
+            blocks: list = field(default_factory=list)
+
+        defaults = RunDefaults(
             workspace=ws,  # type: ignore[arg-type]
-            template=object(),  # type: ignore[arg-type]
+            template=_TemplateStub(  # type: ignore[arg-type]
+                blocks=[_BlockStub(name="solo")]),
             project_root=prompts_dir,
-            prompt="(unused; loaded from role)",
         )
 
         pattern = Pattern(
@@ -804,25 +821,62 @@ class TestPatternRunnerIntegration:
             invocations.append(ctx)
             return HandoffResult(content="OK")
 
-        # Wrap the fake launch_fn so PatternRunner kwargs flow
-        # through the handle factory.  The factory keeps a
-        # reference so the test can inspect the underlying
-        # loop_result after run() returns.
-        fake_launch = _make_launch_fn(ws_path, scripts, workspace=ws)
+        fake_launch = _make_launch_fn(
+            ws_path, scripts, workspace=ws)
 
-        def _factory(**kwargs: Any) -> HandoffAgentHandle:
-            handle = HandoffAgentHandle(
-                block_runner=_br,
-                launch_kwargs=kwargs,
-                launch_fn=fake_launch,
-            )
-            captured_handles.append(handle)
-            return handle
+        # Minimal :class:`BlockExecutor` that wraps each launch
+        # in a :class:`HandoffAgentHandle` running the fake
+        # launch_fn.  Mirrors what :class:`AgentExecutor` would
+        # do internally, but parameterised so the test can pin
+        # the handoff loop without going through the real
+        # agent battery.
+        class _HandoffExecutor:
+            def __init__(self):
+                self.handles: list[HandoffAgentHandle] = []
+
+            def for_pattern(
+                self, *, pattern_router, post_dispatch_fn,
+            ):
+                return self
+
+            def launch(
+                self,
+                block_name,
+                workspace,
+                input_bindings,
+                *,
+                execution_id=None,
+                overrides=None,
+                allowed_blocks=None,
+                state_lineage_id=None,
+                run_id=None,
+                extra_env=None,
+                extra_mounts=None,
+            ):
+                ov = overrides or {}
+                handle = HandoffAgentHandle(
+                    block_runner=_br,
+                    launch_kwargs={
+                        "workspace": workspace,
+                        "template": object(),
+                        "project_root": prompts_dir,
+                        "prompt": ov.get("prompt", ""),
+                        "agent_workspace_dir": (
+                            "agent_workspaces/pr_handle_test"),
+                    },
+                    launch_fn=fake_launch,
+                )
+                self.handles.append(handle)
+                captured_handles.append(handle)
+                return AgentExecutionHandle(
+                    inner=handle, workspace=workspace)
+
+        executor = _HandoffExecutor()
 
         runner = PatternRunner(
             pattern,
-            base_config=cfg,
-            launch_fn=_factory,
+            defaults=defaults,
+            executor_factory=lambda _block_def: executor,
             poll_interval_s=0.05,
             max_total_runtime_s=10.0,
         )
@@ -832,8 +886,11 @@ class TestPatternRunnerIntegration:
         assert result.agents_launched == 1
         assert len(result.results_by_role["solo"]) == 1
         terminal = result.results_by_role["solo"][0]
+        # Pattern runner consumes :class:`ExecutionResult` from
+        # the executor seam now; the terminal cycle's
+        # ``execution_id`` is preserved through
+        # :class:`AgentExecutionHandle`.
         assert terminal.execution_id == "exec-pr-final"
-        assert terminal.exit_reason == "completed"
 
         assert len(captured_handles) == 1
         loop = captured_handles[0].loop_result

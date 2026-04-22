@@ -1,16 +1,22 @@
 """Tests for :class:`flywheel.pattern_runner.PatternRunner`.
 
 Exercises the runner against an in-memory fake workspace and a
-fake ``launch_fn``; no Docker, no ``launch_agent_block``.  The
-fakes are kept tight on purpose: each test focuses on one
-contract (continuous fires once, every-N fires at the right
-cadence, cohort cardinality, termination, reactive triggers
-raise) so failures point at exactly which behavior regressed.
+fake :class:`flywheel.executor.BlockExecutor`; no Docker, no
+:func:`flywheel.agent.launch_agent_block`.  The fakes are kept
+tight on purpose: each test focuses on one contract (continuous
+fires once, every-N fires at the right cadence, cohort
+cardinality, termination, reactive triggers raise) so failures
+point at exactly which behaviour regressed.
+
+The fake executor mirrors :class:`flywheel.agent_executor.AgentExecutor`'s
+``for_pattern`` integration point so tests can capture the
+runner's pattern-router wiring (the merged ``block_runner`` and
+the adapted ``post_dispatch_fn``) without paying for a real
+agent launch.
 """
 
 from __future__ import annotations
 
-import functools
 import json
 import shutil
 import threading
@@ -18,10 +24,11 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from flywheel.agent import AgentBlockConfig, AgentResult
+from flywheel.agent import AgentResult
 from flywheel.agent_handoff import HandoffContext, HandoffResult, ToolRouter
 from flywheel.artifact import (
     ArtifactInstance,
@@ -39,10 +46,15 @@ from flywheel.pattern import (
     Pattern,
     Role,
 )
+from flywheel.pattern_handoff import (
+    adapt_post_dispatch_for_handoff,
+    merge_block_runners,
+)
 from flywheel.pattern_runner import (
     InstanceRuntimeConfig,
     PatternRunner,
 )
+from flywheel.run_defaults import RunDefaults
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
@@ -58,7 +70,7 @@ class _FakeWorkspace:
 
     The runner reads ``executions`` (for trigger evaluation) and
     ``instances_for`` (for input-artifact lookup).  Everything
-    else is wired through ``base_config`` and never touched.
+    else is forwarded to the executor and never touched.
     """
 
     def __init__(self, project_root: Path):
@@ -283,28 +295,151 @@ class _FakeHandle:
         return self._result
 
 
-def _base_config(
+def _defaults(
     tmp_path: Path,
     workspace: _FakeWorkspace,
     *,
     template: Template | None = None,
-) -> AgentBlockConfig:
-    """Build an AgentBlockConfig that points at the fake workspace.
+    pattern: Pattern | None = None,
+) -> RunDefaults:
+    """Build a :class:`RunDefaults` pointing at the fake workspace.
 
-    The runner only reads ``project_root``, ``workspace`` and
-    ``template`` from this; everything else is forwarded to the
-    fake launch_fn unchanged.  Tests that need the template to
-    declare specific blocks (e.g. for ``on_tool`` instances to
-    resolve against) can pass ``template=`` explicitly.
+    The runner now requires every block a pattern references to
+    be declared in the template; tests pass ``pattern=`` so this
+    helper can auto-synthesise minimal :class:`BlockDefinition`
+    stubs for each role / instance the pattern declares (which
+    is enough for the fakes here — no test inspects fields
+    other than ``name``).  Tests that need a richer template
+    (e.g. for ``on_tool`` instances that bind to specific
+    container blocks) can still pass ``template=`` explicitly.
     """
     if template is None:
-        template = Template(name="t", artifacts=[], blocks=[])
-    return AgentBlockConfig(
+        block_names: set[str] = set()
+        if pattern is not None:
+            for role in pattern.roles:
+                block_names.add(role.block_name or role.name)
+            for inst in pattern.instances:
+                block_names.add(inst.block or inst.name)
+        blocks = [
+            BlockDefinition(name=n) for n in sorted(block_names)
+        ]
+        template = Template(
+            name="t", artifacts=[], blocks=blocks)
+    return RunDefaults(
         workspace=workspace,  # type: ignore[arg-type]
         template=template,
         project_root=tmp_path,
-        prompt="",
     )
+
+
+class _FakeExecutor:
+    """In-memory :class:`flywheel.executor.BlockExecutor` for tests.
+
+    Calls ``on_launch(**kwargs)`` for each launch with a
+    flattened kwargs dict that includes the protocol's top-level
+    args (``block_name``, ``workspace``, ``input_bindings``,
+    ``run_id``) *plus* every key from the runner's
+    per-launch ``overrides`` dict (``prompt``, ``model``,
+    ``predecessor_id``, ...) *plus* the executor's own wired
+    ``block_runner`` / ``post_dispatch_fn`` so tests that used
+    to pull those off ``launch_fn`` kwargs keep working.
+
+    Mirrors :meth:`flywheel.agent_executor.AgentExecutor.for_pattern`
+    so the pattern runner's ``on_tool`` router merge happens
+    against the same surface the real executor exposes.
+    Construction-time ``block_runner`` lets tests pin a
+    pre-existing router that the pattern's router will be
+    merged on top of (or collide with).
+    """
+
+    def __init__(
+        self,
+        on_launch,
+        *,
+        block_runner: Any | None = None,
+        post_dispatch_fn: Any | None = None,
+    ):
+        self._on_launch = on_launch
+        self.block_runner = block_runner
+        self.post_dispatch_fn = post_dispatch_fn
+
+    def for_pattern(
+        self,
+        *,
+        pattern_router: Any,
+        post_dispatch_fn,
+    ) -> "_FakeExecutor":
+        merged = merge_block_runners(
+            pattern_router=pattern_router,
+            fallback=self.block_runner,
+            context_label="_FakeExecutor.for_pattern",
+            collision_label="_FakeExecutor.for_pattern",
+        )
+        return _FakeExecutor(
+            self._on_launch,
+            block_runner=merged,
+            post_dispatch_fn=adapt_post_dispatch_for_handoff(
+                post_dispatch_fn),
+        )
+
+    def launch(
+        self,
+        *,
+        block_name: str,
+        workspace,
+        input_bindings,
+        overrides: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
+        **_extras: Any,
+    ):
+        kwargs: dict[str, Any] = dict(overrides or {})
+        kwargs.update({
+            "block_name": block_name,
+            "workspace": workspace,
+            "input_bindings": input_bindings,
+            "run_id": run_id,
+            "block_runner": self.block_runner,
+            "post_dispatch_fn": self.post_dispatch_fn,
+        })
+        # Mirror the runner's container-extras convention:
+        # ``extra_env`` / ``extra_mounts`` are explicit kwargs.
+        # Surface them on the captured kwargs dict so existing
+        # assertions (``call["extra_env"]``) keep working.
+        if extra_env is not None:
+            kwargs["extra_env"] = dict(extra_env)
+        if extra_mounts is not None:
+            kwargs["extra_mounts"] = list(extra_mounts)
+        return self._on_launch(**kwargs)
+
+
+def _factory(on_launch, *, block_runner: Any | None = None):
+    """Build an executor_factory returning one :class:`_FakeExecutor`.
+
+    The same executor instance is returned for every block; for
+    patterns that mix agent-style and on_tool-target blocks see
+    :func:`_mixed_factory`.
+    """
+    exe = _FakeExecutor(on_launch, block_runner=block_runner)
+    return lambda _block_def: exe
+
+
+def _mixed_factory(on_launch, *, target_executor, target_blocks):
+    """Factory dispatching on_tool target blocks to a separate executor.
+
+    Used by :class:`TestOnToolBridge` and the event-driven cohort
+    tests where the on_tool target needs a different executor
+    (e.g. a capturing one) from the agent-style continuous role.
+    """
+    fake = _FakeExecutor(on_launch)
+
+    def factory(block_def):
+        if block_def.name in target_blocks:
+            return target_executor
+        return fake
+
+    return factory
 
 
 def _write_prompt(tmp_path: Path, name: str, body: str = "hi") -> str:
@@ -343,8 +478,8 @@ class TestContinuous:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         result = runner.run()
@@ -381,8 +516,8 @@ class TestContinuous:
 
         PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
         ).run()
 
@@ -438,8 +573,8 @@ class TestAutorestart:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         result = runner.run()
@@ -478,8 +613,8 @@ class TestAutorestart:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         result = runner.run()
@@ -505,8 +640,10 @@ class TestAutorestart:
         ):
             PatternRunner(
                 pattern,
-                base_config=_base_config(
-                    tmp_path, _FakeWorkspace(tmp_path)),
+                defaults=_defaults(
+                    tmp_path, _FakeWorkspace(tmp_path),
+                    pattern=pattern),
+                executor_factory=_factory(lambda **_: None),
             )
 
     def test_autorestart_alone_drives_run(
@@ -542,8 +679,8 @@ class TestAutorestart:
         # and run returns after the halt propagates.
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         runner.run()
@@ -602,8 +739,8 @@ class TestEveryNExecutions:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         result = runner.run()
@@ -659,8 +796,8 @@ class TestEveryNExecutions:
 
         PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         ).run()
 
@@ -733,8 +870,8 @@ class TestEveryNExecutions:
 
         result = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         ).run()
 
@@ -783,8 +920,8 @@ class TestEveryNExecutions:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         )
         runner.run()
@@ -832,8 +969,8 @@ class TestEveryNExecutions:
 
         result = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
             max_total_runtime_s=0.05,
         ).run()
@@ -870,8 +1007,8 @@ class TestEveryNExecutions:
 
         result = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.02,
         ).run()
 
@@ -900,8 +1037,10 @@ class TestRejectsBadPatterns:
         ):
             PatternRunner(
                 pattern,
-                base_config=_base_config(
-                    tmp_path, _FakeWorkspace(tmp_path)),
+                defaults=_defaults(
+                    tmp_path, _FakeWorkspace(tmp_path),
+                    pattern=pattern),
+                executor_factory=_factory(lambda **_: None),
             )
 
     def test_on_request_trigger_raises(self, tmp_path: Path):
@@ -920,8 +1059,10 @@ class TestRejectsBadPatterns:
         with pytest.raises(NotImplementedError, match="on_request"):
             PatternRunner(
                 pattern,
-                base_config=_base_config(
-                    tmp_path, _FakeWorkspace(tmp_path)),
+                defaults=_defaults(
+                    tmp_path, _FakeWorkspace(tmp_path),
+                    pattern=pattern),
+                executor_factory=_factory(lambda **_: None),
             )
 
     def test_on_event_trigger_raises(self, tmp_path: Path):
@@ -940,8 +1081,10 @@ class TestRejectsBadPatterns:
         with pytest.raises(NotImplementedError, match="on_event"):
             PatternRunner(
                 pattern,
-                base_config=_base_config(
-                    tmp_path, _FakeWorkspace(tmp_path)),
+                defaults=_defaults(
+                    tmp_path, _FakeWorkspace(tmp_path),
+                    pattern=pattern),
+                executor_factory=_factory(lambda **_: None),
             )
 
 
@@ -969,8 +1112,8 @@ class TestTermination:
 
         result = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
             max_total_runtime_s=0.05,
         ).run()
@@ -986,11 +1129,12 @@ class TestInstancesGrammar:
     Regression guard: the runner previously iterated
     ``pattern.roles`` to seed the continuous triggers at
     ``run()`` start, leaving ``instances:``-only patterns with
-    no launches at all.  These tests also pin the new
+    no launches at all.  These tests also pin the
     ``on_tool`` router plumbing — continuous launches happen,
     ``on_tool`` instances are not launched by the runner, and
-    the pattern-derived block_runner lands in ``launch_fn``'s
-    kwargs.
+    the pattern-derived block_runner lands in the executor's
+    wired surface (the fake executor surfaces it as
+    ``kwargs["block_runner"]``).
     """
 
     def test_continuous_instance_fires(
@@ -1019,11 +1163,14 @@ class TestInstancesGrammar:
         )
 
         # ExecuteAction block needed in the template so the
-        # pattern-router builder can look up its input slot.
+        # pattern-router builder can look up its input slot;
+        # ``play`` block declared too because the runner now
+        # rejects undeclared block references.
         tmpl = Template(
             name="t",
             artifacts=[],
             blocks=[
+                BlockDefinition(name="play"),
                 BlockDefinition(
                     name="ExecuteAction",
                     image="dummy:latest",
@@ -1050,26 +1197,17 @@ class TestInstancesGrammar:
                 raise AssertionError(
                     "executor.launch must not run in this test")
 
-        def executor_factory(block_def):
-            return _StubExecutor()
-
         ws = _FakeWorkspace(tmp_path)
-        base = _base_config(tmp_path, ws)
-        # Swap in a template that carries ExecuteAction so the
-        # router builder can resolve it.
-        base = AgentBlockConfig(
-            workspace=base.workspace,
-            template=tmpl,
-            project_root=base.project_root,
-            prompt=base.prompt,
-        )
         result = PatternRunner(
             pattern,
-            base_config=base,
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, template=tmpl),
+            executor_factory=_mixed_factory(
+                launch_fn,
+                target_executor=_StubExecutor(),
+                target_blocks={"ExecuteAction"},
+            ),
             poll_interval_s=0.01,
             max_total_runtime_s=1.0,
-            executor_factory=executor_factory,
             per_instance_runtime_config={
                 "execute_action": InstanceRuntimeConfig(),
             },
@@ -1081,47 +1219,11 @@ class TestInstancesGrammar:
         assert len(launches) == 1
         assert result.agents_launched == 1
         assert launches[0].kwargs["block_name"] == "play"
-        # The pattern runner wrapped launch_fn so the call
-        # carries a merged block_runner.
+        # The pattern runner wrapped the executor so its wired
+        # ``block_runner`` carries the pattern's tool router.
         assert (
-            "block_runner" in launches[0].kwargs
-        ), "pattern runner must inject block_runner"
-
-    def test_on_tool_without_executor_factory_raises(
-        self, tmp_path: Path,
-    ):
-        prompt = _write_prompt(tmp_path, "p.md", "play body")
-        pattern = Pattern(
-            name="needs-factory",
-            roles=[],
-            instances=[
-                BlockInstance(
-                    name="play",
-                    block="play",
-                    trigger=ContinuousTrigger(),
-                    prompt=prompt,
-                ),
-                BlockInstance(
-                    name="ea",
-                    block="ExecuteAction",
-                    trigger=OnToolTrigger(
-                        instance="play",
-                        tool="mcp__arc__take_action",
-                    ),
-                ),
-            ],
-        )
-        ws = _FakeWorkspace(tmp_path)
-        with pytest.raises(
-            ValueError, match="no ``executor_factory``",
-        ):
-            PatternRunner(
-                pattern,
-                base_config=_base_config(tmp_path, ws),
-                launch_fn=lambda **k: _FakeHandle(k),
-                poll_interval_s=0.01,
-                max_total_runtime_s=0.1,
-            )
+            launches[0].kwargs.get("block_runner") is not None
+        ), "pattern runner must integrate the on_tool router"
 
     def test_on_tool_collides_with_existing_router_raises(
         self, tmp_path: Path,
@@ -1161,28 +1263,24 @@ class TestInstancesGrammar:
                 )],
             )],
         )
-        # Pre-bind a router that ALSO claims take_action.
+        # Pre-bind a router on the agent executor that ALSO
+        # claims take_action — the pattern-router merge must
+        # raise on collision.
         existing = ToolRouter({
             "mcp__arc__take_action":
                 lambda ctx: None,
         })
-        base_launch = lambda **k: None  # noqa: E731
-        pre_bound = functools.partial(
-            base_launch, block_runner=existing)
-
-        def executor_factory(block_def):
-            class _E:
-                def launch(self, **_):
-                    raise AssertionError("unreached")
-            return _E()
-
         ws = _FakeWorkspace(tmp_path)
-        base = AgentBlockConfig(
-            workspace=ws,
-            template=tmpl,
-            project_root=tmp_path,
-            prompt="",
-        )
+
+        def factory(block_def):
+            if block_def.name == "ExecuteAction":
+                class _E:
+                    def launch(self, **_):
+                        raise AssertionError("unreached")
+                return _E()
+            return _FakeExecutor(
+                lambda **_: None, block_runner=existing)
+
         with pytest.raises(
             ValueError,
             match=(
@@ -1190,12 +1288,16 @@ class TestInstancesGrammar:
                 "instances and the caller-supplied "
                 "block_runner"),
         ):
-            PatternRunner(
+            runner = PatternRunner(
                 pattern,
-                base_config=base,
-                launch_fn=pre_bound,
-                executor_factory=executor_factory,
+                defaults=_defaults(tmp_path, ws, template=tmpl),
+                executor_factory=factory,
             )
+            # The merge happens lazily on the first launch
+            # through the wrapped factory; force it by asking
+            # the factory directly for the play block.
+            runner._executor_factory(
+                BlockDefinition(name="play"))
 
     def test_instance_launches_correct_block_when_names_differ(
         self, tmp_path: Path,
@@ -1225,8 +1327,8 @@ class TestInstancesGrammar:
         ws = _FakeWorkspace(tmp_path)
         PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
             max_total_runtime_s=1.0,
         ).run()
@@ -1307,10 +1409,10 @@ class TestOnToolBridge:
         self,
         *,
         tmp_path: Path,
-        project_setup=None,
         template=None,
         launch_fn=None,
-        executor=None,
+        target_executor=None,
+        agent_block_runner=None,
         runtime_config=None,
     ):
         prompt = _write_prompt(tmp_path, "p.md", "body")
@@ -1323,21 +1425,12 @@ class TestOnToolBridge:
         # artifact before trying to serialise tool_input to JSON.
         for art in tmpl.artifacts:
             ws.artifact_declarations[art.name] = art.kind
-        base = AgentBlockConfig(
-            workspace=ws,  # type: ignore[arg-type]
-            template=tmpl,
-            project_root=tmp_path,
-            prompt="",
-        )
 
         def _default_launch(**kw):
             handle = _FakeHandle(kw)
             handle.finish()
             return handle
 
-        # Preserve the exact callable the test supplied so
-        # ``PatternRunner`` can introspect ``functools.partial``
-        # to find any pre-bound ``block_runner``.
         final_launch = (
             launch_fn if launch_fn is not None else _default_launch)
 
@@ -1357,15 +1450,22 @@ class TestOnToolBridge:
                 handle.wait = lambda: result_ns
                 return handle
 
-        exe = executor or _CapturingExecutor()
+        exe = target_executor or _CapturingExecutor()
         rt = runtime_config or {
             "execute_action": InstanceRuntimeConfig(),
         }
+        agent_exe = _FakeExecutor(
+            final_launch, block_runner=agent_block_runner)
+
+        def factory(block_def):
+            if block_def.name == "TARGET":
+                return exe
+            return agent_exe
+
         runner = PatternRunner(
             pattern,
-            base_config=base,
-            launch_fn=final_launch,
-            executor_factory=lambda block_def: exe,
+            defaults=_defaults(tmp_path, ws, template=tmpl),
+            executor_factory=factory,
             per_instance_runtime_config=rt,
             poll_interval_s=0.01,
             max_total_runtime_s=0.1,
@@ -1480,17 +1580,18 @@ class TestOnToolBridge:
         def opaque_runner(_ctx):
             return HandoffResult(content="OK")
 
-        opaque_launch = functools.partial(
-            lambda **_: None, block_runner=opaque_runner)
-
+        runner, _exe, _ws = self._make_runner(
+            tmp_path=tmp_path,
+            agent_block_runner=opaque_runner,
+        )
         with pytest.raises(
             ValueError,
             match="not a ``ToolRouter``",
         ):
-            self._make_runner(
-                tmp_path=tmp_path,
-                launch_fn=opaque_launch,
-            )
+            # The merge fires lazily when the wrapped factory
+            # is asked for an executor that exposes ``for_pattern``.
+            runner._executor_factory(
+                BlockDefinition(name="play"))
 
 
 class TestPauseAndRelaunch:
@@ -1581,8 +1682,8 @@ class TestPauseAndRelaunch:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
             max_total_runtime_s=2.0,
         )
@@ -1665,8 +1766,8 @@ class TestPauseAndRelaunch:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
             max_total_runtime_s=2.0,
         )
@@ -1742,16 +1843,24 @@ class TestEventDrivenCohortFiring:
             name="t",
             artifacts=[ArtifactDeclaration(
                 name="action", kind="copy")],
-            blocks=[BlockDefinition(
-                name="ExecuteAction",
-                image="dummy:latest",
-                runner="container",
-                lifecycle="workspace_persistent",
-                inputs=[InputSlot(
-                    name="action",
-                    container_path="/input/action",
-                )],
-            )],
+            blocks=[
+                # ``play`` and ``brainstorm`` are agent-shaped
+                # blocks the test launches via the fake
+                # executor; bare-name stubs are enough since
+                # the fake doesn't inspect block fields.
+                BlockDefinition(name="play"),
+                BlockDefinition(name="brainstorm"),
+                BlockDefinition(
+                    name="ExecuteAction",
+                    image="dummy:latest",
+                    runner="container",
+                    lifecycle="workspace_persistent",
+                    inputs=[InputSlot(
+                        name="action",
+                        container_path="/input/action",
+                    )],
+                ),
+            ],
         )
 
     def test_hook_returns_after_cohort_fires_in_main_loop(
@@ -1842,17 +1951,17 @@ class TestEventDrivenCohortFiring:
                 raise AssertionError(
                     "executor.launch should not run in this test")
 
-        def executor_factory(block_def):
-            return _StubExecutor()
-
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(
+            defaults=_defaults(
                 tmp_path, ws, template=template),
-            launch_fn=launch_fn,
+            executor_factory=_mixed_factory(
+                launch_fn,
+                target_executor=_StubExecutor(),
+                target_blocks={"ExecuteAction"},
+            ),
             poll_interval_s=0.01,
             max_total_runtime_s=5.0,
-            executor_factory=executor_factory,
             per_instance_runtime_config={
                 "execute_action": InstanceRuntimeConfig(),
             },
@@ -1926,17 +2035,17 @@ class TestEventDrivenCohortFiring:
             def launch(self, **_):
                 raise AssertionError("unused")
 
-        def executor_factory(block_def):
-            return _StubExecutor()
-
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(
+            defaults=_defaults(
                 tmp_path, ws, template=template),
-            launch_fn=launch_fn,
+            executor_factory=_mixed_factory(
+                launch_fn,
+                target_executor=_StubExecutor(),
+                target_blocks={"ExecuteAction"},
+            ),
             poll_interval_s=0.01,
             max_total_runtime_s=2.0,
-            executor_factory=executor_factory,
             per_instance_runtime_config={
                 "execute_action": InstanceRuntimeConfig(),
             },
@@ -2009,8 +2118,8 @@ class TestActiveStopOnHalt:
 
         runner = PatternRunner(
             pattern,
-            base_config=_base_config(tmp_path, ws),
-            launch_fn=launch_fn,
+            defaults=_defaults(tmp_path, ws, pattern=pattern),
+            executor_factory=_factory(launch_fn),
             poll_interval_s=0.01,
             max_total_runtime_s=2.0,
         )

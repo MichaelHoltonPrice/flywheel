@@ -29,11 +29,13 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.agent import AgentBlockConfig, run_agent_block
+from flywheel.agent_executor import AgentExecutor
 from flywheel.config import load_project_config
 from flywheel.execution import run_block
 from flywheel.pattern import Pattern, discover_patterns
 from flywheel.pattern_runner import PatternRunner
 from flywheel.project_hooks import load_project_hooks_class
+from flywheel.run_defaults import RunDefaults
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -463,8 +465,34 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
 
     Discovers ``<project_root>/patterns/<name>.yaml`` (mirrors
     template discovery), loads project hooks if configured,
-    builds an :class:`AgentBlockConfig` from CLI flags + hook
-    overrides, and hands off to :class:`PatternRunner`.
+    builds a :class:`RunDefaults` and an
+    :class:`flywheel.executor.BlockExecutor` factory from CLI
+    flags + hook overrides, and hands off to
+    :class:`PatternRunner`.
+
+    Project hooks are expected to return:
+
+    * ``executor_factory`` (optional): the
+      :class:`flywheel.pattern_runner.ExecutorFactory` the
+      runner will use for every block dispatch.  Hooks that
+      need agent-battery wiring (e.g. cyberarc's ``on_tool``
+      handoff loop) construct an
+      :class:`flywheel.agent_executor.AgentExecutor` here and
+      return a factory that hands it out.  When absent, the
+      CLI builds a default agent-only factory from CLI flags
+      + the legacy battery-shaped overrides below.
+    * ``per_instance_runtime_config`` (optional): forwarded
+      verbatim to the runner's same-named parameter.
+    * ``defaults`` (optional): a free-form dict merged into
+      :attr:`RunDefaults.defaults`.  Each executor reads what
+      it cares about and ignores the rest.
+    * Legacy battery-shaped keys (``agent_image``, ``model``,
+      ``mcp_servers``, ``extra_env``, ``extra_mounts``,
+      ``prompt_substitutions``, ...): consumed only when the
+      hooks did *not* supply ``executor_factory``.  In that
+      mode the CLI builds a single
+      :class:`flywheel.agent_executor.AgentExecutor` carrying
+      these defaults and uses it for every block.
 
     Args:
         args: Parsed argparse namespace with pattern-specific
@@ -523,51 +551,59 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         )
         sys.exit(1)
 
-    agent_config = AgentBlockConfig(
+    executor_factory = overrides.get("executor_factory")
+    if executor_factory is None:
+        # No project-supplied factory: build a default
+        # AgentExecutor configured from CLI args + the legacy
+        # battery-shaped overrides hooks may still set.  This
+        # is the path agent-only patterns take when their
+        # project doesn't need any host-side dispatch beyond
+        # what the agent battery already provides.
+        agent_executor = AgentExecutor(
+            template=template,
+            project_root=config.project_root,
+            agent_image=overrides.get(
+                "agent_image", args.agent_image),
+            auth_volume=overrides.get(
+                "auth_volume", args.auth_volume),
+            model=overrides.get("model", args.model),
+            max_turns=overrides.get(
+                "max_turns", args.max_turns),
+            total_timeout=overrides.get(
+                "total_timeout", args.total_timeout),
+            mcp_servers=overrides.get("mcp_servers"),
+            allowed_tools=overrides.get("allowed_tools"),
+            extra_env=overrides.get("extra_env"),
+            extra_mounts=overrides.get("extra_mounts"),
+            isolated_network=overrides.get(
+                "isolated_network", True),
+        )
+        executor_factory = lambda _block_def: agent_executor
+
+    defaults_bag: dict[str, Any] = dict(
+        overrides.get("defaults") or {})
+    if "prompt_substitutions" in overrides:
+        defaults_bag.setdefault(
+            "prompt_substitutions",
+            overrides["prompt_substitutions"])
+
+    run_defaults = RunDefaults(
         workspace=ws,
         template=template,
         project_root=config.project_root,
-        prompt="",  # Set by the pattern runner per-role.
-        agent_image=overrides.get(
-            "agent_image", args.agent_image),
-        auth_volume=overrides.get(
-            "auth_volume", args.auth_volume),
-        model=overrides.get("model", args.model),
-        max_turns=overrides.get("max_turns", args.max_turns),
-        total_timeout=overrides.get(
-            "total_timeout", args.total_timeout),
-        mcp_servers=overrides.get("mcp_servers"),
-        allowed_tools=overrides.get("allowed_tools"),
-        extra_env=overrides.get("extra_env"),
-        extra_mounts=overrides.get("extra_mounts"),
-        isolated_network=overrides.get(
-            "isolated_network", True),
-        prompt_substitutions=overrides.get(
-            "prompt_substitutions"),
+        defaults=defaults_bag,
     )
 
     runner_kwargs: dict[str, Any] = {}
-    if "launch_fn" in overrides:
-        # Projects that need the host-side full-stop handoff
-        # loop (e.g. cyberarc) inject ``launch_agent_with_handoffs``
-        # here.  Default is ``launch_agent_block``.
-        runner_kwargs["launch_fn"] = overrides["launch_fn"]
-    if "executor_factory" in overrides:
-        # Pattern ``on_tool`` dispatch uses this to look up the
-        # right executor per target block.
-        runner_kwargs["executor_factory"] = (
-            overrides["executor_factory"])
     if "per_instance_runtime_config" in overrides:
-        # Per-instance env / mount knobs the pattern runner
-        # forwards to the executor on the on_tool dispatch
-        # path.
         runner_kwargs["per_instance_runtime_config"] = (
             overrides["per_instance_runtime_config"])
 
     try:
         runner = PatternRunner(
             pattern,
-            base_config=agent_config,
+            defaults=run_defaults,
+            executor_factory=executor_factory,
             poll_interval_s=args.poll_interval,
             max_total_runtime_s=args.max_runtime,
             **runner_kwargs,

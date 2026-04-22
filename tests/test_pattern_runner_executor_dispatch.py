@@ -1,13 +1,12 @@
-"""Tests for the pure-container dispatch path in :class:`PatternRunner`.
+"""Tests for :class:`PatternRunner` driving pure-container blocks.
 
-Slice-3 step 1 added a branch in
-:meth:`PatternRunner._launch_role_member` that bypasses the agent
-launch path entirely when a pattern instance declares no
-``prompt:``.  This module exercises that branch end-to-end against
-a fake :class:`flywheel.executor.BlockExecutor`, with no agent
-machinery in the picture.
+The runner is agnostic to what kind of block any role launches:
+every dispatch goes through ``executor_factory(block_def).launch(...)``.
+This module exercises that path against a fake
+:class:`flywheel.executor.BlockExecutor` with no agent machinery
+in the picture.
 
-The new path is what unblocks pure-container patterns: a continuous
+The path is what unblocks pure-container patterns: a continuous
 or autorestart role can drive a one-shot training container, a
 workspace-persistent runtime, or any other block-shaped executor
 without inheriting any of the agent battery's surface (no
@@ -16,14 +15,13 @@ without inheriting any of the agent battery's surface (no
 
 from __future__ import annotations
 
-import shutil
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from flywheel.agent import AgentBlockConfig
 from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
@@ -39,6 +37,7 @@ from flywheel.pattern_runner import (
     InstanceRuntimeConfig,
     PatternRunner,
 )
+from flywheel.run_defaults import RunDefaults
 from flywheel.template import (
     BlockDefinition,
     Template,
@@ -90,14 +89,7 @@ class _FakeWorkspace:
 
 
 class _FakeExecutionHandle:
-    """Programmable :class:`ExecutionHandle` stand-in.
-
-    Stays alive until :meth:`finish` is called or :meth:`stop` is
-    invoked, at which point the next :meth:`wait` returns the
-    pre-built :class:`ExecutionResult`.  The runner only relies
-    on ``is_alive`` / ``wait`` / ``stop``, so mirroring those
-    three is enough.
-    """
+    """Programmable :class:`ExecutionHandle` stand-in."""
 
     def __init__(
         self,
@@ -138,11 +130,18 @@ class _FakeExecutionHandle:
 class _RecordingExecutor:
     """Captures every ``launch`` call; returns programmable handles.
 
-    The runner is expected to call ``launch`` with the protocol
-    arguments (``block_name``, ``workspace``, ``input_bindings``)
-    plus protocol-level extras (``run_id``) and the well-known
-    container extras (``extra_env``, ``extra_mounts``).  Tests
-    inspect ``calls`` to verify the handoff is correct.
+    Models the :class:`flywheel.executor.ProcessExitExecutor` /
+    :class:`flywheel.executor.RequestResponseExecutor` seam
+    rather than the agent battery's: container-extras
+    (``extra_env`` / ``extra_mounts``) arrive as explicit
+    launch kwargs, ``overrides`` is for free-form
+    per-launch knobs (e.g. CLI flag substitutions or the
+    battery-specific ``predecessor_id``).  Tests inspect
+    ``calls`` to verify the handoff is correct; the
+    container-extras kwargs and ``overrides`` keys are flattened
+    onto the recorded dict so assertions stay terse — but the
+    fake itself enforces the seam by accepting them only on
+    their declared channel.
     """
 
     def __init__(self) -> None:
@@ -151,17 +150,26 @@ class _RecordingExecutor:
 
     def launch(
         self,
+        *,
         block_name: str,
         workspace,  # noqa: ANN001
         input_bindings: dict[str, str],
-        **extras,
+        overrides: dict | None = None,
+        run_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
     ) -> _FakeExecutionHandle:
-        recorded = {
+        recorded = dict(overrides or {})
+        recorded.update({
             "block_name": block_name,
             "workspace": workspace,
             "input_bindings": dict(input_bindings),
-            **extras,
-        }
+            "run_id": run_id,
+        })
+        if extra_env is not None:
+            recorded["extra_env"] = dict(extra_env)
+        if extra_mounts is not None:
+            recorded["extra_mounts"] = list(extra_mounts)
         self.calls.append(recorded)
         handle = _FakeExecutionHandle(
             block_name=block_name,
@@ -191,19 +199,13 @@ def _container_template() -> Template:
     return Template(name="trainer", artifacts=[], blocks=[block])
 
 
-def _base_config(
+def _defaults(
     tmp_path: Path, workspace: _FakeWorkspace, template: Template,
-) -> AgentBlockConfig:
-    """Build the (still-required) ``base_config`` for the runner.
-
-    Slice-3 step 2 replaces this with :class:`RunDefaults`; for
-    step 1 the runner's __init__ still demands ``base_config``.
-    """
-    return AgentBlockConfig(
+) -> RunDefaults:
+    return RunDefaults(
         workspace=workspace,  # type: ignore[arg-type]
         template=template,
         project_root=tmp_path,
-        prompt="",
     )
 
 
@@ -212,8 +214,8 @@ def _continuous_pattern(role_name: str = "trainer") -> Pattern:
 
     The :func:`_role_from_instance` helper inside the pattern
     runner sets ``role.prompt = inst.prompt or ""``; passing
-    ``prompt=None`` here is what makes
-    ``_role_uses_executor_dispatch`` return True.
+    ``prompt=None`` here means the runner never reads a prompt
+    body off disk and the executor sees no ``prompt`` override.
     """
     return Pattern(
         name="trainer-loop",
@@ -230,6 +232,24 @@ def _continuous_pattern(role_name: str = "trainer") -> Pattern:
     )
 
 
+def _drain_first_handle(executor: _RecordingExecutor) -> threading.Thread:
+    """Spawn a daemon that finishes the first launched handle.
+
+    The continuous handle is alive after the runner fires the
+    role; finishing it on a worker lets ``run()`` terminate
+    naturally instead of relying on ``max_total_runtime_s``.
+    """
+
+    def _finisher() -> None:
+        while not executor.handles:
+            pass
+        executor.handles[0].finish()
+
+    t = threading.Thread(target=_finisher, daemon=True)
+    t.start()
+    return t
+
+
 # ── Tests ────────────────────────────────────────────────────────
 
 
@@ -238,10 +258,8 @@ def test_continuous_pure_container_runs_via_executor_factory(
 ) -> None:
     """A prompt-less continuous role dispatches via the executor seam.
 
-    The runner must call ``executor_factory(block_def).launch(...)``
-    instead of any agent launcher.  Verifies the protocol-level
-    arguments land correctly and the run terminates when the
-    handle finishes naturally.
+    Verifies the protocol-level arguments land correctly and the
+    run terminates when the handle finishes naturally.
     """
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
@@ -250,26 +268,12 @@ def test_continuous_pure_container_runs_via_executor_factory(
 
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: pytest.fail(
-            "agent launch_fn must not be invoked for "
-            "prompt-less roles"),
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _block_def: executor,
         poll_interval_s=0.01,
     )
 
-    # The continuous handle is alive after the runner fires the
-    # role; finish it on a worker thread so ``run()`` terminates.
-    import threading
-
-    def _finisher() -> None:
-        # Spin until at least one launch has happened.
-        while not executor.handles:
-            pass
-        executor.handles[0].finish()
-
-    t = threading.Thread(target=_finisher, daemon=True)
-    t.start()
+    t = _drain_first_handle(executor)
     result = runner.run()
     t.join(timeout=2.0)
 
@@ -283,6 +287,9 @@ def test_continuous_pure_container_runs_via_executor_factory(
     # The runner stamps the active run_id on every launch so the
     # executor can tag executions for cadence accounting.
     assert call["run_id"] == result.run_id
+    # No prompt key: the role has no prompt, so the runner does
+    # not synthesise one.
+    assert "prompt" not in call
     assert result.cohorts_by_role == {"trainer": 1}
     assert result.agents_launched == 1
 
@@ -290,12 +297,12 @@ def test_continuous_pure_container_runs_via_executor_factory(
 def test_executor_dispatch_forwards_role_extra_env(
     tmp_path: Path,
 ) -> None:
-    """``role.extra_env`` reaches the executor as the ``extra_env`` extra.
+    """``role.extra_env`` reaches the executor as the ``extra_env`` override.
 
-    Mirrors the on_tool dispatch path: per-instance env knobs
-    declared on the YAML instance flow through to the executor's
-    ``launch(extra_env=...)`` extra so container blocks can be
-    parameterised without baking the value into the image.
+    Per-instance env knobs declared on the YAML instance flow
+    through to the executor's ``overrides["extra_env"]`` so
+    container blocks can be parameterised without baking the
+    value into the image.
     """
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
@@ -317,62 +324,29 @@ def test_executor_dispatch_forwards_role_extra_env(
 
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: pytest.fail(
-            "agent launch_fn must not be invoked"),
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _bd: executor,
         poll_interval_s=0.01,
     )
 
-    import threading
-
-    def _finisher() -> None:
-        while not executor.handles:
-            pass
-        executor.handles[0].finish()
-
-    threading.Thread(target=_finisher, daemon=True).start()
+    _drain_first_handle(executor)
     runner.run()
 
     assert executor.calls[0]["extra_env"] == {
         "SEED": "42", "RUN_TAG": "step1"}
 
 
-def test_executor_dispatch_without_factory_raises(
-    tmp_path: Path,
-) -> None:
-    """Prompt-less role + no executor_factory must raise loudly.
-
-    The runner cannot guess which executor to use; failing early
-    surfaces the misconfiguration at the first fire instead of
-    silently falling through to the agent launcher.
-    """
-    ws = _FakeWorkspace(tmp_path)
-    template = _container_template()
-    pattern = _continuous_pattern()
-
-    runner = PatternRunner(
-        pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: pytest.fail(
-            "agent launch_fn must not be invoked"),
-        executor_factory=None,
-        poll_interval_s=0.01,
-    )
-
-    with pytest.raises(ValueError, match="no ``executor_factory``"):
-        runner.run()
-
-
 def test_executor_dispatch_unknown_block_raises(
     tmp_path: Path,
 ) -> None:
-    """Pattern referencing a block not in the template raises.
+    """Pattern referencing an undeclared block fails fast.
 
-    The check lives in the executor-dispatch branch (the agent
-    path's equivalent is implicit through ``launch_agent_block``);
-    surfacing it here keeps the failure attributable to the
-    pattern, not to a downstream NoneType deref.
+    The executor factory branches on real
+    :class:`BlockDefinition` metadata (today: ``lifecycle``).
+    A stub default for an undeclared block could silently
+    misroute the launch to the wrong executor, so the runner
+    requires every referenced block to be declared in the
+    template up front.
     """
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
@@ -393,13 +367,12 @@ def test_executor_dispatch_unknown_block_raises(
 
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: None,
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _bd: executor,
         poll_interval_s=0.01,
     )
 
-    with pytest.raises(ValueError, match="not declared in the template"):
+    with pytest.raises(ValueError, match="not_in_template"):
         runner.run()
 
 
@@ -408,11 +381,10 @@ def test_per_instance_runtime_config_extra_env_merges(
 ) -> None:
     """``per_instance_runtime_config`` env layers under ``role.extra_env``.
 
-    Mirrors the on_tool dispatch path semantics: the project
-    hook supplies a per-instance runtime config keyed by
-    instance name; the executor receives the merge of those env
-    vars with the role's own ``extra_env`` (role wins on
-    collision, matching :meth:`PatternRunner._merge_env`).
+    The project hook supplies a per-instance runtime config keyed
+    by instance name; the executor receives the merge of those
+    env vars with the role's own ``extra_env`` (role wins on
+    collision).
     """
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
@@ -448,22 +420,13 @@ def test_per_instance_runtime_config_extra_env_merges(
 
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: pytest.fail(
-            "agent launch_fn must not be invoked"),
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _bd: executor,
         per_instance_runtime_config=runtime_cfg,
         poll_interval_s=0.01,
     )
 
-    import threading
-
-    def _finisher() -> None:
-        while not executor.handles:
-            pass
-        executor.handles[0].finish()
-
-    threading.Thread(target=_finisher, daemon=True).start()
+    _drain_first_handle(executor)
     runner.run()
 
     call = executor.calls[0]
@@ -477,18 +440,16 @@ def test_per_instance_runtime_config_extra_env_merges(
     ]
 
 
-def test_predecessor_id_is_dropped_on_executor_path(
+def test_predecessor_id_flows_through_overrides(
     tmp_path: Path,
 ) -> None:
-    """Executor dispatch silently drops ``predecessor_id``.
+    """``predecessor_id`` is forwarded to the executor via overrides.
 
-    The :class:`flywheel.executor.BlockExecutor` protocol does
-    not declare a chaining concept; forwarding the kwarg as an
-    "extra" would probe executor-specific tolerance for unknown
-    arguments.  Instead, the runner suppresses it on this path.
-    Tested by calling the dispatch helper directly with a
-    predecessor — the recorded launch call must contain neither
-    a ``predecessor_id`` key nor any other proxy for chaining.
+    The runner does not assume any executor honours it — agent
+    batteries do, generic container executors don't and ignore
+    the unknown override per the protocol's "unknown keys are
+    silent" contract.  Verifying it lands in the dict is enough;
+    each executor's behaviour is tested in its own suite.
     """
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
@@ -497,44 +458,38 @@ def test_predecessor_id_is_dropped_on_executor_path(
 
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=lambda **_: pytest.fail(
-            "agent launch_fn must not be invoked"),
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _bd: executor,
         poll_interval_s=0.01,
     )
-    # The dispatch helper needs an active run id (normally set
-    # at the top of ``run()``); fake one for the unit test.
     runner._run_id = "run_test"  # noqa: SLF001
     role = next(iter(runner._state.values())).role  # noqa: SLF001
 
-    runner._dispatch_role_via_executor(  # noqa: SLF001
+    handle = runner._launch_role_member(  # noqa: SLF001
         role,
         cohort_index=0,
         member_index=0,
         predecessor_id="prev_ex_0001",
     )
+    handle.finish()
 
     assert len(executor.calls) == 1
-    assert "predecessor_id" not in executor.calls[0]
+    assert executor.calls[0]["predecessor_id"] == "prev_ex_0001"
 
 
 def test_executor_dispatch_runs_alongside_agent_role(
     tmp_path: Path,
 ) -> None:
-    """Mixed pattern: an agent role and a container role coexist.
+    """Mixed pattern: a prompt-bearing role and a prompt-less role coexist.
 
-    The runner must route each role through its respective path
-    (agent → ``launch_fn``; container → ``executor_factory``)
-    and terminate when both drivers finish.  The order of fires
-    is start-time deterministic (the runner iterates
-    ``self._state.values()`` in insertion order).
+    Both go through the executor seam in the unified dispatch
+    model; the runner just builds different ``overrides`` dicts
+    based on role declarations.  The order of fires is start-time
+    deterministic (the runner iterates ``self._state.values()``
+    in insertion order).
     """
-    from flywheel.agent import AgentResult
-
     ws = _FakeWorkspace(tmp_path)
     template = _container_template()
-    # Add a second block so the agent role has something to point at.
     template.blocks.append(BlockDefinition(
         name="play", runner="container",
         image="agent:latest", lifecycle="one_shot",
@@ -563,56 +518,31 @@ def test_executor_dispatch_runs_alongside_agent_role(
         ],
     )
 
-    agent_handles: list = []
-
-    class _AgentHandle:
-        def __init__(self) -> None:
-            self._alive = True
-
-        def is_alive(self) -> bool:
-            return self._alive
-
-        def stop(self, reason: str = "") -> None:
-            self._alive = False
-
-        def wait(self) -> AgentResult:
-            self._alive = False
-            return AgentResult(
-                exit_code=0, elapsed_s=0.0, evals_run=0,
-                exit_reason="completed",
-                execution_id="agent_ex",
-            )
-
-        def finish(self) -> None:
-            self._alive = False
-
-    def _agent_launch_fn(**kwargs):
-        h = _AgentHandle()
-        agent_handles.append(h)
-        return h
-
     executor = _RecordingExecutor()
     runner = PatternRunner(
         pattern,
-        base_config=_base_config(tmp_path, ws, template),
-        launch_fn=_agent_launch_fn,
+        defaults=_defaults(tmp_path, ws, template),
         executor_factory=lambda _bd: executor,
         poll_interval_s=0.01,
     )
 
-    import threading
-
     def _finisher() -> None:
-        while not (agent_handles and executor.handles):
+        while len(executor.handles) < 2:
             pass
-        agent_handles[0].finish()
         executor.handles[0].finish()
+        executor.handles[1].finish()
 
     threading.Thread(target=_finisher, daemon=True).start()
     result = runner.run()
 
-    # Container role hit the executor seam; agent role hit launch_fn.
-    assert len(executor.calls) == 1
-    assert executor.calls[0]["block_name"] == "train"
-    assert len(agent_handles) == 1
+    assert len(executor.calls) == 2
+    block_names = {c["block_name"] for c in executor.calls}
+    assert block_names == {"play", "train"}
+    play_call = next(
+        c for c in executor.calls if c["block_name"] == "play")
+    train_call = next(
+        c for c in executor.calls if c["block_name"] == "train")
+    # The play role carries a prompt; trainer doesn't.
+    assert play_call["prompt"] == "hi"
+    assert "prompt" not in train_call
     assert result.cohorts_by_role == {"play": 1, "trainer": 1}

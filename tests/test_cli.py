@@ -464,9 +464,11 @@ roles:
             def teardown(self):
                 teardown_called.append(True)
 
+        captured: dict = {}
+
         class _FakeRunner:
             def __init__(self, pattern, **kwargs):
-                self.cfg = kwargs["base_config"]
+                captured["kwargs"] = kwargs
 
             def run(self):
                 class R:
@@ -495,16 +497,19 @@ roles:
         assert init_called[0][1] == ["--game-id", "abc"]
         # teardown ran.
         assert teardown_called == [True]
+        # The CLI built an executor_factory for the runner even
+        # though the hooks did not supply one.
+        assert callable(captured["kwargs"]["executor_factory"])
 
-    def test_project_hooks_can_override_launch_fn(
+    def test_project_hooks_can_override_executor_factory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         # Projects that need the host-side full-stop handoff loop
-        # (cyberarc) put a partial-bound
-        # ``launch_agent_with_handoffs`` in the overrides dict.
-        # The CLI must thread it through to ``PatternRunner``;
-        # otherwise the default ``launch_agent_block`` runs and
-        # the handoff path never fires.
+        # (cyberarc) hand the runner a pre-configured
+        # ``executor_factory`` from their hooks.  The CLI must
+        # thread it through to :class:`PatternRunner` verbatim;
+        # otherwise the default agent-only factory runs and the
+        # handoff path never fires.
         project_root = make_project(tmp_path)
         monkeypatch.chdir(project_root)
         main(["create", "workspace", "--name", "ws",
@@ -517,11 +522,11 @@ roles:
       kind: continuous
 """)
 
-        sentinel = object()
+        sentinel = lambda _block_def: object()
 
         class _Hooks:
             def init(self, ws, template, pr, args):
-                return {"launch_fn": sentinel}
+                return {"executor_factory": sentinel}
 
             def teardown(self):
                 pass
@@ -553,14 +558,16 @@ roles:
                 "--project-hooks", "x:Y",
             ])
 
-        assert captured["kwargs"]["launch_fn"] is sentinel
+        assert captured["kwargs"]["executor_factory"] is sentinel
 
-    def test_project_hooks_without_launch_fn_uses_default(
+    def test_project_hooks_without_executor_factory_uses_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        # When hooks don't supply ``launch_fn`` the CLI must
-        # leave the kwarg out so PatternRunner falls back to its
-        # default (``launch_agent_block``).
+        # When hooks don't supply ``executor_factory`` the CLI
+        # builds a default :class:`AgentExecutor`-backed factory
+        # from CLI args + legacy battery-shaped overrides so
+        # agent-only patterns keep working without project-side
+        # wiring.
         project_root = make_project(tmp_path)
         monkeypatch.chdir(project_root)
         main(["create", "workspace", "--name", "ws",
@@ -607,7 +614,7 @@ roles:
                 "--project-hooks", "x:Y",
             ])
 
-        assert "launch_fn" not in captured["kwargs"]
+        assert callable(captured["kwargs"]["executor_factory"])
 
 
 class TestProjectConfigFields:

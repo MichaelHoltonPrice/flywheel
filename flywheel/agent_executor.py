@@ -234,22 +234,37 @@ class AgentExecutor:
         allowed_blocks: list[str] | None = None,
         state_lineage_id: str | None = None,
         run_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_mounts: list[tuple[str, str, str]] | None = None,
     ) -> ExecutionHandle:
         """Launch an agent block; return an :class:`ExecutionHandle`.
 
         ``overrides`` carries per-instance knobs; see the module
-        docstring for the keys consumed.  ``execution_id``,
-        ``allowed_blocks``, ``state_lineage_id`` are accepted
-        for protocol parity but not consumed by today's agent
-        machinery (the underlying launcher mints its own ids and
-        the agent's container does not honour an external block
-        whitelist).  ``run_id`` is forwarded so the resulting
+        docstring for the keys consumed.  ``extra_env`` and
+        ``extra_mounts`` follow the substrate-wide
+        container-extras convention (see ``executors.md``):
+        ``extra_env`` merges over the constructor's defaults
+        with per-launch winning on key collision;
+        ``extra_mounts`` appends after the constructor's mounts.
+        Callers that still pass these through ``overrides``
+        (legacy battery-shape) are honoured for compatibility,
+        with explicit kwargs taking precedence.
+        ``execution_id``, ``allowed_blocks``,
+        ``state_lineage_id`` are accepted for protocol parity
+        but not consumed by today's agent machinery (the
+        underlying launcher mints its own ids and the agent's
+        container does not honour an external block whitelist).
+        ``run_id`` is forwarded so the resulting
         :class:`flywheel.artifact.BlockExecution` is stamped
         with the caller's run grouping.
         """
         del execution_id, allowed_blocks, state_lineage_id
 
-        plan = self._resolve_plan(overrides)
+        plan = self._resolve_plan(
+            overrides,
+            kwarg_extra_env=extra_env,
+            kwarg_extra_mounts=extra_mounts,
+        )
 
         launch_kwargs: dict[str, Any] = {
             "workspace": workspace,
@@ -293,15 +308,26 @@ class AgentExecutor:
         )
 
     def _resolve_plan(
-        self, overrides: dict[str, Any] | None,
+        self,
+        overrides: dict[str, Any] | None,
+        *,
+        kwarg_extra_env: dict[str, str] | None = None,
+        kwarg_extra_mounts: (
+            list[tuple[str, str, str]] | None) = None,
     ) -> _LaunchPlan:
         """Layer per-launch overrides on top of constructor defaults.
 
         The single place where the merge policy lives.  Scalar
-        keys take per-launch when present; ``extra_env`` merges
-        (per-launch wins on collision); ``extra_mounts`` appends
-        per-launch after constructor mounts.  Unknown keys are
-        ignored silently per the protocol contract.
+        keys take per-launch when present.  ``extra_env`` merges
+        with per-launch winning on collision; ``extra_mounts``
+        appends per-launch after constructor mounts.  When the
+        caller passes ``extra_env`` / ``extra_mounts`` both as
+        explicit kwargs (the substrate-wide container-extras
+        seam) and via ``overrides`` (legacy battery-shape), the
+        kwargs take precedence — overrides are merged in first,
+        then the kwargs win on the same merge rule.  Unknown
+        keys in ``overrides`` are ignored silently per the
+        protocol contract.
 
         Raises:
             ValueError: When ``overrides`` carries no ``prompt``.
@@ -326,12 +352,14 @@ class AgentExecutor:
                     "{{" + str(key) + "}}", str(value))
 
         merged_env = dict(self._extra_env)
-        per_launch_env = ov.get(OVERRIDE_EXTRA_ENV) or {}
-        merged_env.update(per_launch_env)
+        merged_env.update(ov.get(OVERRIDE_EXTRA_ENV) or {})
+        if kwarg_extra_env:
+            merged_env.update(kwarg_extra_env)
 
         merged_mounts = list(self._extra_mounts)
-        per_launch_mounts = ov.get(OVERRIDE_EXTRA_MOUNTS) or []
-        merged_mounts.extend(per_launch_mounts)
+        merged_mounts.extend(ov.get(OVERRIDE_EXTRA_MOUNTS) or [])
+        if kwarg_extra_mounts:
+            merged_mounts.extend(kwarg_extra_mounts)
 
         return _LaunchPlan(
             prompt=prompt,
