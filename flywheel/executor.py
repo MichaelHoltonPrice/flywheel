@@ -186,44 +186,87 @@ class SyncExecutionHandle(ExecutionHandle):
 class BlockExecutor(Protocol):
     """Protocol for executing a block definition.
 
-    Implementations receive a block definition, workspace, and
-    input bindings, then produce output artifacts and record the
-    execution.  The ``launch()`` method returns an
-    ``ExecutionHandle`` for non-blocking control.
+    The seam every runner (the ad-hoc ``flywheel run *`` commands
+    and the pattern runner) talks to.  Implementations receive a
+    block definition by name, the workspace whose ledger they
+    will append to, and input slot bindings; they return an
+    :class:`ExecutionHandle` whose ``wait()`` produces an
+    :class:`ExecutionResult` and an appended :class:`BlockExecution`
+    record.
+
+    Runners must depend only on this protocol — never on a
+    concrete executor class, never on agent-specific surfaces.
+    Batteries-included blocks (the agent battery being the
+    canonical example) wrap their machinery as a
+    ``BlockExecutor`` implementation; the runner cannot tell them
+    apart from a generic container executor.
+
+    Per-launch context falls into three buckets:
+
+    * **Bindings** — :attr:`input_bindings`, :attr:`overrides`,
+      :attr:`allowed_blocks`: what this single execution is
+      processing.
+    * **Workspace identity** — :attr:`execution_id`,
+      :attr:`state_lineage_id`, :attr:`run_id`: how this
+      execution slots into the durable ledger.
+    * **Executor-specific extras** (not on the protocol):
+      container-shaped executors additionally accept
+      ``extra_env``, ``extra_mounts``, ``extra_docker_args``;
+      callers using those kwargs implicitly assume the executor
+      is container-shaped.  See ``executors.md`` for the full
+      conventions.
     """
 
     def launch(
         self,
         block_name: str,
-        workspace: Any,
+        workspace: Workspace,
         input_bindings: dict[str, str],
         *,
-        outputs_data: dict[str, Any] | None = None,
-        elapsed_s: float | None = None,
         execution_id: str | None = None,
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
+        state_lineage_id: str | None = None,
+        run_id: str | None = None,
     ) -> ExecutionHandle:
         """Launch a block execution.
 
         Args:
-            block_name: Name of the block to execute.
-            workspace: The flywheel workspace.
+            block_name: Name of the block to execute.  Must
+                resolve against the executor's bound template.
+            workspace: The flywheel workspace.  The execution
+                record is appended to its ledger; output
+                artifacts are registered against its declarations.
             input_bindings: Maps input slot names to artifact
-                instance IDs.
-            outputs_data: Optional output data dicts to write as
-                artifacts (used by executors that produce outputs
-                from in-memory data rather than container output).
-            elapsed_s: Optional wall-clock time to record on the
-                execution record when known by the caller.
+                instance IDs already registered in ``workspace``.
             execution_id: Optional pre-assigned execution ID.
-            overrides: CLI flag overrides for container blocks.
+                Callers that need to thread an ID through their
+                own bookkeeping (e.g. nested handoffs) supply
+                one; otherwise the executor mints its own.
+            overrides: Free-form per-launch overrides the
+                executor may consume.  Container-style executors
+                today read CLI flag substitutions; battery
+                executors read battery-specific knobs (prompt,
+                model, ...).  Unknown keys must be ignored
+                silently — validation, if any, is the executor's
+                concern.
             allowed_blocks: If set, only these block names are
-                permitted.
+                permitted.  Used by host-side handoff loops to
+                fence what an agent's nested executions can
+                touch.
+            state_lineage_id: Optional state-chain identifier the
+                executor uses to populate ``/state/`` from a
+                prior execution's captured state directory.
+                Executors with no state concept ignore this.
+            run_id: Optional :class:`flywheel.artifact.RunRecord`
+                id stamped onto the resulting execution record so
+                pattern-level cadence counters can scope to a
+                single run.
 
         Returns:
-            An ``ExecutionHandle`` for monitoring and collecting
-            the result.
+            An :class:`ExecutionHandle` for monitoring and
+            collecting the result.  Callers must call
+            :meth:`ExecutionHandle.wait` exactly once.
         """
         ...
 
@@ -1563,11 +1606,10 @@ class ProcessExecutor:
         input_bindings: dict[str, str],
         *,
         command: str | list[str] | None = None,
-        outputs_data: dict[str, Any] | None = None,
-        elapsed_s: float | None = None,
         execution_id: str | None = None,
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
+        state_lineage_id: str | None = None,
         run_id: str | None = None,
     ) -> ProcessExecutionHandle:
         """Launch a local subprocess.
@@ -1579,11 +1621,11 @@ class ProcessExecutor:
                 mounted — local processes access files directly).
             command: Shell command string or argument list.
                 Required.
-            outputs_data: Unused (protocol compat).
-            elapsed_s: Unused (protocol compat).
             execution_id: Pre-assigned execution ID.
             overrides: Unused (protocol compat).
             allowed_blocks: If set, only these block names allowed.
+            state_lineage_id: Unused (protocol compat — local
+                subprocesses have no state mount to populate).
             run_id: Optional run grouping id stamped on the
                 resulting :class:`BlockExecution` record.
                 ``None`` means ad-hoc (no grouping).
