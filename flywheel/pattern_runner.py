@@ -35,12 +35,7 @@ depend on Docker.
 
 from __future__ import annotations
 
-import functools
-import inspect
-import json
 import queue
-import shutil
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -53,13 +48,11 @@ from flywheel.agent import (
     AgentResult,
     launch_agent_block,
 )
-from flywheel.agent_handoff import (
-    BlockRunner,
-    HandoffContext,
-    HandoffResult,
-    ToolRouter,
+from flywheel.executor import ExecutionResult
+from flywheel.instance_runtime import (
+    ExecutorFactory,
+    InstanceRuntimeConfig,
 )
-from flywheel.executor import BlockExecutor, ExecutionResult
 from flywheel.pattern import (
     AutorestartTrigger,
     BlockInstance,
@@ -71,7 +64,23 @@ from flywheel.pattern import (
     Pattern,
     Role,
 )
+from flywheel.pattern_handoff import (
+    build_pattern_tool_router,
+    wrap_launch_fn_with_router,
+)
 from flywheel.template import BlockDefinition
+
+# ``InstanceRuntimeConfig`` and ``ExecutorFactory`` are defined
+# in :mod:`flywheel.instance_runtime` so the runner and the
+# agent-battery wiring can both depend on them without forming
+# an import cycle.  They remain importable from this module for
+# back-compat with project code (cyberarc, tests).
+__all__ = [
+    "ExecutorFactory",
+    "InstanceRuntimeConfig",
+    "PatternRunResult",
+    "PatternRunner",
+]
 
 
 class _Handle(Protocol):
@@ -117,39 +126,6 @@ class _PostDispatchEvent:
 
     block_name: str
     done: threading.Event
-
-
-@dataclass(frozen=True)
-class InstanceRuntimeConfig:
-    """Runtime knobs the pattern runner applies to one instance.
-
-    Supplied by the project layer (e.g. cyberarc's
-    ``ProjectHooks``) and forwarded to the executor on launch.
-    Keyed by *instance* name, not block name, because two
-    instances of the same block may eventually need different
-    config (e.g. different game ids, different mount directories).
-
-    Attributes:
-        extra_env: Environment variables merged into the
-            container's env on startup.
-        extra_mounts: Bind mounts appended to the executor's
-            standard mount list.  Each entry is
-            ``(host_path, container_path, mode)``.
-    """
-
-    extra_env: dict[str, str] = field(default_factory=dict)
-    extra_mounts: list[tuple[str, str, str]] = field(
-        default_factory=list)
-
-
-# Type alias for the caller-supplied executor factory.  Given a
-# block definition (the resolved target of an ``on_tool``
-# instance), the factory returns the executor that should
-# dispatch calls to that block.  Today's MVP shape is "always
-# return the shared RequestResponseExecutor," but the factory
-# signature keeps lifecycle-per-block routing available without
-# an API change when the need arrives.
-ExecutorFactory = Callable[[BlockDefinition], BlockExecutor]
 
 
 @dataclass
@@ -230,7 +206,7 @@ class PatternRunner:
         block runner the handoff loop consults.  Omitting them
         when the pattern has no ``on_tool`` instances is fine;
         omitting them when it does is an error (see
-        :meth:`_build_pattern_tool_router`).
+        :func:`flywheel.pattern_handoff.build_pattern_tool_router`).
         """
         self._pattern = pattern
         self._base = base_config
@@ -262,9 +238,21 @@ class PatternRunner:
         # Build the pattern-owned tool router.  When there are
         # no on_tool instances it's ``None``; the launch path
         # then leaves the caller's existing block_runner in
-        # place unchanged.
-        self._pattern_tool_router: ToolRouter | None = (
-            self._build_pattern_tool_router())
+        # place unchanged.  The router itself is an agent-
+        # battery shape (:class:`flywheel.agent_handoff.ToolRouter`)
+        # owned by :mod:`flywheel.pattern_handoff` — the runner
+        # treats it as opaque and only checks for ``None``.
+        self._pattern_tool_router: Any | None = (
+            build_pattern_tool_router(
+                pattern_name=self._pattern.name,
+                on_tool_instances=self._on_tool_instances,
+                workspace=self._base.workspace,
+                template=self._base.template,
+                executor_factory=self._executor_factory,
+                per_instance_runtime_config=(
+                    self._per_instance_runtime_config),
+                run_id_provider=lambda: self._run_id,
+            ))
 
         # Reject reactive triggers we don't yet implement.
         for role in synthesized_roles:
@@ -328,10 +316,20 @@ class PatternRunner:
         # so every call forwards a merged block_runner and a
         # post_dispatch_fn.  The merge raises at construction time
         # on any collision with a ``ToolRouter`` already pre-bound
-        # by partial.
+        # by partial.  The wiring lives in
+        # :mod:`flywheel.pattern_handoff` — the runner only
+        # supplies the generic cadence callback (a ``str -> None``
+        # function) and lets the wiring adapt it to the handoff
+        # loop's :class:`HandoffContext`-shaped protocol.
         if self._pattern_tool_router is not None:
-            self._launch_fn = self._wrap_launch_fn_with_router(
-                launch_fn, self._pattern_tool_router)
+            self._launch_fn = wrap_launch_fn_with_router(
+                launch_fn,
+                pattern_name=self._pattern.name,
+                on_tool_instance_count=len(
+                    self._on_tool_instances),
+                pattern_router=self._pattern_tool_router,
+                post_dispatch_fn=self._post_dispatch_hook,
+            )
 
         # Map block name → whether any every_n_executions trigger
         # references it.  Used by ``_post_dispatch_hook`` to
@@ -674,21 +672,24 @@ class PatternRunner:
         state.cohorts_fired += 1
         self._drain_cohort(role.name, cohort_handles)
 
-    def _post_dispatch_hook(
-        self, ctx: HandoffContext,
-    ) -> None:
+    def _post_dispatch_hook(self, tool_name: str) -> None:
         """Called from HANDOFF thread after each successful dispatch.
 
+        Receives only the dispatched tool name — the agent-
+        battery's :class:`HandoffContext` is adapted in
+        :func:`flywheel.pattern_handoff.wrap_launch_fn_with_router`
+        so the runner stays free of any handoff-loop types.
+
         Resolves the block name behind the tool, skips if no
-        ``every_n_executions`` trigger watches that block, otherwise
-        enqueues an event and blocks until the main loop has
-        evaluated triggers and signalled completion.
+        ``every_n_executions`` trigger watches that block,
+        otherwise enqueues an event and blocks until the main
+        loop has evaluated triggers and signalled completion.
 
         Blocking here is the pause mechanism for ``pause:[]``
         cohorts — the agent's handoff loop doesn't relaunch the
         next container until this hook returns.
         """
-        block_name = self._block_name_for_tool(ctx.tool_name)
+        block_name = self._block_name_for_tool(tool_name)
         if block_name is None:
             return
         if block_name not in self._blocks_watched_for_cadence:
@@ -1195,188 +1196,6 @@ class PatternRunner:
             return self._base.agent_workspace_dir
         return None
 
-    # ─── Pattern-owned tool dispatch ──────────────────────────
-
-    def _build_pattern_tool_router(
-        self,
-    ) -> ToolRouter | None:
-        """Turn ``on_tool`` instances into a :class:`ToolRouter`.
-
-        Returns ``None`` when the pattern declares no ``on_tool``
-        instances (the runner then leaves the caller's existing
-        block_runner unchanged).  Raises at construction time
-        on any declared-but-unserviceable instance:
-
-        * Missing ``executor_factory``: the caller must provide
-          one whenever the pattern has at least one ``on_tool``
-          trigger.
-        * Target block not in the template: the pattern
-          references a block the project's registry doesn't know.
-        * Target block has an ``inputs:`` list with count != 1:
-          the tool-input serialisation convention (JSON into the
-          single declared input slot) only works for 1-input
-          blocks.  Multi-input blocks must wait for an explicit
-          ``input_slot`` or ``input_map`` field on the trigger.
-        """
-        if not self._on_tool_instances:
-            return None
-        if self._executor_factory is None:
-            raise ValueError(
-                f"Pattern {self._pattern.name!r} declares "
-                f"{len(self._on_tool_instances)} on_tool "
-                f"instance(s) but no ``executor_factory`` was "
-                f"supplied to PatternRunner; cannot dispatch."
-            )
-        routes: dict[str, BlockRunner] = {}
-        for inst in self._on_tool_instances:
-            trigger = inst.trigger
-            assert isinstance(trigger, OnToolTrigger)
-            block_def = self._find_block(inst.block)
-            if block_def is None:
-                raise ValueError(
-                    f"Pattern {self._pattern.name!r} on_tool "
-                    f"instance {inst.name!r} references "
-                    f"unknown block {inst.block!r}"
-                )
-            if len(block_def.inputs) != 1:
-                raise ValueError(
-                    f"Pattern {self._pattern.name!r} on_tool "
-                    f"dispatch to block {block_def.name!r} "
-                    f"requires exactly one declared input slot "
-                    f"(tool_input is serialised as JSON into "
-                    f"that slot); block has "
-                    f"{len(block_def.inputs)} inputs.  "
-                    f"Declare a wrapper block or extend the "
-                    f"trigger with an explicit input mapping."
-                )
-            # Tool-input serialisation writes a file and calls
-            # ``workspace.register_artifact``, which only
-            # works for copy artifacts.  Reject incremental or
-            # other kinds at construction so the author sees a
-            # clear error instead of a runtime failure the
-            # first time the tool fires.
-            slot_name = block_def.inputs[0].name
-            declared_kind = (
-                self._base.workspace.artifact_declarations
-                .get(slot_name)
-            )
-            if declared_kind not in (None, "copy"):
-                raise ValueError(
-                    f"Pattern {self._pattern.name!r} on_tool "
-                    f"dispatch to block {block_def.name!r}: "
-                    f"input slot {slot_name!r} is declared as "
-                    f"{declared_kind!r} but the tool-input "
-                    f"bridge only supports ``copy`` artifacts "
-                    f"(it serialises tool_input to a single "
-                    f"JSON file and registers it as a fresh "
-                    f"instance).  Declare the artifact as "
-                    f"``kind: copy`` or extend the trigger "
-                    f"with an explicit input mapping."
-                )
-            runtime_cfg = (
-                self._per_instance_runtime_config.get(
-                    inst.name, InstanceRuntimeConfig())
-            )
-            runner = self._make_on_tool_runner(
-                block_def=block_def,
-                runtime_cfg=runtime_cfg,
-            )
-            if trigger.tool in routes:
-                raise ValueError(
-                    f"Pattern {self._pattern.name!r}: tool "
-                    f"{trigger.tool!r} is declared by multiple "
-                    f"on_tool instances"
-                )
-            routes[trigger.tool] = runner
-        return ToolRouter(routes)
-
-    def _make_on_tool_runner(
-        self,
-        *,
-        block_def: BlockDefinition,
-        runtime_cfg: InstanceRuntimeConfig,
-    ) -> BlockRunner:
-        """Build the callable that dispatches one tool → block.
-
-        Called once per ``on_tool`` instance at construction
-        time.  The resulting callable writes ``ctx.tool_input``
-        as JSON into the block's single declared input slot,
-        registers it as a fresh artifact instance, and invokes
-        the executor with the per-instance runtime config
-        forwarded as ``extra_env`` / ``extra_mounts``.
-        """
-        assert self._executor_factory is not None
-        workspace = self._base.workspace
-        executor = self._executor_factory(block_def)
-        slot_name = block_def.inputs[0].name
-
-        def _runner(ctx: HandoffContext) -> HandoffResult:
-            # Every failure from here to the end is mapped to a
-            # ``HandoffResult(is_error=True)`` so no exception
-            # can escape into the handoff loop's uncaught path.
-            # Earlier versions wrapped only the ``executor.launch``
-            # call, letting ``json.dumps`` or
-            # ``register_artifact`` failures blow up the loop.
-            try:
-                try:
-                    payload = json.dumps(ctx.tool_input)
-                except (TypeError, ValueError) as exc:
-                    return HandoffResult(
-                        content=(
-                            f"ERROR: on_tool dispatch to "
-                            f"{block_def.name!r} cannot "
-                            f"serialize tool_input: {exc}"),
-                        is_error=True,
-                    )
-                tmp = Path(
-                    tempfile.mkdtemp(prefix="on-tool-"))
-                try:
-                    (tmp / f"{slot_name}.json").write_text(
-                        payload, encoding="utf-8")
-                    instance = workspace.register_artifact(
-                        slot_name, tmp,
-                        source=(
-                            f"on_tool {ctx.tool_name!r} -> "
-                            f"{block_def.name}"),
-                    )
-                finally:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                handle = executor.launch(
-                    block_name=block_def.name,
-                    workspace=workspace,
-                    input_bindings={
-                        slot_name: instance.id},
-                    run_id=self._run_id,
-                    extra_env=(
-                        dict(runtime_cfg.extra_env)
-                        if runtime_cfg.extra_env else None),
-                    extra_mounts=(
-                        list(runtime_cfg.extra_mounts)
-                        if runtime_cfg.extra_mounts else None),
-                )
-                result = handle.wait()
-            except Exception as exc:  # noqa: BLE001
-                return HandoffResult(
-                    content=(
-                        f"ERROR: on_tool dispatch to "
-                        f"{block_def.name!r} failed: {exc}"
-                    ),
-                    is_error=True,
-                )
-            if result.status == "succeeded":
-                return HandoffResult(content="OK")
-            execution = workspace.executions.get(
-                result.execution_id)
-            err = (
-                execution.error if execution is not None
-                else result.status
-            )
-            return HandoffResult(
-                content=f"ERROR: {err}", is_error=True,
-            )
-
-        return _runner
-
     def _find_block(
         self, block_name: str,
     ) -> BlockDefinition | None:
@@ -1385,87 +1204,6 @@ class PatternRunner:
             if b.name == block_name:
                 return b
         return None
-
-    def _wrap_launch_fn_with_router(
-        self,
-        launch_fn: Callable[..., _Handle],
-        pattern_router: ToolRouter,
-    ) -> Callable[..., _Handle]:
-        """Produce a launch_fn that forwards a merged block_runner.
-
-        Construction-time invariant: when the pattern declares
-        ``on_tool`` triggers, any pre-bound ``block_runner`` on
-        ``launch_fn`` must be a :class:`ToolRouter` (or absent).
-        Opaque callables are rejected — the whole point of the
-        "pattern is authoritative" guarantee is that we can see
-        every tool both sides will dispatch; an opaque fallback
-        could silently handle a tool the pattern also claims,
-        producing exactly the split-brain dispatch this check
-        exists to prevent.
-
-        Once both sides are :class:`ToolRouter`s the merge
-        unions the routes; any tool name declared by both
-        raises immediately.
-        """
-        existing_router: Any = None
-        if isinstance(launch_fn, functools.partial):
-            existing_router = launch_fn.keywords.get(
-                "block_runner")
-        if (existing_router is not None
-                and not isinstance(existing_router, ToolRouter)):
-            raise ValueError(
-                f"Pattern {self._pattern.name!r}: declares "
-                f"{len(self._on_tool_instances)} on_tool "
-                f"instance(s) but the caller's ``launch_fn`` "
-                f"has a pre-bound ``block_runner`` of type "
-                f"{type(existing_router).__name__!r} that is "
-                f"not a ``ToolRouter``.  Wrap the caller's "
-                f"routing in ``make_tool_router(...)`` so the "
-                f"pattern runner can statically detect tool-"
-                f"name collisions and honour the 'pattern is "
-                f"authoritative' guarantee."
-            )
-        if isinstance(existing_router, ToolRouter):
-            overlap = (
-                pattern_router.tools()
-                & existing_router.tools()
-            )
-            if overlap:
-                raise ValueError(
-                    f"Pattern {self._pattern.name!r}: tool(s) "
-                    f"{sorted(overlap)} are declared by both "
-                    f"the pattern's on_tool instances and the "
-                    f"caller-supplied block_runner; refusing "
-                    f"to dispatch one silently over the other"
-                )
-        merged = _MergedRouter(
-            pattern_router=pattern_router,
-            fallback=existing_router,
-        )
-
-        post_dispatch_fn = self._post_dispatch_hook
-
-        def _wrapped(**kwargs: Any) -> _Handle:
-            kwargs["block_runner"] = merged
-            # Only forward post_dispatch_fn when the callee's
-            # launcher accepts it.  ``launch_agent_with_handoffs``
-            # (production) does; bare ``launch_agent_block`` does
-            # not.  The pattern runner's default ``launch_fn`` is
-            # the latter so tests that don't need handoff loop
-            # semantics keep working; production wires the former
-            # via ``functools.partial`` in
-            # :func:`cyberarc.project.ProjectHooks.init`.
-            try:
-                sig_params = _launch_fn_accepts_post_dispatch(
-                    launch_fn)
-            except (TypeError, ValueError):
-                sig_params = False
-            if sig_params:
-                kwargs.setdefault(
-                    "post_dispatch_fn", post_dispatch_fn)
-            return launch_fn(**kwargs)
-
-        return _wrapped
 
     def _drain_all_handles(self) -> None:
         """Wait on every launched handle, recording results.
@@ -1508,72 +1246,6 @@ class PatternRunner:
         return PatternRunner(
             pattern, base_config=base_config, **runner_kwargs,
         )
-
-
-class _MergedRouter:
-    """Layer a pattern-owned :class:`ToolRouter` over a fallback.
-
-    The pattern router handles every tool it declares; anything
-    else is forwarded to the ``fallback`` block runner (usually
-    a project-hooks-provided router for the handoff tools the
-    pattern has not yet migrated to ``on_tool``).  Overlap is
-    detected and rejected at construction time in
-    :meth:`PatternRunner._wrap_launch_fn_with_router`; this
-    class assumes the merge is disjoint and trusts its builder.
-    """
-
-    def __init__(
-        self,
-        *,
-        pattern_router: ToolRouter,
-        fallback: BlockRunner | None,
-    ) -> None:
-        """Capture both routers."""
-        self._pattern = pattern_router
-        self._fallback = fallback
-
-    def __call__(
-        self, ctx: HandoffContext,
-    ) -> HandoffResult:
-        """Dispatch to the pattern router's tools first."""
-        if ctx.tool_name in self._pattern.tools():
-            return self._pattern(ctx)
-        if self._fallback is not None:
-            return self._fallback(ctx)
-        return HandoffResult(
-            content=(
-                f"ERROR: no runner for tool "
-                f"{ctx.tool_name!r}"
-            ),
-            is_error=True,
-        )
-
-
-def _launch_fn_accepts_post_dispatch(launch_fn: Any) -> bool:
-    """Return True if ``launch_fn`` accepts a ``post_dispatch_fn`` kwarg.
-
-    Handles :class:`functools.partial` by unwrapping to the inner
-    callable.  Inspecting ``inspect.signature`` is safe for
-    production callers (``launch_agent_with_handoffs``,
-    ``launch_agent_block``) and for tests passing plain
-    ``lambda``s with ``**kwargs`` — the latter returns ``True`` on
-    the ``**kwargs`` varkeyword entry.  Unknown callable kinds
-    return ``False`` so the router silently declines to forward
-    the hook rather than crashing at launch time.
-    """
-    target = launch_fn
-    while isinstance(target, functools.partial):
-        target = target.func
-    try:
-        sig = inspect.signature(target)
-    except (TypeError, ValueError):
-        return False
-    for param in sig.parameters.values():
-        if param.name == "post_dispatch_fn":
-            return True
-        if param.kind is inspect.Parameter.VAR_KEYWORD:
-            return True
-    return False
 
 
 def _role_from_instance(inst: BlockInstance) -> Role:
