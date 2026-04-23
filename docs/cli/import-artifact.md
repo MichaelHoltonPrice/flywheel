@@ -31,7 +31,13 @@ Do not use `import artifact` to:
   workspace creation (`git` baselines) or by block execution
   (`incremental` appends).
 * "patch" an existing instance. Artifact instances are
-  immutable; an import always creates a *new* instance.
+  immutable; an import always creates a *new* instance with
+  no recorded lineage to anything else. To register a
+  corrective successor with explicit lineage, use
+  [`flywheel amend artifact`](amend-artifact.md) (predecessor
+  is an accepted instance) or [`flywheel fix
+  execution`](fix-execution.md) (predecessor is a
+  validator-rejected output slot of a failed execution).
 * register names not in the template's `artifacts:` list.
   Undeclared names are rejected — see
   [../architecture.md](../architecture.md) §

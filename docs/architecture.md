@@ -239,6 +239,91 @@ new instances; it does not modify existing ones. This ensures
 the execution history is trustworthy — an artifact referenced
 by an execution record will never silently change.
 
+### Rejected-output preservation and amendment lineage
+
+Immutability rules out in-place fixes, so flywheel pairs
+*preserve-on-reject* (don't lose the bytes) with
+*amendment-as-versioning* (the operator registers a corrective
+successor instance instead of mutating the predecessor).
+
+**Quarantine of rejected outputs.**  When a block-output
+validator rejects a slot (see "Artifact validation" above), the
+rejected bytes are copied to
+``<workspace>/quarantine/<execution-id>/<slot-name>/`` and a
+``RejectedOutput(reason, quarantine_path)`` record is attached
+to the failed ``BlockExecution.rejected_outputs``.  The
+execution is still recorded as ``failed`` with
+``failure_phase=output_validate``; quarantine is purely
+operator-visible state.
+
+Quarantine is **best-effort**: if the I/O fails (permission
+error, missing source, pre-existing destination), the failure
+is logged and ``quarantine_path`` is recorded as ``None``.  The
+validation failure itself is the primary signal and is
+recorded either way.  ``flywheel.quarantine`` owns the
+``<workspace>/quarantine/<exec>/<slot>/`` convention so every
+producer evolves it in one place.
+
+Imports do not quarantine — the operator's source path is
+still on disk and is the authoritative copy.
+
+**Amendment lineage.**  An ``ArtifactInstance`` may carry an
+optional ``SupersedesRef`` recording which predecessor it
+supersedes:
+
+* ``SupersedesRef(artifact_id=...)`` — supersedes an accepted
+  predecessor (an existing ``ArtifactInstance`` id).
+* ``SupersedesRef(rejection=RejectionRef(execution_id, slot))``
+  — supersedes a quarantined slot of a failed execution.
+
+The two flavours match the two operator workflows (``flywheel
+amend artifact`` and ``flywheel fix execution`` respectively;
+see [cli/amend-artifact.md](cli/amend-artifact.md) and
+[cli/fix-execution.md](cli/fix-execution.md)).  The substrate
+treats them uniformly — the distinction matters for CLI
+ergonomics, not for storage.
+
+The pointer is **backward-only** and the predecessor is
+identified by a stable ledger handle (artifact id or
+``(execution_id, slot)`` pair), never by a filesystem path.
+Multiple successors may point at the same predecessor —
+forking is allowed by the schema, even if the CLI doesn't
+expose it yet.  The pointer is provenance / intent, not a
+resolution rule: consumers still resolve by ``latest
+created_at``, exactly as for plain registrations.  An optional
+``supersedes_reason`` string captures *why* the successor was
+registered so the audit trail is reconstructible without
+out-of-band notes.
+
+The same artifact validator that gates ``flywheel import
+artifact`` runs against the corrected bytes; successors get no
+validation discount.  A failed amendment registers nothing.
+Predecessor existence is checked before any bytes are staged
+so a bad reference fails cheaply and leaves no debris.
+
+Today only ``copy`` artifacts can be re-registered;
+``register_artifact`` rejects ``git`` and ``incremental``
+predecessors.
+
+Quarantine directories accumulate forever today; flywheel
+never deletes them.  An automatic deletion policy — by age,
+by linked-execution status, by operator command, or some
+combination — is deferred until we have enough quarantine
+volume in the wild to know which policy actually fits real
+usage.  Schema fields for "preservation succeeded?" or
+"preservation error" are likewise deferred until a real need
+appears — the presence or absence of ``quarantine_path`` is
+the only state today.
+
+Implementation pointers:
+[`flywheel/artifact.py`](../flywheel/artifact.py)
+(``SupersedesRef``, ``RejectionRef``, ``RejectedOutput``);
+[`flywheel/quarantine.py`](../flywheel/quarantine.py)
+(``quarantine_slot``);
+[`flywheel/workspace.py`](../flywheel/workspace.py)
+(``Workspace.register_artifact``'s ``supersedes`` /
+``supersedes_reason`` parameters and ``_check_supersedes``).
+
 ## Block executions
 
 A **block execution** is the atomic operation in flywheel: one
@@ -1084,47 +1169,6 @@ policy declaration would let each project pick.  Until then,
 projects that need all-or-nothing semantics can layer a
 validator that *deliberately* fails every paired slot together
 — clumsy but workable.
-
-### Rejected-artifact preservation and amendment
-
-Today, when a block-output validator rejects a slot, the
-staged bytes are destroyed during normal tempdir cleanup.  An
-operator who wants to inspect or correct a rejected output has
-no recourse short of re-running the block.  The intended
-direction is **preserve-on-reject** plus
-**amendment-as-versioning**:
-
-- Rejected slot bytes are moved into
-  ``<workspace>/quarantine/<execution-id>/<slot-name>/`` as
-  part of finalization.  The execution still records
-  ``failure_phase=output_validate``; quarantine is purely
-  operator-visible state.
-- A ``flywheel amend`` (or ``fix``) verb registers a *new*
-  ``copy`` artifact instance whose provenance points at a
-  predecessor — either an existing artifact id or a
-  quarantined slot.  The original is never mutated.
-- Lineage is recorded as a durable ledger reference
-  (artifact id, or ``(execution_id, slot_name)`` for a
-  quarantined predecessor), never as a filesystem path.
-  Paths are storage details; lineage is ledger truth.
-- The schema carries a single backward pointer
-  (``supersedes``) and never a forward pointer or "current
-  child" mutation on the predecessor, so multiple successors
-  may point at the same parent without schema changes when
-  forking is eventually exposed via the CLI.
-- The validator must pass on the amended instance; a failed
-  amendment registers nothing.
-- Imports do not quarantine — the operator's source path is
-  still on disk.
-- Quarantine I/O failures are deliberately handled simply:
-  log, proceed with the validation-failure record without a
-  quarantine path.  Schema fields for "preservation
-  succeeded?" or "preservation error" are not added until we
-  observe a real need.
-
-A sweep / GC story for quarantine is left for later, on the
-same principle: design it once we have enough quarantine
-volume in the wild to know what we'd be sweeping.
 
 ### Incremental artifacts replaced by tagged copy instances
 

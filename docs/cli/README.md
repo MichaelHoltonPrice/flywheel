@@ -14,6 +14,14 @@ and concepts.
   artifact instance inside an existing workspace, optionally
   subject to a project-supplied validator. (Artifact instances
   are always directory-shaped; wrap single files first.)
+* [fix-execution.md](fix-execution.md) — `flywheel fix
+  execution`. Register a corrected artifact instance for an
+  output slot that an earlier execution's validator rejected;
+  records lineage at the rejected `(execution_id, slot)` pair.
+* [amend-artifact.md](amend-artifact.md) — `flywheel amend
+  artifact`. Register a corrective successor to an accepted
+  artifact instance; records lineage at the predecessor's
+  artifact id.
 
 The remaining two user-facing commands (`run block`, `run
 pattern`) gain their per-command docs as the underlying behavior
