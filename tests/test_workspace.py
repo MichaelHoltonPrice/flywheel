@@ -577,6 +577,186 @@ class TestRegisterArtifact:
         assert inst.id in ws.artifacts
 
 
+class TestRegisterArtifactSupersedes:
+    """``supersedes`` / ``supersedes_reason`` substrate on
+    :meth:`Workspace.register_artifact`.
+
+    Covers both predecessor flavours (accepted artifact id and
+    rejected slot) and the predecessor-existence checks that
+    fire before staging so a bad lineage reference fails cheaply.
+    """
+
+    @staticmethod
+    def _src(tmp_path: Path, name: str = "src") -> Path:
+        src = tmp_path / name
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+        return src
+
+    def test_supersede_accepted_artifact(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        first = ws.register_artifact(
+            "checkpoint", self._src(tmp_path, "v1"),
+        )
+        second = ws.register_artifact(
+            "checkpoint", self._src(tmp_path, "v2"),
+            supersedes=SupersedesRef(artifact_id=first.id),
+            supersedes_reason="hand-edited weights",
+        )
+
+        assert second.supersedes == SupersedesRef(artifact_id=first.id)
+        assert second.supersedes_reason == "hand-edited weights"
+        assert first.id in ws.artifacts
+        assert second.id in ws.artifacts
+
+    def test_supersede_rejected_slot(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_execution(BlockExecution(
+            id="exec_bad", block_name="train",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            rejected_outputs={
+                "checkpoint": RejectedOutput(
+                    reason="schema mismatch",
+                    quarantine_path=(
+                        "quarantine/exec_bad/checkpoint"
+                    ),
+                ),
+            },
+        ))
+
+        inst = ws.register_artifact(
+            "checkpoint", self._src(tmp_path),
+            supersedes=SupersedesRef(rejection=RejectionRef(
+                execution_id="exec_bad", slot="checkpoint",
+            )),
+            supersedes_reason="re-derived after fixing schema",
+        )
+
+        assert inst.supersedes == SupersedesRef(
+            rejection=RejectionRef(
+                execution_id="exec_bad", slot="checkpoint",
+            ),
+        )
+        assert (
+            inst.supersedes_reason == "re-derived after fixing schema"
+        )
+
+    def test_reason_without_supersedes_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(
+            ValueError, match="reason text is only meaningful",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes_reason="orphan reason",
+            )
+
+    def test_missing_artifact_id_predecessor_raises(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(ValueError, match="does not exist"):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(
+                    artifact_id="checkpoint@deadbeef",
+                ),
+            )
+
+    def test_name_mismatch_predecessor_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        # The 'engine' git baseline was created at workspace
+        # creation time and lives under a different declaration
+        # name than 'checkpoint'.
+        engine_id = next(
+            inst.id for inst in ws.artifacts.values()
+            if inst.name == "engine"
+        )
+
+        with pytest.raises(
+            ValueError, match="cannot supersede across artifact names",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(artifact_id=engine_id),
+            )
+
+    def test_missing_execution_for_rejection_raises(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(
+            ValueError, match="execution_id 'exec_ghost'",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(rejection=RejectionRef(
+                    execution_id="exec_ghost", slot="checkpoint",
+                )),
+            )
+
+    def test_slot_not_rejected_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_execution(BlockExecution(
+            id="exec_ok", block_name="train",
+            started_at=now, finished_at=now,
+            status="succeeded",
+            rejected_outputs={},
+        ))
+
+        with pytest.raises(
+            ValueError, match="no rejected output for slot",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(rejection=RejectionRef(
+                    execution_id="exec_ok", slot="checkpoint",
+                )),
+            )
+
+    def test_predecessor_check_runs_before_staging(
+        self, tmp_path: Path,
+    ):
+        # A bad lineage reference must fail before any bytes
+        # are copied into the workspace's artifacts dir, so
+        # bad calls leave no debris.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(ValueError, match="does not exist"):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(
+                    artifact_id="checkpoint@nope",
+                ),
+            )
+
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("checkpoint@")
+            or d.name.startswith("_staging-checkpoint-")
+        ]
+        assert leftover == []
+
+
 class TestNameValidation:
     def test_empty_name_raises(self):
         with pytest.raises(ValueError, match="must not be empty"):

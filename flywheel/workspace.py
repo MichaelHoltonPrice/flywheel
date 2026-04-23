@@ -623,6 +623,8 @@ class Workspace:
         *,
         validator_registry: ArtifactValidatorRegistry | None = None,
         declaration: ArtifactDeclaration | None = None,
+        supersedes: SupersedesRef | None = None,
+        supersedes_reason: str | None = None,
     ) -> ArtifactInstance:
         """Import an external directory as an artifact instance.
 
@@ -652,6 +654,17 @@ class Workspace:
         See ``docs/architecture.md`` § "Undeclared artifacts are
         rejected".
 
+        When ``supersedes`` is provided, the resulting instance
+        records a backward lineage pointer at registration time;
+        the predecessor must already exist in the workspace
+        ledger.  See :class:`flywheel.artifact.SupersedesRef` for
+        the two predecessor flavours (accepted artifact vs.
+        quarantined slot).  Lineage is provenance / intent, not
+        a resolution rule: consumers still pick the latest
+        instance by ``created_at``.  Predecessor existence is
+        verified before any bytes are staged so a bad reference
+        fails cheaply.
+
         Args:
             name: The artifact declaration name (must be a declared
                 copy artifact).
@@ -675,13 +688,29 @@ class Workspace:
                 validator so it can branch on declaration metadata.
                 Optional — validators that ignore the declaration
                 tolerate ``None``.
+            supersedes: Optional backward lineage pointer recorded
+                on the resulting instance.  When set, the
+                predecessor it references must exist in this
+                workspace; same-name lineage is enforced for the
+                ``artifact_id`` flavour (the predecessor's
+                declaration name must equal ``name``).  ``None``
+                for plain registrations.
+            supersedes_reason: Optional human-readable description
+                of *why* this successor is being registered.
+                Recorded verbatim on the instance.  Must be
+                ``None`` when ``supersedes`` is ``None``.
 
         Returns:
             The created ArtifactInstance.
 
         Raises:
             ValueError: If the name is not declared, is not a copy
-                artifact, or ``source_path`` is not a directory.
+                artifact, ``source_path`` is not a directory,
+                ``supersedes_reason`` is set without
+                ``supersedes``, or a ``supersedes`` predecessor
+                cannot be resolved (missing artifact, name
+                mismatch, missing execution, or slot not present
+                in that execution's ``rejected_outputs``).
             FileNotFoundError: If source_path does not exist.
             flywheel.artifact_validator.ArtifactValidationError:
                 If a validator is registered for ``name`` and rejects
@@ -707,6 +736,7 @@ class Workspace:
                 f"directory and pass that — artifacts are always "
                 f"directory-shaped, mirroring block output slots."
             )
+        self._check_supersedes(name, supersedes, supersedes_reason)
 
         # Stage the source contents into a flywheel-owned
         # directory shaped exactly like the canonical artifact
@@ -748,10 +778,90 @@ class Workspace:
             produced_by=None,
             source=source,
             copy_path=artifact_id,
+            supersedes=supersedes,
+            supersedes_reason=supersedes_reason,
         )
         self.add_artifact(instance)
         self.save()
         return instance
+
+    def _check_supersedes(
+        self,
+        name: str,
+        supersedes: SupersedesRef | None,
+        supersedes_reason: str | None,
+    ) -> None:
+        """Verify that a ``supersedes`` predecessor exists.
+
+        Called from :meth:`register_artifact` before any bytes
+        are staged so a bad reference fails cheaply and leaves
+        no debris.  The substrate trusts
+        :class:`SupersedesRef`'s own one-of invariant; this
+        helper only checks ledger-level existence and the
+        same-name lineage rule.
+
+        Args:
+            name: The new artifact's declaration name (used to
+                enforce same-name lineage for the ``artifact_id``
+                flavour).
+            supersedes: The lineage pointer to verify, or
+                ``None`` for plain registrations.
+            supersedes_reason: The accompanying reason string;
+                checked here only to reject the
+                "reason without lineage" combination.
+
+        Raises:
+            ValueError: If ``supersedes_reason`` is set without
+                ``supersedes``, or if the predecessor referenced
+                by ``supersedes`` does not exist (missing
+                artifact, name mismatch, missing execution, or
+                slot not present in that execution's
+                ``rejected_outputs``).
+        """
+        if supersedes is None:
+            if supersedes_reason is not None:
+                raise ValueError(
+                    "supersedes_reason was provided without a "
+                    "supersedes lineage pointer; reason text is "
+                    "only meaningful when superseding a "
+                    "predecessor."
+                )
+            return
+
+        if supersedes.artifact_id is not None:
+            predecessor = self.artifacts.get(supersedes.artifact_id)
+            if predecessor is None:
+                raise ValueError(
+                    f"supersedes.artifact_id "
+                    f"{supersedes.artifact_id!r} does not exist "
+                    f"in this workspace"
+                )
+            if predecessor.name != name:
+                raise ValueError(
+                    f"supersedes.artifact_id "
+                    f"{supersedes.artifact_id!r} is declared "
+                    f"{predecessor.name!r}; cannot supersede "
+                    f"across artifact names (new instance is "
+                    f"{name!r})"
+                )
+            return
+
+        assert supersedes.rejection is not None  # SupersedesRef invariant
+        rej = supersedes.rejection
+        execution = self.executions.get(rej.execution_id)
+        if execution is None:
+            raise ValueError(
+                f"supersedes.rejection.execution_id "
+                f"{rej.execution_id!r} does not exist in this "
+                f"workspace"
+            )
+        if rej.slot not in execution.rejected_outputs:
+            raise ValueError(
+                f"execution {rej.execution_id!r} has no rejected "
+                f"output for slot {rej.slot!r}; available "
+                f"rejected slots: "
+                f"{sorted(execution.rejected_outputs)!r}"
+            )
 
     @classmethod
     def create(cls, name: str, template: Template, foundry_dir: Path) -> Workspace:
