@@ -44,6 +44,8 @@ Usage with agent blocks::
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -267,10 +269,27 @@ class BlockGroup:
                         f"wrote fallback for {file_stem}")
 
             if artifact_file is not None:
-                inst = self._workspace.register_artifact(
-                    artifact_name, artifact_file,
-                    source=f"group member {index + 1}",
-                )
+                # ``register_artifact`` requires a directory
+                # source (artifact instances are
+                # directory-shaped, mirroring block output
+                # slots).  Each collected file is wrapped in a
+                # short-lived staging directory so the imported
+                # artifact is exactly ``<artifact-id>/<file-name>``
+                # — equivalent to what the old single-file
+                # import path produced.
+                wrap = Path(tempfile.mkdtemp(
+                    prefix=f"bg-collect-{artifact_name}-"))
+                try:
+                    shutil.copy2(
+                        artifact_file,
+                        wrap / artifact_file.name,
+                    )
+                    inst = self._workspace.register_artifact(
+                        artifact_name, wrap,
+                        source=f"group member {index + 1}",
+                    )
+                finally:
+                    shutil.rmtree(wrap, ignore_errors=True)
                 collected.append(inst.id)
 
         return collected

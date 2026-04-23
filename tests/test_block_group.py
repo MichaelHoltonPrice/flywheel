@@ -10,8 +10,12 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from flywheel.block_group import BlockGroup, BlockGroupMember
 from flywheel.executor import ExecutionResult, SyncExecutionHandle
+from flywheel.template import ArtifactDeclaration, Template
+from flywheel.workspace import Workspace
 
 
 def _mock_workspace(tmp_path: Path | None = None) -> MagicMock:
@@ -22,6 +26,21 @@ def _mock_workspace(tmp_path: Path | None = None) -> MagicMock:
     ws.generate_event_id.return_value = "evt_bg"
 
     def _register(name, path, source=None):
+        # Mirror the real ``Workspace.register_artifact``
+        # contract: artifact sources are always
+        # directory-shaped, never single files.  Asserting
+        # here means every existing BlockGroup test catches
+        # any future regression where a caller hands a file in
+        # without wrapping it first.
+        assert isinstance(path, Path), (
+            f"register_artifact path must be a Path, got "
+            f"{type(path).__name__}"
+        )
+        assert path.is_dir(), (
+            f"register_artifact requires a directory source; "
+            f"got {path} (is_dir={path.is_dir()}, "
+            f"is_file={path.is_file()})"
+        )
         inst = MagicMock()
         inst.id = f"{name}@mock"
         return inst
@@ -350,6 +369,115 @@ class TestBlockGroupArtifactCollection:
             collect_artifacts=[("result", "result")])
 
         assert results[0].artifacts_collected == []
+
+
+# ------------------------------------------------------------------
+# Integration: real Workspace, real register_artifact
+# ------------------------------------------------------------------
+
+
+class TestBlockGroupArtifactCollectionIntegration:
+    """End-to-end coverage of the artifact-collection path
+    against a real :class:`Workspace`.
+
+    The mocked ``register_artifact`` in the unit tests above
+    asserts the ``is_dir()`` contract directly.  These tests go
+    one step further: they let
+    :meth:`BlockGroup._collect` call into the real
+    :meth:`Workspace.register_artifact`, which enforces
+    directory-only inputs and stages the bytes into the
+    workspace.  If the wrap-into-tempdir step in
+    ``_collect`` ever regresses to passing the file directly,
+    the real ``register_artifact`` will reject it with the
+    ``must be a directory`` error and these tests will fail.
+    """
+
+    @staticmethod
+    def _build_workspace(tmp_path: Path) -> Workspace:
+        # Minimal copy-only template; no git artifact, so we
+        # don't need to initialize a git repo.
+        foundry_dir = tmp_path / "foundry"
+        foundry_dir.mkdir()
+        template = Template(
+            name="bg_int",
+            artifacts=[
+                ArtifactDeclaration(
+                    name="exploration_result", kind="copy",
+                ),
+            ],
+            blocks=[],
+        )
+        return Workspace.create(
+            "ws_int", template, foundry_dir,
+        )
+
+    def test_collected_file_lands_under_artifact_id(
+        self, tmp_path: Path,
+    ):
+        ws = self._build_workspace(tmp_path)
+        mock_launch = MagicMock(
+            return_value=_mock_agent_handle())
+
+        agent_dir = ws.path / "ws_0"
+        agent_dir.mkdir()
+        (agent_dir / "result.json").write_text(
+            '{"ok": true}')
+
+        group = BlockGroup(ws, launch_fn=mock_launch)
+        group.add(BlockGroupMember(
+            overrides={"prompt": "test"},
+            output_dir="ws_0",
+        ))
+        results = group.run(
+            collect_artifacts=[
+                ("result", "exploration_result"),
+            ],
+        )
+
+        # One artifact id was returned and the bytes landed at
+        # the canonical location with the original filename.
+        ids = results[0].artifacts_collected
+        assert len(ids) == 1
+        artifact_path = ws.path / "artifacts" / ids[0]
+        assert artifact_path.is_dir()
+        assert (artifact_path / "result.json").read_text() == (
+            '{"ok": true}')
+        # No staging directories should be left behind under
+        # artifacts/ once collection is done.
+        leftover = [
+            p for p in (ws.path / "artifacts").iterdir()
+            if p.name.startswith("_staging-")
+        ]
+        assert leftover == []
+
+    def test_undeclared_artifact_name_is_rejected_end_to_end(
+        self, tmp_path: Path,
+    ):
+        # Catches the broader contract: ``_collect`` happily
+        # passes whatever ``artifact_name`` the caller asked
+        # for through to ``register_artifact``, and
+        # ``register_artifact`` is the gatekeeper for "is this
+        # name declared in the workspace's template?".  A
+        # ``BlockGroup`` collecting under an undeclared name
+        # should surface the rejection rather than silently
+        # succeeding.
+        ws = self._build_workspace(tmp_path)
+        mock_launch = MagicMock(
+            return_value=_mock_agent_handle())
+
+        agent_dir = ws.path / "ws_0"
+        agent_dir.mkdir()
+        (agent_dir / "result.json").write_text("{}")
+
+        group = BlockGroup(ws, launch_fn=mock_launch)
+        group.add(BlockGroupMember(
+            overrides={"prompt": "test"},
+            output_dir="ws_0",
+        ))
+        with pytest.raises(ValueError, match="not declared"):
+            group.run(collect_artifacts=[
+                ("result", "not_in_template"),
+            ])
 
 
 # ------------------------------------------------------------------

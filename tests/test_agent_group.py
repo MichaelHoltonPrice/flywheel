@@ -21,6 +21,18 @@ def _mock_workspace(tmp_path: Path) -> MagicMock:
     ws.generate_event_id.return_value = "evt_grp1"
 
     def _register(name, path, source=None):
+        # Mirror the real ``Workspace.register_artifact``
+        # contract: artifact sources are always
+        # directory-shaped, never single files.
+        assert isinstance(path, Path), (
+            f"register_artifact path must be a Path, got "
+            f"{type(path).__name__}"
+        )
+        assert path.is_dir(), (
+            f"register_artifact requires a directory source; "
+            f"got {path} (is_dir={path.is_dir()}, "
+            f"is_file={path.is_file()})"
+        )
         inst = MagicMock()
         inst.id = f"{name}@mock"
         return inst
