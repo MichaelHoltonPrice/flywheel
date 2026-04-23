@@ -44,15 +44,14 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from flywheel import runtime
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    RejectedOutput,
+)
 from flywheel.artifact_validator import (
     ArtifactValidationError,
     ArtifactValidatorRegistry,
-)
-from flywheel.post_check import (
-    HaltDirective,
-    PostCheckCallable,
-    PostCheckContext,
 )
 from flywheel.container import (
     ContainerConfig,
@@ -63,6 +62,12 @@ from flywheel.input_staging import (
     cleanup_staged_inputs,
     stage_artifact_instances,
 )
+from flywheel.post_check import (
+    HaltDirective,
+    PostCheckCallable,
+    PostCheckContext,
+)
+from flywheel.quarantine import quarantine_slot
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
@@ -587,6 +592,7 @@ class ContainerExecutionHandle(ExecutionHandle):
         error: str | None = None
         state_dir_rel: str | None = None
         output_bindings: dict[str, str] = {}
+        rejected_outputs: dict[str, RejectedOutput] = {}
 
         try:
             self._process.wait()
@@ -654,12 +660,17 @@ class ContainerExecutionHandle(ExecutionHandle):
                     template=self._template,
                 )
             except ArtifactValidationError as e:
-                # Commit-A: slots that passed validation are
-                # already in ``e.partial_bindings``; record
-                # them on the failed execution so an operator
-                # can still inspect what was produced.
+                # Commit-passing-slots: slots that passed
+                # validation are already in
+                # ``e.partial_bindings``; rejected slots'
+                # bytes have been quarantined and described in
+                # ``e.rejected_outputs``.  Record both on the
+                # failed execution so an operator (or
+                # ``flywheel fix execution``) can act on them.
                 output_bindings = getattr(
                     e, "partial_bindings", {}) or {}
+                rejected_outputs = getattr(
+                    e, "rejected_outputs", {}) or {}
                 if failure_phase is None:
                     failure_phase = (
                         runtime.FAILURE_OUTPUT_VALIDATE)
@@ -718,6 +729,7 @@ class ContainerExecutionHandle(ExecutionHandle):
             state_lineage_id=self._state_lineage_id,
             stop_reason=self._stop_reason,
             run_id=self._run_id,
+            rejected_outputs=rejected_outputs,
         )
         self._workspace.add_execution(execution)
         self._workspace.save()
@@ -1262,17 +1274,23 @@ def _collect_outputs(
     When a ``validator_registry`` is supplied, every slot whose
     declaration name has a registered validator is validated
     *before* commit.  The semantics are intentionally
-    "commit-A":
+    commit-passing-slots:
 
     * Slots whose validator passes are committed normally and
       appear in the returned bindings.
     * Slots whose validator rejects the candidate are *not*
       committed and do not appear in the returned bindings.
+      The rejected bytes are copied to
+      ``<workspace>/quarantine/<execution_id>/<slot>/`` (a
+      best-effort step; failure to preserve does not change
+      the validation outcome).
     * If any slot was rejected, an
       :class:`ArtifactValidationError` is raised after every
       remaining slot has been processed.  The exception
       carries the partial bindings on
-      ``ArtifactValidationError.partial_bindings`` so the
+      ``ArtifactValidationError.partial_bindings`` and the
+      per-slot :class:`RejectedOutput` records on
+      ``ArtifactValidationError.rejected_outputs`` so the
       caller can record them on the failed
       :class:`BlockExecution`.
 
@@ -1283,7 +1301,8 @@ def _collect_outputs(
         ArtifactValidationError: When one or more declared
             output slots failed validation.  All slots that
             passed are still committed; the partial bindings
-            are attached to the exception.
+            and per-slot rejection records are attached to the
+            exception.
     """
     declarations: dict[str, ArtifactDeclaration] = {}
     if template is not None:
@@ -1292,6 +1311,7 @@ def _collect_outputs(
         }
 
     output_bindings: dict[str, str] = {}
+    rejected_outputs: dict[str, RejectedOutput] = {}
     rejection_messages: list[str] = []
     for slot in block_def.outputs:
         src = output_tempdirs.get(slot.name)
@@ -1305,14 +1325,25 @@ def _collect_outputs(
                     src,
                 )
             except ArtifactValidationError as exc:
+                reason = str(exc)
                 rejection_messages.append(
-                    f"{slot.name}: {exc}",
+                    f"{slot.name}: {reason}",
                 )
-                # Reject this slot.  Continue processing the
-                # remaining slots so an execution that produced
-                # multiple outputs surfaces every problem at
-                # once rather than masking later failures
-                # behind the first.
+                # Preserve the rejected bytes before the caller's
+                # ``finally`` cleans up ``output_tempdirs``.
+                # Quarantine is best-effort: ``None`` here just
+                # means the bytes were not recoverable, not that
+                # the validation outcome changes.
+                qpath = quarantine_slot(
+                    workspace.path, exec_id, slot.name, src,
+                )
+                rejected_outputs[slot.name] = RejectedOutput(
+                    reason=reason, quarantine_path=qpath,
+                )
+                # Continue processing the remaining slots so an
+                # execution that produced multiple outputs
+                # surfaces every problem at once rather than
+                # masking later failures behind the first.
                 continue
         kind = workspace.artifact_declarations.get(slot.name)
         if kind == "incremental":
@@ -1332,9 +1363,10 @@ def _collect_outputs(
         exc = ArtifactValidationError(
             "; ".join(rejection_messages),
         )
-        # Attach partial commits so the caller can record them
-        # on the failed execution alongside the rejected slots.
+        # Attach partial commits and per-slot rejection records
+        # so the caller can record both on the failed execution.
         exc.partial_bindings = output_bindings  # type: ignore[attr-defined]
+        exc.rejected_outputs = rejected_outputs  # type: ignore[attr-defined]
         raise exc
     return output_bindings
 
@@ -2257,6 +2289,7 @@ class _RequestExecutionHandle(ExecutionHandle):
         failure_phase: str | None = None
         error: str | None = None
         output_bindings: dict[str, str] = {}
+        rejected_outputs: dict[str, RejectedOutput] = {}
 
         try:
             self._thread.join()
@@ -2302,6 +2335,8 @@ class _RequestExecutionHandle(ExecutionHandle):
             except ArtifactValidationError as e:
                 output_bindings = getattr(
                     e, "partial_bindings", {}) or {}
+                rejected_outputs = getattr(
+                    e, "rejected_outputs", {}) or {}
                 if failure_phase is None:
                     failure_phase = (
                         runtime.FAILURE_OUTPUT_VALIDATE)
@@ -2339,6 +2374,7 @@ class _RequestExecutionHandle(ExecutionHandle):
             state_lineage_id=self._state_lineage_id,
             run_id=self._run_id,
             stop_reason=self._stop_reason,
+            rejected_outputs=rejected_outputs,
         )
         # Run the block-declared post_check (if any) before the
         # execution record is persisted, so the ``halt_directive``

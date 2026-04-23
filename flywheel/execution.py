@@ -13,12 +13,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flywheel import runtime
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    RejectedOutput,
+)
 from flywheel.artifact_validator import (
     ArtifactValidationError,
     ArtifactValidatorRegistry,
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
+from flywheel.quarantine import quarantine_slot
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
 
@@ -181,6 +186,7 @@ def _record_execution(
     image: str,
     failure_phase: str | None = None,
     error: str | None = None,
+    rejected_outputs: dict[str, RejectedOutput] | None = None,
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -200,6 +206,10 @@ def _record_execution(
             :mod:`flywheel.runtime` for the canonical constants.
         error: Human-readable error message recorded alongside
             ``failure_phase`` for failed executions.
+        rejected_outputs: Per-slot rejection records for an
+            ``output_validate`` failure, keyed by slot name.
+            ``None`` (the default) is recorded as an empty
+            mapping.
     """
     execution = BlockExecution(
         id=execution_id,
@@ -214,6 +224,7 @@ def _record_execution(
         image=image,
         failure_phase=failure_phase,
         error=error,
+        rejected_outputs=rejected_outputs or {},
     )
     workspace.add_execution(execution)
     workspace.save()
@@ -412,13 +423,16 @@ def run_block(
         )
 
     # 7. Record output artifact instances (convention-based).
-    #    Validate per-slot before commit.  Commit-A semantics:
+    #    Validate per-slot before commit.  Commit-passing-slots:
     #    slots that pass land in ``output_bindings`` and the
     #    execution is recorded ``succeeded``; slots that fail
-    #    are not committed and the execution is recorded
-    #    ``failed`` with ``failure_phase=output_validate``.
+    #    are not committed, their bytes are quarantined under
+    #    ``<workspace>/quarantine/<exec_id>/<slot>/``, and the
+    #    execution is recorded ``failed`` with
+    #    ``failure_phase=output_validate``.
     declarations = {a.name: a for a in template.artifacts}
     output_bindings: dict[str, str] = {}
+    rejected_outputs: dict[str, RejectedOutput] = {}
     rejection_messages: list[str] = []
     for slot in block_def.outputs:
         artifact_id = output_artifact_ids[slot.name]
@@ -433,8 +447,20 @@ def run_block(
                     output_dir,
                 )
             except ArtifactValidationError as exc:
+                reason = str(exc)
                 rejection_messages.append(
-                    f"{slot.name}: {exc}",
+                    f"{slot.name}: {reason}",
+                )
+                # Preserve the rejected bytes before tearing
+                # down the pre-allocated artifact dir; the
+                # validation failure is the primary signal
+                # either way.
+                qpath = quarantine_slot(
+                    workspace.path, execution_id, slot.name,
+                    output_dir,
+                )
+                rejected_outputs[slot.name] = RejectedOutput(
+                    reason=reason, quarantine_path=qpath,
                 )
                 # Reject this slot's pre-allocated dir so we
                 # don't leave half-committed artifact storage
@@ -474,6 +500,7 @@ def run_block(
             result.exit_code, result.elapsed_s, block_def.image,
             failure_phase=runtime.FAILURE_OUTPUT_VALIDATE,
             error=error_msg,
+            rejected_outputs=rejected_outputs,
         )
         raise ArtifactValidationError(error_msg)
 

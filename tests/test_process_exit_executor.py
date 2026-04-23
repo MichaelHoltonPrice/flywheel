@@ -1523,8 +1523,9 @@ class TestStopConcurrency:
 class TestArtifactValidation:
     """Validator-registry integration with ProcessExitExecutor.
 
-    Covers commit-A: passing slots are committed, the
-    rejected-slot is dropped, and the BlockExecution lands as
+    Covers commit-passing-slots semantics: passing slots are
+    committed, rejected slots are dropped (their bytes
+    quarantined), and the :class:`BlockExecution` lands as
     failed with ``failure_phase=output_validate``.
     """
 
@@ -1628,11 +1629,96 @@ class TestArtifactValidation:
                 "train", ws, input_bindings={}).wait()
 
         assert result.status == "failed"
-        # Commit-A: the passing slot still appears in the
-        # recorded output bindings.
+        # Commit-passing-slots: the passing slot still appears
+        # in the recorded output bindings.
         assert "good" in result.output_bindings
         assert "bad" not in result.output_bindings
         assert len(ws.instances_for("good")) == 1
         assert ws.instances_for("bad") == []
         ex = ws.executions[result.execution_id]
         assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+
+    def test_rejected_slot_is_quarantined(self, tmp_path: Path):
+        # The rejected slot's bytes survive the producing
+        # tempdir's cleanup and land under
+        # ``<workspace>/quarantine/<exec_id>/<slot>/`` so an
+        # operator can inspect or correct them.
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("model.pt missing")
+
+        registry = ArtifactValidatorRegistry({"result": reject})
+        executor = ProcessExitExecutor(
+            template, validator_registry=registry,
+        )
+
+        def _fake(config, args=None, name=None, **_):
+            for host, container, _mode in config.mounts:
+                if container == "/output/result":
+                    (Path(host) / "out.txt").write_text("rejected bytes")
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake,
+        ):
+            result = executor.launch(
+                "train", ws, input_bindings={}).wait()
+
+        ex = ws.executions[result.execution_id]
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        # Per-slot RejectedOutput records the validator reason
+        # and the workspace-relative quarantine path.
+        rec = ex.rejected_outputs["result"]
+        assert "model.pt missing" in rec.reason
+        assert rec.quarantine_path == (
+            f"quarantine/{result.execution_id}/result"
+        )
+        # Bytes preserved on disk for operator inspection.
+        quarantined = ws.path / rec.quarantine_path / "out.txt"
+        assert quarantined.read_text() == "rejected bytes"
+
+    def test_quarantine_io_failure_preserves_validation_signal(
+        self, tmp_path: Path,
+    ):
+        # If quarantine itself can't preserve the bytes (disk
+        # full, permission denied, etc.), the validation
+        # failure remains the primary signal: failure_phase
+        # stays ``output_validate``, ``error`` still reports the
+        # validator's reason, and ``quarantine_path`` is
+        # ``None`` to indicate bytes were not recovered.
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("bad checkpoint")
+
+        registry = ArtifactValidatorRegistry({"result": reject})
+        executor = ProcessExitExecutor(
+            template, validator_registry=registry,
+        )
+
+        def _fake(config, args=None, name=None, **_):
+            for host, container, _mode in config.mounts:
+                if container == "/output/result":
+                    (Path(host) / "out.txt").write_text("nope")
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake,
+        ), patch(
+            "flywheel.executor.quarantine_slot",
+            return_value=None,
+        ):
+            result = executor.launch(
+                "train", ws, input_bindings={}).wait()
+
+        ex = ws.executions[result.execution_id]
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert "bad checkpoint" in (ex.error or "")
+        rec = ex.rejected_outputs["result"]
+        assert rec.reason == "bad checkpoint"
+        assert rec.quarantine_path is None

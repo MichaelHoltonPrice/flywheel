@@ -507,7 +507,11 @@ class TestFailureCleanup:
 
 
 class TestArtifactValidation:
-    """``run_block`` artifact-validator integration (commit-A)."""
+    """``run_block`` artifact-validator integration.
+
+    Covers commit-passing-slots semantics plus quarantine of
+    rejected outputs.
+    """
 
     def test_validator_pass_commits_output(self, tmp_path: Path):
         project_root, foundry_dir, template = _setup_git_project(tmp_path)
@@ -573,13 +577,66 @@ class TestArtifactValidation:
         assert "checkpoint missing" in (ex.error or "")
         assert ex.output_bindings == {}
 
-        # Reject path is cleaned up.
+        # Rejected bytes are preserved under quarantine; the
+        # ledger references the workspace-relative path.
+        rec = ex.rejected_outputs["checkpoint"]
+        assert rec.reason == "checkpoint missing"
+        assert rec.quarantine_path == (
+            f"quarantine/{ex.id}/checkpoint"
+        )
+        quarantined = ws.path / rec.quarantine_path / "model.pt"
+        assert quarantined.read_text() == "weights"
+
+        # Reject path is cleaned up out of artifact storage.
         artifacts_dir = ws.path / "artifacts"
         leftover = [
             d for d in artifacts_dir.iterdir()
             if d.name.startswith("checkpoint@")
         ]
         assert leftover == []
+
+    def test_quarantine_io_failure_preserves_validation_signal(
+        self, tmp_path: Path,
+    ):
+        # If quarantine itself can't preserve the bytes, the
+        # validation failure remains the primary signal:
+        # failure_phase stays output_validate, the validator's
+        # reason is reported, and quarantine_path is None.
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "add workspace")
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("checkpoint missing")
+
+        registry = ArtifactValidatorRegistry({"checkpoint": reject})
+
+        fake_run = _fake_run_with_output({"model.pt": "weights"})
+        with (
+            patch(
+                "flywheel.execution.run_container",
+                side_effect=fake_run,
+            ),
+            patch(
+                "flywheel.execution.quarantine_slot",
+                return_value=None,
+            ),
+            pytest.raises(
+                ArtifactValidationError,
+                match="checkpoint missing",
+            ),
+        ):
+            run_block(
+                ws, "train", template, project_root,
+                validator_registry=registry,
+            )
+
+        ex = next(iter(ws.executions.values()))
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert "checkpoint missing" in (ex.error or "")
+        rec = ex.rejected_outputs["checkpoint"]
+        assert rec.reason == "checkpoint missing"
+        assert rec.quarantine_path is None
 
     def test_no_validator_registered_skips(self, tmp_path: Path):
         project_root, foundry_dir, template = _setup_git_project(tmp_path)
