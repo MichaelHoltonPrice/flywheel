@@ -11,21 +11,18 @@ block-execution model:
   for this execution, waits for it to exit, and parses the
   termination announcement from the sidecar at
   ``/flywheel/termination``.  This is the ephemeral-container
-  invocation strategy; the persistent-container strategy lives
-  in :class:`flywheel.executor.PersistentContainerExecutor` and
-  is a separate code path.
+  invocation strategy.  Container-specific mechanics are hidden
+  behind :class:`EphemeralContainerRunner`.
 * :func:`commit_block_execution` — forges validated proposals
   through ``Workspace.register_artifact`` (proposal-then-forge),
   quarantines rejections, and records the :class:`BlockExecution`
   via ``Workspace.record_execution``.
 
-``flywheel run block`` is the only call site today.  The
-:class:`flywheel.executor.EphemeralContainerExecutor` and
-:class:`flywheel.executor.PersistentContainerExecutor` classes
-still carry their own pre-refactor staging and commit code and
-do not yet route through these helpers; harmonizing them is
-follow-on work whose timing is bound to the deferred-batteries
-spec that owns their consumers (agents, patterns, block groups).
+``flywheel run block`` is the canonical happy-path call site
+today.  Container-specific code plugs into the invoke phase as a
+narrow runner: it runs work described by an :class:`ExecutionPlan`
+and reports an :class:`InvocationResult`; it does not own input
+resolution, artifact forging, quarantine, or ledger semantics.
 """
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from flywheel import runtime
 from flywheel.artifact import (
@@ -58,7 +56,6 @@ from flywheel.termination import (
     read_termination_sidecar,
 )
 from flywheel.workspace import Workspace
-
 
 # ── Plan & invocation result ─────────────────────────────────────
 
@@ -118,11 +115,30 @@ class InvocationResult:
             termination sidecar, before normalization.  ``None`` if
             no sidecar was written.  Used for protocol-violation
             error messages.
+        error: Runtime-level error text for invoke failures.  Commit
+            records this verbatim when present.
     """
 
     termination_reason: str
     container_result: ContainerResult | None
     announcement: str | None = None
+    error: str | None = None
+
+
+class EphemeralContainerRunner(Protocol):
+    """Container-specific runner for an already-prepared block body.
+
+    Implementations consume a fully prepared :class:`ExecutionPlan`
+    and return an :class:`InvocationResult`.  They must not resolve
+    inputs, commit artifacts, quarantine outputs, or record ledger
+    entries; those are owned by prepare/commit.
+    """
+
+    def run(
+        self, plan: ExecutionPlan, args: list[str] | None = None,
+    ) -> InvocationResult:
+        """Run the prepared container body and report how it ended."""
+        ...
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -422,17 +438,65 @@ def prepare_block_execution(
 # ── Phase 2: invoke ──────────────────────────────────────────────
 
 
+def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
+    """Build the runtime container config from a prepared plan."""
+    return ContainerConfig(
+        image=plan.block_def.image,
+        docker_args=plan.block_def.docker_args,
+        env=plan.block_def.env,
+        mounts=plan.mounts,
+    )
+
+
+def observe_ephemeral_container_exit(
+    plan: ExecutionPlan,
+    result: ContainerResult,
+) -> InvocationResult:
+    """Translate an exited one-shot container into invoke facts.
+
+    Non-zero exit is a runtime crash.  Zero exit must announce a
+    project-defined termination reason through the sidecar mounted
+    at ``/flywheel/termination``; malformed or undeclared reasons
+    are normalized to ``protocol_violation``.
+    """
+    if result.exit_code != 0:
+        return InvocationResult(
+            termination_reason=runtime.TERMINATION_REASON_CRASH,
+            container_result=result,
+            error=f"container exited with code {result.exit_code}",
+        )
+
+    announcement = read_termination_sidecar(plan.termination_file)
+    termination_reason = normalize_termination_reason(
+        announcement=announcement,
+        declared_reasons=set(plan.block_def.outputs.keys()),
+    )
+    return InvocationResult(
+        termination_reason=termination_reason,
+        container_result=result,
+        announcement=announcement,
+    )
+
+
+@dataclass(frozen=True)
+class DockerEphemeralContainerRunner:
+    """Default runner for ephemeral Docker container bodies."""
+
+    def run(
+        self, plan: ExecutionPlan, args: list[str] | None = None,
+    ) -> InvocationResult:
+        """Run the prepared plan in a fresh container."""
+        result = run_container(_container_config_for_plan(plan), args)
+        return observe_ephemeral_container_exit(plan, result)
+
+
 def invoke_ephemeral_container(
     plan: ExecutionPlan,
     args: list[str] | None = None,
+    *,
+    container_runner: EphemeralContainerRunner | None = None,
 ) -> InvocationResult:
-    """Run the block once and observe how it ended.
-
-    Starts a container per the plan's mounts and image, waits
-    for it to exit, and reads the termination announcement the
-    block wrote to ``plan.termination_file``.  The announcement
-    is normalized against the block's declared reasons before
-    being returned.
+    """Run the block body once through an ephemeral container runner.
 
     Returns:
         An :class:`InvocationResult` with the normalized
@@ -444,32 +508,8 @@ def invoke_ephemeral_container(
             execution is the caller's responsibility (see
             :func:`run_block`).
     """
-    config = ContainerConfig(
-        image=plan.block_def.image,
-        docker_args=plan.block_def.docker_args,
-        env=plan.block_def.env,
-        mounts=plan.mounts,
-    )
-    declared_reasons = set(plan.block_def.outputs.keys())
-
-    result = run_container(config, args)
-
-    if result.exit_code != 0:
-        return InvocationResult(
-            termination_reason=runtime.TERMINATION_REASON_CRASH,
-            container_result=result,
-        )
-
-    announcement = read_termination_sidecar(plan.termination_file)
-    termination_reason = normalize_termination_reason(
-        announcement=announcement,
-        declared_reasons=declared_reasons,
-    )
-    return InvocationResult(
-        termination_reason=termination_reason,
-        container_result=result,
-        announcement=announcement,
-    )
+    runner = container_runner or DockerEphemeralContainerRunner()
+    return runner.run(plan, args)
 
 
 # ── Phase 3: commit ──────────────────────────────────────────────
@@ -525,6 +565,7 @@ def commit_block_execution(
 
     # ── Substrate-reserved failure-shaped reasons ────────────────
     if termination_reason == runtime.TERMINATION_REASON_CRASH:
+        error = invocation.error or f"container exited with code {exit_code}"
         shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
@@ -533,14 +574,15 @@ def commit_block_execution(
             exit_code, elapsed_s, image,
             all_expected_committed=True,
             failure_phase=runtime.FAILURE_INVOKE,
-            error=f"container exited with code {exit_code}",
+            error=error,
         )
-        raise RuntimeError(
-            f"Block {block_name!r} container exited with code "
-            f"{exit_code}"
-        )
+        raise RuntimeError(f"Block {block_name!r} invoke failed: {error}")
 
     if termination_reason == runtime.TERMINATION_REASON_TIMEOUT:
+        error = (
+            invocation.error
+            or "container exceeded its execution deadline"
+        )
         shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
@@ -549,13 +591,14 @@ def commit_block_execution(
             exit_code, elapsed_s, image,
             all_expected_committed=True,
             failure_phase=runtime.FAILURE_INVOKE,
-            error="container exceeded its execution deadline",
+            error=error,
         )
         raise RuntimeError(
             f"Block {block_name!r} container timed out"
         )
 
     if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
+        error = invocation.error or "container was interrupted"
         shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
@@ -564,7 +607,7 @@ def commit_block_execution(
             exit_code, elapsed_s, image,
             all_expected_committed=True,
             failure_phase=runtime.FAILURE_INVOKE,
-            error="container was interrupted",
+            error=error,
         )
         raise KeyboardInterrupt(
             f"Block {block_name!r} was interrupted"
@@ -573,6 +616,11 @@ def commit_block_execution(
     if termination_reason == runtime.TERMINATION_REASON_PROTOCOL_VIOLATION:
         shutil.rmtree(plan.proposals_root, ignore_errors=True)
         declared = sorted(block_def.outputs.keys())
+        error = invocation.error or (
+            f"protocol violation: termination announcement "
+            f"{invocation.announcement!r} did not match any "
+            f"declared reason {declared!r}"
+        )
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
             termination_reason,
@@ -580,11 +628,7 @@ def commit_block_execution(
             exit_code, elapsed_s, image,
             all_expected_committed=True,
             failure_phase=runtime.FAILURE_OUTPUT_PROTOCOL,
-            error=(
-                f"protocol violation: termination announcement "
-                f"{invocation.announcement!r} did not match any "
-                f"declared reason {declared!r}"
-            ),
+            error=error,
         )
         raise RuntimeError(
             f"Block {block_name!r} announced an invalid "
@@ -703,6 +747,7 @@ def run_block(
     args: list[str] | None = None,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
+    container_runner: EphemeralContainerRunner | None = None,
 ) -> ContainerResult:
     """Execute a block within a workspace.
 
@@ -722,6 +767,8 @@ def run_block(
         args: Optional extra arguments for the container entrypoint.
         validator_registry: Project-supplied artifact validator
             registry consulted before each output slot is committed.
+        container_runner: Optional runner for the prepared ephemeral
+            container body.  Defaults to the Docker-backed runner.
 
     Returns:
         A ContainerResult with exit code and wall-clock elapsed
@@ -755,6 +802,18 @@ def run_block(
             f"Block {block_name!r} not found in template "
             f"{template.name!r}"
         )
+    if block_def.runner != "container":
+        raise ValueError(
+            f"flywheel run block uses the ephemeral container "
+            f"pipeline and requires runner 'container'; block "
+            f"{block_name!r} has runner {block_def.runner!r}"
+        )
+    if block_def.lifecycle != "one_shot":
+        raise ValueError(
+            f"flywheel run block uses the ephemeral container "
+            f"pipeline and requires lifecycle 'one_shot'; block "
+            f"{block_name!r} has lifecycle {block_def.lifecycle!r}"
+        )
 
     # ── identity ─────────────────────────────────────────────────
     # Minted before prepare so any prepare-time failure has an
@@ -786,7 +845,9 @@ def run_block(
 
     # ── invoke ───────────────────────────────────────────────────
     try:
-        invocation = invoke_ephemeral_container(plan, args)
+        invocation = invoke_ephemeral_container(
+            plan, args, container_runner=container_runner,
+        )
     except KeyboardInterrupt:
         commit_failure(
             workspace,

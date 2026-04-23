@@ -13,7 +13,7 @@ from flywheel.artifact_validator import (
     ArtifactValidatorRegistry,
 )
 from flywheel.container import ContainerResult
-from flywheel.execution import run_block
+from flywheel.execution import InvocationResult, run_block
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -278,12 +278,14 @@ class TestEmptyOutput:
                         "normal")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
-        with patch("flywheel.execution.run_container", side_effect=empty_run):
-            with pytest.raises(
+        with (
+            patch("flywheel.execution.run_container", side_effect=empty_run),
+            pytest.raises(
                 RuntimeError,
                 match="no output bytes written",
-            ):
-                run_block(ws, "train", template, project_root)
+            ),
+        ):
+            run_block(ws, "train", template, project_root)
 
         ex = next(iter(ws.executions.values()))
         assert ex.status == "failed"
@@ -562,6 +564,51 @@ class TestFailureCleanup:
         assert len(engine_instances) == 2
         engine_id = ex.input_bindings["engine"]
         assert engine_id in ws.artifacts
+
+
+class TestEphemeralContainerRunner:
+    def test_run_block_delegates_body_run_to_container_runner(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "add workspace")
+
+        class FakeContainerRunner:
+            def __init__(self):
+                self.seen_args = None
+                self.seen_plan = None
+
+            def run(self, plan, args=None):
+                self.seen_plan = plan
+                self.seen_args = args
+                out = plan.proposal_dirs["checkpoint"]
+                (out / "model.pt").write_text("weights")
+                return InvocationResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.25),
+                )
+
+        runner = FakeContainerRunner()
+        with patch(
+            "flywheel.execution.run_container",
+            side_effect=AssertionError("default container runner used"),
+        ):
+            result = run_block(
+                ws, "train", template, project_root,
+                args=["--example-flag", "example-value"],
+                container_runner=runner,
+            )
+
+        assert result.exit_code == 0
+        assert runner.seen_args == ["--example-flag", "example-value"]
+        assert runner.seen_plan is not None
+        assert runner.seen_plan.block_name == "train"
+        ex = ws.executions[runner.seen_plan.execution_id]
+        assert ex.status == "succeeded"
+        assert ex.termination_reason == "normal"
+        assert "checkpoint" in ex.output_bindings
 
 
 class TestArtifactValidation:
