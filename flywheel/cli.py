@@ -15,6 +15,10 @@ Supports:
         [-- project-specific args...]
     flywheel import artifact --workspace PATH --name NAME
         --from SOURCE [--source TEXT]
+    flywheel fix execution --workspace PATH --execution EXEC_ID
+        --slot SLOT --from SOURCE_DIR [--reason TEXT]
+    flywheel amend artifact --workspace PATH --artifact ARTIFACT_ID
+        --from SOURCE_DIR [--reason TEXT]
 
 Multi-round / multi-agent workflows are expressed as patterns
 under ``<project>/patterns/`` and run via
@@ -30,13 +34,15 @@ from typing import Any
 
 from flywheel.agent import AgentBlockConfig, run_agent_block
 from flywheel.agent_executor import AgentExecutor
-from flywheel.config import load_project_config
+from flywheel.artifact import RejectionRef, SupersedesRef
+from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
 from flywheel.pattern import Pattern, discover_patterns
 from flywheel.pattern_runner import PatternRunner
 from flywheel.project_hooks import load_project_hooks_class
 from flywheel.run_defaults import RunDefaults
-from flywheel.template import Template
+from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
 
 
@@ -75,6 +81,81 @@ def main(argv: list[str] | None = None) -> None:
     import_art_parser.add_argument(
         "--source", default=None,
         help="Free-text provenance description (defaults to source path).",
+    )
+
+    # flywheel fix execution
+    fix_parser = subparsers.add_parser(
+        "fix",
+        help=(
+            "Register a corrected artifact for a quarantined "
+            "output slot of a failed execution."),
+    )
+    fix_sub = fix_parser.add_subparsers(dest="resource")
+
+    fix_exec_parser = fix_sub.add_parser(
+        "execution",
+        help=(
+            "Register corrected bytes as a new artifact instance "
+            "that supersedes the rejected output slot of a "
+            "failed execution."),
+    )
+    fix_exec_parser.add_argument("--workspace", required=True)
+    fix_exec_parser.add_argument(
+        "--execution", required=True, dest="execution_id",
+        help=(
+            "Execution id whose rejected slot is being "
+            "superseded."),
+    )
+    fix_exec_parser.add_argument(
+        "--slot", required=True,
+        help=(
+            "Output slot name within the execution.  Must appear "
+            "in that execution's rejected_outputs."),
+    )
+    fix_exec_parser.add_argument(
+        "--from", dest="source_path", required=True,
+        help=(
+            "Path to the directory whose contents become the "
+            "corrected artifact instance.  Must be a directory."),
+    )
+    fix_exec_parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional human-readable reason recorded on the "
+            "successor instance."),
+    )
+
+    # flywheel amend artifact
+    amend_parser = subparsers.add_parser(
+        "amend",
+        help=(
+            "Register a corrective successor to an accepted "
+            "artifact instance."),
+    )
+    amend_sub = amend_parser.add_subparsers(dest="resource")
+
+    amend_art_parser = amend_sub.add_parser(
+        "artifact",
+        help=(
+            "Register corrected bytes as a new artifact instance "
+            "that supersedes an accepted predecessor."),
+    )
+    amend_art_parser.add_argument("--workspace", required=True)
+    amend_art_parser.add_argument(
+        "--artifact", required=True, dest="artifact_id",
+        help="Predecessor artifact id being superseded.",
+    )
+    amend_art_parser.add_argument(
+        "--from", dest="source_path", required=True,
+        help=(
+            "Path to the directory whose contents become the "
+            "successor artifact instance.  Must be a directory."),
+    )
+    amend_art_parser.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional human-readable reason recorded on the "
+            "successor instance."),
     )
 
     # flywheel run block
@@ -222,6 +303,21 @@ def main(argv: list[str] | None = None) -> None:
         import_artifact(
             args.workspace, args.name, args.source_path, args.source,
         )
+    elif args.command == "fix" and getattr(args, "resource", None) == "execution":
+        fix_execution(
+            workspace_path=args.workspace,
+            execution_id=args.execution_id,
+            slot=args.slot,
+            source_path=args.source_path,
+            reason=args.reason,
+        )
+    elif args.command == "amend" and getattr(args, "resource", None) == "artifact":
+        amend_artifact(
+            workspace_path=args.workspace,
+            artifact_id=args.artifact_id,
+            source_path=args.source_path,
+            reason=args.reason,
+        )
     elif args.command == "run" and getattr(args, "target", None) == "block":
         bindings = _parse_bindings(args.bind)
         run_block_command(
@@ -357,6 +453,172 @@ def import_artifact(
         declaration=declaration,
     )
     print(f"Imported {name!r} as {instance.id!r}")
+
+
+def _resolve_validator_and_declaration(
+    config: ProjectConfig,
+    workspace: Workspace,
+    name: str,
+) -> tuple[ArtifactValidatorRegistry, ArtifactDeclaration | None]:
+    """Resolve validator registry and declaration for an artifact name.
+
+    Mirrors the loading shape of :func:`import_artifact` so
+    every entry point that lands new bytes runs the same
+    validator the original import would have.  Factored here
+    because three CLI verbs (``import artifact``,
+    ``fix execution``, ``amend artifact``) all need the same
+    pair.
+
+    Args:
+        config: The loaded project config (already resolved
+            against the project root).
+        workspace: The workspace receiving the new instance;
+            its ``template_name`` selects which template the
+            declaration is read from.
+        name: The artifact declaration name.
+
+    Returns:
+        ``(validator_registry, declaration)``.  ``declaration``
+        is ``None`` when the workspace has no template_name, the
+        template file is missing, or the template doesn't
+        declare ``name`` — matching ``import_artifact``'s
+        existing behaviour.
+    """
+    validator_registry = config.load_artifact_validator_registry()
+    declaration: ArtifactDeclaration | None = None
+    template_name = workspace.template_name
+    if template_name:
+        template_path = (
+            config.templates_dir / f"{template_name}.yaml"
+        )
+        if template_path.is_file():
+            template = Template.from_yaml(
+                template_path,
+                block_registry=config.load_block_registry(),
+            )
+            for decl in template.artifacts:
+                if decl.name == name:
+                    declaration = decl
+                    break
+    return validator_registry, declaration
+
+
+def fix_execution(
+    *,
+    workspace_path: str,
+    execution_id: str,
+    slot: str,
+    source_path: str,
+    reason: str | None,
+) -> None:
+    """Register a corrected artifact for a quarantined slot.
+
+    Looks up ``execution_id`` in the workspace, locates the
+    rejected output ``slot`` (must appear in
+    :attr:`flywheel.artifact.BlockExecution.rejected_outputs`),
+    and registers the corrected bytes as a fresh artifact
+    instance whose ``supersedes`` points at that
+    ``RejectionRef``.  The corrected bytes are run through the
+    project's validator registry the same way a fresh
+    ``import artifact`` call would be — successors get no
+    validation discount.
+
+    Args:
+        workspace_path: Path to the workspace directory.
+        execution_id: The failed execution being fixed.
+        slot: The output slot name within that execution; also
+            the artifact declaration name used for the new
+            instance.
+        source_path: Directory whose contents become the new
+            instance.
+        reason: Optional human-readable reason.
+
+    Raises:
+        ValueError: If the execution / slot / source path are
+            invalid, or the predecessor existence check on the
+            workspace fails.
+        FileNotFoundError: If the workspace or source path does
+            not exist.
+        flywheel.artifact_validator.ArtifactValidationError: If
+            the corrected bytes fail validation.
+    """
+    config = load_project_config(Path.cwd())
+    ws = Workspace.load(Path(workspace_path))
+    validator_registry, declaration = (
+        _resolve_validator_and_declaration(config, ws, slot)
+    )
+    instance = ws.register_artifact(
+        slot, Path(source_path),
+        validator_registry=validator_registry,
+        declaration=declaration,
+        supersedes=SupersedesRef(rejection=RejectionRef(
+            execution_id=execution_id, slot=slot,
+        )),
+        supersedes_reason=reason,
+    )
+    print(
+        f"Registered {slot!r} as {instance.id!r} "
+        f"superseding rejected slot {slot!r} of "
+        f"execution {execution_id!r}"
+    )
+
+
+def amend_artifact(
+    *,
+    workspace_path: str,
+    artifact_id: str,
+    source_path: str,
+    reason: str | None,
+) -> None:
+    """Register a corrective successor to an accepted artifact.
+
+    Looks up ``artifact_id`` in the workspace to read its
+    declaration name (lineage is same-name; see
+    :class:`flywheel.artifact.SupersedesRef`), then registers
+    the corrected bytes as a fresh artifact instance whose
+    ``supersedes`` points at that predecessor id.  Successors
+    are validated by the same registry a fresh import would
+    use.
+
+    Args:
+        workspace_path: Path to the workspace directory.
+        artifact_id: The accepted predecessor being superseded.
+        source_path: Directory whose contents become the new
+            instance.
+        reason: Optional human-readable reason.
+
+    Raises:
+        ValueError: If the predecessor does not exist, or the
+            source path / workspace are invalid.
+        FileNotFoundError: If the workspace or source path does
+            not exist.
+        flywheel.artifact_validator.ArtifactValidationError: If
+            the corrected bytes fail validation.
+    """
+    config = load_project_config(Path.cwd())
+    ws = Workspace.load(Path(workspace_path))
+    predecessor = ws.artifacts.get(artifact_id)
+    if predecessor is None:
+        raise ValueError(
+            f"Artifact {artifact_id!r} does not exist in this "
+            f"workspace"
+        )
+    validator_registry, declaration = (
+        _resolve_validator_and_declaration(
+            config, ws, predecessor.name,
+        )
+    )
+    instance = ws.register_artifact(
+        predecessor.name, Path(source_path),
+        validator_registry=validator_registry,
+        declaration=declaration,
+        supersedes=SupersedesRef(artifact_id=artifact_id),
+        supersedes_reason=reason,
+    )
+    print(
+        f"Registered {predecessor.name!r} as {instance.id!r} "
+        f"superseding {artifact_id!r}"
+    )
 
 
 def run_block_command(

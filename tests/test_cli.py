@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from flywheel.artifact import BlockExecution, RejectedOutput
 from flywheel.cli import _parse_bindings, create_workspace, main
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -308,6 +310,208 @@ class TestMainImportArtifact:
         data_instances = loaded.instances_for("data")
         assert len(data_instances) == 1
         assert data_instances[0].source == "written by agent"
+
+
+class TestMainFixExecution:
+    """``flywheel fix execution`` registers a corrected artifact
+    for a quarantined output slot and records the rejection
+    lineage on the new instance.
+    """
+
+    @staticmethod
+    def _seed_workspace_with_rejection(
+        project_root: Path,
+    ) -> tuple[Path, str, str]:
+        """Create a workspace and seed a failed-execution record
+        whose ``rejected_outputs`` references the ``data`` slot.
+
+        Returns ``(workspace_path, execution_id, slot_name)``.
+        """
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_execution(BlockExecution(
+            id="exec_bad", block_name="produce_data",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            rejected_outputs={
+                "data": RejectedOutput(
+                    reason="schema mismatch",
+                    quarantine_path="quarantine/exec_bad/data",
+                ),
+            },
+        ))
+        ws.save()
+        return ws.path, "exec_bad", "data"
+
+    def test_registers_corrected_artifact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, exec_id, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        main([
+            "fix", "execution",
+            "--workspace", str(ws_path),
+            "--execution", exec_id,
+            "--slot", slot,
+            "--from", str(src),
+            "--reason", "patched schema",
+        ])
+
+        loaded = Workspace.load(ws_path)
+        instances = loaded.instances_for(slot)
+        assert len(instances) == 1
+        inst = instances[0]
+        assert inst.supersedes is not None
+        assert inst.supersedes.rejection is not None
+        assert inst.supersedes.rejection.execution_id == exec_id
+        assert inst.supersedes.rejection.slot == slot
+        assert inst.supersedes_reason == "patched schema"
+
+    def test_reason_is_optional(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, exec_id, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        main([
+            "fix", "execution",
+            "--workspace", str(ws_path),
+            "--execution", exec_id,
+            "--slot", slot,
+            "--from", str(src),
+        ])
+
+        loaded = Workspace.load(ws_path)
+        inst = loaded.instances_for(slot)[0]
+        assert inst.supersedes_reason is None
+
+    def test_unknown_execution_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, _, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        with pytest.raises(ValueError, match="execution_id 'exec_ghost'"):
+            main([
+                "fix", "execution",
+                "--workspace", str(ws_path),
+                "--execution", "exec_ghost",
+                "--slot", slot,
+                "--from", str(src),
+            ])
+
+
+class TestMainAmendArtifact:
+    """``flywheel amend artifact`` registers a corrective successor
+    to an accepted predecessor and records the artifact-id
+    lineage on the new instance.
+    """
+
+    @staticmethod
+    def _seed_workspace_with_accepted(
+        project_root: Path, tmp_path: Path,
+    ) -> tuple[Path, str]:
+        """Create a workspace and register one accepted ``data``
+        instance.  Returns ``(workspace_path, predecessor_id)``.
+        """
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        Workspace.create("test_ws", template, foundry_dir)
+
+        src = tmp_path / "v1"
+        src.mkdir()
+        (src / "data.txt").write_text("v1")
+        ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
+        main([
+            "import", "artifact",
+            "--workspace", ws_path,
+            "--name", "data",
+            "--from", str(src),
+        ])
+        loaded = Workspace.load(Path(ws_path))
+        predecessor_id = loaded.instances_for("data")[0].id
+        return Path(ws_path), predecessor_id
+
+    def test_registers_successor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, predecessor_id = (
+            self._seed_workspace_with_accepted(
+                project_root, tmp_path,
+            )
+        )
+
+        src = tmp_path / "v2"
+        src.mkdir()
+        (src / "data.txt").write_text("v2")
+
+        main([
+            "amend", "artifact",
+            "--workspace", str(ws_path),
+            "--artifact", predecessor_id,
+            "--from", str(src),
+            "--reason", "hand-edited",
+        ])
+
+        loaded = Workspace.load(ws_path)
+        instances = loaded.instances_for("data")
+        assert len(instances) == 2
+        successor = next(
+            i for i in instances if i.id != predecessor_id
+        )
+        assert successor.supersedes is not None
+        assert successor.supersedes.artifact_id == predecessor_id
+        assert successor.supersedes_reason == "hand-edited"
+
+    def test_unknown_artifact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, _ = self._seed_workspace_with_accepted(
+            project_root, tmp_path,
+        )
+
+        src = tmp_path / "v2"
+        src.mkdir()
+        (src / "data.txt").write_text("v2")
+
+        with pytest.raises(ValueError, match="does not exist"):
+            main([
+                "amend", "artifact",
+                "--workspace", str(ws_path),
+                "--artifact", "data@deadbeef",
+                "--from", str(src),
+            ])
 
 
 class TestMainRunBlock:
