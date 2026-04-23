@@ -156,10 +156,12 @@ def _make_template(
             InputSlot(name=n, container_path=f"/input/{n}")
             for n in inputs
         ],
-        outputs=[
-            OutputSlot(name=n, container_path=f"/output/{n}")
-            for n in outputs
-        ],
+        outputs={
+            "normal": [
+                OutputSlot(name=n, container_path=f"/output/{n}")
+                for n in outputs
+            ],
+        },
         state=False,
         stop_timeout_s=stop_timeout_s,
     )
@@ -258,7 +260,7 @@ class TestLaunchValidation:
             runner="container",
             lifecycle="one_shot",
             inputs=[],
-            outputs=[],
+            outputs={},
         )
         template = Template(
             name="t", artifacts=[], blocks=[block])
@@ -471,7 +473,7 @@ class TestEnsureRuntime:
             runner="container",
             lifecycle="one_shot",
             inputs=[],
-            outputs=[],
+            outputs={},
         )
         template = Template(
             name="t", artifacts=[], blocks=[block])
@@ -615,6 +617,16 @@ class TestRequestSerialization:
         ]
 
 
+_RR_DEFERRED_REASON = (
+    "Cancellation, run_id stamping, and post-check tests cover "
+    "BlockExecution fields removed by the schema purge "
+    "(stop_reason, run_id, halt_directive, post_check_error). "
+    "These behaviours move to the deferred patterns / batteries "
+    "specs."
+)
+
+
+@pytest.mark.skip(reason=_RR_DEFERRED_REASON)
 class TestRequestCancellation:
     def test_stop_cancels_in_flight_request(
         self, workspace: Workspace, template: Template,
@@ -762,6 +774,7 @@ class TestExecuteResponseShapes:
         assert "transport error" in (execution.error or "")
 
 
+@pytest.mark.skip(reason=_RR_DEFERRED_REASON)
 class TestRunIdStamping:
     """The real executor stamps ``BlockExecution.run_id``.
 
@@ -1071,6 +1084,7 @@ class TestShutdown:
         assert harness.executor.attached_keys() == []
 
 
+@pytest.mark.skip(reason=_RR_DEFERRED_REASON)
 class TestPostCheckInvocation:
     """Block-declared ``post_check`` runs on every dispatch.
 

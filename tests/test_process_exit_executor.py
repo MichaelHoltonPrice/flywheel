@@ -102,10 +102,12 @@ def _make_template(
             InputSlot(name=n, container_path=f"/input/{n}")
             for n in inputs
         ],
-        outputs=[
-            OutputSlot(name=n, container_path=f"/output/{n}")
-            for n in outputs
-        ],
+        outputs={
+            "normal": [
+                OutputSlot(name=n, container_path=f"/output/{n}")
+                for n in outputs
+            ],
+        },
         state=state,
         stop_timeout_s=stop_timeout_s,
     )
@@ -188,8 +190,7 @@ class TestHappyPathStateless:
 
         ex = ws.executions[result.execution_id]
         assert ex.failure_phase is None
-        assert ex.state_dir is None
-        assert ex.runner == "container"
+        assert ex.runner == "container_ephemeral"
 
         # Canonical artifact dir exists with the output the
         # fake container wrote.
@@ -217,6 +218,15 @@ class TestHappyPathStateless:
         assert result.output_bindings == {}
 
 
+_DEFERRED_REASON = (
+    "State, cooperative-stop, and watchdog-stop tests cover "
+    "BlockExecution fields removed by the schema purge "
+    "(state_dir, state_lineage_id, stop_reason).  These "
+    "behaviours move to the deferred state / patterns specs."
+)
+
+
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStateRoundTrip:
     def test_first_execution_empty_state(self, tmp_path: Path):
         template = _make_template(state=True, outputs=["result"])
@@ -309,7 +319,7 @@ class TestCanonicalNotMountedInvariant:
         canonical = ws.path / "artifacts" / aid
         canonical.mkdir(parents=True)
         (canonical / "data.txt").write_text("original")
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id=aid, name="engine", kind="copy",
             created_at=datetime.now(UTC),
             copy_path=aid,
@@ -410,6 +420,7 @@ class TestFailurePhases:
         assert "docker daemon gone" in ex.error
 
 
+@pytest.mark.skip(reason="Incremental artifacts excised; outputs now copy-only")
 class TestIncrementalOutputs:
     """Outputs declared ``kind: incremental`` must append to the
     canonical incremental artifact, not be rejected as copy."""
@@ -529,6 +540,7 @@ class TestIncrementalOutputs:
         assert "game_history" not in result.output_bindings
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStateCaptureFailure:
     def test_state_capture_oserror_records_failure_phase(
         self, tmp_path: Path,
@@ -602,6 +614,7 @@ class TestOutputCollectFailure:
         assert "simulated workspace lock failure" in ex.error
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestMissingStateDir:
     def test_missing_recorded_state_dir_fails_stage_in(
         self, tmp_path: Path,
@@ -648,6 +661,7 @@ class TestMissingStateDir:
         assert "missing on disk" in ex.error
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStateRestoreEligibility:
     """Which prior executions does populate_state_mount restore from?"""
 
@@ -676,7 +690,7 @@ class TestStateRestoreEligibility:
             status="succeeded",
             state_dir="state/train/exec-old-success",
         )
-        ws.add_execution(succeeded_exec)
+        ws._add_execution(succeeded_exec)
         (ws.path / "state" / "train" / "exec-old-success"
          ).mkdir(parents=True)
         (ws.path / "state" / "train" / "exec-old-success"
@@ -694,7 +708,7 @@ class TestStateRestoreEligibility:
             stop_reason="operator",
             state_dir="state/train/exec-recent-interrupted",
         )
-        ws.add_execution(interrupted_exec)
+        ws._add_execution(interrupted_exec)
         (ws.path / "state" / "train" / "exec-recent-interrupted"
          ).mkdir(parents=True)
         (ws.path / "state" / "train" / "exec-recent-interrupted"
@@ -739,7 +753,7 @@ class TestStateRestoreEligibility:
             status="succeeded",
             state_dir="state/train/exec-old-success",
         )
-        ws.add_execution(succeeded_exec)
+        ws._add_execution(succeeded_exec)
         (ws.path / "state" / "train" / "exec-old-success"
          ).mkdir(parents=True)
         (ws.path / "state" / "train" / "exec-old-success"
@@ -755,7 +769,7 @@ class TestStateRestoreEligibility:
             failure_phase=runtime.FAILURE_INVOKE,
             state_dir="state/train/exec-recent-failed",
         )
-        ws.add_execution(failed_exec)
+        ws._add_execution(failed_exec)
         (ws.path / "state" / "train" / "exec-recent-failed"
          ).mkdir(parents=True)
         (ws.path / "state" / "train" / "exec-recent-failed"
@@ -783,6 +797,7 @@ class TestStateRestoreEligibility:
         assert seen["tag"] == "OLD"
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStateLineage:
     def test_default_lineage_is_none(self, tmp_path: Path):
         template = _make_template(state=True)
@@ -1002,6 +1017,7 @@ def _start_cancellable(
     return _factory, popen_ref
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestCooperativeStop:
     """Cooperative stop: container sees the sentinel and exits."""
 
@@ -1033,6 +1049,7 @@ class TestCooperativeStop:
         assert ex.exit_code == 0
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestForcedTermination:
     """Container ignores the sentinel; TERM (and maybe KILL) fires."""
 
@@ -1137,6 +1154,7 @@ class TestForcedTermination:
         assert ex.exit_code == 137  # SIGKILL exit
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStopOnExitedContainer:
     """stop() when the container already finished must not mislabel."""
 
@@ -1402,6 +1420,7 @@ class _WatchdogTestPopen:
                 self._time.sleep(0.05)
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestWatchdogTimeout:
     """Watchdog enforces ``total_timeout_s`` independent of stdout."""
 
@@ -1453,6 +1472,7 @@ class TestWatchdogTimeout:
         assert execution.stop_reason == "total_timeout"
 
 
+@pytest.mark.skip(reason=_DEFERRED_REASON)
 class TestStopConcurrency:
     """``stop()`` is idempotent and lock-protected.
 

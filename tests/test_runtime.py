@@ -77,6 +77,7 @@ class TestFailurePhases:
             runtime.FAILURE_OUTPUT_COLLECT,
             runtime.FAILURE_OUTPUT_VALIDATE,
             runtime.FAILURE_ARTIFACT_COMMIT,
+            runtime.FAILURE_OUTPUT_PROTOCOL,
         }
         assert expected == runtime.FAILURE_PHASES
 

@@ -79,9 +79,10 @@ class TestFromYaml:
         assert len(train_block.inputs) == 1
         assert train_block.inputs[0].name == "checkpoint"
         assert train_block.inputs[0].container_path == "/input/checkpoint"
-        assert len(train_block.outputs) == 1
-        assert train_block.outputs[0].name == "checkpoint"
-        assert train_block.outputs[0].container_path == "/output/checkpoint"
+        train_outputs = train_block.all_output_slots()
+        assert len(train_outputs) == 1
+        assert train_outputs[0].name == "checkpoint"
+        assert train_outputs[0].container_path == "/output/checkpoint"
 
     def test_eval_block_fields(self, valid_template_path: Path):
         template = _from_yaml_with_inline_blocks(valid_template_path)
@@ -90,8 +91,9 @@ class TestFromYaml:
         assert eval_block.image == "cyberloop-eval:latest"
         assert len(eval_block.inputs) == 1
         assert eval_block.inputs[0].name == "checkpoint"
-        assert len(eval_block.outputs) == 1
-        assert eval_block.outputs[0].name == "score"
+        eval_outputs = eval_block.all_output_slots()
+        assert len(eval_outputs) == 1
+        assert eval_outputs[0].name == "score"
 
 
 class TestGitArtifactValidation:
@@ -191,7 +193,7 @@ class TestDataclassProperties:
             decl.name = "y"
 
     def test_block_definition_frozen(self):
-        block = BlockDefinition(name="b", image="img", inputs=[], outputs=[])
+        block = BlockDefinition(name="b", image="img", inputs=[], outputs={})
         with pytest.raises(AttributeError):
             block.name = "other"
 
@@ -418,7 +420,7 @@ blocks:
         path = tmp_path / "expanded.yaml"
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
-        out = template.blocks[0].outputs[0]
+        out = template.blocks[0].all_output_slots()[0]
         assert out.name == "checkpoint"
         assert out.container_path == "/output"
 
@@ -462,7 +464,9 @@ blocks:
         assert block.env == {}
         assert block.inputs[0].optional is False
         assert block.inputs[0].container_path == "/input/data"
-        assert block.outputs[0].container_path == "/output/data"
+        assert (
+            block.all_output_slots()[0].container_path == "/output/data"
+        )
 
 
 class TestNameValidationAccepted:
@@ -502,7 +506,9 @@ blocks:
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
         assert template.blocks[0].inputs[0].name == "session"
-        assert template.blocks[0].outputs[0].name == "session"
+        assert (
+            template.blocks[0].all_output_slots()[0].name == "session"
+        )
 
 
 class TestLifecycle:

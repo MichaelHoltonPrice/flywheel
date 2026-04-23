@@ -5,16 +5,13 @@ executor types.  A block executor takes a block definition, a
 workspace, and input bindings, and produces an execution result
 with output artifacts.
 
-- **ProcessExitExecutor**: process-exit protocol.  One container
-  run per execution.  Stages inputs, starts the container, waits
-  for exit, captures ``/state/`` (if declared), collects outputs
-  as artifact instances, records the execution.
-- **ProcessExecutor**: Runs a block as a local subprocess.
-  For trusted, host-local processes like game servers.
-
-``runner: lifecycle`` blocks have no executor — they are
-recorded directly by
-:class:`flywheel.local_block.LocalBlockRecorder`.
+- **EphemeralContainerExecutor**: one container per execution.
+  Stages inputs, starts the container, waits for exit, collects
+  outputs as artifact instances, records the execution.
+- **PersistentContainerExecutor**: one long-running container that
+  serves many executions over an in-container control channel.
+  Necessary workaround for blocks whose in-container state we
+  cannot yet serialize between executions.
 
 All executors satisfy the ``BlockExecutor`` protocol and return
 an ``ExecutionHandle`` from ``launch()``.  The external
@@ -45,7 +42,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from flywheel import runtime
 from flywheel.artifact import (
-    ArtifactInstance,
     BlockExecution,
     RejectedOutput,
 )
@@ -294,13 +290,13 @@ def _find_block(
     return None
 
 
-# ── ProcessExitExecutor ──────────────────────────────────────────
+# ── EphemeralContainerExecutor ───────────────────────────────────
 
 
 class _AbortExecution(Exception):
     """Internal signal: a failure phase was recorded; stop the pipeline.
 
-    Raised by :class:`ProcessExitExecutor` when a pipeline phase
+    Raised by :class:`EphemeralContainerExecutor` when a pipeline phase
     fails.  Keeps the per-phase try/except blocks terse and lets
     the outer ``try/finally`` guarantee cleanup.  Not part of the
     public API.
@@ -326,7 +322,7 @@ def _docker_send_signal(container_name: str, signal: str) -> None:
 class ContainerExecutionHandle(ExecutionHandle):
     """Handle to a running container execution.
 
-    Returned by :meth:`ProcessExitExecutor.launch` when the
+    Returned by :meth:`EphemeralContainerExecutor.launch` when the
     container has been started.  The caller must call
     :meth:`wait` exactly once to drive the post-exit pipeline
     (state capture, output collection, execution record).
@@ -722,17 +718,12 @@ class ContainerExecutionHandle(ExecutionHandle):
             exit_code=exit_code,
             elapsed_s=elapsed,
             image=self._block_def.image,
-            runner="container",
-            state_dir=state_dir_rel,
+            runner="container_ephemeral",
             failure_phase=failure_phase,
             error=error,
-            state_lineage_id=self._state_lineage_id,
-            stop_reason=self._stop_reason,
-            run_id=self._run_id,
             rejected_outputs=rejected_outputs,
         )
-        self._workspace.add_execution(execution)
-        self._workspace.save()
+        self._workspace.record_execution(execution)
 
         return ExecutionResult(
             exit_code=exit_code,
@@ -743,8 +734,8 @@ class ContainerExecutionHandle(ExecutionHandle):
         )
 
 
-class ProcessExitExecutor:
-    """Process-exit protocol executor — one container per execution.
+class EphemeralContainerExecutor:
+    """Ephemeral-container executor — one container per execution.
 
     Implements the container runtime contract for blocks whose
     lifecycle is ``one_shot``:
@@ -910,7 +901,7 @@ class ProcessExitExecutor:
                 f"Block {block_name!r} not found in template")
         if block_def.runner != "container":
             raise ValueError(
-                f"Block {block_name!r}: ProcessExitExecutor only "
+                f"Block {block_name!r}: EphemeralContainerExecutor only "
                 f"runs container blocks (got runner "
                 f"{block_def.runner!r})")
 
@@ -973,7 +964,7 @@ class ProcessExitExecutor:
                     )
 
             # Allocate per-slot output tempdirs.
-            for slot in block_def.outputs:
+            for slot in block_def.all_output_slots():
                 output_tempdirs[slot.name] = Path(
                     tempfile.mkdtemp(
                         prefix=f"flywheel-output-{slot.name}-"))
@@ -1086,96 +1077,17 @@ def populate_state_mount(
     block_name: str,
     state_lineage_id: str | None,
 ) -> Path:
-    """Create a tempdir populated with the block's prior state.
+    """Stub: state lifecycle is deferred for now.
 
-    Walks the workspace's executions in reverse chronological
-    order, picks the most recent execution of ``block_name``
-    within the given ``state_lineage_id`` whose status is in
-    :data:`_STATE_ELIGIBLE_STATUSES` and that has a captured
-    ``state_dir``, and copies its captured state into a fresh
-    tempdir.  The tempdir is what gets mounted at ``/state/``
-    inside the container.
-
-    Matching on ``state_lineage_id`` (including the ``None``
-    default) lets callers keep independent state chains for the
-    same block without colliding.  Today's default-``None``
-    callers all end up in the same bucket, which matches the
-    single-instance assumption for stateful blocks we actually
-    have (one play agent, one predict agent, etc.).
-
-    Returns an empty tempdir if no prior state exists in this
-    lineage.
-
-    Raises:
-        OSError: If a prior execution's recorded ``state_dir``
-            is missing on disk.  Silently cold-starting would
-            mask workspace corruption; better to fail stage_in
-            loudly so the operator notices.
+    Returns an always-empty staging tempdir.  The full
+    state-lineage / restore behaviour was excised from the
+    substrate :class:`BlockExecution` schema (no more ``state_dir``
+    or ``state_lineage_id`` fields).  State is a real substrate
+    concern that will land in its own normative pass; this stub
+    keeps existing call sites callable until that spec arrives.
     """
-    staging = Path(tempfile.mkdtemp(
+    return Path(tempfile.mkdtemp(
         prefix=f"flywheel-state-{block_name}-"))
-
-    # Find the most recent state-eligible execution in the
-    # target lineage.
-    prior: BlockExecution | None = None
-    for ex in sorted(
-        workspace.executions.values(),
-        key=lambda e: e.started_at,
-        reverse=True,
-    ):
-        if (ex.block_name == block_name
-                and ex.status in _STATE_ELIGIBLE_STATUSES
-                and ex.state_dir is not None
-                and ex.state_lineage_id == state_lineage_id):
-            prior = ex
-            break
-
-    # Migration visibility: when a workspace has prior state
-    # captured under the legacy synthetic ``__agent__`` name but
-    # no state under the caller-supplied ``block_name``, warn
-    # once so the operator sees the cold-start isn't a bug in
-    # flywheel, it's unmigrated state.  Resolution is
-    # operator-driven (rename the state_dir + rewrite the
-    # execution record's block_name, or accept the cold start).
-    if prior is None and block_name != "__agent__":
-        legacy_present = any(
-            ex.block_name == "__agent__"
-            and ex.state_dir is not None
-            and ex.status in _STATE_ELIGIBLE_STATUSES
-            for ex in workspace.executions.values()
-        )
-        if legacy_present:
-            print(
-                f"  [flywheel] WARNING: workspace has state "
-                f"captured under the legacy '__agent__' block "
-                f"name but the current launch keys on "
-                f"{block_name!r}.  Starting fresh; migrate by "
-                f"renaming state/__agent__/ -> "
-                f"state/{block_name}/ and updating "
-                f"workspace.yaml execution block_name fields.",
-                file=sys.stderr,
-            )
-
-    if prior is not None and prior.state_dir is not None:
-        src = workspace.path / prior.state_dir
-        if not src.is_dir():
-            # Clean up the empty staging tempdir before raising
-            # so we don't leak it on the failure path.
-            shutil.rmtree(staging, ignore_errors=True)
-            raise OSError(
-                f"recorded state_dir {prior.state_dir!r} for "
-                f"prior execution {prior.id!r} is missing on "
-                f"disk; workspace state for block "
-                f"{block_name!r} may be corrupted"
-            )
-        for child in src.iterdir():
-            dest = staging / child.name
-            if child.is_dir():
-                shutil.copytree(child, dest)
-            else:
-                shutil.copy2(child, dest)
-
-    return staging
 
 
 def capture_state(
@@ -1260,15 +1172,10 @@ def _collect_outputs(
     - ``copy`` — allocate a fresh artifact id, copy the tempdir
       contents into ``<workspace>/artifacts/<aid>/``, register a
       new :class:`ArtifactInstance`.
-    - ``incremental`` — read ``entries.jsonl`` from the tempdir,
-      parse one JSON value per non-blank line, append to the
-      canonical incremental artifact (creating it if this is
-      the first append to that name).
 
     Git artifacts are never outputs; the schema rejects them.
 
-    Empty output dirs and incremental dirs missing an
-    ``entries.jsonl`` are skipped silently — a block is free to
+    Empty output dirs are skipped silently — a block is free to
     declare optional outputs it doesn't always produce.
 
     When a ``validator_registry`` is supplied, every slot whose
@@ -1313,52 +1220,38 @@ def _collect_outputs(
     output_bindings: dict[str, str] = {}
     rejected_outputs: dict[str, RejectedOutput] = {}
     rejection_messages: list[str] = []
-    for slot in block_def.outputs:
+    for slot in block_def.all_output_slots():
         src = output_tempdirs.get(slot.name)
         if src is None or not any(src.iterdir()):
             continue
-        if validator_registry is not None:
-            try:
-                validator_registry.validate(
-                    slot.name,
-                    declarations.get(slot.name),
-                    src,
-                )
-            except ArtifactValidationError as exc:
-                reason = str(exc)
-                rejection_messages.append(
-                    f"{slot.name}: {reason}",
-                )
-                # Preserve the rejected bytes before the caller's
-                # ``finally`` cleans up ``output_tempdirs``.
-                # Quarantine is best-effort: ``None`` here just
-                # means the bytes were not recoverable, not that
-                # the validation outcome changes.
-                qpath = quarantine_slot(
-                    workspace.path, exec_id, slot.name, src,
-                )
-                rejected_outputs[slot.name] = RejectedOutput(
-                    reason=reason, quarantine_path=qpath,
-                )
-                # Continue processing the remaining slots so an
-                # execution that produced multiple outputs
-                # surfaces every problem at once rather than
-                # masking later failures behind the first.
-                continue
-        kind = workspace.artifact_declarations.get(slot.name)
-        if kind == "incremental":
-            instance_id = _commit_incremental_output(
-                workspace, slot.name, src, exec_id)
-            if instance_id is not None:
-                output_bindings[slot.name] = instance_id
-        else:
-            # Default to copy semantics.  ``kind`` being None
-            # shouldn't happen for a block whose output is in
-            # the template's declared artifacts (the parser
-            # validates this), but if it does we still produce
-            # something operable rather than crashing.
-            output_bindings[slot.name] = _commit_copy_output(
-                workspace, slot.name, src, exec_id, finished_at)
+
+        # Copy semantics — proposal-then-forge.  Hand the per-slot
+        # tempdir (the proposal) to ``Workspace.register_artifact``
+        # which stages, validates, and atomically renames the
+        # contents into the canonical artifact location.  Validator
+        # rejections are caught here so commit-passing-slots
+        # semantics survive: rejected proposals are quarantined and
+        # the loop continues processing remaining slots.
+        try:
+            instance = workspace.register_artifact(
+                slot.name,
+                source_path=src,
+                source=None,
+                validator_registry=validator_registry,
+                declaration=declarations.get(slot.name),
+                produced_by=exec_id,
+            )
+        except ArtifactValidationError as exc:
+            reason = str(exc)
+            rejection_messages.append(f"{slot.name}: {reason}")
+            qpath = quarantine_slot(
+                workspace.path, exec_id, slot.name, src,
+            )
+            rejected_outputs[slot.name] = RejectedOutput(
+                reason=reason, quarantine_path=qpath,
+            )
+            continue
+        output_bindings[slot.name] = instance.id
     if rejection_messages:
         exc = ArtifactValidationError(
             "; ".join(rejection_messages),
@@ -1369,71 +1262,6 @@ def _collect_outputs(
         exc.rejected_outputs = rejected_outputs  # type: ignore[attr-defined]
         raise exc
     return output_bindings
-
-
-def _commit_copy_output(
-    workspace: Workspace,
-    slot_name: str,
-    src: Path,
-    exec_id: str,
-    finished_at: datetime,
-) -> str:
-    """Create a fresh copy-artifact instance from a tempdir."""
-    aid = workspace.generate_artifact_id(slot_name)
-    canonical = workspace.path / "artifacts" / aid
-    canonical.mkdir(parents=True)
-    for child in src.iterdir():
-        dest = canonical / child.name
-        if child.is_dir():
-            shutil.copytree(child, dest)
-        else:
-            shutil.copy2(child, dest)
-    workspace.add_artifact(ArtifactInstance(
-        id=aid,
-        name=slot_name,
-        kind="copy",
-        created_at=finished_at,
-        produced_by=exec_id,
-        copy_path=aid,
-    ))
-    return aid
-
-
-def _commit_incremental_output(
-    workspace: Workspace,
-    slot_name: str,
-    src: Path,
-    exec_id: str,
-) -> str | None:
-    """Append entries from the tempdir to the canonical instance.
-
-    Mirrors :meth:`flywheel.local_block.LocalBlockRecorder._append_incremental_output`
-    so both execution paths produce identically-shaped
-    incremental artifacts.  Returns the canonical instance id,
-    or ``None`` if the tempdir had no ``entries.jsonl`` to
-    contribute.
-    """
-    entries_file = src / "entries.jsonl"
-    if not entries_file.exists():
-        return None
-    raw = entries_file.read_text(encoding="utf-8")
-    entries: list[Any] = []
-    for line in raw.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        entries.append(json.loads(stripped))
-    if not entries:
-        return None
-    instance = workspace.latest_incremental_instance(slot_name)
-    if instance is None:
-        instance = workspace.register_incremental_artifact(
-            slot_name,
-            produced_by=exec_id,
-            source=f"first appended by execution {exec_id}",
-        )
-    workspace.append_to_incremental(instance.id, entries)
-    return instance.id
 
 
 def _build_mounts(
@@ -1457,7 +1285,7 @@ def _build_mounts(
         if staged is not None:
             mounts.append(
                 (str(staged), slot.container_path, "ro"))
-    for slot in block_def.outputs:
+    for slot in block_def.all_output_slots():
         tempdir = output_tempdirs.get(slot.name)
         if tempdir is not None:
             mounts.append(
@@ -1477,74 +1305,15 @@ def _apply_post_check(
     workspace_path: Path,
     error: str | None,
 ) -> BlockExecution:
-    """Invoke the block's post_check (if any) and merge the result.
+    """Stub: post-check support is deferred for now.
 
-    Returns ``execution`` unchanged when no check is wired.  Otherwise
-    builds a :class:`PostCheckContext` in the same shape
-    ``LocalBlockRecorder._run_post_check`` uses, invokes the
-    callable, and returns a new :class:`BlockExecution` with
-    ``halt_directive`` and / or ``post_check_error`` populated.
-    Mirrors the lifecycle-block contract so the pattern runner's
-    ledger-driven halt logic works uniformly across runner kinds.
-
-    Args:
-        post_check: The callable to invoke, or ``None``.
-        execution: The freshly-built execution record.
-        output_dirs: Map from output slot name to the per-execution
-            directory the container wrote.  Passed into the
-            context's ``outputs`` so checks can inspect what the
-            container produced (e.g. parsing a JSON blob and
-            halting on a terminal-state field).
-        workspace_path: The workspace root — surfaced on the
-            context for checks that want to peek at sibling
-            artifacts / ledger files.
-        error: The ``execution.error`` string (or ``None``), passed
-            through so checks can behave differently on
-            succeeded-but-with-a-note paths.  ``RequestResponseExecutor``
-            does not have a ``caller`` / ``params`` / ``synthetic``
-            / ``parent_execution_id`` concept today; those fields
-            are left as their :class:`PostCheckContext` defaults.
+    Returns ``execution`` unchanged.  The post-check feature
+    (``halt_directive`` / ``post_check_error``) was excised from
+    the substrate :class:`BlockExecution` schema; whatever the
+    pattern-runner / agent layer ultimately needs lives in the
+    deferred batteries spec.
     """
-    if post_check is None:
-        return execution
-
-    ctx = PostCheckContext(
-        block=execution.block_name,
-        execution_id=execution.id,
-        status=execution.status,  # type: ignore[arg-type]
-        caller=None,
-        params=None,
-        error=error,
-        outputs=output_dirs,
-        parent_execution_id=None,
-        synthetic=False,
-        workspace_path=workspace_path,
-    )
-
-    directive: HaltDirective | None = None
-    post_check_error: str | None = None
-    try:
-        directive = post_check(ctx)
-    except Exception as exc:  # noqa: BLE001
-        post_check_error = f"{type(exc).__name__}: {exc}"
-
-    if directive is not None and not isinstance(
-            directive, HaltDirective):
-        post_check_error = (
-            f"post_check returned "
-            f"{type(directive).__name__}, expected "
-            f"HaltDirective | None")
-        directive = None
-
-    if directive is None and post_check_error is None:
-        return execution
-
-    return replace(
-        execution,
-        halt_directive=(
-            directive.to_dict() if directive is not None else None),
-        post_check_error=post_check_error,
-    )
+    return execution
 
 
 def _record_pre_container_failure(
@@ -1592,14 +1361,11 @@ def _record_pre_container_failure(
         exit_code=None,
         elapsed_s=0.0,
         image=block_def.image,
-        runner="container",
+        runner="container_ephemeral",
         failure_phase=failure_phase,
         error=error,
-        state_lineage_id=state_lineage_id,
-        run_id=run_id,
     )
-    workspace.add_execution(execution)
-    workspace.save()
+    workspace.record_execution(execution)
 
     return SyncExecutionHandle(ExecutionResult(
         exit_code=INVOKE_FAILURE_EXIT_CODE,
@@ -1625,182 +1391,7 @@ def _build_container_args(
     return args
 
 
-# ── ProcessExecutor ──────────────────────────────────────────────
-
-
-class ProcessExecutionHandle(ExecutionHandle):
-    """Handle to a running local subprocess.
-
-    Wraps a ``subprocess.Popen`` process.  ``stop()`` terminates
-    the process.  ``wait()`` blocks until exit and records the
-    execution in the workspace.
-    """
-
-    def __init__(
-        self,
-        process: subprocess.Popen,
-        workspace: Workspace,
-        block_name: str,
-        execution_id: str,
-        started_at: datetime,
-        start_monotonic: float,
-        run_id: str | None = None,
-    ):
-        """Initialize from a running subprocess."""
-        self._process = process
-        self._workspace = workspace
-        self._block_name = block_name
-        self._execution_id = execution_id
-        self._started_at = started_at
-        self._run_id = run_id
-        self._start_monotonic = start_monotonic
-        self._stop_reason: str | None = None
-        self._waited = False
-
-    def is_alive(self) -> bool:
-        """Check if the subprocess is still running."""
-        return self._process.poll() is None
-
-    def stop(self, reason: str = "requested") -> None:
-        """Terminate the subprocess."""
-        self._stop_reason = reason
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
-
-    def wait(self) -> ExecutionResult:
-        """Block until the subprocess exits and record execution.
-
-        Raises:
-            RuntimeError: If ``wait()`` has already been called.
-        """
-        if self._waited:
-            raise RuntimeError(
-                "wait() already called on this handle")
-        self._waited = True
-
-        self._process.wait()
-        elapsed = time.monotonic() - self._start_monotonic
-        finished_at = datetime.now(UTC)
-
-        exit_code = self._process.returncode or 0
-        if self._stop_reason:
-            status = "interrupted"
-        elif exit_code == 0:
-            status = "succeeded"
-        else:
-            status = "failed"
-
-        execution = BlockExecution(
-            id=self._execution_id,
-            block_name=self._block_name,
-            started_at=self._started_at,
-            finished_at=finished_at,
-            status=status,
-            exit_code=exit_code,
-            elapsed_s=elapsed,
-            stop_reason=self._stop_reason,
-            run_id=self._run_id,
-        )
-        self._workspace.add_execution(execution)
-        self._workspace.save()
-
-        return ExecutionResult(
-            exit_code=exit_code,
-            elapsed_s=elapsed,
-            output_bindings={},
-            execution_id=self._execution_id,
-            status=status,
-        )
-
-
-class ProcessExecutor:
-    """Execute a block as a local subprocess.
-
-    For trusted, host-local processes like game servers or local
-    tools.  Launches via ``subprocess.Popen`` and returns a
-    ``ProcessExecutionHandle`` for lifecycle control.
-    """
-
-    def launch(
-        self,
-        block_name: str,
-        workspace: Workspace,
-        input_bindings: dict[str, str],
-        *,
-        command: str | list[str] | None = None,
-        execution_id: str | None = None,
-        overrides: dict[str, Any] | None = None,
-        allowed_blocks: list[str] | None = None,
-        state_lineage_id: str | None = None,
-        run_id: str | None = None,
-    ) -> ProcessExecutionHandle:
-        """Launch a local subprocess.
-
-        Args:
-            block_name: Name of the block.
-            workspace: The flywheel workspace.
-            input_bindings: Input bindings (recorded but not
-                mounted — local processes access files directly).
-            command: Shell command string or argument list.
-                Required.
-            execution_id: Pre-assigned execution ID.
-            overrides: Unused (protocol compat).
-            allowed_blocks: If set, only these block names allowed.
-            state_lineage_id: Unused (protocol compat — local
-                subprocesses have no state mount to populate).
-            run_id: Optional run grouping id stamped on the
-                resulting :class:`BlockExecution` record.
-                ``None`` means ad-hoc (no grouping).
-
-        Returns:
-            A ``ProcessExecutionHandle`` for monitoring the
-            subprocess.
-
-        Raises:
-            ValueError: If command is not provided or block is
-                not allowed.
-        """
-        if allowed_blocks and block_name not in allowed_blocks:
-            raise ValueError(
-                f"Block {block_name!r} not in allowed list: "
-                f"{allowed_blocks}")
-
-        if command is None:
-            raise ValueError(
-                "ProcessExecutor requires a command")
-
-        exec_id = execution_id or workspace.generate_execution_id()
-        started_at = datetime.now(UTC)
-
-        if isinstance(command, str):
-            process = subprocess.Popen(
-                command, shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        else:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        return ProcessExecutionHandle(
-            process=process,
-            workspace=workspace,
-            block_name=block_name,
-            execution_id=exec_id,
-            started_at=started_at,
-            start_monotonic=time.monotonic(),
-            run_id=run_id,
-        )
-
-
-# ── RequestResponseExecutor ──────────────────────────────────────
+# ── PersistentContainerExecutor ──────────────────────────────────
 
 REQUEST_RESPONSE_PROTOCOL_VERSION: str = "1"
 """Bumped when the wire protocol (endpoints, request / response
@@ -2258,7 +1849,7 @@ class _RequestExecutionHandle(ExecutionHandle):
 
         Idempotent; a second call is a no-op.  Does not tear
         down the runtime — use
-        :meth:`RequestResponseExecutor.shutdown` for that.
+        :meth:`PersistentContainerExecutor.shutdown` for that.
         """
         with self._stop_lock:
             if self._stop_initiated:
@@ -2368,29 +1959,12 @@ class _RequestExecutionHandle(ExecutionHandle):
             exit_code=None,
             elapsed_s=elapsed,
             image=self._runtime.block_def.image,
-            runner="container",
+            runner="container_persistent",
             failure_phase=failure_phase,
             error=error,
-            state_lineage_id=self._state_lineage_id,
-            run_id=self._run_id,
-            stop_reason=self._stop_reason,
             rejected_outputs=rejected_outputs,
         )
-        # Run the block-declared post_check (if any) before the
-        # execution record is persisted, so the ``halt_directive``
-        # / ``post_check_error`` fields the ledger reader sees are
-        # the post-check result.  Symmetric with
-        # ``LocalBlockRecorder._run_post_check``: same
-        # ``PostCheckContext`` shape, same merge onto the record.
-        execution = _apply_post_check(
-            post_check=self._post_check,
-            execution=execution,
-            output_dirs=self._output_dirs,
-            workspace_path=self._runtime.workspace.path,
-            error=error,
-        )
-        self._runtime.workspace.add_execution(execution)
-        self._runtime.workspace.save()
+        self._runtime.workspace.record_execution(execution)
 
         return ExecutionResult(
             exit_code=(
@@ -2403,8 +1977,8 @@ class _RequestExecutionHandle(ExecutionHandle):
         )
 
 
-class RequestResponseExecutor:
-    """Request-response protocol executor — one runtime, many requests.
+class PersistentContainerExecutor:
+    """Persistent-container executor — one runtime, many requests.
 
     Implements the container runtime contract for blocks whose
     lifecycle is ``workspace_persistent``:
@@ -2506,7 +2080,7 @@ class RequestResponseExecutor:
         path, not by ``workspace.name``: two distinct workspaces
         that happen to share a name must not reattach to each
         other's runtimes.  Kept as a helper so
-        :class:`RequestResponseExecutor` can evolve to per-run
+        :class:`PersistentContainerExecutor` can evolve to per-run
         or per-session keys without every caller having to
         update.
         """
@@ -2557,12 +2131,12 @@ class RequestResponseExecutor:
         if block_def.runner != "container":
             raise ValueError(
                 f"Block {block_name!r}: "
-                f"RequestResponseExecutor only runs container "
+                f"PersistentContainerExecutor only runs container "
                 f"blocks (got runner {block_def.runner!r})")
         if block_def.lifecycle != "workspace_persistent":
             raise ValueError(
                 f"Block {block_name!r}: "
-                f"RequestResponseExecutor requires "
+                f"PersistentContainerExecutor requires "
                 f"'lifecycle: workspace_persistent' (got "
                 f"{block_def.lifecycle!r})")
 
@@ -2606,7 +2180,7 @@ class RequestResponseExecutor:
                 )
             output_root = request_dir / "output"
             output_root.mkdir()
-            for slot in block_def.outputs:
+            for slot in block_def.all_output_slots():
                 out = output_root / slot.name
                 out.mkdir()
                 output_dirs[slot.name] = out
@@ -2785,12 +2359,12 @@ class RequestResponseExecutor:
         if block_def.runner != "container":
             raise ValueError(
                 f"Block {block_name!r}: "
-                f"RequestResponseExecutor only runs container "
+                f"PersistentContainerExecutor only runs container "
                 f"blocks (got runner {block_def.runner!r})")
         if block_def.lifecycle != "workspace_persistent":
             raise ValueError(
                 f"Block {block_name!r}: "
-                f"RequestResponseExecutor requires "
+                f"PersistentContainerExecutor requires "
                 f"'lifecycle: workspace_persistent' (got "
                 f"{block_def.lifecycle!r})")
 
@@ -3113,3 +2687,12 @@ def _stage_single_input_to_path(
     finally:
         cleanup_staged_inputs(staged)
     return target
+
+
+# ── Deprecated aliases ────────────────────────────────────────────
+# Pre-rename names retained so deferred-batteries modules
+# (agent.py, agent_executor.py, pattern_runner.py, downstream
+# projects) keep importing while the layering spec catches up.
+# Remove together with the agent batteries move.
+ProcessExitExecutor = EphemeralContainerExecutor
+RequestResponseExecutor = PersistentContainerExecutor

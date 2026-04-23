@@ -1,7 +1,10 @@
 """Core data models for flywheel artifacts, executions, and events.
 
-An artifact instance is a concrete, immutable record of data produced
-by a block execution or captured at workspace creation. A block
+An artifact instance is a concrete, immutable record of data
+registered in a workspace.  Instances enter the workspace through
+several paths: produced by a block execution, imported directly
+via ``flywheel import artifact``, or created by the ``flywheel
+fix execution`` and ``flywheel amend artifact`` flows. A block
 execution is the record of running a single block within a workspace.
 A lifecycle event records an operational occurrence (e.g., agent
 stopped, group completed) that is not itself a block execution.
@@ -116,10 +119,21 @@ class RejectedOutput:
             validation failure is the primary signal either
             way; the missing path just means the bytes were
             not preserved this time.
+        phase: The commit-pipeline phase at which the slot was
+            rejected — one of
+            :data:`flywheel.runtime.FAILURE_OUTPUT_COLLECT`,
+            :data:`flywheel.runtime.FAILURE_OUTPUT_VALIDATE`, or
+            :data:`flywheel.runtime.FAILURE_ARTIFACT_COMMIT`.
+            Per-slot resolution lives here; the execution-level
+            ``failure_phase`` is the most-downstream phase across
+            all rejected slots.  Defaults to
+            ``"output_validate"`` so legacy rejections (which
+            only occurred at validation) deserialize unchanged.
     """
 
     reason: str
     quarantine_path: str | None = None
+    phase: str = "output_validate"
 
 
 @dataclass(frozen=True)
@@ -127,37 +141,26 @@ class ArtifactInstance:
     """A concrete artifact record within a workspace.
 
     Each instance has a unique ID in the form ``name@uuid``
-    (e.g., ``checkpoint@a3f7b2``, ``engine@baseline``). Three storage
+    (e.g., ``checkpoint@a3f7b2``, ``engine@baseline``). Two storage
     kinds:
 
     * ``copy`` — directory of files written once; immutable after
       registration.
     * ``git`` — reference to a commit in a git repo.
-    * ``incremental`` — directory containing exactly one
-      ``entries.jsonl`` file, append-only.  Each appended entry is
-      itself immutable (no rewrites of earlier entries); the file as
-      a whole grows over time as block executions add new entries.
-      The "logical instance" is a sequence of immutable entries
-      stored in one growing file.
 
     Attributes:
         id: Unique identifier within the workspace (e.g., ``checkpoint@a3f7b2``).
         name: The artifact declaration name this instance belongs to.
-        kind: Storage kind, ``"copy"``, ``"git"``, or ``"incremental"``.
+        kind: Storage kind, ``"copy"`` or ``"git"``.
         created_at: When this instance was created.
         produced_by: The execution ID that produced this instance,
             or None for artifacts not produced by a block execution
             (e.g., baseline git snapshots or imported artifacts).
-            For incremental artifacts, this is the *first* execution
-            that appended an entry; subsequent appenders are recorded
-            in their own ``BlockExecution.output_bindings``.
         source: For imported artifacts, a description of where the
             artifact came from (e.g., a file path). None for
             block-produced and baseline artifacts.
-        copy_path: For copy and incremental artifacts, the directory
-            name under ``workspace/artifacts/`` where files are
-            stored.  Copy artifacts hold arbitrary files; incremental
-            artifacts hold exactly one ``entries.jsonl``.
+        copy_path: For copy artifacts, the directory name under
+            ``workspace/artifacts/`` where files are stored.
         repo: For git artifacts, the absolute path to the repo root.
         commit: For git artifacts, the full commit SHA.
         git_path: For git artifacts, the path within the repo.
@@ -176,7 +179,7 @@ class ArtifactInstance:
 
     id: str
     name: str
-    kind: Literal["copy", "git", "incremental"]
+    kind: Literal["copy", "git"]
     created_at: datetime
     produced_by: str | None = None
     source: str | None = None
@@ -195,15 +198,6 @@ class BlockExecution:
     Captures the full provenance: which artifact instances were consumed,
     which were produced, and the outcome.
 
-    Two distinct linkage fields exist:
-
-    - ``predecessor_id`` is the *resume chain*: this execution
-      continues a previous one (same logical agent step, fresh
-      container).
-    - ``parent_execution_id`` is the *control-flow tree*: this
-      execution was launched from inside another one (e.g., a tool
-      call inside an agent container that triggers a logical block).
-
     Attributes:
         id: Unique identifier within the workspace (e.g., ``exec_a3f7b2e1``).
         block_name: The name of the block that was executed.
@@ -211,8 +205,9 @@ class BlockExecution:
         finished_at: When execution ended, or None if not yet finished.
         status: The outcome: ``"succeeded"``, ``"failed"``,
             ``"interrupted"``, or ``"running"`` for executions that
-            have begun but not yet ended (used by the lifecycle API
-            between begin and end).
+            have begun but not yet ended.  Derived from
+            ``termination_reason`` via
+            :func:`flywheel.termination.derive_status`.
         input_bindings: Maps each input artifact name to the artifact
             instance ID that was consumed.
         output_bindings: Maps each output artifact name to the artifact
@@ -220,110 +215,50 @@ class BlockExecution:
         exit_code: The container's exit code, if available.
         elapsed_s: Wall-clock time in seconds, if available.
         image: The Docker image that was used.
-        stop_reason: Why the execution ended, if it was stopped
-            externally (e.g., ``"exploration_request"``,
-            ``"prediction_mismatch"``, ``"timeout"``). None for
-            normal completion.
-        predecessor_id: Execution ID that this block resumes from,
-            enabling resume chains. None if this is a fresh start.
-        parent_execution_id: Execution ID of the execution that
-            launched this one (e.g., the agent container hosting a
-            tool-triggered logical block execution). None for
-            top-level executions. Distinct from ``predecessor_id``:
-            parent is "who launched me," predecessor is "who am I
-            resuming."
         runner: How this execution was physically performed:
-            ``"container"`` (Docker), ``"record"`` (legacy
-            record-mode, no work performed), or ``"agent"``
-            (long-lived agent container).  None for legacy
-            executions that predate the runner concept.
-        caller: For tool-triggered logical executions, identifies
-            which MCP server and tool invoked this block. Shape is
-            ``{"mcp_server": str, "tool": str}``. None for executions
-            not triggered by a tool call.
-        params: Function-argument parameters supplied by the caller
-            (e.g., ``{"action_id": 6, "x": 15, "y": 20}``).  These
-            are not artifacts but are recorded for lineage so the
-            full call can be reconstructed.  None if the block has
-            no params or for legacy executions.
+            ``"container_ephemeral"`` (one-shot container) or
+            ``"container_persistent"`` (long-lived container,
+            multiple invocations over an HTTP loop).
         error: Error message if status is ``"failed"`` and the
             failure produced a string description. None otherwise.
-        synthetic: ``True`` when the channel created this execution record in
-        place of a request that never made it past
-        ``/execution/begin`` (e.g., manifest mismatch,
-        unknown block, missing input).  Synthetic executions let
-            post-execution checks see infrastructure failures the
-            same way they see body failures.  Default ``False``.
-        halt_directive: Persisted form of a
-            :class:`flywheel.post_check.HaltDirective` returned by
-            this block's post-execution callback.  Shape is
-            ``{"scope": "caller"|"run", "reason": str}``.  Means
-            "the post-check asked one or more runners to stop
-            after this execution landed."  ``None`` when no directive
-            was issued.  Distinct from ``stop_reason``, which
-            describes why an *individual* execution ended.
-        post_check_error: Error string if the post-execution
-            callback itself raised.  The execution record is not retroactively
-            marked failed; the field exists so operators can see
-            the check is broken without it taking the run down.
-            ``None`` when no callback was configured or it
-            completed normally.
-        agent_workspace_dir: Workspace-relative path to the
-            ``/scratch`` bind mount used by this agent (e.g.,
-            ``"agent_workspaces/abc12345"``).  Recorded so an
-            operator looking at a workspace directory can find
-            the execution that produced it (and vice versa) without
-            having to grep timestamps.  ``None`` for non-agent
-            executions and for agent executions that predate this
-            field.
-        state_dir: Workspace-relative path to the directory where
-            this execution's private state was captured (e.g.,
-            ``"state/play/exec_a3f7b2e1"``).  Set only for blocks
-            that declare ``state: true`` and whose state-capture
-            step succeeded.  Not an artifact — never in the
-            artifact graph, never consumed by other blocks.
-            ``None`` for stateless blocks, for executions that
-            failed before state could be captured, and for legacy
-            executions that predate this field.
         failure_phase: When ``status == "failed"``, identifies
-            *which* step of the execution pipeline failed.  One
-            of ``"stage_in"``, ``"invoke"``, ``"state_capture"``,
-            ``"output_collect"``, ``"artifact_commit"`` — see
-            :mod:`flywheel.runtime` for the canonical constants.
+            *which* step of the execution pipeline failed.  Values
+            from :data:`flywheel.runtime.FAILURE_PHASES`.
             ``None`` for succeeded / interrupted / running
-            executions, and for failed executions that predate
-            this field.
-        state_lineage_id: Names the state lineage this execution
-            belongs to.  The state loader matches on
-            ``(block_name, state_lineage_id)`` to find the prior
-            state to restore.  ``None`` means the default
-            (single-lineage) bucket — today's executor always
-            passes ``None``, which gives every block one
-            evolving state chain per workspace.  When multiple
-            lineages become needed (parallel instances, forks),
-            callers can pass distinct IDs without a schema
-            migration.
-        run_id: Names the :class:`RunRecord` this execution
-            belongs to.  ``None`` means "ad-hoc" — this
-            execution was not started inside a durable grouped
-            run (direct ``flywheel run block`` / ``flywheel run
-            agent`` calls, for example).  ``PatternRunner``
-            opens a run and tags every ``BlockExecution`` it
-            drives with that id; nested executions triggered
-            through the host-side handoff loop inherit the
-            same id from the agent that triggered them.
-            Cadence counters scope by this field so executions
-            from a prior run do not pollute a fresh run's
-            counter.
+            executions.
         rejected_outputs: Per-slot record of output slots that
-            failed validation, keyed by slot name.  Present only
-            on executions whose ``failure_phase`` is
-            ``"output_validate"``.  Each entry carries the
-            validator's rejection ``reason`` and the
-            workspace-relative ``quarantine_path`` (when
-            quarantine I/O succeeded).  Empty dict by default;
-            absent on disk for executions with no rejected
-            slots.  See :class:`RejectedOutput`.
+            failed at any commit-time phase, keyed by slot name.
+            Each entry carries the rejection ``reason``, the
+            ``phase`` of failure (``output_collect``,
+            ``output_validate``, or ``artifact_commit``), and the
+            workspace-relative ``quarantine_path`` (when quarantine
+            I/O succeeded).  Empty dict by default; absent on disk
+            for executions with no rejected slots.  See
+            :class:`RejectedOutput`.
+        termination_reason: How the execution ended, as a string
+            label.  Either a substrate-reserved value
+            (``"crash"``, ``"interrupted"``, ``"timeout"``,
+            ``"protocol_violation"`` — see
+            :data:`flywheel.runtime.RESERVED_TERMINATION_REASONS`)
+            describing what the substrate observed, or a
+            project-defined value the block announced via the
+            per-runtime termination channel.  ``None`` for legacy
+            executions that predate the field.
+
+    Fields removed in the block-execution refactor (see
+    ``flywheel/docs/specs/block-execution.md``):
+
+    * ``caller`` and ``agent_workspace_dir`` — agent/MCP-shaped,
+      removed entirely from the substrate schema.  Will live in
+      whatever batteries-layer record the agent runtime owns.
+    * ``parent_execution_id`` — handoff-shaped; will return as
+      ``invoking_execution_id`` when the handoff primitive lands.
+    * ``params``, ``synthetic``, ``halt_directive``,
+      ``post_check_error``, ``state_dir``, ``state_lineage_id``,
+      ``run_id``, ``predecessor_id``, ``stop_reason`` — out of
+      happy-path scope; their fates are decided by the follow-on
+      specs (state, handoffs, patterns, etc.) that own those
+      concepts.
     """
 
     id: str
@@ -338,23 +273,14 @@ class BlockExecution:
     exit_code: int | None = None
     elapsed_s: float | None = None
     image: str | None = None
-    stop_reason: str | None = None
-    predecessor_id: str | None = None
-    parent_execution_id: str | None = None
-    runner: str | None = None
-    caller: dict[str, Any] | None = None
-    params: dict[str, Any] | None = None
+    runner: Literal[
+        "container_ephemeral", "container_persistent"
+    ] = "container_ephemeral"
     error: str | None = None
-    synthetic: bool = False
-    halt_directive: dict[str, Any] | None = None
-    post_check_error: str | None = None
-    agent_workspace_dir: str | None = None
-    state_dir: str | None = None
     failure_phase: str | None = None
-    state_lineage_id: str | None = None
-    run_id: str | None = None
     rejected_outputs: dict[str, RejectedOutput] = field(
         default_factory=dict)
+    termination_reason: str | None = None
 
 
 @dataclass(frozen=True)

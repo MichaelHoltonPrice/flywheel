@@ -333,7 +333,7 @@ class TestMainFixExecution:
         ws = Workspace.create("test_ws", template, foundry_dir)
 
         now = datetime.now(UTC)
-        ws.add_execution(BlockExecution(
+        ws._add_execution(BlockExecution(
             id="exec_bad", block_name="produce_data",
             started_at=now, finished_at=now,
             status="failed", failure_phase="output_validate",
@@ -552,6 +552,14 @@ def _write_pattern(project_root: Path, name: str, body: str) -> Path:
     return path
 
 
+@pytest.mark.skip(
+    reason=(
+        "`flywheel run pattern` depends on the agent-tool-call "
+        "modules excised by the block-execution rewrite spec. "
+        "Patterns will be reintroduced by a follow-on patterns "
+        "spec; these tests are reactivated then."
+    )
+)
 class TestRunPattern:
     def test_unknown_pattern_exits(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

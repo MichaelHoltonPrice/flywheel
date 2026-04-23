@@ -32,7 +32,9 @@ from flywheel.artifact import (
     SupersedesRef,
 )
 from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.runtime import FAILURE_PHASES
 from flywheel.template import ArtifactDeclaration, Template
+from flywheel.termination import derive_status
 from flywheel.validation import validate_name as _validate_name
 
 
@@ -93,6 +95,12 @@ def _rejected_outputs_to_yaml(
         entry: dict = {"reason": rec.reason}
         if rec.quarantine_path is not None:
             entry["quarantine_path"] = rec.quarantine_path
+        # ``phase`` is always populated on the dataclass (default
+        # ``"output_validate"`` for legacy rejections) so it
+        # always serializes — keeps the on-disk record
+        # self-describing without a back-compat sniff at read
+        # time.
+        entry["phase"] = rec.phase
         out[slot] = entry
     return out
 
@@ -118,6 +126,7 @@ def _rejected_outputs_from_yaml(
         out[slot] = RejectedOutput(
             reason=rec["reason"],
             quarantine_path=rec.get("quarantine_path"),
+            phase=rec.get("phase", "output_validate"),
         )
     return out
 
@@ -176,8 +185,17 @@ class Workspace:
             if candidate not in self.executions:
                 return candidate
 
-    def add_artifact(self, instance: ArtifactInstance) -> None:
-        """Add an artifact instance to the workspace.
+    def _add_artifact(self, instance: ArtifactInstance) -> None:
+        """Add an artifact instance to the workspace ledger.
+
+        Private. The sanctioned write paths for artifacts are
+        :meth:`register_artifact` and (forthcoming)
+        ``register_git_artifact``. This method exists only as the
+        shared low-level write inside those canonical paths and is
+        not meant to be called from outside the workspace, callers
+        outside ``Workspace`` should use a canonical path. Tests may
+        call it for fixture setup but should treat that as a
+        deliberate internal-API access.
 
         Thread-safe: acquires the workspace lock.
 
@@ -212,12 +230,6 @@ class Workspace:
                     f"Copy artifact {instance.id!r} is missing "
                     f"copy_path"
                 )
-            if (instance.kind == "incremental"
-                    and instance.copy_path is None):
-                raise ValueError(
-                    f"Incremental artifact {instance.id!r} is "
-                    f"missing copy_path"
-                )
             if instance.kind == "git":
                 missing = [
                     f for f in ("repo", "commit", "git_path")
@@ -230,8 +242,16 @@ class Workspace:
                     )
             self.artifacts[instance.id] = instance
 
-    def add_execution(self, execution: BlockExecution) -> None:
-        """Add a block execution record to the workspace.
+    def _add_execution(self, execution: BlockExecution) -> None:
+        """Add a block execution record to the workspace ledger.
+
+        Private. The sanctioned write path for block executions is
+        :meth:`record_execution`. This method exists only as the
+        shared low-level write inside that canonical path and is
+        not meant to be called from outside the workspace; callers
+        outside ``Workspace`` should use ``record_execution``.
+        Tests may call it for fixture setup but should treat that
+        as a deliberate internal-API access.
 
         Thread-safe: acquires the workspace lock.
 
@@ -248,6 +268,104 @@ class Workspace:
                     f"in workspace"
                 )
             self.executions[execution.id] = execution
+
+    def record_execution(
+        self, execution: BlockExecution,
+    ) -> BlockExecution:
+        """Record a block execution and persist the workspace.
+
+        The single canonical write path for ``BlockExecution``
+        records.  Validates the substrate invariants, derives the
+        canonical ``status`` from ``termination_reason`` (when
+        provided), then adds the execution to the in-memory ledger
+        and immediately persists the workspace to disk.
+
+        Canonical-mode invariants (enforced when
+        ``execution.termination_reason`` is set):
+
+        * ``runner`` must be one of ``"container_ephemeral"`` or
+          ``"container_persistent"``.
+        * ``failure_phase``, when set, must be a known phase from
+          :data:`flywheel.runtime.FAILURE_PHASES`.
+        * ``status`` is recomputed from ``termination_reason`` via
+          :func:`flywheel.termination.derive_status`; any value the
+          caller passed is overwritten.
+        * Successful executions (``status == "succeeded"``) must
+          have no ``failure_phase`` and no ``rejected_outputs``.
+        * Non-successful executions must have a ``failure_phase``.
+
+        Legacy callers that have not yet adopted termination_reason
+        (the unmodified ``EphemeralContainerExecutor`` /
+        ``PersistentContainerExecutor`` classes) may pass
+        ``termination_reason=None``; the record is appended as-is
+        and these invariants are skipped.  This leniency goes away
+        when those executors are migrated to the canonical helpers.
+
+        Args:
+            execution: The execution record to record.
+
+        Returns:
+            The (possibly status-corrected) execution record, for
+            caller convenience.
+
+        Raises:
+            ValueError: If an execution with this ID already
+                exists, or if a canonical-mode invariant fails.
+        """
+        if execution.termination_reason is not None:
+            execution = self._validate_and_normalize_execution(execution)
+        self._add_execution(execution)
+        self.save()
+        return execution
+
+    @staticmethod
+    def _validate_and_normalize_execution(
+        execution: BlockExecution,
+    ) -> BlockExecution:
+        """Apply canonical invariants and derive status."""
+        if execution.runner not in (
+            "container_ephemeral", "container_persistent",
+        ):
+            raise ValueError(
+                f"BlockExecution {execution.id!r}: runner must be "
+                f"'container_ephemeral' or 'container_persistent'; "
+                f"got {execution.runner!r}"
+            )
+        if (execution.failure_phase is not None
+                and execution.failure_phase not in FAILURE_PHASES):
+            raise ValueError(
+                f"BlockExecution {execution.id!r}: failure_phase "
+                f"{execution.failure_phase!r} is not in "
+                f"runtime.FAILURE_PHASES"
+            )
+
+        all_expected_committed = not execution.rejected_outputs
+        derived = derive_status(
+            execution.termination_reason,  # type: ignore[arg-type]
+            all_expected_committed=all_expected_committed,
+        )
+        if execution.status != derived:
+            execution = replace(execution, status=derived)
+
+        if derived == "succeeded":
+            if execution.failure_phase is not None:
+                raise ValueError(
+                    f"BlockExecution {execution.id!r}: status "
+                    f"'succeeded' must not carry a failure_phase "
+                    f"(got {execution.failure_phase!r})"
+                )
+            if execution.rejected_outputs:
+                raise ValueError(
+                    f"BlockExecution {execution.id!r}: status "
+                    f"'succeeded' must not carry rejected_outputs"
+                )
+        else:
+            if execution.failure_phase is None:
+                raise ValueError(
+                    f"BlockExecution {execution.id!r}: status "
+                    f"{derived!r} requires a failure_phase"
+                )
+        return execution
 
     def generate_event_id(self) -> str:
         """Generate a unique lifecycle event ID.
@@ -396,9 +514,9 @@ class Workspace:
         )
 
     def instance_path(self, instance_id: str) -> Path:
-        """Return the on-disk directory for a copy or incremental artifact.
+        """Return the on-disk directory for a copy artifact.
 
-        For ``copy`` and ``incremental`` artifacts the returned path is
+        For ``copy`` artifacts the returned path is
         ``<workspace>/artifacts/<copy_path>/``.  For ``git`` artifacts
         this raises — git artifacts are not directory-stored within
         the workspace.
@@ -424,197 +542,6 @@ class Workspace:
             )
         return self.path / "artifacts" / inst.copy_path
 
-    def register_incremental_artifact(
-        self,
-        name: str,
-        *,
-        produced_by: str | None = None,
-        source: str | None = None,
-    ) -> ArtifactInstance:
-        """Allocate a new incremental artifact instance.
-
-        Creates the artifact directory, an empty ``entries.jsonl``
-        file, and a registered :class:`ArtifactInstance` of kind
-        ``incremental``.  Subsequent appenders should use
-        :meth:`append_to_incremental` to add entries.
-
-        Args:
-            name: The artifact declaration name (must be declared
-                with ``kind: incremental``).
-            produced_by: Execution ID of the first appender, if
-                known.  May be ``None`` if the instance is created
-                ahead of any appends (e.g., during workspace
-                bootstrap).
-            source: Free-text provenance description.
-
-        Returns:
-            The created :class:`ArtifactInstance`.
-
-        Raises:
-            ValueError: If the name is not declared as an
-                incremental artifact.
-        """
-        if name not in self.artifact_declarations:
-            raise ValueError(
-                f"Artifact {name!r} not declared in this workspace"
-            )
-        if self.artifact_declarations[name] != "incremental":
-            raise ValueError(
-                f"Artifact {name!r} is declared as "
-                f"{self.artifact_declarations[name]!r}; "
-                f"register_incremental_artifact requires "
-                f"'incremental'"
-            )
-
-        artifact_id = self.generate_artifact_id(name)
-        target_dir = self.path / "artifacts" / artifact_id
-        target_dir.mkdir(parents=True)
-        try:
-            (target_dir / "entries.jsonl").touch()
-            instance = ArtifactInstance(
-                id=artifact_id,
-                name=name,
-                kind="incremental",
-                created_at=datetime.now(UTC),
-                produced_by=produced_by,
-                source=source,
-                copy_path=artifact_id,
-            )
-            self.add_artifact(instance)
-            self.save()
-            return instance
-        except Exception:
-            shutil.rmtree(target_dir, ignore_errors=True)
-            raise
-
-    def latest_incremental_instance(
-        self, name: str,
-    ) -> ArtifactInstance | None:
-        """Return the most recent incremental instance of *name*, or None.
-
-        v1 expects at most one incremental instance per declaration
-        per workspace; this helper exists so callers don't have to
-        enforce that themselves and so a future v2 with multiple
-        instances can change the resolution policy here.
-
-        Args:
-            name: The artifact declaration name.
-
-        Returns:
-            The newest incremental instance, or ``None`` if no
-            incremental instances exist for this name.
-        """
-        if name not in self.artifact_declarations:
-            raise ValueError(
-                f"Artifact {name!r} not declared in this workspace"
-            )
-        if self.artifact_declarations[name] != "incremental":
-            raise ValueError(
-                f"Artifact {name!r} is declared as "
-                f"{self.artifact_declarations[name]!r}; "
-                f"latest_incremental_instance requires 'incremental'"
-            )
-        candidates = [
-            a for a in self.artifacts.values()
-            if a.name == name and a.kind == "incremental"
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda a: a.created_at)
-
-    def append_to_incremental(
-        self,
-        instance_id: str,
-        entries: list[Any],
-    ) -> None:
-        """Append one or more entries to an incremental artifact.
-
-        Each entry is JSON-encoded and written as one line to
-        ``entries.jsonl``.  Holds the workspace lock for the
-        duration of the append; concurrent appenders within the
-        same process serialize against each other.  v1 assumes
-        cross-process appenders will not collide (block executions
-        producing an incremental are expected to be serialized by
-        the workspace owner).
-
-        Args:
-            instance_id: The incremental artifact instance ID.
-            entries: List of JSON-encodable values to append.
-                Empty list is a no-op.
-
-        Raises:
-            KeyError: If no instance exists with that ID.
-            ValueError: If the instance is not an incremental
-                artifact.
-        """
-        if not entries:
-            return
-        if instance_id not in self.artifacts:
-            raise KeyError(instance_id)
-        inst = self.artifacts[instance_id]
-        if inst.kind != "incremental":
-            raise ValueError(
-                f"Artifact {instance_id!r} has kind {inst.kind!r}; "
-                f"append_to_incremental requires 'incremental'"
-            )
-        if inst.copy_path is None:
-            raise ValueError(
-                f"Incremental artifact {instance_id!r} is missing "
-                f"copy_path"
-            )
-        entries_path = (
-            self.path / "artifacts" / inst.copy_path / "entries.jsonl"
-        )
-        with self._lock, open(entries_path, "a", encoding="utf-8") as f:
-            for entry in entries:
-                f.write(
-                    json.dumps(entry, separators=(",", ":")) + "\n"
-                )
-
-    def read_incremental_entries(
-        self, instance_id: str,
-    ) -> list[Any]:
-        """Read all entries from an incremental artifact in append order.
-
-        Convenience reader for in-process callers; container blocks
-        read ``/input/<name>/entries.jsonl`` directly.
-
-        Args:
-            instance_id: The incremental artifact instance ID.
-
-        Returns:
-            List of JSON values in append order.
-
-        Raises:
-            KeyError: If no instance exists with that ID.
-            ValueError: If the instance is not an incremental
-                artifact.
-        """
-        if instance_id not in self.artifacts:
-            raise KeyError(instance_id)
-        inst = self.artifacts[instance_id]
-        if inst.kind != "incremental":
-            raise ValueError(
-                f"Artifact {instance_id!r} has kind {inst.kind!r}; "
-                f"read_incremental_entries requires 'incremental'"
-            )
-        if inst.copy_path is None:
-            raise ValueError(
-                f"Incremental artifact {instance_id!r} is missing "
-                f"copy_path"
-            )
-        entries_path = (
-            self.path / "artifacts" / inst.copy_path / "entries.jsonl"
-        )
-        if not entries_path.exists():
-            return []
-        with open(entries_path, encoding="utf-8") as f:
-            return [
-                json.loads(line)
-                for line in f
-                if line.strip()
-            ]
-
     def register_artifact(
         self,
         name: str,
@@ -625,6 +552,7 @@ class Workspace:
         declaration: ArtifactDeclaration | None = None,
         supersedes: SupersedesRef | None = None,
         supersedes_reason: str | None = None,
+        produced_by: str | None = None,
     ) -> ArtifactInstance:
         """Import an external directory as an artifact instance.
 
@@ -699,6 +627,11 @@ class Workspace:
                 of *why* this successor is being registered.
                 Recorded verbatim on the instance.  Must be
                 ``None`` when ``supersedes`` is ``None``.
+            produced_by: Optional execution ID that produced this
+                artifact.  Set when the proposal directory came
+                from a block execution; ``None`` (the default) for
+                operator-driven imports.  Recorded verbatim on
+                the instance.
 
         Returns:
             The created ArtifactInstance.
@@ -767,7 +700,12 @@ class Workspace:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
 
-        if source is None:
+        # Only synthesise an "imported from ..." source for
+        # operator-driven imports.  Block-produced artifacts
+        # already carry provenance via ``produced_by`` and should
+        # not have a synthetic source pointing at the transient
+        # proposal directory.
+        if source is None and produced_by is None:
             source = f"imported from {source_path.resolve()}"
 
         instance = ArtifactInstance(
@@ -775,13 +713,113 @@ class Workspace:
             name=name,
             kind="copy",
             created_at=datetime.now(UTC),
-            produced_by=None,
+            produced_by=produced_by,
             source=source,
             copy_path=artifact_id,
             supersedes=supersedes,
             supersedes_reason=supersedes_reason,
         )
-        self.add_artifact(instance)
+        self._add_artifact(instance)
+        self.save()
+        return instance
+
+    def register_git_artifact(
+        self,
+        name: str,
+        declaration: ArtifactDeclaration,
+        project_root: Path,
+    ) -> ArtifactInstance:
+        """Resolve a declared git input and register it.
+
+        The canonical write path for git-kind artifact instances.
+        Resolves the declaration's repo + path against ``project_root``
+        at the current ``HEAD`` commit, constructs an
+        :class:`ArtifactInstance` of kind ``git``, persists it via
+        :meth:`_add_artifact`, and returns it.
+
+        Git artifacts are project source materials — references to
+        committed bytes, not bytes the substrate produces. The
+        method therefore runs no validators and never touches the
+        quarantine: there is no produced output to reject. The only
+        thing being "registered" is the resolved snapshot reference.
+
+        The repo working tree must be clean: a dirty working tree
+        means HEAD does not exhaustively describe the bytes the
+        block would see, which would silently break provenance.
+        Operators must commit (or stash) before running a block
+        that consumes a git artifact.
+
+        Args:
+            name: The artifact declaration name (must be a declared
+                ``git`` artifact in the workspace's template).
+            declaration: The matching declaration. Carries the
+                ``repo`` (relative to ``project_root``) and ``path``
+                (relative to that repo's root) being snapshotted.
+            project_root: The project root used to resolve
+                ``declaration.repo`` to a concrete repo directory.
+
+        Returns:
+            The registered :class:`ArtifactInstance` of kind
+            ``git`` pinned to ``HEAD``.
+
+        Raises:
+            ValueError: If ``declaration`` is missing ``repo`` or
+                ``path`` fields.
+            RuntimeError: If the resolved repo has uncommitted
+                changes.
+            FileNotFoundError: If ``declaration.path`` does not
+                exist at ``HEAD`` of the resolved repo.
+        """
+        if declaration.repo is None or declaration.path is None:
+            raise ValueError(
+                f"Git artifact {name!r} missing repo or path "
+                f"in declaration"
+            )
+
+        repo_path = (project_root / declaration.repo).resolve()
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if status.stdout.strip():
+            raise RuntimeError(
+                f"Git repo {repo_path} has uncommitted changes. "
+                f"Commit or stash before running a block."
+            )
+
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commit = head.stdout.strip()
+
+        artifact_path = repo_path / declaration.path
+        if not artifact_path.exists():
+            raise FileNotFoundError(
+                f"Git artifact {name!r} path "
+                f"{declaration.path!r} does not exist in repo "
+                f"{repo_path}"
+            )
+
+        artifact_id = self.generate_artifact_id(name)
+        instance = ArtifactInstance(
+            id=artifact_id,
+            name=name,
+            kind="git",
+            created_at=datetime.now(UTC),
+            produced_by=None,
+            repo=str(repo_path),
+            commit=commit,
+            git_path=declaration.path,
+        )
+        self._add_artifact(instance)
         self.save()
         return instance
 
@@ -1023,24 +1061,12 @@ class Workspace:
                 exit_code=entry.get("exit_code"),
                 elapsed_s=entry.get("elapsed_s"),
                 image=entry.get("image"),
-                stop_reason=entry.get("stop_reason"),
-                predecessor_id=entry.get("predecessor_id"),
-                parent_execution_id=entry.get("parent_execution_id"),
-                runner=entry.get("runner"),
-                caller=entry.get("caller"),
-                params=entry.get("params"),
+                runner=entry["runner"],
                 error=entry.get("error"),
-                synthetic=entry.get("synthetic", False),
-                halt_directive=entry.get("halt_directive"),
-                post_check_error=entry.get("post_check_error"),
-                agent_workspace_dir=entry.get(
-                    "agent_workspace_dir"),
-                state_dir=entry.get("state_dir"),
                 failure_phase=entry.get("failure_phase"),
-                state_lineage_id=entry.get("state_lineage_id"),
-                run_id=entry.get("run_id"),
                 rejected_outputs=_rejected_outputs_from_yaml(
                     entry.get("rejected_outputs")),
+                termination_reason=entry.get("termination_reason"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -1099,8 +1125,7 @@ class Workspace:
                     entry["produced_by"] = inst.produced_by
                 if inst.source is not None:
                     entry["source"] = inst.source
-                if (inst.kind in ("copy", "incremental")
-                        and inst.copy_path is not None):
+                if inst.kind == "copy" and inst.copy_path is not None:
                     entry["copy_path"] = inst.copy_path
                 if inst.kind == "git":
                     entry["repo"] = inst.repo
@@ -1129,41 +1154,17 @@ class Workspace:
                     entry["elapsed_s"] = ex.elapsed_s
                 if ex.image is not None:
                     entry["image"] = ex.image
-                if ex.stop_reason is not None:
-                    entry["stop_reason"] = ex.stop_reason
-                if ex.predecessor_id is not None:
-                    entry["predecessor_id"] = ex.predecessor_id
-                if ex.parent_execution_id is not None:
-                    entry["parent_execution_id"] = ex.parent_execution_id
-                if ex.runner is not None:
-                    entry["runner"] = ex.runner
-                if ex.caller is not None:
-                    entry["caller"] = ex.caller
-                if ex.params is not None:
-                    entry["params"] = ex.params
+                entry["runner"] = ex.runner
                 if ex.error is not None:
                     entry["error"] = ex.error
-                if ex.synthetic:
-                    entry["synthetic"] = True
-                if ex.halt_directive is not None:
-                    entry["halt_directive"] = ex.halt_directive
-                if ex.post_check_error is not None:
-                    entry["post_check_error"] = ex.post_check_error
-                if ex.agent_workspace_dir is not None:
-                    entry["agent_workspace_dir"] = (
-                        ex.agent_workspace_dir)
-                if ex.state_dir is not None:
-                    entry["state_dir"] = ex.state_dir
                 if ex.failure_phase is not None:
                     entry["failure_phase"] = ex.failure_phase
-                if ex.state_lineage_id is not None:
-                    entry["state_lineage_id"] = ex.state_lineage_id
-                if ex.run_id is not None:
-                    entry["run_id"] = ex.run_id
                 if ex.rejected_outputs:
                     entry["rejected_outputs"] = (
                         _rejected_outputs_to_yaml(
                             ex.rejected_outputs))
+                if ex.termination_reason is not None:
+                    entry["termination_reason"] = ex.termination_reason
                 serialized_executions[eid] = entry
 
             serialized_events = {}

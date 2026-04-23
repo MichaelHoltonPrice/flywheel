@@ -1,14 +1,37 @@
 """Block execution orchestration for flywheel.
 
-Ties together workspace state, container launching, and
-convention-based output recording. The run_block function is the
-main entry point for executing a single block within a workspace.
+The public entry point is :func:`run_block`, which is a thin
+``prepare → invoke → commit`` orchestration over the canonical
+block-execution model:
+
+* :func:`prepare_block_execution` — resolves inputs, allocates
+  per-slot proposal directories, builds the container mount set,
+  and mints the execution ID.  Returns an :class:`ExecutionPlan`.
+* :func:`invoke_ephemeral_container` — runs a fresh container
+  for this execution, waits for it to exit, and parses the
+  termination announcement from the sidecar at
+  ``/flywheel/termination``.  This is the ephemeral-container
+  invocation strategy; the persistent-container strategy lives
+  in :class:`flywheel.executor.PersistentContainerExecutor` and
+  is a separate code path.
+* :func:`commit_block_execution` — forges validated proposals
+  through ``Workspace.register_artifact`` (proposal-then-forge),
+  quarantines rejections, and records the :class:`BlockExecution`
+  via ``Workspace.record_execution``.
+
+``flywheel run block`` is the only call site today.  The
+:class:`flywheel.executor.EphemeralContainerExecutor` and
+:class:`flywheel.executor.PersistentContainerExecutor` classes
+still carry their own pre-refactor staging and commit code and
+do not yet route through these helpers; harmonizing them is
+follow-on work whose timing is bound to the deferred-batteries
+spec that owns their consumers (agents, patterns, block groups).
 """
 
 from __future__ import annotations
 
 import shutil
-import subprocess
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,99 +47,95 @@ from flywheel.artifact_validator import (
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
 from flywheel.quarantine import quarantine_slot
-from flywheel.template import ArtifactDeclaration, Template
+from flywheel.template import (
+    ArtifactDeclaration,
+    BlockDefinition,
+    Template,
+)
+from flywheel.termination import (
+    derive_status,
+    normalize_termination_reason,
+    read_termination_sidecar,
+)
 from flywheel.workspace import Workspace
+
+
+# ── Plan & invocation result ─────────────────────────────────────
+
+
+@dataclass
+class ExecutionPlan:
+    """Output of the prepare phase — everything invoke/commit need.
+
+    A plan is constructed once per execution and threaded through
+    :func:`invoke_ephemeral_container` and
+    :func:`commit_block_execution`.  No
+    field is mutated after construction; downstream phases only
+    read.
+
+    Attributes:
+        execution_id: The minted execution ID.
+        block_def: The resolved block definition.
+        block_name: Convenience copy of ``block_def.name``.
+        started_at: Wall-clock timestamp captured at prepare time.
+        resolved_bindings: ``{slot_name: artifact_id}`` for every
+            input the block was given.
+        mounts: Container mount tuples ``(host, container, mode)``.
+        proposal_dirs: ``{slot_name: host_path}`` for the per-slot
+            proposal directories the block writes to.
+        proposals_root: Parent directory of all per-slot proposal
+            dirs and the termination sidecar dir.  Removed after
+            commit completes.
+        termination_file: Path the block writes its
+            termination-reason announcement to (sidecar at
+            ``/flywheel/termination`` inside the container).
+    """
+
+    execution_id: str
+    block_def: BlockDefinition
+    block_name: str
+    started_at: datetime
+    resolved_bindings: dict[str, str]
+    mounts: list[tuple[str, str, str]]
+    proposal_dirs: dict[str, Path]
+    proposals_root: Path
+    termination_file: Path
+
+
+@dataclass
+class InvocationResult:
+    """Output of the invoke phase — what the runtime observed.
+
+    Attributes:
+        termination_reason: The normalized termination reason.
+            Either a substrate-reserved value (``crash``,
+            ``interrupted``, ``timeout``, ``protocol_violation``)
+            or a project-defined value the block declared.
+        container_result: The raw ``ContainerResult`` from the
+            runtime, or ``None`` if the container never ran (e.g.,
+            ``KeyboardInterrupt`` before launch).
+        announcement: The raw bytes the block wrote to the
+            termination sidecar, before normalization.  ``None`` if
+            no sidecar was written.  Used for protocol-violation
+            error messages.
+    """
+
+    termination_reason: str
+    container_result: ContainerResult | None
+    announcement: str | None = None
+
+
+# ── Helpers ──────────────────────────────────────────────────────
 
 
 def _find_artifact_declaration(
     template: Template, name: str
 ) -> ArtifactDeclaration | None:
-    """Find an artifact declaration by name in a template.
-
-    Args:
-        template: The template to search.
-        name: The artifact name to find.
-
-    Returns:
-        The matching ArtifactDeclaration, or None if not found.
-    """
+    """Find an artifact declaration by name in a template."""
     for decl in template.artifacts:
         if decl.name == name:
             return decl
     return None
-
-
-def _resolve_git_input(
-    name: str, decl: ArtifactDeclaration, project_root: Path,
-    workspace: Workspace,
-) -> ArtifactInstance:
-    """Re-resolve a git artifact to the latest committed state.
-
-    Checks that the repo working tree is clean, verifies the declared
-    path exists at the current commit, and creates a new ArtifactInstance
-    pinned to HEAD.
-
-    Args:
-        name: The artifact declaration name.
-        decl: The artifact declaration from the template.
-        project_root: The project root for resolving relative repo paths.
-        workspace: The workspace, used to generate the next artifact ID.
-
-    Returns:
-        A new git ArtifactInstance pinned to HEAD.
-
-    Raises:
-        RuntimeError: If the git repo has a dirty working tree.
-        ValueError: If the declaration is missing repo or path fields.
-        FileNotFoundError: If the declared path does not exist at HEAD.
-    """
-    if decl.repo is None or decl.path is None:
-        raise ValueError(
-            f"Git artifact {name!r} missing repo or path in declaration"
-        )
-
-    repo_path = (project_root / decl.repo).resolve()
-
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    if status.stdout.strip():
-        raise RuntimeError(
-            f"Git repo {repo_path} has uncommitted changes. "
-            f"Commit or stash before running a block."
-        )
-
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    commit = result.stdout.strip()
-
-    artifact_path = repo_path / decl.path
-    if not artifact_path.exists():
-        raise FileNotFoundError(
-            f"Git artifact {name!r} path {decl.path!r} "
-            f"does not exist in repo {repo_path}"
-        )
-
-    artifact_id = workspace.generate_artifact_id(name)
-    return ArtifactInstance(
-        id=artifact_id,
-        name=name,
-        kind="git",
-        created_at=datetime.now(UTC),
-        produced_by=None,
-        repo=str(repo_path),
-        commit=commit,
-        git_path=decl.path,
-    )
 
 
 def _mount_artifact_instance(
@@ -161,56 +180,31 @@ def _mount_artifact_instance(
     return (host_path, container_path, "ro")
 
 
-def _cleanup_output_dirs(
-    workspace: Workspace, output_artifact_ids: dict[str, str],
-) -> None:
-    """Remove output directories that were allocated but not finalized.
-
-    Args:
-        workspace: The workspace containing the directories.
-        output_artifact_ids: Mapping of slot names to artifact IDs whose
-            directories should be cleaned up.
-    """
-    for artifact_id in output_artifact_ids.values():
-        output_dir = workspace.path / "artifacts" / artifact_id
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-
-
 def _record_execution(
     workspace: Workspace, execution_id: str, block_name: str,
-    started_at: datetime, status: str,
+    started_at: datetime,
+    termination_reason: str,
     input_bindings: dict[str, str],
     output_bindings: dict[str, str],
     exit_code: int | None, elapsed_s: float | None,
     image: str,
+    *,
+    all_expected_committed: bool,
     failure_phase: str | None = None,
     error: str | None = None,
     rejected_outputs: dict[str, RejectedOutput] | None = None,
 ) -> None:
     """Record a block execution and persist the workspace.
 
-    Args:
-        workspace: The workspace to record in.
-        execution_id: The execution's unique ID.
-        block_name: The block that was executed.
-        started_at: When execution began.
-        status: The outcome (succeeded, failed, or interrupted).
-        input_bindings: Which artifact instances were consumed.
-        output_bindings: Which artifact instances were produced.
-        exit_code: The container's exit code, if available.
-        elapsed_s: Wall-clock time in seconds, if available.
-        image: The Docker image that was used.
-        failure_phase: Which step of the pipeline failed.  Set
-            only when status is ``"failed"``.  See
-            :mod:`flywheel.runtime` for the canonical constants.
-        error: Human-readable error message recorded alongside
-            ``failure_phase`` for failed executions.
-        rejected_outputs: Per-slot rejection records for an
-            ``output_validate`` failure, keyed by slot name.
-            ``None`` (the default) is recorded as an empty
-            mapping.
+    Status is derived from ``termination_reason`` via the canonical
+    status-mapping rule (see
+    :func:`flywheel.termination.derive_status`).  Callers do not
+    pass ``status`` directly.
     """
+    status = derive_status(
+        termination_reason,
+        all_expected_committed=all_expected_committed,
+    )
     execution = BlockExecution(
         id=execution_id,
         block_name=block_name,
@@ -222,107 +216,149 @@ def _record_execution(
         exit_code=exit_code,
         elapsed_s=elapsed_s,
         image=image,
+        runner="container_ephemeral",
         failure_phase=failure_phase,
         error=error,
         rejected_outputs=rejected_outputs or {},
+        termination_reason=termination_reason,
     )
-    workspace.add_execution(execution)
-    workspace.save()
+    workspace.record_execution(execution)
 
 
-def run_block(
+# ── Failure recording helper (prepare/invoke phases) ─────────────
+
+
+def commit_failure(
     workspace: Workspace,
-    block_name: str,
-    template: Template,
-    project_root: Path,
-    input_bindings: dict[str, str] | None = None,
-    args: list[str] | None = None,
     *,
-    validator_registry: ArtifactValidatorRegistry | None = None,
-) -> ContainerResult:
-    """Execute a block within a workspace.
+    execution_id: str,
+    block_name: str,
+    started_at: datetime,
+    image: str,
+    phase: str,
+    error: str,
+    termination_reason: str = runtime.TERMINATION_REASON_CRASH,
+    resolved_bindings: dict[str, str] | None = None,
+    proposals_root: Path | None = None,
+) -> None:
+    """Record a failure that happened upstream of the commit phase.
 
-    Resolves input artifact instances, launches a Docker container,
-    and records produced artifact instances and the execution record
-    using convention-based output directories.
+    Used by :func:`run_block` for failures that occur after
+    ``execution_id`` is minted but before the commit phase runs:
+    proposal-allocation failures, input-resolution failures, and
+    invoke-time crashes that bubble out as exceptions.
 
-    Input binding resolution follows this order for each input slot:
-    1. If an explicit binding is provided, use it.
-    2. If the slot is a git artifact, re-resolve to the latest commit.
-    3. Otherwise, use the most recent copy instance for the slot.
-       This implicit "latest wins" policy is a provisional default.
-    4. If no instance exists and the slot is optional, skip it.
-    5. If no instance exists and the slot is required, raise an error.
+    The ``status`` is derived from ``termination_reason`` via the
+    canonical mapping; callers do not pass it.  ``output_bindings``
+    is forced empty (no slot reached the forge).  ``rejected_outputs``
+    is empty (the substrate's own pre-commit failures are not
+    per-slot rejections).
+
+    If ``proposals_root`` is supplied and exists on disk, it is
+    removed.
 
     Args:
-        workspace: The workspace to execute the block in.
-        block_name: Name of the block to execute.
-        template: The template defining blocks and artifacts.
-        project_root: The project root for resolving relative paths.
-        input_bindings: Optional mapping of input slot names to specific
-            artifact instance IDs. Each bound artifact must belong to
-            the same declaration as the slot it is bound to.
-        args: Optional extra arguments for the container entrypoint.
-        validator_registry: Project-supplied artifact validator
-            registry consulted before each output slot is committed.
-            See :mod:`flywheel.artifact_validator` for semantics.
-            Optional: when omitted, outputs are committed without
-            validation.
+        workspace: Workspace to record into.
+        execution_id: Pre-minted execution ID.
+        block_name: Block that was being executed.
+        started_at: When the execution attempt began.
+        image: Container image declared by the block.
+        phase: Failure phase from :data:`flywheel.runtime.FAILURE_PHASES`.
+        error: Human-readable error message.
+        termination_reason: Substrate-reserved reason describing
+            the failure.  Defaults to
+            :data:`flywheel.runtime.TERMINATION_REASON_CRASH`.
+        resolved_bindings: Any input bindings that were already
+            resolved before the failure.  ``None`` records an
+            empty mapping.
+        proposals_root: Per-execution proposals tree to clean up,
+            if one was allocated before the failure.
+    """
+    if proposals_root is not None:
+        shutil.rmtree(proposals_root, ignore_errors=True)
+    _record_execution(
+        workspace, execution_id, block_name, started_at,
+        termination_reason,
+        resolved_bindings or {}, {},
+        None, None, image,
+        all_expected_committed=True,
+        failure_phase=phase,
+        error=error,
+    )
+
+
+# ── Phase 1: prepare ─────────────────────────────────────────────
+
+
+def prepare_block_execution(
+    workspace: Workspace,
+    block_def: BlockDefinition,
+    template: Template,
+    project_root: Path,
+    input_bindings: dict[str, str],
+    *,
+    execution_id: str,
+    started_at: datetime,
+) -> ExecutionPlan:
+    """Allocate proposal dirs, resolve inputs, build mounts.
+
+    Spec ordering: proposal allocation happens before input
+    resolution so the per-execution proposals tree exists for
+    cleanup before any input-resolution failure.  Identity
+    (``execution_id``, ``started_at``) is minted by the caller so
+    the caller can record a failed :class:`BlockExecution` via
+    :func:`commit_failure` if anything in this function raises.
+
+    Input binding resolution order:
+
+    1. Explicit binding wins.
+    2. Git-kind slots are re-resolved against the working tree.
+    3. Otherwise the most recent ``copy`` instance is used.
+    4. If no instance is found and the slot is optional, skip it.
+    5. Required-with-no-instance raises ``ValueError``.
 
     Returns:
-        A ContainerResult with exit code and wall-clock elapsed seconds.
+        An :class:`ExecutionPlan` with the resolved inputs,
+        mounts, and proposal directories.
 
     Raises:
-        KeyError: If block_name is not found in the template.
-        ValueError: If the template does not match the workspace, a
-            required input artifact is not available, or a binding
-            references an artifact that does not match the slot.
-        RuntimeError: If the container exits with non-zero code or
-            a git repo has uncommitted changes.
-        FileNotFoundError: If a git artifact path does not exist.
-        flywheel.artifact_validator.ArtifactValidationError: If a
-            project-declared validator rejects one or more output
-            slots.  The execution is recorded ``failed`` with
-            ``failure_phase=output_validate`` and the slots that
-            passed validation are still committed (commit-A).
+        ValueError: If a required input cannot be resolved or a
+            binding is incompatible with its slot.  Caller is
+            responsible for routing this through
+            :func:`commit_failure`.
+        OSError: If proposal-directory allocation fails.  Same
+            failure-recording responsibility applies.
     """
-    if input_bindings is None:
-        input_bindings = {}
-
-    # 1. Validate template matches workspace
-    if template.name != workspace.template_name:
-        raise ValueError(
-            f"Template {template.name!r} does not match workspace "
-            f"template {workspace.template_name!r}"
-        )
-
-    # 2. Look up block definition
-    block_def = None
-    for block in template.blocks:
-        if block.name == block_name:
-            block_def = block
-            break
-    if block_def is None:
-        raise KeyError(
-            f"Block {block_name!r} not found in template "
-            f"{template.name!r}"
-        )
-
-    # 3. Create execution ID
-    execution_id = workspace.generate_execution_id()
-    started_at = datetime.now(UTC)
-
-    # 4. Resolve inputs and build mounts.
-    #    Explicit bindings take precedence over all other resolution,
-    #    including git re-resolution.
     mounts: list[tuple[str, str, str]] = []
     resolved_bindings: dict[str, str] = {}
+
+    # Per-slot proposal dirs (proposal-then-forge).  Allocated
+    # first so any subsequent input-resolution failure has a known
+    # proposals tree to clean up via commit_failure.
+    proposals_root = workspace.path / "proposals" / execution_id
+    proposal_dirs: dict[str, Path] = {}
+    for slot in block_def.all_output_slots():
+        proposal_dir = proposals_root / slot.name
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+        proposal_dirs[slot.name] = proposal_dir
+        mounts.append(
+            (str(proposal_dir.resolve()),
+             slot.container_path, "rw")
+        )
+
+    # Termination-channel sidecar.  The block writes one line to
+    # /flywheel/termination announcing why it ended.
+    termination_dir = proposals_root / "_flywheel"
+    termination_dir.mkdir(parents=True, exist_ok=True)
+    termination_file = termination_dir / "termination"
+    mounts.append(
+        (str(termination_dir.resolve()), "/flywheel", "rw")
+    )
 
     for slot in block_def.inputs:
         decl = _find_artifact_declaration(template, slot.name)
 
         if slot.name in input_bindings:
-            # Explicit binding — validate and use the specified instance
             artifact_id = input_bindings[slot.name]
             if artifact_id not in workspace.artifacts:
                 raise ValueError(
@@ -337,177 +373,454 @@ def run_block(
                 )
             resolved_bindings[slot.name] = artifact_id
             mounts.append(
-                _mount_artifact_instance(instance, slot.container_path,
-                                         workspace)
+                _mount_artifact_instance(
+                    instance, slot.container_path, workspace)
             )
 
         elif decl is not None and decl.kind == "git":
-            # Re-resolve git artifact to latest committed state.
-            # Commit immediately — git instances are inputs that
-            # exist regardless of whether the execution succeeds.
-            git_instance = _resolve_git_input(
-                slot.name, decl, project_root, workspace,
+            git_instance = workspace.register_git_artifact(
+                slot.name, decl, project_root,
             )
-            workspace.add_artifact(git_instance)
             resolved_bindings[slot.name] = git_instance.id
             mounts.append(
-                _mount_artifact_instance(git_instance, slot.container_path,
-                                         workspace)
+                _mount_artifact_instance(
+                    git_instance, slot.container_path, workspace)
             )
 
         else:
-            # Implicit binding: use the most recent copy instance.
-            # This is a provisional "latest wins" default.
             instances = workspace.instances_for(slot.name)
-            copy_instances = [i for i in instances if i.kind == "copy"]
+            copy_instances = [
+                i for i in instances if i.kind == "copy"]
             if copy_instances:
                 instance = copy_instances[-1]
                 resolved_bindings[slot.name] = instance.id
                 mounts.append(
-                    _mount_artifact_instance(instance, slot.container_path,
-                                             workspace)
+                    _mount_artifact_instance(
+                        instance, slot.container_path, workspace)
                 )
             elif slot.optional:
                 continue
             else:
                 raise ValueError(
-                    f"Required input artifact {slot.name!r} for block "
-                    f"{block_name!r} is not available"
+                    f"Required input artifact {slot.name!r} for "
+                    f"block {block_def.name!r} is not available"
                 )
 
-    # 5. Allocate fresh output directories with new artifact IDs
-    output_artifact_ids: dict[str, str] = {}
-    for slot in block_def.outputs:
-        artifact_id = workspace.generate_artifact_id(slot.name)
-        output_artifact_ids[slot.name] = artifact_id
-
-        output_dir = workspace.path / "artifacts" / artifact_id
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-        output_dir.mkdir(parents=True)
-        mounts.append((str(output_dir.resolve()), slot.container_path, "rw"))
-
-    # 6. Build ContainerConfig and run.
-    #    Wrap in try/except to handle both non-zero exit and
-    #    KeyboardInterrupt (Ctrl+C).
-    config = ContainerConfig(
-        image=block_def.image,
-        docker_args=block_def.docker_args,
-        env=block_def.env,
+    return ExecutionPlan(
+        execution_id=execution_id,
+        block_def=block_def,
+        block_name=block_def.name,
+        started_at=started_at,
+        resolved_bindings=resolved_bindings,
         mounts=mounts,
+        proposal_dirs=proposal_dirs,
+        proposals_root=proposals_root,
+        termination_file=termination_file,
     )
 
-    try:
-        result = run_container(config, args)
-    except KeyboardInterrupt:
-        _cleanup_output_dirs(workspace, output_artifact_ids)
-        _record_execution(
-            workspace, execution_id, block_name, started_at,
-            "interrupted", resolved_bindings, {}, None, None,
-            block_def.image,
-        )
-        raise
 
-    finished_at = datetime.now(UTC)
+# ── Phase 2: invoke ──────────────────────────────────────────────
+
+
+def invoke_ephemeral_container(
+    plan: ExecutionPlan,
+    args: list[str] | None = None,
+) -> InvocationResult:
+    """Run the block once and observe how it ended.
+
+    Starts a container per the plan's mounts and image, waits
+    for it to exit, and reads the termination announcement the
+    block wrote to ``plan.termination_file``.  The announcement
+    is normalized against the block's declared reasons before
+    being returned.
+
+    Returns:
+        An :class:`InvocationResult` with the normalized
+        termination reason and the raw container result.
+
+    Raises:
+        KeyboardInterrupt: Propagated from the container runtime
+            on operator stop.  Recording the interrupted
+            execution is the caller's responsibility (see
+            :func:`run_block`).
+    """
+    config = ContainerConfig(
+        image=plan.block_def.image,
+        docker_args=plan.block_def.docker_args,
+        env=plan.block_def.env,
+        mounts=plan.mounts,
+    )
+    declared_reasons = set(plan.block_def.outputs.keys())
+
+    result = run_container(config, args)
 
     if result.exit_code != 0:
-        _cleanup_output_dirs(workspace, output_artifact_ids)
+        return InvocationResult(
+            termination_reason=runtime.TERMINATION_REASON_CRASH,
+            container_result=result,
+        )
+
+    announcement = read_termination_sidecar(plan.termination_file)
+    termination_reason = normalize_termination_reason(
+        announcement=announcement,
+        declared_reasons=declared_reasons,
+    )
+    return InvocationResult(
+        termination_reason=termination_reason,
+        container_result=result,
+        announcement=announcement,
+    )
+
+
+# ── Phase 3: commit ──────────────────────────────────────────────
+
+
+def commit_block_execution(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+    invocation: InvocationResult,
+    template: Template,
+    *,
+    validator_registry: ArtifactValidatorRegistry | None = None,
+) -> ContainerResult | None:
+    """Forge proposals, record the execution, and clean up.
+
+    Implements the canonical commit pipeline:
+
+    1. If the runtime announced a substrate-reserved
+       failure-shaped reason (``crash``, ``interrupted``,
+       ``protocol_violation``, ...), record the execution as
+       ``failed`` with the appropriate ``failure_phase`` and
+       raise.
+    2. For every output slot the announced termination reason
+       maps to: empty proposal → ``output_collect`` rejection;
+       validator failure → quarantined ``output_validate``
+       rejection; other forge failure → quarantined
+       ``artifact_commit`` rejection; success → register through
+       ``Workspace.register_artifact``.
+    3. Record the :class:`BlockExecution` via
+       ``Workspace.record_execution``.
+
+    Returns:
+        The raw ``ContainerResult`` from the invocation on the
+        happy path.  ``None`` is never returned for happy-path
+        ephemeral runs; the field exists so the persistent-runtime
+        adapter can return ``None`` for handle metadata it doesn't
+        own.
+
+    Raises:
+        RuntimeError: For substrate-reserved failure reasons and
+            for non-validation commit failures.
+        flywheel.artifact_validator.ArtifactValidationError: When
+            ``output_validate`` is the most-downstream rejection
+            phase.
+    """
+    block_name = plan.block_name
+    block_def = plan.block_def
+    image = block_def.image
+    container_result = invocation.container_result
+    exit_code = container_result.exit_code if container_result else None
+    elapsed_s = container_result.elapsed_s if container_result else None
+    termination_reason = invocation.termination_reason
+
+    # ── Substrate-reserved failure-shaped reasons ────────────────
+    if termination_reason == runtime.TERMINATION_REASON_CRASH:
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
-            workspace, execution_id, block_name, started_at,
-            "failed", resolved_bindings, {},
-            result.exit_code, result.elapsed_s, block_def.image,
+            workspace, plan.execution_id, block_name, plan.started_at,
+            termination_reason,
+            plan.resolved_bindings, {},
+            exit_code, elapsed_s, image,
+            all_expected_committed=True,
+            failure_phase=runtime.FAILURE_INVOKE,
+            error=f"container exited with code {exit_code}",
         )
         raise RuntimeError(
             f"Block {block_name!r} container exited with code "
-            f"{result.exit_code}"
+            f"{exit_code}"
         )
 
-    # 7. Record output artifact instances (convention-based).
-    #    Validate per-slot before commit.  Commit-passing-slots:
-    #    slots that pass land in ``output_bindings`` and the
-    #    execution is recorded ``succeeded``; slots that fail
-    #    are not committed, their bytes are quarantined under
-    #    ``<workspace>/quarantine/<exec_id>/<slot>/``, and the
-    #    execution is recorded ``failed`` with
-    #    ``failure_phase=output_validate``.
+    if termination_reason == runtime.TERMINATION_REASON_TIMEOUT:
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        _record_execution(
+            workspace, plan.execution_id, block_name, plan.started_at,
+            termination_reason,
+            plan.resolved_bindings, {},
+            exit_code, elapsed_s, image,
+            all_expected_committed=True,
+            failure_phase=runtime.FAILURE_INVOKE,
+            error="container exceeded its execution deadline",
+        )
+        raise RuntimeError(
+            f"Block {block_name!r} container timed out"
+        )
+
+    if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        _record_execution(
+            workspace, plan.execution_id, block_name, plan.started_at,
+            termination_reason,
+            plan.resolved_bindings, {},
+            exit_code, elapsed_s, image,
+            all_expected_committed=True,
+            failure_phase=runtime.FAILURE_INVOKE,
+            error="container was interrupted",
+        )
+        raise KeyboardInterrupt(
+            f"Block {block_name!r} was interrupted"
+        )
+
+    if termination_reason == runtime.TERMINATION_REASON_PROTOCOL_VIOLATION:
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        declared = sorted(block_def.outputs.keys())
+        _record_execution(
+            workspace, plan.execution_id, block_name, plan.started_at,
+            termination_reason,
+            plan.resolved_bindings, {},
+            exit_code, elapsed_s, image,
+            all_expected_committed=True,
+            failure_phase=runtime.FAILURE_OUTPUT_PROTOCOL,
+            error=(
+                f"protocol violation: termination announcement "
+                f"{invocation.announcement!r} did not match any "
+                f"declared reason {declared!r}"
+            ),
+        )
+        raise RuntimeError(
+            f"Block {block_name!r} announced an invalid "
+            f"termination reason ({invocation.announcement!r})"
+        )
+
+    # ── Forge proposals into artifact instances ──────────────────
     declarations = {a.name: a for a in template.artifacts}
     output_bindings: dict[str, str] = {}
     rejected_outputs: dict[str, RejectedOutput] = {}
     rejection_messages: list[str] = []
-    for slot in block_def.outputs:
-        artifact_id = output_artifact_ids[slot.name]
-        output_dir = workspace.path / "artifacts" / artifact_id
-        if not any(output_dir.iterdir()):
-            continue
-        if validator_registry is not None:
-            try:
-                validator_registry.validate(
-                    slot.name,
-                    declarations.get(slot.name),
-                    output_dir,
-                )
-            except ArtifactValidationError as exc:
-                reason = str(exc)
-                rejection_messages.append(
-                    f"{slot.name}: {reason}",
-                )
-                # Preserve the rejected bytes before tearing
-                # down the pre-allocated artifact dir; the
-                # validation failure is the primary signal
-                # either way.
-                qpath = quarantine_slot(
-                    workspace.path, execution_id, slot.name,
-                    output_dir,
-                )
-                rejected_outputs[slot.name] = RejectedOutput(
-                    reason=reason, quarantine_path=qpath,
-                )
-                # Reject this slot's pre-allocated dir so we
-                # don't leave half-committed artifact storage
-                # behind.
-                if output_dir.exists():
-                    shutil.rmtree(output_dir)
-                continue
-        instance = ArtifactInstance(
-            id=artifact_id,
-            name=slot.name,
-            kind="copy",
-            created_at=finished_at,
-            produced_by=execution_id,
-            copy_path=artifact_id,
-        )
-        workspace.add_artifact(instance)
-        output_bindings[slot.name] = artifact_id
+    expected_slots = block_def.outputs_for(termination_reason)
 
-    # Clean up any pre-allocated dirs that never received
-    # content (matches the prior behavior).
-    for slot in block_def.outputs:
-        artifact_id = output_artifact_ids[slot.name]
-        if artifact_id in output_bindings:
+    for slot in expected_slots:
+        proposal_dir = plan.proposal_dirs[slot.name]
+        if not proposal_dir.exists() or not any(
+                proposal_dir.iterdir()):
+            rejection_messages.append(
+                f"{slot.name}: no output bytes written"
+            )
+            rejected_outputs[slot.name] = RejectedOutput(
+                reason="no output bytes written",
+                quarantine_path=None,
+                phase=runtime.FAILURE_OUTPUT_COLLECT,
+            )
             continue
-        leftover = workspace.path / "artifacts" / artifact_id
-        if leftover.exists() and not any(leftover.iterdir()):
-            shutil.rmtree(leftover)
+        try:
+            instance = workspace.register_artifact(
+                slot.name,
+                source_path=proposal_dir,
+                source=None,
+                validator_registry=validator_registry,
+                declaration=declarations.get(slot.name),
+                produced_by=plan.execution_id,
+            )
+        except ArtifactValidationError as exc:
+            reason = str(exc)
+            rejection_messages.append(f"{slot.name}: {reason}")
+            qpath = quarantine_slot(
+                workspace.path, plan.execution_id, slot.name,
+                proposal_dir,
+            )
+            rejected_outputs[slot.name] = RejectedOutput(
+                reason=reason, quarantine_path=qpath,
+                phase=runtime.FAILURE_OUTPUT_VALIDATE,
+            )
+            continue
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            rejection_messages.append(f"{slot.name}: {reason}")
+            qpath = quarantine_slot(
+                workspace.path, plan.execution_id, slot.name,
+                proposal_dir,
+            )
+            rejected_outputs[slot.name] = RejectedOutput(
+                reason=reason, quarantine_path=qpath,
+                phase=runtime.FAILURE_ARTIFACT_COMMIT,
+            )
+            continue
+        output_bindings[slot.name] = instance.id
 
-    # 8. Record execution and save.
+    shutil.rmtree(plan.proposals_root, ignore_errors=True)
+
+    all_expected_committed = not rejected_outputs
+
     if rejection_messages:
+        # Most-downstream phase across all rejected slots is the
+        # execution-level failure_phase.
+        phase_order = {
+            runtime.FAILURE_OUTPUT_COLLECT: 0,
+            runtime.FAILURE_OUTPUT_VALIDATE: 1,
+            runtime.FAILURE_ARTIFACT_COMMIT: 2,
+        }
+        execution_phase = max(
+            (rej.phase for rej in rejected_outputs.values()),
+            key=lambda p: phase_order.get(p, 0),
+        )
         error_msg = (
-            f"output_validate: {'; '.join(rejection_messages)}"
+            f"{execution_phase}: "
+            f"{'; '.join(rejection_messages)}"
         )
         _record_execution(
-            workspace, execution_id, block_name, started_at,
-            "failed", resolved_bindings, output_bindings,
-            result.exit_code, result.elapsed_s, block_def.image,
-            failure_phase=runtime.FAILURE_OUTPUT_VALIDATE,
+            workspace, plan.execution_id, block_name, plan.started_at,
+            termination_reason,
+            plan.resolved_bindings, output_bindings,
+            exit_code, elapsed_s, image,
+            all_expected_committed=all_expected_committed,
+            failure_phase=execution_phase,
             error=error_msg,
             rejected_outputs=rejected_outputs,
         )
-        raise ArtifactValidationError(error_msg)
+        if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
+            raise ArtifactValidationError(error_msg)
+        raise RuntimeError(error_msg)
 
     _record_execution(
-        workspace, execution_id, block_name, started_at,
-        "succeeded", resolved_bindings, output_bindings,
-        result.exit_code, result.elapsed_s, block_def.image,
+        workspace, plan.execution_id, block_name, plan.started_at,
+        termination_reason,
+        plan.resolved_bindings, output_bindings,
+        exit_code, elapsed_s, image,
+        all_expected_committed=all_expected_committed,
     )
 
-    return result
+    return container_result
+
+
+# ── Top-level entry point ────────────────────────────────────────
+
+
+def run_block(
+    workspace: Workspace,
+    block_name: str,
+    template: Template,
+    project_root: Path,
+    input_bindings: dict[str, str] | None = None,
+    args: list[str] | None = None,
+    *,
+    validator_registry: ArtifactValidatorRegistry | None = None,
+) -> ContainerResult:
+    """Execute a block within a workspace.
+
+    Thin orchestration over the canonical
+    ``prepare → invoke → commit`` model.  See
+    :func:`prepare_block_execution`,
+    :func:`invoke_ephemeral_container`, and
+    :func:`commit_block_execution` for the per-phase contracts.
+
+    Args:
+        workspace: The workspace to execute the block in.
+        block_name: Name of the block to execute.
+        template: The template defining blocks and artifacts.
+        project_root: The project root for resolving relative paths.
+        input_bindings: Optional mapping of input slot names to
+            specific artifact instance IDs.
+        args: Optional extra arguments for the container entrypoint.
+        validator_registry: Project-supplied artifact validator
+            registry consulted before each output slot is committed.
+
+    Returns:
+        A ContainerResult with exit code and wall-clock elapsed
+        seconds.
+
+    Raises:
+        KeyError: If block_name is not found in the template.
+        ValueError: If template/workspace mismatch or an input
+            cannot be resolved.
+        RuntimeError: For container crashes, protocol violations,
+            or non-validation commit failures.
+        flywheel.artifact_validator.ArtifactValidationError: If
+            output validation rejects one or more slots.
+    """
+    if input_bindings is None:
+        input_bindings = {}
+
+    if template.name != workspace.template_name:
+        raise ValueError(
+            f"Template {template.name!r} does not match workspace "
+            f"template {workspace.template_name!r}"
+        )
+
+    block_def = None
+    for block in template.blocks:
+        if block.name == block_name:
+            block_def = block
+            break
+    if block_def is None:
+        raise KeyError(
+            f"Block {block_name!r} not found in template "
+            f"{template.name!r}"
+        )
+
+    # ── identity ─────────────────────────────────────────────────
+    # Minted before prepare so any prepare-time failure has an
+    # execution_id to record itself against.
+    execution_id = workspace.generate_execution_id()
+    started_at = datetime.now(UTC)
+    proposals_root = workspace.path / "proposals" / execution_id
+
+    # ── prepare ──────────────────────────────────────────────────
+    try:
+        plan = prepare_block_execution(
+            workspace, block_def, template, project_root,
+            input_bindings,
+            execution_id=execution_id,
+            started_at=started_at,
+        )
+    except Exception as exc:
+        commit_failure(
+            workspace,
+            execution_id=execution_id,
+            block_name=block_name,
+            started_at=started_at,
+            image=block_def.image,
+            phase=runtime.FAILURE_STAGE_IN,
+            error=f"{type(exc).__name__}: {exc}",
+            proposals_root=proposals_root,
+        )
+        raise
+
+    # ── invoke ───────────────────────────────────────────────────
+    try:
+        invocation = invoke_ephemeral_container(plan, args)
+    except KeyboardInterrupt:
+        commit_failure(
+            workspace,
+            execution_id=plan.execution_id,
+            block_name=plan.block_name,
+            started_at=plan.started_at,
+            image=block_def.image,
+            phase=runtime.FAILURE_INVOKE,
+            error="operator interrupt",
+            termination_reason=runtime.TERMINATION_REASON_INTERRUPTED,
+            resolved_bindings=plan.resolved_bindings,
+            proposals_root=plan.proposals_root,
+        )
+        raise
+    except Exception as exc:
+        commit_failure(
+            workspace,
+            execution_id=plan.execution_id,
+            block_name=plan.block_name,
+            started_at=plan.started_at,
+            image=block_def.image,
+            phase=runtime.FAILURE_INVOKE,
+            error=f"{type(exc).__name__}: {exc}",
+            resolved_bindings=plan.resolved_bindings,
+            proposals_root=plan.proposals_root,
+        )
+        raise
+
+    # ── commit ───────────────────────────────────────────────────
+    result = commit_block_execution(
+        workspace, plan, invocation, template,
+        validator_registry=validator_registry,
+    )
+    # commit_block_execution returns the container_result on the
+    # happy path; for completeness, fall back to the invocation's
+    # raw container result if we somehow get None.
+    return result or invocation.container_result  # type: ignore[return-value]

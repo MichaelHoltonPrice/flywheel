@@ -94,6 +94,13 @@ FAILURE_ARTIFACT_COMMIT: Final[str] = "artifact_commit"
 """Outputs were read but the workspace commit failed (e.g., disk
 full, concurrent write race, invalid instance shape)."""
 
+FAILURE_OUTPUT_PROTOCOL: Final[str] = "output_protocol"
+"""Block exited cleanly but failed to follow the termination-channel
+protocol — i.e., the substrate normalized the announced reason to
+``protocol_violation``.  See
+:data:`TERMINATION_REASON_PROTOCOL_VIOLATION` and the
+``block-execution`` spec."""
+
 FAILURE_PHASES: Final[frozenset[str]] = frozenset({
     FAILURE_STAGE_IN,
     FAILURE_INVOKE,
@@ -101,8 +108,70 @@ FAILURE_PHASES: Final[frozenset[str]] = frozenset({
     FAILURE_OUTPUT_COLLECT,
     FAILURE_OUTPUT_VALIDATE,
     FAILURE_ARTIFACT_COMMIT,
+    FAILURE_OUTPUT_PROTOCOL,
 })
 """All valid non-``None`` ``BlockExecution.failure_phase`` values.
 
 Used by validators and tests.  An executor that sets a phase not
 in this set is a bug."""
+
+# ── Termination reasons ─────────────────────────────────────────
+#
+# A first-class field on :class:`flywheel.artifact.BlockExecution`
+# (``termination_reason``).  Always populated.  Either a
+# substrate-reserved value the substrate set based on what it
+# observed, or a project-defined value the block announced via
+# the per-runtime termination channel.  The ledger value is a
+# plain string; these constants are the substrate-reserved names
+# only.  See ``flywheel/docs/specs/block-execution.md`` for the
+# full contract.
+
+TERMINATION_REASON_CRASH: Final[str] = "crash"
+"""Block process exited non-zero, the container died unexpectedly,
+the persistent server raised, or the connection dropped."""
+
+TERMINATION_REASON_INTERRUPTED: Final[str] = "interrupted"
+"""Block was killed by stop signal or operator interrupt."""
+
+TERMINATION_REASON_TIMEOUT: Final[str] = "timeout"
+"""Block exceeded a substrate-enforced deadline.  The constant is
+reserved now so the vocabulary is stable; deadline enforcement
+itself lands later."""
+
+TERMINATION_REASON_PROTOCOL_VIOLATION: Final[str] = "protocol_violation"
+"""Block exited cleanly but failed to follow the
+termination-channel protocol — no announcement, an announcement
+that collides with a reserved name, or an announcement that does
+not match any declared project reason.  The substrate substitutes
+this value before recording."""
+
+RESERVED_TERMINATION_REASONS: Final[frozenset[str]] = frozenset({
+    TERMINATION_REASON_CRASH,
+    TERMINATION_REASON_INTERRUPTED,
+    TERMINATION_REASON_TIMEOUT,
+    TERMINATION_REASON_PROTOCOL_VIOLATION,
+})
+"""All substrate-reserved ``termination_reason`` values.  A block
+that announces any of these via the termination channel is a
+protocol violation."""
+
+DEFAULT_TERMINATION_REASON: Final[str] = "normal"
+"""Convention default termination-reason label used by happy-path
+blocks that declare a single clean-exit pathway.  Not reserved —
+projects may use a different label.  The block-declaration
+parser maps a legacy flat ``outputs:`` list to this label so
+existing single-reason blocks parse without YAML migration."""
+
+TERMINATION_PATH: Final[str] = "/flywheel/termination"
+"""Container-side path for the ephemeral runtime's termination
+channel.  The block writes a single line of UTF-8 with the
+termination reason; the executor reads it after the container
+exits.  See ``flywheel/docs/specs/block-execution.md`` §
+"Runtime mechanism for termination reasons"."""
+
+TERMINATION_REASON_RESPONSE_FIELD: Final[str] = "termination_reason"
+"""JSON field name in the persistent runtime's ``/execute``
+response body carrying the block's announced termination reason.
+Top-level string field; absent / non-string / missing is
+normalized to ``crash`` (transport failures) or ignored when the
+substrate observed something stronger."""

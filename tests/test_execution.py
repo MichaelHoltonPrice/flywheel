@@ -97,14 +97,33 @@ def _commit_all(project_root: Path, message: str = "auto") -> None:
     )
 
 
-def _fake_run_with_output(output_files: dict[str, str]):
+def _fake_run_with_output(
+    output_files: dict[str, str],
+    termination_reason: str | None = "normal",
+):
+    """Build a ``run_container`` stub that mimics a happy-path block.
+
+    Writes ``output_files`` into every per-slot proposal mount
+    (matching the proposal-then-forge contract) and announces
+    ``termination_reason`` via the ``/flywheel/termination``
+    sidecar.  Pass ``termination_reason=None`` to simulate a
+    block that exits cleanly without announcing — exercises the
+    substrate's ``protocol_violation`` path.
+    """
     def fake_run(config, args=None):
-        for host, _container, mode in config.mounts:
-            if mode == "rw":
-                for name, content in output_files.items():
-                    file_path = Path(host) / name
-                    file_path.parent.mkdir(parents=True, exist_ok=True)
-                    file_path.write_text(content)
+        for host, container, mode in config.mounts:
+            if mode != "rw":
+                continue
+            if container == "/flywheel":
+                if termination_reason is not None:
+                    (Path(host) / "termination").write_text(
+                        termination_reason,
+                    )
+                continue
+            for name, content in output_files.items():
+                file_path = Path(host) / name
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content)
         return ContainerResult(exit_code=0, elapsed_s=1.0)
     return fake_run
 
@@ -172,9 +191,14 @@ class TestInputResolution:
 
         def fake_run(config, args=None):
             captured_config["config"] = config
-            for host, _container, mode in config.mounts:
-                if mode == "rw":
-                    (Path(host) / "model.pt").write_text("weights")
+            for host, container, mode in config.mounts:
+                if mode != "rw":
+                    continue
+                if container == "/flywheel":
+                    (Path(host) / "termination").write_text(
+                        "normal")
+                    continue
+                (Path(host) / "model.pt").write_text("weights")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
         with patch("flywheel.execution.run_container", side_effect=fake_run):
@@ -235,22 +259,41 @@ class TestRepeatedExecution:
 
 
 class TestEmptyOutput:
-    def test_empty_output_not_recorded_as_artifact(self, tmp_path: Path):
+    def test_empty_output_recorded_as_collect_rejection(
+        self, tmp_path: Path,
+    ):
         project_root, foundry_dir, template = _setup_git_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
-        # Container succeeds but writes nothing
+        # Container exits cleanly and announces "normal" but
+        # writes no output bytes.  Per the block-execution spec
+        # this is an ``output_collect`` rejection: the block
+        # promised an output that the proposal directory did not
+        # receive.
         def empty_run(config, args=None):
+            for host, container, mode in config.mounts:
+                if mode == "rw" and container == "/flywheel":
+                    (Path(host) / "termination").write_text(
+                        "normal")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
         with patch("flywheel.execution.run_container", side_effect=empty_run):
-            run_block(ws, "train", template, project_root)
+            with pytest.raises(
+                RuntimeError,
+                match="no output bytes written",
+            ):
+                run_block(ws, "train", template, project_root)
 
-        # Execution should succeed but with no output bindings
         ex = next(iter(ws.executions.values()))
-        assert ex.status == "succeeded"
+        assert ex.status == "failed"
+        assert ex.failure_phase == "output_collect"
         assert ex.output_bindings == {}
+        assert "checkpoint" in ex.rejected_outputs
+        assert (
+            ex.rejected_outputs["checkpoint"].phase
+            == "output_collect"
+        )
         assert len(ws.instances_for("checkpoint")) == 0
 
 
@@ -310,9 +353,14 @@ class TestResourceConfig:
 
         def fake_run(config, args=None):
             captured_config["config"] = config
-            for host, _container, mode in config.mounts:
-                if mode == "rw":
-                    (Path(host) / "model.pt").write_text("weights")
+            for host, container, mode in config.mounts:
+                if mode != "rw":
+                    continue
+                if container == "/flywheel":
+                    (Path(host) / "termination").write_text(
+                        "normal")
+                    continue
+                (Path(host) / "model.pt").write_text("weights")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
         with patch("flywheel.execution.run_container", side_effect=fake_run):
@@ -364,9 +412,14 @@ class TestErrorCases:
 
         def fake_run(config, args=None):
             captured_args["args"] = args
-            for host, _container, mode in config.mounts:
-                if mode == "rw":
-                    (Path(host) / "model.pt").write_text("weights")
+            for host, container, mode in config.mounts:
+                if mode != "rw":
+                    continue
+                if container == "/flywheel":
+                    (Path(host) / "termination").write_text(
+                        "normal")
+                    continue
+                (Path(host) / "model.pt").write_text("weights")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
         with patch("flywheel.execution.run_container", side_effect=fake_run):
@@ -399,9 +452,14 @@ class TestInputBindings:
 
         # Run eval with explicit binding to the first checkpoint
         def capturing_run(config, args=None):
-            for host, _container, mode in config.mounts:
-                if mode == "rw":
-                    (Path(host) / "scores.json").write_text("{}")
+            for host, container, mode in config.mounts:
+                if mode != "rw":
+                    continue
+                if container == "/flywheel":
+                    (Path(host) / "termination").write_text(
+                        "normal")
+                    continue
+                (Path(host) / "scores.json").write_text("{}")
             return ContainerResult(exit_code=0, elapsed_s=1.0)
 
         with patch("flywheel.execution.run_container", side_effect=capturing_run):
@@ -518,10 +576,16 @@ class TestArtifactValidation:
         ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
 
-        seen: list[tuple[str, Path]] = []
+        seen: list[tuple[str, str, str]] = []
 
         def validator(name, decl, path):
-            seen.append((name, path))
+            # Snapshot the staged contents synchronously; the
+            # staging dir is renamed into place once this returns.
+            assert path.is_dir()
+            seen.append((
+                name, path.name,
+                (path / "model.pt").read_text(),
+            ))
 
         registry = ArtifactValidatorRegistry({"checkpoint": validator})
 
@@ -533,9 +597,14 @@ class TestArtifactValidation:
             )
 
         assert len(seen) == 1
-        name, path = seen[0]
+        name, dirname, content = seen[0]
         assert name == "checkpoint"
-        assert path.name.startswith("checkpoint@")
+        # Validator sees the staged candidate produced by
+        # ``Workspace.register_artifact``; the staging directory
+        # mirrors the canonical artifact's shape but lives under
+        # a transient ``_staging-checkpoint-...`` name.
+        assert dirname.startswith("_staging-checkpoint-")
+        assert content == "weights"
         ex = next(iter(ws.executions.values()))
         assert ex.status == "succeeded"
         assert "checkpoint" in ex.output_bindings

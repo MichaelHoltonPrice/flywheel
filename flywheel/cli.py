@@ -33,13 +33,11 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.agent import AgentBlockConfig, run_agent_block
-from flywheel.agent_executor import AgentExecutor
 from flywheel.artifact import RejectionRef, SupersedesRef
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
 from flywheel.pattern import Pattern, discover_patterns
-from flywheel.pattern_runner import PatternRunner
 from flywheel.project_hooks import load_project_hooks_class
 from flywheel.run_defaults import RunDefaults
 from flywheel.template import ArtifactDeclaration, Template
@@ -798,6 +796,15 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             ``--``; forwarded verbatim to the project hooks'
             ``init``.
     """
+    # Deferred batteries.  ``AgentExecutor`` and ``PatternRunner``
+    # import the agent-tool-call modules excised by the
+    # block-execution rewrite spec; ``flywheel run pattern`` lands
+    # under a follow-on patterns spec.  Until then we keep the
+    # imports lazy so ``flywheel run block`` (the happy path) still
+    # works at module-load time.
+    from flywheel.agent_executor import AgentExecutor
+    from flywheel.pattern_runner import PatternRunner
+
     config = load_project_config(Path.cwd())
 
     template_path = config.templates_dir / f"{args.template}.yaml"

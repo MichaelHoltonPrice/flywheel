@@ -59,7 +59,7 @@ def _register_copy(ws: Workspace, name: str,
         created_at=datetime.now(UTC),
         produced_by=None, copy_path=aid,
     )
-    ws.add_artifact(inst)
+    ws._add_artifact(inst)
     return inst
 
 
@@ -119,6 +119,7 @@ class TestStageArtifactInstance:
         finally:
             cleanup_staged_inputs({"a": first, "b": second})
 
+    @pytest.mark.skip(reason="Incremental artifact kind has been excised")
     def test_incremental_artifact_entries_file_is_copied(
             self, workspace):
         inst = workspace.register_incremental_artifact("history")
@@ -147,7 +148,7 @@ class TestStageArtifactInstance:
             created_at=datetime.now(UTC),
             produced_by=None, copy_path=aid,
         )
-        workspace.add_artifact(inst)
+        workspace._add_artifact(inst)
 
         staged = stage_artifact_instance(workspace, inst)
         try:
@@ -182,6 +183,7 @@ class TestStageArtifactInstance:
 class TestStageArtifactInstances:
     """Batch wrapper composes per-slot staging correctly."""
 
+    @pytest.mark.skip(reason="Incremental artifact kind has been excised")
     def test_returns_one_path_per_slot(self, workspace):
         a = _register_copy(workspace, "predictor", {"a.txt": "1"})
         b = workspace.register_incremental_artifact("history")

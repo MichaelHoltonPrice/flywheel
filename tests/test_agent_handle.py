@@ -24,6 +24,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "AgentHandle lives in the deferred 'batteries' layer; the "
+        "block-execution refactor purged the agent-shaped fields "
+        "(stop_reason, predecessor_id, halt_directive, etc.) from "
+        "BlockExecution.  These tests will move under the deferred "
+        "batteries spec."
+    ),
+)
+
 from flywheel.agent import AgentHandle, AgentResult
 from flywheel.artifact import BlockExecution
 from flywheel.executor import ExecutionResult

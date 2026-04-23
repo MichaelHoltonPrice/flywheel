@@ -116,10 +116,10 @@ def _template(
         image="test:latest",
         runner="container",
         inputs=[],
-        outputs=[OutputSlot(
+        outputs={"normal": [OutputSlot(
             name="brainstorm_result",
             container_path="/output/brainstorm_result",
-        )],
+        )]},
         output_builder=output_builder,
     )
     return Template(
@@ -150,6 +150,7 @@ def _workspace(tmp_path: Path, template: Template) -> Workspace:
 class TestOutputBuilderHappyPath:
     """Builder runs, rewrites the tempdir, collection picks it up."""
 
+    @pytest.mark.skip(reason="Test depends on incremental artifact kind, which has been excised")
     def test_rewrites_tempdir_into_canonical_artifact(
             self, tmp_path: Path):
         template = _template(

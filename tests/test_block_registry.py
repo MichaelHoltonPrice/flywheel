@@ -92,7 +92,7 @@ class TestParseBlockDefinition:
         assert block.runner_justification is None
         assert len(block.inputs) == 1
         assert block.inputs[0].name == "engine"
-        assert block.outputs[0].name == "checkpoint"
+        assert block.all_output_slots()[0].name == "checkpoint"
 
     def test_unknown_runner_rejected(self):
         body = {**CONTAINER_BLOCK, "runner": "wasm"}

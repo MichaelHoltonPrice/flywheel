@@ -27,21 +27,16 @@ if TYPE_CHECKING:
 class ArtifactDeclaration:
     """A declared artifact in a template — name, storage kind, and git fields if applicable.
 
-    Three kinds:
+    Two kinds:
 
     * ``copy`` — directory of arbitrary files, written once per
       instance.  Each block execution that emits one creates a fresh
       instance.
     * ``git`` — reference to a path within a git repo at a specific
       commit.  Resolved at workspace creation time.
-    * ``incremental`` — append-only sequence of opaque JSON entries.
-      A workspace holds at most one current instance per declaration;
-      block executions append to it rather than producing fresh
-      instances.  See :class:`flywheel.artifact.ArtifactInstance` for
-      the on-disk shape.
     """
     name: str
-    kind: Literal["copy", "git", "incremental"]
+    kind: Literal["copy", "git"]
     repo: str | None = None  # git only, relative to project root
     path: str | None = None  # git only
 
@@ -60,10 +55,6 @@ class InputSlot:
             either way.
         optional: If ``True``, missing instances skip the slot
             silently rather than raising.
-
-    Live step-by-step history is expressed as a first-class
-    :attr:`incremental` artifact whose contents are per-mount
-    staged on every relaunch.
     """
 
     name: str
@@ -118,9 +109,7 @@ class BlockDefinition:
             the per-execution output directories.  The callback
             reads whatever the container wrote (raw, human-
             readable, agent-authored) and writes the canonical
-            artifact files in place — e.g., collapsing two
-            markdown files into a single ``entries.jsonl`` line
-            for an incremental slot.  See
+            artifact files in place.  See
             :mod:`flywheel.output_builder`.  ``None`` means the
             standard "whatever is in the output dir becomes the
             artifact" contract applies.  Resolved eagerly at
@@ -159,7 +148,23 @@ class BlockDefinition:
     name: str
     image: str = ""
     inputs: list[InputSlot] = field(default_factory=list)
-    outputs: list[OutputSlot] = field(default_factory=list)
+    outputs: dict[str, list[OutputSlot]] = field(default_factory=dict)
+    """Output slots grouped by termination reason.
+
+    Keys are project-defined termination-reason labels (e.g.,
+    ``"normal"``, ``"defer"``); flywheel ascribes no semantics to
+    them.  Each value is the ordered list of output slots the
+    block is expected to produce when it terminates with that
+    reason.  Substrate-reserved reasons
+    (:data:`flywheel.runtime.RESERVED_TERMINATION_REASONS`) map
+    implicitly to the empty output set and are not enumerated
+    here.
+
+    The legacy YAML shape ``outputs: [<flat list>]`` parses as
+    ``{DEFAULT_TERMINATION_REASON: <flat list>}`` so single-reason
+    blocks need no migration.  See
+    :func:`_parse_output_groups`.
+    """
     docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     runner: Literal["container", "lifecycle"] = "container"
@@ -169,6 +174,43 @@ class BlockDefinition:
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
     state: bool = False
     stop_timeout_s: int = 30
+
+    def all_output_slots(self) -> list[OutputSlot]:
+        """Return every distinct output slot across all termination reasons.
+
+        A block may declare the same slot under multiple
+        termination reasons (e.g., a ``turn_summary`` slot
+        produced under both ``normal`` and ``defer``); the
+        returned list contains each slot name exactly once, in
+        first-encounter order across termination reasons.
+
+        Used by callers that need the union of slots — proposal
+        directory pre-allocation, mount construction, template
+        validation — without caring which termination reason
+        each slot belongs to.
+        """
+        seen: set[str] = set()
+        union: list[OutputSlot] = []
+        for slots in self.outputs.values():
+            for slot in slots:
+                if slot.name in seen:
+                    continue
+                seen.add(slot.name)
+                union.append(slot)
+        return union
+
+    def outputs_for(
+        self, termination_reason: str,
+    ) -> list[OutputSlot]:
+        """Return the output slots expected for a termination reason.
+
+        Empty list for substrate-reserved reasons (which always
+        map to the empty output set) and for unknown
+        project-defined reasons (the substrate normalizes those
+        to ``protocol_violation`` before commit, but we still
+        return ``[]`` defensively here).
+        """
+        return list(self.outputs.get(termination_reason, []))
 
 
 @dataclass(frozen=True)
@@ -272,7 +314,7 @@ def _parse_artifacts(
         repo = entry.get("repo")
         path_field = entry.get("path")
 
-        if kind not in ("copy", "git", "incremental"):
+        if kind not in ("copy", "git"):
             raise ValueError(
                 f"Artifact {name!r} has unknown kind {kind!r}")
 
@@ -335,9 +377,7 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
         if "derive_from" in inp or "derive_kind" in inp:
             raise ValueError(
                 f"Input slot {ref!r}: 'derive_from' / "
-                f"'derive_kind' are not supported.  Declare "
-                f"the source artifact as 'kind: incremental' "
-                f"instead and reference it directly here."
+                f"'derive_kind' are not supported."
             )
         unknown = set(inp) - _INPUT_SLOT_KEYS
         if unknown:
@@ -356,15 +396,16 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
     return slots
 
 
-def _parse_output_slots(
-    raw: list, *, block_name: str,
+def _parse_output_slot_list(
+    raw: list, *, block_name: str, group_label: str,
 ) -> list[OutputSlot]:
-    """Parse a list of raw output entries into OutputSlot objects.
+    """Parse a flat list of raw output entries into OutputSlot objects.
 
-    Each entry is either a string (bare artifact name) or a
-    mapping with a known set of keys.  Validates that no output
-    name is duplicated within the block and that no unknown keys
-    appear in a mapping entry.
+    Helper for :func:`_parse_output_groups`.  Each entry is
+    either a string (bare artifact name) or a mapping with a
+    known set of keys.  Slot names must be unique within the
+    list (a block may repeat a slot across termination reasons,
+    but never within a single reason).
     """
     slots: list[OutputSlot] = []
     seen: set[str] = set()
@@ -375,7 +416,7 @@ def _parse_output_slots(
                 name=ref,
                 container_path=f"/output/{ref}",
             ))
-        else:
+        elif isinstance(out, dict):
             ref = out["name"]
             unknown = set(out) - _OUTPUT_SLOT_KEYS
             if unknown:
@@ -389,11 +430,106 @@ def _parse_output_slots(
                 container_path=out.get(
                     "container_path", f"/output/{ref}"),
             ))
+        else:
+            raise ValueError(
+                f"Block {block_name!r} output entry under "
+                f"{group_label!r} must be a string or mapping; "
+                f"got {type(out).__name__}"
+            )
         if ref in seen:
             raise ValueError(
-                f"Block {block_name!r} has duplicate output {ref!r}")
+                f"Block {block_name!r} has duplicate output "
+                f"{ref!r} under termination reason "
+                f"{group_label!r}")
         seen.add(ref)
     return slots
+
+
+def _parse_output_groups(
+    raw: object, *, block_name: str,
+) -> dict[str, list[OutputSlot]]:
+    """Parse a block's ``outputs:`` declaration into the grouped form.
+
+    Two YAML shapes are accepted:
+
+    * **Flat list** (legacy / single-termination-reason blocks)::
+
+        outputs:
+          - name: result
+            container_path: /scratch/result
+
+      Parses to ``{DEFAULT_TERMINATION_REASON: [<slots>]}`` —
+      the slots all live under the single conventional
+      ``"normal"`` reason.
+
+    * **Mapping keyed by termination reason** (multi-reason
+      blocks)::
+
+        outputs:
+          normal:
+            - name: turn_summary
+              container_path: /scratch/turn_summary
+          defer:
+            - name: action
+              container_path: /scratch/action
+
+      Each key is a project-defined termination-reason label.
+      Substrate-reserved labels
+      (:data:`flywheel.runtime.RESERVED_TERMINATION_REASONS`)
+      are rejected — declarations never enumerate them; they
+      implicitly map to the empty output set at commit time.
+
+    A block with no outputs (``outputs:`` omitted, ``[]``, or
+    ``{}``) parses to ``{DEFAULT_TERMINATION_REASON: []}`` — every
+    block declares at least one termination reason, defaulting to
+    the conventional ``"normal"`` reason with an empty output set.
+    """
+    from flywheel.runtime import (
+        DEFAULT_TERMINATION_REASON,
+        RESERVED_TERMINATION_REASONS,
+    )
+
+    if raw is None or raw == [] or raw == {}:
+        return {DEFAULT_TERMINATION_REASON: []}
+    if isinstance(raw, list):
+        slots = _parse_output_slot_list(
+            raw, block_name=block_name,
+            group_label=DEFAULT_TERMINATION_REASON,
+        )
+        return {DEFAULT_TERMINATION_REASON: slots}
+    if isinstance(raw, dict):
+        groups: dict[str, list[OutputSlot]] = {}
+        for reason, entries in raw.items():
+            if not isinstance(reason, str):
+                raise ValueError(
+                    f"Block {block_name!r} outputs key "
+                    f"{reason!r} must be a string termination "
+                    f"reason label"
+                )
+            if reason in RESERVED_TERMINATION_REASONS:
+                raise ValueError(
+                    f"Block {block_name!r}: termination reason "
+                    f"{reason!r} is reserved by the substrate "
+                    f"and must not appear in declarations; "
+                    f"reserved reasons map implicitly to the "
+                    f"empty output set"
+                )
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f"Block {block_name!r} outputs[{reason!r}] "
+                    f"must be a list, got "
+                    f"{type(entries).__name__}"
+                )
+            groups[reason] = _parse_output_slot_list(
+                entries, block_name=block_name,
+                group_label=reason,
+            )
+        return groups
+    raise ValueError(
+        f"Block {block_name!r}: 'outputs' must be a list "
+        f"(legacy single-reason form) or a mapping keyed by "
+        f"termination reason, got {type(raw).__name__}"
+    )
 
 
 # Top-level keys accepted in a per-block YAML (or inline block
@@ -584,8 +720,8 @@ def parse_block_definition(
         name=name,
         image=image,
         inputs=_parse_input_slots(entry.get("inputs", [])),
-        outputs=_parse_output_slots(
-            entry.get("outputs", []), block_name=name),
+        outputs=_parse_output_groups(
+            entry.get("outputs"), block_name=name),
         docker_args=entry.get("docker_args", []),
         env=entry.get("env", {}),
         runner=runner,
@@ -612,7 +748,7 @@ def _validate_block_against_artifacts(
                 f"declared in artifacts of template "
                 f"{template_label!r}"
             )
-    for slot in block.outputs:
+    for slot in block.all_output_slots():
         if slot.name not in artifact_names:
             raise ValueError(
                 f"Block {block.name!r} output {slot.name!r} not "

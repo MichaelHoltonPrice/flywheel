@@ -161,7 +161,7 @@ class TestWorkspaceLoadSave:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=now, produced_by="exec1", copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
 
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
@@ -170,7 +170,7 @@ class TestWorkspaceLoadSave:
             output_bindings={"checkpoint": "checkpoint@1"},
             exit_code=0, elapsed_s=10.0, image="train:latest",
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         ws.save()
 
         loaded = Workspace.load(ws.path)
@@ -190,7 +190,7 @@ class TestAddArtifact:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=datetime.now(UTC), copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
         assert "checkpoint@1" in ws.artifacts
 
     def test_duplicate_id_raises(self, tmp_path: Path):
@@ -200,9 +200,9 @@ class TestAddArtifact:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=datetime.now(UTC), copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
         with pytest.raises(ValueError, match="already exists"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_undeclared_slot_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -212,7 +212,7 @@ class TestAddArtifact:
             created_at=datetime.now(UTC),
         )
         with pytest.raises(ValueError, match="not declared"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_kind_mismatch_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -222,7 +222,7 @@ class TestAddArtifact:
             created_at=datetime.now(UTC),
         )
         with pytest.raises(ValueError, match="expects"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_copy_without_copy_path_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -233,7 +233,7 @@ class TestAddArtifact:
             copy_path=None,
         )
         with pytest.raises(ValueError, match="missing copy_path"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_git_without_required_fields_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -244,7 +244,7 @@ class TestAddArtifact:
             repo="/repo", commit=None, git_path=None,
         )
         with pytest.raises(ValueError, match="missing required fields"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
 
 class TestGenerateArtifactId:
@@ -281,11 +281,11 @@ class TestInstancesFor:
         ws = Workspace.create("test_ws", template, foundry_dir)
         t1 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
         t2 = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@aaa", name="checkpoint", kind="copy",
             created_at=t1, copy_path="checkpoint@aaa",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@bbb", name="checkpoint", kind="copy",
             created_at=t2, copy_path="checkpoint@bbb",
         ))
@@ -306,15 +306,15 @@ class TestInstancesFor:
         t2 = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
         t3 = datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
         # Add out of order
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@ccc", name="checkpoint", kind="copy",
             created_at=t3, copy_path="checkpoint@ccc",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@aaa", name="checkpoint", kind="copy",
             created_at=t1, copy_path="checkpoint@aaa",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@bbb", name="checkpoint", kind="copy",
             created_at=t2, copy_path="checkpoint@bbb",
         ))
@@ -330,7 +330,7 @@ class TestInstancesFor:
         assert len(baseline) == 1
         assert baseline[0].id == "engine@baseline"
         later = datetime(2099, 1, 1, tzinfo=UTC)
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="engine@abc123", name="engine", kind="git",
             created_at=later, repo="/r", commit="def", git_path="src",
         ))
@@ -361,7 +361,7 @@ class TestAddExecution:
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         assert "exec1" in ws.executions
 
     def test_duplicate_execution_raises(self, tmp_path: Path):
@@ -371,9 +371,9 @@ class TestAddExecution:
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         with pytest.raises(ValueError, match="already exists"):
-            ws.add_execution(ex)
+            ws._add_execution(ex)
 
 
 class TestRegisterArtifact:
@@ -616,7 +616,7 @@ class TestRegisterArtifactSupersedes:
         ws = Workspace.create("test_ws", template, foundry_dir)
 
         now = datetime.now(UTC)
-        ws.add_execution(BlockExecution(
+        ws._add_execution(BlockExecution(
             id="exec_bad", block_name="train",
             started_at=now, finished_at=now,
             status="failed", failure_phase="output_validate",
@@ -714,7 +714,7 @@ class TestRegisterArtifactSupersedes:
         ws = Workspace.create("test_ws", template, foundry_dir)
 
         now = datetime.now(UTC)
-        ws.add_execution(BlockExecution(
+        ws._add_execution(BlockExecution(
             id="exec_ok", block_name="train",
             started_at=now, finished_at=now,
             status="succeeded",
@@ -770,85 +770,14 @@ class TestNameValidation:
         validate_name("my-workspace_01", "Test")
 
 
-class TestBlockExecutionNewFields:
-    """Tests for stop_reason and predecessor_id on BlockExecution."""
+class TestBlockExecutionFailurePhase:
+    """Tests for the runtime-contract fields on BlockExecution.
 
-    def test_round_trip_with_stop_reason(self, tmp_path: Path):
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="__agent__", started_at=now,
-            finished_at=now, status="interrupted",
-            exit_code=0, elapsed_s=5.0,
-            stop_reason="exploration_request",
-            predecessor_id="exec0",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        loaded = Workspace.load(ws.path)
-        loaded_ex = loaded.executions["exec1"]
-        assert loaded_ex.stop_reason == "exploration_request"
-        assert loaded_ex.predecessor_id == "exec0"
-
-    def test_none_fields_not_serialized(self, tmp_path: Path):
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="train", started_at=now,
-            status="succeeded",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        # Read raw YAML to confirm stop_reason is absent.
-        with open(ws.path / "workspace.yaml") as f:
-            raw = yaml.safe_load(f)
-        exec_data = raw["executions"]["exec1"]
-        assert "stop_reason" not in exec_data
-        assert "predecessor_id" not in exec_data
-
-    def test_load_old_format_defaults_none(self, tmp_path: Path):
-        """Old workspace.yaml without stop_reason loads correctly."""
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="train", started_at=now,
-            status="succeeded",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        loaded = Workspace.load(ws.path)
-        assert loaded.executions["exec1"].stop_reason is None
-        assert loaded.executions["exec1"].predecessor_id is None
-
-
-class TestBlockExecutionStateAndFailurePhase:
-    """Tests for the runtime-contract fields on BlockExecution."""
-
-    def test_round_trip_with_state_dir(self, tmp_path: Path):
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="play", started_at=now,
-            finished_at=now, status="succeeded",
-            state_dir="state/play/exec1",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        loaded = Workspace.load(ws.path)
-        assert loaded.executions["exec1"].state_dir == "state/play/exec1"
-        assert loaded.executions["exec1"].failure_phase is None
+    Stripped down after the block-execution schema purge: the
+    legacy ``stop_reason`` / ``predecessor_id`` / ``state_dir`` /
+    ``state_lineage_id`` round-trip cases were dropped along with
+    their fields.  See ``flywheel/docs/specs/block-execution.md``.
+    """
 
     def test_round_trip_with_failure_phase(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -858,14 +787,17 @@ class TestBlockExecutionStateAndFailurePhase:
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
             finished_at=now, status="failed",
-            failure_phase="state_capture",
-            error="copy failed: permission denied",
+            failure_phase="output_validate",
+            error="validator rejected slot",
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         ws.save()
 
         loaded = Workspace.load(ws.path)
-        assert loaded.executions["exec1"].failure_phase == "state_capture"
+        assert (
+            loaded.executions["exec1"].failure_phase
+            == "output_validate"
+        )
         assert loaded.executions["exec1"].status == "failed"
 
     def test_none_fields_not_serialized(self, tmp_path: Path):
@@ -877,54 +809,13 @@ class TestBlockExecutionStateAndFailurePhase:
             id="exec1", block_name="train", started_at=now,
             status="succeeded",
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         ws.save()
 
         with open(ws.path / "workspace.yaml") as f:
             raw = yaml.safe_load(f)
         exec_data = raw["executions"]["exec1"]
-        assert "state_dir" not in exec_data
         assert "failure_phase" not in exec_data
-
-    def test_load_old_format_defaults_none(self, tmp_path: Path):
-        """Old workspace.yaml without these fields loads cleanly."""
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="train", started_at=now,
-            status="succeeded",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        loaded = Workspace.load(ws.path)
-        assert loaded.executions["exec1"].state_dir is None
-        assert loaded.executions["exec1"].failure_phase is None
-        assert loaded.executions["exec1"].state_lineage_id is None
-
-    def test_round_trip_with_state_lineage_id(
-        self, tmp_path: Path,
-    ):
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex = BlockExecution(
-            id="exec1", block_name="play", started_at=now,
-            finished_at=now, status="succeeded",
-            state_dir="state/play/exec1",
-            state_lineage_id="branch_a",
-        )
-        ws.add_execution(ex)
-        ws.save()
-
-        loaded = Workspace.load(ws.path)
-        assert (
-            loaded.executions["exec1"].state_lineage_id
-            == "branch_a"
-        )
 
 
 class TestRoundTripSupersedesAndQuarantine:
@@ -951,9 +842,9 @@ class TestRoundTripSupersedesAndQuarantine:
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
 
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="checkpoint@1"))
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="checkpoint@2",
             supersedes=SupersedesRef(artifact_id="checkpoint@1"),
             supersedes_reason="fix gradient explosion",
@@ -973,7 +864,7 @@ class TestRoundTripSupersedesAndQuarantine:
         ws = Workspace.create("test_ws", template, foundry_dir)
 
         rej = RejectionRef(execution_id="exec_a3f", slot="checkpoint")
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="checkpoint@2",
             supersedes=SupersedesRef(rejection=rej),
             supersedes_reason="corrected validator-rejected output",
@@ -1011,7 +902,7 @@ class TestRoundTripSupersedesAndQuarantine:
                 ),
             },
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         ws.save()
 
         loaded = Workspace.load(ws.path)
@@ -1033,9 +924,9 @@ class TestRoundTripSupersedesAndQuarantine:
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
 
-        ws.add_artifact(self._make_instance(inst_id="checkpoint@plain"))
+        ws._add_artifact(self._make_instance(inst_id="checkpoint@plain"))
         now = datetime.now(UTC)
-        ws.add_execution(BlockExecution(
+        ws._add_execution(BlockExecution(
             id="exec_plain", block_name="train",
             started_at=now, status="succeeded",
         ))
@@ -1057,10 +948,10 @@ class TestRoundTripSupersedesAndQuarantine:
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
 
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="checkpoint@old"))
         now = datetime.now(UTC)
-        ws.add_execution(BlockExecution(
+        ws._add_execution(BlockExecution(
             id="exec_old", block_name="train",
             started_at=now, status="failed",
         ))
@@ -1079,11 +970,11 @@ class TestRoundTripSupersedesAndQuarantine:
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
 
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="a@id",
             supersedes=SupersedesRef(artifact_id="a@parent"),
         ))
-        ws.add_artifact(self._make_instance(
+        ws._add_artifact(self._make_instance(
             inst_id="a@rej",
             supersedes=SupersedesRef(rejection=RejectionRef(
                 execution_id="exec_z", slot="checkpoint")),
@@ -1251,34 +1142,6 @@ class TestRuns:
         with pytest.raises(ValueError, match="double-close"):
             ws.end_run(record.id, status="failed")
 
-    def test_block_execution_run_id_round_trip(self, tmp_path: Path):
-        """``BlockExecution.run_id`` persists across save / load."""
-        _, foundry_dir, template = _setup_project(tmp_path)
-        ws = Workspace.create("test_ws", template, foundry_dir)
-
-        now = datetime.now(UTC)
-        ex_tagged = BlockExecution(
-            id="exec_r1", block_name="train", started_at=now,
-            finished_at=now, status="succeeded",
-            run_id="run_abc123",
-        )
-        ex_ad_hoc = BlockExecution(
-            id="exec_ah", block_name="train", started_at=now,
-            finished_at=now, status="succeeded",
-        )
-        ws.add_execution(ex_tagged)
-        ws.add_execution(ex_ad_hoc)
-        ws.save()
-
-        with open(ws.path / "workspace.yaml") as f:
-            raw = yaml.safe_load(f)
-        # run_id persisted only when set.
-        assert raw["executions"]["exec_r1"]["run_id"] == "run_abc123"
-        assert "run_id" not in raw["executions"]["exec_ah"]
-
-        loaded = Workspace.load(ws.path)
-        assert loaded.executions["exec_r1"].run_id == "run_abc123"
-        assert loaded.executions["exec_ah"].run_id is None
 
 
 INCREMENTAL_TEMPLATE_YAML = """\
@@ -1335,6 +1198,7 @@ def _setup_incremental_project(
     return project_root, foundry_dir, template
 
 
+@pytest.mark.skip(reason="Incremental artifact kind has been excised; will be replaced by tagging system")
 class TestIncrementalArtifacts:
     """Tests for the incremental artifact kind."""
 
@@ -1426,7 +1290,7 @@ class TestIncrementalArtifacts:
             id="notes@1", name="notes", kind="copy",
             created_at=datetime.now(UTC), copy_path="notes@1",
         )
-        ws.add_artifact(copy_inst)
+        ws._add_artifact(copy_inst)
         with pytest.raises(ValueError, match="incremental"):
             ws.append_to_incremental("notes@1", [{"x": 1}])
 
@@ -1478,7 +1342,7 @@ class TestIncrementalArtifacts:
             created_at=datetime.now(UTC), copy_path=None,
         )
         with pytest.raises(ValueError, match="copy_path"):
-            ws.add_artifact(bad)
+            ws._add_artifact(bad)
 
     def test_template_rejects_unknown_kind(self, tmp_path: Path):
         bad_yaml = """\
