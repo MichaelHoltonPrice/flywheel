@@ -12,8 +12,8 @@ This module wraps that machinery as a
 :class:`flywheel.executor.BlockExecutor` so runners can launch
 agent blocks through the same protocol they use for any other
 block.  From the runner's vantage point an :class:`AgentExecutor`
-and a :class:`flywheel.executor.ProcessExitExecutor` are
-indistinguishable: both implement ``launch()`` and return an
+and any other executor are
+interchangeable when they implement ``launch()`` and return an
 :class:`flywheel.executor.ExecutionHandle`.
 
 Constructor takes battery-level defaults the project supplies
@@ -52,7 +52,6 @@ from flywheel.agent_handoff import (
 from flywheel.executor import ExecutionHandle, ExecutionResult
 from flywheel.template import Template
 from flywheel.workspace import Workspace
-
 
 # --------------------------------------------------------------------
 # Overrides keys consumed by AgentExecutor.launch().
@@ -391,7 +390,7 @@ class AgentExecutor:
         *,
         pattern_router: Any,
         post_dispatch_fn: Callable[[str], None],
-    ) -> "AgentExecutor":
+    ) -> AgentExecutor:
         """Return a sibling executor wired into a pattern's on_tool router.
 
         The pattern runner builds one router from a pattern's
@@ -433,7 +432,7 @@ class AgentExecutor:
                 holding a reference to the handoff loop's own
                 callback shape.
         """
-        from flywheel.pattern_handoff import (
+        from flywheel.pattern_handoff import (  # noqa: PLC0415
             adapt_post_dispatch_for_handoff,
             merge_block_runners,
         )
@@ -441,7 +440,7 @@ class AgentExecutor:
             pattern_router=pattern_router,
             fallback=self._block_runner,
             context_label=(
-                f"AgentExecutor.for_pattern: this executor"),
+                "AgentExecutor.for_pattern: this executor"),
             collision_label="AgentExecutor.for_pattern",
         )
         return AgentExecutor(

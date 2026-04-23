@@ -669,10 +669,9 @@ routes it to the ``ExecuteAction`` container block rather than
 a host-side runner.
 
 All artifact-recording flows ride either
-``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or
-``ProcessExitExecutor`` / ``ProcessExecutor`` (``runner:
-container`` one-shot blocks and trusted host-local subprocesses
-respectively).  There is no HTTP lifecycle API and no
+``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or the
+canonical ``flywheel.execution.run_block`` path for
+``runner: container`` one-shot blocks.  There is no HTTP lifecycle API and no
 in-container recording proxy — agents trigger recordings
 exclusively through the host-side handoff loop (see "Nested
 block executions from agents" below).

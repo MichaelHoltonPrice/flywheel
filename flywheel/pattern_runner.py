@@ -15,11 +15,10 @@ role launches.  It builds protocol-level launch arguments
 plus a free-form ``overrides`` dict and hands them to an
 :class:`flywheel.executor.BlockExecutor` returned by the
 caller-supplied :class:`ExecutorFactory`.  The executor is
-free to be a generic container executor, a battery
-(:class:`flywheel.agent_executor.AgentExecutor`), a
-workspace-persistent runtime
-(:class:`flywheel.executor.RequestResponseExecutor`), or any
-future implementation of the :class:`BlockExecutor` protocol.
+free to be a canonical container adapter, a battery
+(:class:`flywheel.agent_executor.AgentExecutor`), a future
+workspace-persistent runtime, or any other implementation of the
+:class:`BlockExecutor` protocol.
 
 Termination
 -----------

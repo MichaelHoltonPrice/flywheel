@@ -46,8 +46,7 @@ class InstanceRuntimeConfig:
 # block definition (the resolved target of an ``on_tool``
 # instance, or of a prompt-less continuous role), the factory
 # returns the executor that should dispatch calls to that block.
-# Today's MVP shape is "always return the shared
-# RequestResponseExecutor," but the factory signature keeps
-# lifecycle-per-block routing available without an API change
-# when the need arrives.
+# Today's MVP shape is "always return the shared executor," but
+# the factory signature keeps lifecycle-per-block routing
+# available without an API change when the need arrives.
 ExecutorFactory = Callable[[BlockDefinition], BlockExecutor]

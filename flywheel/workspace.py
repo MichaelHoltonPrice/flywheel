@@ -8,7 +8,6 @@ provenance graph.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -294,12 +293,11 @@ class Workspace:
           have no ``failure_phase`` and no ``rejected_outputs``.
         * Non-successful executions must have a ``failure_phase``.
 
-        Legacy callers that have not yet adopted termination_reason
-        (the unmodified ``EphemeralContainerExecutor`` /
-        ``PersistentContainerExecutor`` classes) may pass
-        ``termination_reason=None``; the record is appended as-is
-        and these invariants are skipped.  This leniency goes away
-        when those executors are migrated to the canonical helpers.
+        Deferred callers that have not yet adopted
+        ``termination_reason`` may pass ``None``; the record is
+        appended as-is and these invariants are skipped.  This
+        leniency is temporary while the remaining batteries and
+        persistent-runtime specs are rebuilt.
 
         Args:
             execution: The execution record to record.

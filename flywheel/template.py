@@ -85,9 +85,8 @@ class BlockDefinition:
         runner: How the block is physically performed.  One of:
 
             - ``"container"`` (default): launched as a Docker
-              container by :class:`flywheel.executor.ProcessExitExecutor`
-              (one-shot) or :class:`flywheel.executor.RequestResponseExecutor`
-              (persistent, when that lands).  Requires ``image``.
+              container by the canonical block execution pipeline.
+              Requires ``image``.
             - ``"lifecycle"``: has no body of its own.  The block
               is invoked exclusively through the ``/execution/begin
               + /execution/end`` lifecycle API by an MCP tool.  The
@@ -484,7 +483,7 @@ def _parse_output_groups(
     block declares at least one termination reason, defaulting to
     the conventional ``"normal"`` reason with an empty output set.
     """
-    from flywheel.runtime import (
+    from flywheel.runtime import (  # noqa: PLC0415
         DEFAULT_TERMINATION_REASON,
         RESERVED_TERMINATION_REASONS,
     )

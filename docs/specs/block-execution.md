@@ -18,9 +18,9 @@ In scope:
 * Termination reasons as a first-class concept (see
   [Termination reasons](#termination-reasons)).
 * Container runtimes:
-  * `EphemeralContainerExecutor` — one container per execution
+  * ephemeral container runner — one container per execution
     (the preferred default).
-  * `PersistentContainerExecutor` — one long-running container hosts
+  * persistent container runner — one long-running container hosts
     many executions (kept only as a workaround for blocks whose
     in-container state cannot yet be serialized; see
     [Runtime variants](#runtime-variants)).
@@ -379,7 +379,7 @@ its termination reason. The channel is part of the substrate
 contract, not an implementation detail — block authors and runtimes
 both depend on it.
 
-### `EphemeralContainerExecutor`
+### Ephemeral Container Runner
 
 * **Channel**: a sidecar file at `/flywheel/termination` inside the
   container. The path is part of the runtime contract.
@@ -401,7 +401,7 @@ both depend on it.
   * Zero exit, announcement matches no declared reason and no
     reserved name → `protocol_violation`.
 
-### `PersistentContainerExecutor`
+### Persistent Container Runner
 
 * **Channel**: a top-level field in the JSON response body of the
   in-container server's `/execute` endpoint. Field name:
@@ -545,9 +545,9 @@ containers can go away.
 
 Two implementations:
 
-* **`EphemeralContainerExecutor`** — starts a fresh container per
+* **ephemeral container runner** — starts a fresh container per
   execution. Block runs, container exits, executor commits.
-* **`PersistentContainerExecutor`** — starts a long-running container
+* **persistent container runner** — starts a long-running container
   once and dispatches each execution as a request over an
   in-container control channel.
 

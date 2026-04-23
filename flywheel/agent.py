@@ -1,32 +1,10 @@
-"""Agent block execution orchestration.
+"""Agent battery block execution types.
 
-Runs a Claude Code agent as a one-shot container block via
-:class:`flywheel.executor.ProcessExitExecutor`.  The agent reads
-its prompt from a bind-mounted ``/prompt/prompt.md``, writes
-declared outputs to ``/output/<slot>/``, and persists its
-conversation session through the ``/flywheel/state/`` mount.
-Framework-owned runtime files (``pending_tool_calls.json``,
-``agent_exit_state.json``) live under ``/flywheel/control/`` —
-the launcher mounts a host tempdir, reads those files after the
-container exits, and surfaces the parsed payloads on
-:class:`AgentResult`.  Nothing under ``/flywheel/`` enters the
-artifact graph.
-
-Cancellation (operator, watchdog, natural exit) lives in
-:class:`flywheel.executor.ContainerExecutionHandle`; this module's
-:class:`AgentHandle` is a thin wrapper that translates the
-container's :class:`flywheel.executor.ExecutionResult` into an
-:class:`AgentResult` carrying agent-specific fields
-(``exit_reason``, ``evals_run``, ``exit_state``,
-``pending_tool_calls``).
-
-Two APIs are provided:
-
-- ``launch_agent_block()`` returns an ``AgentHandle`` immediately
-  for non-blocking control.  The handle supports ``stop()`` to
-  request a graceful shutdown and ``wait()`` to block until
-  completion and collect the result.
-- ``run_agent_block()`` is a blocking convenience wrapper.
+The agent battery has not yet been rebuilt on the canonical
+block-execution pipeline. This module keeps the agent result and
+handle types importable for deferred pattern code, but
+``launch_agent_block`` now fails explicitly instead of depending on the
+removed handle-based container executor.
 """
 
 from __future__ import annotations
@@ -34,17 +12,12 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from flywheel import runtime
 from flywheel.artifact import LifecycleEvent
-from flywheel.executor import (
-    ContainerExecutionHandle,
-    ProcessExitExecutor,
-)
+from flywheel.executor import ExecutionHandle
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -228,12 +201,9 @@ def _build_agent_mounts(
 ) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Build the agent-specific extra mounts + docker_args.
 
-    Returns ``(mounts, docker_args)``.  ``mounts`` is what gets
-    forwarded to :meth:`ProcessExitExecutor.launch` as the
-    ``extra_mounts`` kwarg; the executor appends it to the
-    substrate-reserved mount list (``/input/*``, ``/output/*``,
-    ``/state``, ``/scratch``).  ``docker_args`` extends
-    ``block_def.docker_args`` for network-isolation runs.
+    Returns ``(mounts, docker_args)``.  This helper is retained
+    for the deferred agent battery rebuild; ``docker_args``
+    extends ``block_def.docker_args`` for network-isolation runs.
     """
     mounts: list[tuple[str, str, str]] = [
         (auth_volume, "/home/claude/.claude", "rw"),
@@ -349,7 +319,7 @@ def _classify_exit(
 
     Returns ``(exit_reason, stop_reason)`` — ``stop_reason`` is
     the :class:`BlockExecution` field populated by the executor
-    when a :meth:`ContainerExecutionHandle.stop` call caused the
+    when a :meth:`ExecutionHandle.stop` call caused the
     exit; it takes precedence over any runner-side status.
     """
     if execution_id is None:
@@ -357,7 +327,7 @@ def _classify_exit(
     execution = workspace.executions.get(execution_id)
     if execution is None:
         return "crashed", None
-    stop_reason = execution.stop_reason
+    stop_reason = getattr(execution, "stop_reason", None)
     if stop_reason:
         return "stopped", stop_reason
 
@@ -381,7 +351,7 @@ def _classify_exit(
 
 
 class AgentHandle:
-    """Thin adapter around a :class:`ContainerExecutionHandle`.
+    """Thin adapter around an :class:`ExecutionHandle`.
 
     ``is_alive`` / ``stop`` delegate directly to the inner
     handle.  ``wait`` blocks on the inner handle's post-exit
@@ -400,7 +370,7 @@ class AgentHandle:
     def __init__(
         self,
         *,
-        inner: ContainerExecutionHandle,
+        inner: ExecutionHandle,
         workspace: Workspace,
         executions_before: int,
         prompt_tempdir: Path,
@@ -538,156 +508,24 @@ def launch_agent_block(
     predecessor_id: str | None = None,
     run_id: str | None = None,
 ) -> AgentHandle:
-    """Launch an agent block execution (non-blocking).
+    """Launch an agent block execution.
 
-    Translates agent-specific launch parameters into a
-    :meth:`ProcessExitExecutor.launch` call:
-
-    * ``prompt`` is written to a tempdir ``prompt.md`` and passed
-      as an ``extra_mount`` at ``/prompt`` (the agent runner
-      reads it at startup).
-    * ``auth_volume`` + ``source_dirs`` + any caller
-      ``extra_mounts`` append to the substrate's own mounts.
-    * ``model``, ``max_turns``, ``mcp_servers``, ``allowed_tools``
-      become environment variables via ``extra_env``.
-    * ``block_name`` picks the block definition the executor runs;
-      ``block_def.image`` / ``inputs`` / ``outputs`` are
-      authoritative.
-
-    Args:
-        workspace: The flywheel workspace.
-        template: The template containing block definitions.
-        project_root: Project root (for resolving ``source_dirs``).
-        prompt: The system prompt.  Mounted at ``/prompt/prompt.md``.
-        block_name: Name of the block to execute.  Must exist in
-            the template and declare ``runner: container``.
-        agent_image: Reserved; the executor reads
-            ``block_def.image`` authoritatively.
-        auth_volume: Docker named volume carrying agent credentials.
-        model: Optional model override.
-        max_turns: Optional turn budget.
-        total_timeout: Wall-clock cap.  Enforced by the
-            substrate's watchdog thread.
-        source_dirs: Project source dirs to mount read-only.
-        input_artifacts: Block input slot bindings.
-        overrides: CLI flag overrides forwarded to the executor.
-        mcp_servers: Comma-separated MCP server names.
-        allowed_tools: Comma-separated tool whitelist.
-        extra_env: Additional env merged into the container's env.
-        extra_mounts: Additional bind mounts appended to the
-            substrate mount list.
-        isolated_network: When ``True``, adds
-            ``--cap-add=NET_ADMIN`` and sets
-            ``NETWORK_ISOLATION=1``.  See :class:`AgentBlockConfig`
-            for the whitelist contract (``HOST_WHITELIST_PORTS``).
-        agent_workspace_dir: Reserved; no-op.
-        predecessor_id: Not passed to the executor today (the
-            substrate does not accept a predecessor on launch).
-            Callers that chain executions — the handoff loop —
-            are responsible for writing ``predecessor_id`` onto
-            the :class:`BlockExecution` record after wait().
-        run_id: Optional run grouping id.  When set, the
-            resulting :class:`BlockExecution` record is stamped
-            with this run_id so pattern runners can scope
-            cadence counters to a single run.
-
-    Returns:
-        An :class:`AgentHandle` for monitoring and controlling
-        the agent.
+    Agent execution is a Flywheel batteries-included feature. The
+    handle-based container executor it used to depend on has been
+    removed; until the agent battery is rebuilt on the canonical block
+    execution pipeline, this entry point stays importable and fails
+    explicitly instead of breaking ``flywheel run block`` at import time.
     """
-    del (overrides, agent_workspace_dir,
-         agent_image, predecessor_id)
-
-    # Pattern runners pass ``total_timeout=None`` to mean "no
-    # wall-clock cap"; the executor treats that the same way.
-    timeout_s = (
-        float(total_timeout) if total_timeout else None)
-
-    prompt_tempdir = Path(tempfile.mkdtemp(
-        prefix=f"flywheel-prompt-{block_name}-"))
-    (prompt_tempdir / "prompt.md").write_text(
-        prompt, encoding="utf-8")
-
-    # Host-side control dir mounted at ``/flywheel/control`` so
-    # the agent runner can drop exit-state JSONs and handoff
-    # payloads somewhere the launcher reads after wait().  These
-    # files are intentionally not artifacts — they're
-    # framework-owned runtime data consumed by the handoff loop.
-    control_tempdir = Path(tempfile.mkdtemp(
-        prefix=f"flywheel-control-{block_name}-"))
-    control_mount = (
-        str(control_tempdir),
-        runtime.FLYWHEEL_CONTROL_MOUNT,
-        "rw",
+    del (
+        workspace, template, project_root, prompt, block_name,
+        agent_image, auth_volume, model, max_turns, total_timeout,
+        source_dirs, input_artifacts, overrides, mcp_servers,
+        allowed_tools, extra_env, extra_mounts, isolated_network,
+        agent_workspace_dir, predecessor_id, run_id,
     )
-    effective_mounts = list(extra_mounts or [])
-    effective_mounts.append(control_mount)
-
-    mounts, docker_args = _build_agent_mounts(
-        project_root=project_root,
-        auth_volume=auth_volume,
-        source_dirs=source_dirs,
-        prompt_dir=prompt_tempdir,
-        extra_mounts=effective_mounts,
-        isolated_network=isolated_network,
-    )
-
-    env = _build_agent_env(
-        model=model,
-        max_turns=max_turns,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        isolated_network=isolated_network,
-        extra_env=extra_env,
-    )
-
-    log_dir = workspace.path / "logs" / block_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    executor = ProcessExitExecutor(template)
-    executions_before = len(workspace.executions)
-
-    try:
-        inner = executor.launch(
-            block_name=block_name,
-            workspace=workspace,
-            input_bindings=input_artifacts or {},
-            extra_env=env,
-            extra_mounts=mounts,
-            extra_docker_args=docker_args or None,
-            log_dir=log_dir,
-            total_timeout_s=timeout_s,
-            run_id=run_id,
-        )
-    except BaseException:
-        shutil.rmtree(prompt_tempdir, ignore_errors=True)
-        shutil.rmtree(control_tempdir, ignore_errors=True)
-        raise
-
-    if not isinstance(inner, ContainerExecutionHandle):
-        # Pre-container failure: the executor returned a
-        # :class:`SyncExecutionHandle`.  Still wrap it so the
-        # caller's wait/stop/is_alive protocol works uniformly;
-        # wait() will get back a pre-completed ExecutionResult
-        # and classify exit_reason as "crashed".  The control
-        # tempdir is handed through so wait() can clean it up,
-        # but there's nothing to read — the container never ran.
-        return AgentHandle(
-            inner=inner,  # type: ignore[arg-type]
-            workspace=workspace,
-            executions_before=executions_before,
-            prompt_tempdir=prompt_tempdir,
-            control_tempdir=control_tempdir,
-            log_dir=log_dir,
-        )
-
-    return AgentHandle(
-        inner=inner,
-        workspace=workspace,
-        executions_before=executions_before,
-        prompt_tempdir=prompt_tempdir,
-        control_tempdir=control_tempdir,
-        log_dir=log_dir,
+    raise NotImplementedError(
+        "the agent battery has not yet been rebuilt on the canonical "
+        "block execution pipeline"
     )
 
 

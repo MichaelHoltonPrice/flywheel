@@ -109,9 +109,7 @@ def start_container(
         capture_output: When ``True``, wire the child process's
             stdout and stderr to pipes the caller can drain.
             Default ``False`` lets the streams inherit the parent's
-            file descriptors (prints to the terminal).  Capture is
-            how :class:`flywheel.executor.ContainerExecutionHandle`
-            routes container output into per-execution log files.
+            file descriptors (prints to the terminal).
 
     Returns:
         A running :class:`subprocess.Popen` for the container.

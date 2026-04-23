@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from flywheel.agent import AgentBlockConfig, run_agent_block
+from flywheel.agent import run_agent_block
 from flywheel.artifact import RejectionRef, SupersedesRef
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
@@ -802,8 +802,8 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
     # under a follow-on patterns spec.  Until then we keep the
     # imports lazy so ``flywheel run block`` (the happy path) still
     # works at module-load time.
-    from flywheel.agent_executor import AgentExecutor
-    from flywheel.pattern_runner import PatternRunner
+    from flywheel.agent_executor import AgentExecutor  # noqa: PLC0415
+    from flywheel.pattern_runner import PatternRunner  # noqa: PLC0415
 
     config = load_project_config(Path.cwd())
 
@@ -882,7 +882,8 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             isolated_network=overrides.get(
                 "isolated_network", True),
         )
-        executor_factory = lambda _block_def: agent_executor
+        def executor_factory(_block_def):
+            return agent_executor
 
     defaults_bag: dict[str, Any] = dict(
         overrides.get("defaults") or {})
@@ -953,85 +954,23 @@ def container_stop_command(
     block_name: str,
     reason: str,
 ) -> None:
-    """Tear down the request-response runtime for a workspace / block.
-
-    Loads the project config to resolve the block registry and
-    template, constructs a :class:`RequestResponseExecutor`
-    against the live workspace, and calls its
-    :meth:`~flywheel.executor.RequestResponseExecutor.shutdown`.
-    Shutdown is best-effort; an absent runtime is a no-op.
-    """
-    from flywheel.executor import RequestResponseExecutor
-
-    ws_path = Path(workspace)
-    ws = Workspace.load(ws_path)
-    template = _load_template_for(ws_path, template_name)
-    executor = RequestResponseExecutor(template)
-    key = RequestResponseExecutor._attachment_key(block_name, ws)
-    handled = executor.shutdown(
-        key, reason=reason,
-        block_name=block_name, workspace=ws,
+    """Report that persistent runtime management is deferred."""
+    del workspace, template_name, block_name, reason
+    raise NotImplementedError(
+        "persistent container runtime management is deferred until "
+        "the persistent execution path is rebuilt on the canonical "
+        "block execution pipeline"
     )
-    if handled:
-        print(
-            f"[container stop] block={block_name!r} "
-            f"workspace={ws.name!r} — teardown signalled"
-        )
-    else:
-        print(
-            f"[container stop] block={block_name!r} "
-            f"workspace={ws.name!r} — no matching runtime "
-            f"found (already stopped or never started)"
-        )
 
 
 def container_list_command(*, workspace: str) -> None:
-    """Enumerate request-response runtimes for a workspace.
-
-    Reports whichever runtimes Docker currently has labelled for
-    this workspace, regardless of whether the current flywheel
-    process started them.
-    """
-    import subprocess
-
-    from flywheel.executor import _RUNTIME_LABEL_WORKSPACE
-
-    ws_path = Path(workspace)
-    ws = Workspace.load(ws_path)
-    filter_arg = f"label={_RUNTIME_LABEL_WORKSPACE}={ws.name}"
-    try:
-        result = subprocess.run(
-            [
-                "docker", "ps",
-                "--filter", filter_arg,
-                "--format",
-                "{{.Names}}\t{{.Status}}\t{{.Image}}",
-            ],
-            capture_output=True, check=False, text=True,
-        )
-    except FileNotFoundError:
-        print("[container list] docker not found")
-        sys.exit(1)
-    if result.returncode != 0:
-        print(
-            f"[container list] docker ps failed: "
-            f"{result.stderr.strip()}"
-        )
-        sys.exit(1)
-    lines = [
-        line for line in result.stdout.splitlines() if line]
-    if not lines:
-        print(
-            f"[container list] no runtimes labelled for "
-            f"workspace {ws.name!r}")
-        return
-    print(
-        f"[container list] runtimes for workspace "
-        f"{ws.name!r}:"
+    """Report that persistent runtime management is deferred."""
+    del workspace
+    raise NotImplementedError(
+        "persistent container runtime management is deferred until "
+        "the persistent execution path is rebuilt on the canonical "
+        "block execution pipeline"
     )
-    for line in lines:
-        print(f"  {line}")
-
 
 def _load_template_for(
     workspace_path: Path, template_name: str,

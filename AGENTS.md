@@ -95,26 +95,11 @@ A flywheel-using project root contains:
 `BlockExecutor` protocol that decouples block execution from any
 specific runtime.
 
-Implementations:
-
-* **`ProcessExitExecutor`** — one container per execution
-  (`one_shot` lifecycle). The standard path for batch-style
-  blocks: stage inputs, launch container, wait for exit, collect
-  outputs, persist execution record.
-* **`RequestResponseExecutor`** — one persistent container per
-  workspace, called many times per execution
-  (`workspace_persistent` lifecycle). The standard path for
-  blocks that hold state across calls (a long-running game
-  engine, a SQL session).
-* **`ProcessExecutor`** — local subprocess for trusted host-side
-  processes.
-* **`AgentExecutor`** — `BlockExecutor` for agent batteries.
-
-All container executors return an `ExecutionHandle` with
-`stop()`, `wait()`, `is_alive()`. The mount conventions,
-cancellation protocol, and failure phases that container bodies
-must implement live in
-[`cyber-root/substrate-contract.md`](../substrate-contract.md).
+The ad hoc block-execution surface is `flywheel.execution.run_block`.
+It owns prepare, invoke, artifact commit, quarantine, and ledger
+recording for supported container lifecycles. `flywheel.executor`
+contains protocol/result types only; concrete container execution is not
+implemented there.
 
 Logical block executions with no container body use
 `runner: lifecycle` and are recorded directly by
