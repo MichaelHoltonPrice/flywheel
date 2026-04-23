@@ -12,6 +12,9 @@ from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
     LifecycleEvent,
+    RejectedOutput,
+    RejectionRef,
+    SupersedesRef,
 )
 from flywheel.artifact_validator import (
     ArtifactValidationError,
@@ -742,6 +745,178 @@ class TestBlockExecutionStateAndFailurePhase:
             loaded.executions["exec1"].state_lineage_id
             == "branch_a"
         )
+
+
+class TestRoundTripSupersedesAndQuarantine:
+    """YAML round-trip for the supersedes + quarantine schema
+    additions on :class:`ArtifactInstance` and
+    :class:`BlockExecution`."""
+
+    def _make_instance(
+        self, *, supersedes: SupersedesRef | None = None,
+        supersedes_reason: str | None = None,
+        inst_id: str = "checkpoint@2",
+    ) -> ArtifactInstance:
+        return ArtifactInstance(
+            id=inst_id, name="checkpoint", kind="copy",
+            created_at=datetime.now(UTC),
+            copy_path=inst_id,
+            supersedes=supersedes,
+            supersedes_reason=supersedes_reason,
+        )
+
+    def test_round_trip_supersedes_artifact_id(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws.add_artifact(self._make_instance(
+            inst_id="checkpoint@1"))
+        ws.add_artifact(self._make_instance(
+            inst_id="checkpoint@2",
+            supersedes=SupersedesRef(artifact_id="checkpoint@1"),
+            supersedes_reason="fix gradient explosion",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        successor = loaded.artifacts["checkpoint@2"]
+        assert successor.supersedes == SupersedesRef(
+            artifact_id="checkpoint@1")
+        assert successor.supersedes_reason == "fix gradient explosion"
+
+    def test_round_trip_supersedes_rejection(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        rej = RejectionRef(execution_id="exec_a3f", slot="checkpoint")
+        ws.add_artifact(self._make_instance(
+            inst_id="checkpoint@2",
+            supersedes=SupersedesRef(rejection=rej),
+            supersedes_reason="corrected validator-rejected output",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        successor = loaded.artifacts["checkpoint@2"]
+        assert successor.supersedes is not None
+        assert successor.supersedes.artifact_id is None
+        assert successor.supersedes.rejection == rej
+        assert successor.supersedes_reason == (
+            "corrected validator-rejected output")
+
+    def test_round_trip_rejected_outputs(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec_rej", block_name="train",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            error="checkpoint: model.pt missing",
+            rejected_outputs={
+                "checkpoint": RejectedOutput(
+                    reason="model.pt missing",
+                    quarantine_path=(
+                        "quarantine/exec_rej/checkpoint"),
+                ),
+                "score": RejectedOutput(
+                    reason="score must be a float",
+                    # quarantine_path omitted to verify
+                    # round-trip when quarantine I/O failed.
+                ),
+            },
+        )
+        ws.add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        loaded_ex = loaded.executions["exec_rej"]
+        assert set(loaded_ex.rejected_outputs) == {
+            "checkpoint", "score"}
+        ckpt = loaded_ex.rejected_outputs["checkpoint"]
+        assert ckpt.reason == "model.pt missing"
+        assert ckpt.quarantine_path == (
+            "quarantine/exec_rej/checkpoint")
+        score = loaded_ex.rejected_outputs["score"]
+        assert score.reason == "score must be a float"
+        assert score.quarantine_path is None
+
+    def test_absent_fields_not_serialized(self, tmp_path: Path):
+        # New fields should be absent from the on-disk YAML when
+        # not set, rather than littering ``null`` placeholders
+        # across every existing workspace.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws.add_artifact(self._make_instance(inst_id="checkpoint@plain"))
+        now = datetime.now(UTC)
+        ws.add_execution(BlockExecution(
+            id="exec_plain", block_name="train",
+            started_at=now, status="succeeded",
+        ))
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        artifact_yaml = raw["artifacts"]["checkpoint@plain"]
+        assert "supersedes" not in artifact_yaml
+        assert "supersedes_reason" not in artifact_yaml
+        exec_yaml = raw["executions"]["exec_plain"]
+        assert "rejected_outputs" not in exec_yaml
+
+    def test_load_old_format_has_safe_defaults(
+        self, tmp_path: Path,
+    ):
+        # An older workspace.yaml predating this schema must
+        # still load: unknown fields default to None / empty.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws.add_artifact(self._make_instance(
+            inst_id="checkpoint@old"))
+        now = datetime.now(UTC)
+        ws.add_execution(BlockExecution(
+            id="exec_old", block_name="train",
+            started_at=now, status="failed",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        inst = loaded.artifacts["checkpoint@old"]
+        assert inst.supersedes is None
+        assert inst.supersedes_reason is None
+        ex = loaded.executions["exec_old"]
+        assert ex.rejected_outputs == {}
+
+    def test_supersedes_yaml_shape(self, tmp_path: Path):
+        # Lock in the on-disk YAML shape so external tooling can
+        # rely on it.  Both flavours use a discriminated map.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws.add_artifact(self._make_instance(
+            inst_id="a@id",
+            supersedes=SupersedesRef(artifact_id="a@parent"),
+        ))
+        ws.add_artifact(self._make_instance(
+            inst_id="a@rej",
+            supersedes=SupersedesRef(rejection=RejectionRef(
+                execution_id="exec_z", slot="checkpoint")),
+        ))
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert raw["artifacts"]["a@id"]["supersedes"] == {
+            "artifact": "a@parent"}
+        assert raw["artifacts"]["a@rej"]["supersedes"] == {
+            "rejected": {"execution": "exec_z",
+                         "slot": "checkpoint"}}
 
 
 class TestLifecycleEvents:

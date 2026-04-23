@@ -1107,11 +1107,11 @@ direction is **preserve-on-reject** plus
   (artifact id, or ``(execution_id, slot_name)`` for a
   quarantined predecessor), never as a filesystem path.
   Paths are storage details; lineage is ledger truth.
-- The schema carries a single backward pointer (``amends``)
-  and never a forward pointer or "current child" mutation on
-  the predecessor, so multiple amendments may point at the
-  same parent without schema changes when forking is
-  eventually exposed via the CLI.
+- The schema carries a single backward pointer
+  (``supersedes``) and never a forward pointer or "current
+  child" mutation on the predecessor, so multiple successors
+  may point at the same parent without schema changes when
+  forking is eventually exposed via the CLI.
 - The validator must pass on the amended instance; a failed
   amendment registers nothing.
 - Imports do not quarantine — the operator's source path is
@@ -1163,9 +1163,9 @@ deliberately left open here — the point is to record the
 direction, not commit to a shape.
 
 Until we take this on, amendment of incremental artifacts is
-out of scope and the ``amends`` schema is kept kind-agnostic
-so the future migration is a substrate change rather than a
-schema change.
+out of scope and the ``supersedes`` schema is kept
+kind-agnostic so the future migration is a substrate change
+rather than a schema change.
 
 ### Commit-pinned git mounts
 

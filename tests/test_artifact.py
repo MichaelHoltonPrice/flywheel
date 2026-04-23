@@ -4,7 +4,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    RejectedOutput,
+    RejectionRef,
+    SupersedesRef,
+)
 
 
 class TestArtifactInstance:
@@ -119,3 +125,121 @@ class TestBlockExecution:
         assert ex.exit_code is None
         assert ex.elapsed_s is None
         assert ex.image is None
+        assert ex.rejected_outputs == {}
+
+
+class TestRejectionRef:
+    """Stable ledger handle for a rejected output slot."""
+
+    def test_fields(self):
+        ref = RejectionRef(execution_id="exec_a3f", slot="checkpoint")
+        assert ref.execution_id == "exec_a3f"
+        assert ref.slot == "checkpoint"
+
+    def test_frozen(self):
+        ref = RejectionRef(execution_id="e", slot="s")
+        with pytest.raises(AttributeError):
+            ref.execution_id = "other"
+
+    def test_equal_when_pair_matches(self):
+        # Two refs to the same (exec, slot) pair compare equal so
+        # downstream code can use them as dict keys / set members
+        # for "is this the same rejected slot?".
+        a = RejectionRef(execution_id="e1", slot="checkpoint")
+        b = RejectionRef(execution_id="e1", slot="checkpoint")
+        assert a == b
+        assert hash(a) == hash(b)
+
+
+class TestSupersedesRef:
+    """One-of artifact_id / rejection; predecessor flavours
+    captured at construction."""
+
+    def test_artifact_id_flavour(self):
+        ref = SupersedesRef(artifact_id="checkpoint@2026-01-abc")
+        assert ref.artifact_id == "checkpoint@2026-01-abc"
+        assert ref.rejection is None
+
+    def test_rejection_flavour(self):
+        rej = RejectionRef(execution_id="exec_a3f", slot="checkpoint")
+        ref = SupersedesRef(rejection=rej)
+        assert ref.rejection == rej
+        assert ref.artifact_id is None
+
+    def test_both_set_raises(self):
+        # Setting both predecessors makes "what does this supersede?"
+        # ambiguous and is a programmer error rather than something
+        # the substrate should silently disambiguate.
+        with pytest.raises(ValueError, match="exactly one"):
+            SupersedesRef(
+                artifact_id="x",
+                rejection=RejectionRef(execution_id="e", slot="s"),
+            )
+
+    def test_neither_set_raises(self):
+        # Empty SupersedesRef has no predecessor and no meaning.
+        with pytest.raises(ValueError, match="exactly one"):
+            SupersedesRef()
+
+    def test_frozen(self):
+        ref = SupersedesRef(artifact_id="x")
+        with pytest.raises(AttributeError):
+            ref.artifact_id = "other"
+
+
+class TestRejectedOutput:
+    """Per-slot record on BlockExecution.rejected_outputs."""
+
+    def test_fields(self):
+        rec = RejectedOutput(
+            reason="model.pt missing",
+            quarantine_path="quarantine/exec_a3f/checkpoint",
+        )
+        assert rec.reason == "model.pt missing"
+        assert rec.quarantine_path == (
+            "quarantine/exec_a3f/checkpoint")
+
+    def test_quarantine_path_optional(self):
+        # Quarantine I/O may fail; the validation reason is the
+        # primary signal, so quarantine_path defaults to None.
+        rec = RejectedOutput(reason="bad")
+        assert rec.quarantine_path is None
+
+    def test_frozen(self):
+        rec = RejectedOutput(reason="r")
+        with pytest.raises(AttributeError):
+            rec.reason = "other"
+
+
+class TestSupersedesFieldsOnArtifactInstance:
+    """Smoke coverage for the ``supersedes`` /
+    ``supersedes_reason`` fields on :class:`ArtifactInstance`."""
+
+    def test_defaults_to_none(self):
+        inst = ArtifactInstance(
+            id="x@1", name="x", kind="copy",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        assert inst.supersedes is None
+        assert inst.supersedes_reason is None
+
+    def test_carries_supersedes_artifact(self):
+        inst = ArtifactInstance(
+            id="x@2", name="x", kind="copy",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            supersedes=SupersedesRef(artifact_id="x@1"),
+            supersedes_reason="fix gradient explosion",
+        )
+        assert inst.supersedes == SupersedesRef(artifact_id="x@1")
+        assert inst.supersedes_reason == "fix gradient explosion"
+
+    def test_carries_supersedes_rejection(self):
+        rej = RejectionRef(execution_id="exec_a3f", slot="x")
+        inst = ArtifactInstance(
+            id="x@2", name="x", kind="copy",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            supersedes=SupersedesRef(rejection=rej),
+            supersedes_reason="corrected validator-rejected output",
+        )
+        assert inst.supersedes is not None
+        assert inst.supersedes.rejection == rej

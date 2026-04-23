@@ -26,11 +26,100 @@ from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
     LifecycleEvent,
+    RejectedOutput,
+    RejectionRef,
     RunRecord,
+    SupersedesRef,
 )
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.validation import validate_name as _validate_name
+
+
+def _supersedes_to_yaml(ref: SupersedesRef) -> dict:
+    """Serialize a :class:`SupersedesRef` for ``workspace.yaml``.
+
+    Output shape is one of two discriminated maps:
+    ``{"artifact": "<id>"}`` or
+    ``{"rejected": {"execution": "<id>", "slot": "<slot>"}}``.
+    The shape is stable on purpose so operators (and any other
+    tooling reading the ledger by hand) can spot the predecessor
+    flavour without consulting code.
+    """
+    if ref.artifact_id is not None:
+        return {"artifact": ref.artifact_id}
+    assert ref.rejection is not None  # guaranteed by SupersedesRef
+    return {
+        "rejected": {
+            "execution": ref.rejection.execution_id,
+            "slot": ref.rejection.slot,
+        }
+    }
+
+
+def _supersedes_from_yaml(entry: object) -> SupersedesRef | None:
+    """Inverse of :func:`_supersedes_to_yaml`; tolerates ``None``."""
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"supersedes entry must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    if "artifact" in entry:
+        return SupersedesRef(artifact_id=entry["artifact"])
+    if "rejected" in entry:
+        rej = entry["rejected"]
+        return SupersedesRef(rejection=RejectionRef(
+            execution_id=rej["execution"], slot=rej["slot"],
+        ))
+    raise ValueError(
+        f"supersedes entry must have an 'artifact' or 'rejected' "
+        f"key; got keys {sorted(entry)}"
+    )
+
+
+def _rejected_outputs_to_yaml(
+    outputs: dict[str, RejectedOutput],
+) -> dict:
+    """Serialize ``BlockExecution.rejected_outputs`` for YAML.
+
+    Per-slot entries omit ``quarantine_path`` when ``None`` so
+    failed-quarantine cases serialize as a single ``reason``
+    field rather than a stale ``quarantine_path: null``.
+    """
+    out: dict = {}
+    for slot, rec in outputs.items():
+        entry: dict = {"reason": rec.reason}
+        if rec.quarantine_path is not None:
+            entry["quarantine_path"] = rec.quarantine_path
+        out[slot] = entry
+    return out
+
+
+def _rejected_outputs_from_yaml(
+    entry: object,
+) -> dict[str, RejectedOutput]:
+    """Inverse of :func:`_rejected_outputs_to_yaml`."""
+    if entry is None:
+        return {}
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"rejected_outputs must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    out: dict[str, RejectedOutput] = {}
+    for slot, rec in entry.items():
+        if not isinstance(rec, dict):
+            raise ValueError(
+                f"rejected_outputs[{slot!r}] must be a mapping, "
+                f"got {type(rec).__name__}"
+            )
+        out[slot] = RejectedOutput(
+            reason=rec["reason"],
+            quarantine_path=rec.get("quarantine_path"),
+        )
+    return out
 
 
 @dataclass
@@ -804,6 +893,8 @@ class Workspace:
                 repo=entry.get("repo"),
                 commit=entry.get("commit"),
                 git_path=entry.get("git_path"),
+                supersedes=_supersedes_from_yaml(entry.get("supersedes")),
+                supersedes_reason=entry.get("supersedes_reason"),
             )
 
         executions: dict[str, BlockExecution] = {}
@@ -838,6 +929,8 @@ class Workspace:
                 failure_phase=entry.get("failure_phase"),
                 state_lineage_id=entry.get("state_lineage_id"),
                 run_id=entry.get("run_id"),
+                rejected_outputs=_rejected_outputs_from_yaml(
+                    entry.get("rejected_outputs")),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -903,6 +996,10 @@ class Workspace:
                     entry["repo"] = inst.repo
                     entry["commit"] = inst.commit
                     entry["git_path"] = inst.git_path
+                if inst.supersedes is not None:
+                    entry["supersedes"] = _supersedes_to_yaml(inst.supersedes)
+                if inst.supersedes_reason is not None:
+                    entry["supersedes_reason"] = inst.supersedes_reason
                 serialized_artifacts[aid] = entry
 
             serialized_executions = {}
@@ -953,6 +1050,10 @@ class Workspace:
                     entry["state_lineage_id"] = ex.state_lineage_id
                 if ex.run_id is not None:
                     entry["run_id"] = ex.run_id
+                if ex.rejected_outputs:
+                    entry["rejected_outputs"] = (
+                        _rejected_outputs_to_yaml(
+                            ex.rejected_outputs))
                 serialized_executions[eid] = entry
 
             serialized_events = {}

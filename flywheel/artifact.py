@@ -15,6 +15,114 @@ from typing import Any, Literal
 
 
 @dataclass(frozen=True)
+class RejectionRef:
+    """Reference to a rejected output slot from a failed execution.
+
+    Used as the predecessor type when an :class:`ArtifactInstance`
+    supersedes bytes that were quarantined after their producing
+    execution's validator rejected them.
+
+    Attributes:
+        execution_id: The :class:`BlockExecution` whose output
+            slot was rejected.
+        slot: The output slot name within that execution.
+
+    The pair ``(execution_id, slot)`` is the durable ledger
+    handle for a rejected slot — the bytes themselves live under
+    ``<workspace>/quarantine/<execution_id>/<slot>/`` (when
+    quarantine succeeded), but lineage references the ledger
+    pair, not the path, so the storage location is free to move.
+    """
+
+    execution_id: str
+    slot: str
+
+
+@dataclass(frozen=True)
+class SupersedesRef:
+    """Backward lineage pointer for a superseding ArtifactInstance.
+
+    An :class:`ArtifactInstance` carrying a ``SupersedesRef``
+    declares "this instance supersedes that predecessor."
+    Exactly one of ``artifact_id`` or ``rejection`` is set;
+    setting both or neither is a programmer error and raises
+    ``ValueError``.
+
+    The two flavours match the two operator workflows:
+
+    * ``artifact_id``: amend an accepted instance — the operator
+      has better bytes for the same artifact name and is
+      recording a corrective successor (``flywheel amend
+      artifact``).
+    * ``rejection``: fix a quarantined slot from a failed
+      execution — the operator corrected the bytes that the
+      validator rejected and is registering them as a fresh
+      instance (``flywheel fix execution``).
+
+    The substrate treats the two flavours uniformly — the
+    distinction matters for CLI ergonomics, not for storage.
+    Lineage is **backward-only and kind-agnostic**: the
+    predecessor is identified by a stable ledger handle, never
+    by a filesystem path; multiple successors may point at the
+    same predecessor (forking is allowed). The pointer is
+    provenance / intent, not a resolution rule: consumers still
+    resolve by ``latest created_at``.
+
+    Attributes:
+        artifact_id: The id of an accepted predecessor
+            :class:`ArtifactInstance`. ``None`` when superseding
+            a rejected slot.
+        rejection: The :class:`RejectionRef` of a quarantined
+            predecessor slot. ``None`` when superseding an
+            accepted artifact.
+    """
+
+    artifact_id: str | None = None
+    rejection: RejectionRef | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce the one-of invariant at construction time."""
+        if (self.artifact_id is None) == (self.rejection is None):
+            raise ValueError(
+                "SupersedesRef must have exactly one of "
+                "'artifact_id' or 'rejection' set; got "
+                f"artifact_id={self.artifact_id!r}, "
+                f"rejection={self.rejection!r}."
+            )
+
+
+@dataclass(frozen=True)
+class RejectedOutput:
+    """Per-slot record of an output rejected by its validator.
+
+    Lives on :attr:`BlockExecution.rejected_outputs` keyed by
+    slot name.  When present, the producing execution is
+    recorded as ``failed`` with
+    :data:`flywheel.runtime.FAILURE_OUTPUT_VALIDATE` and the
+    rejected bytes are preserved under
+    ``<workspace>/quarantine/<execution_id>/<slot>/`` whenever
+    the quarantine I/O succeeded.
+
+    Attributes:
+        reason: The validator's rejection message, surfaced
+            verbatim from
+            :class:`flywheel.artifact_validator.ArtifactValidationError`.
+            Stable enough for operators (and AI agents) to grep
+            and act on.
+        quarantine_path: Workspace-relative path to the
+            preserved bytes (e.g.,
+            ``"quarantine/exec_a3f7b2/checkpoint"``), or
+            ``None`` when quarantine I/O failed.  The
+            validation failure is the primary signal either
+            way; the missing path just means the bytes were
+            not preserved this time.
+    """
+
+    reason: str
+    quarantine_path: str | None = None
+
+
+@dataclass(frozen=True)
 class ArtifactInstance:
     """A concrete artifact record within a workspace.
 
@@ -53,6 +161,17 @@ class ArtifactInstance:
         repo: For git artifacts, the absolute path to the repo root.
         commit: For git artifacts, the full commit SHA.
         git_path: For git artifacts, the path within the repo.
+        supersedes: Backward lineage pointer when this instance
+            was registered as a superseding successor of a
+            predecessor (either an accepted artifact id or a
+            quarantined rejection ref).  ``None`` for plain
+            registrations.  See :class:`SupersedesRef`.
+        supersedes_reason: Human-readable description of *why*
+            this successor was registered, captured at
+            registration time so the audit trail can be
+            reconstructed without out-of-band notes.  ``None``
+            when ``supersedes`` is ``None``; recommended (but
+            not required) when it is set.
     """
 
     id: str
@@ -65,6 +184,8 @@ class ArtifactInstance:
     repo: str | None = None
     commit: str | None = None
     git_path: str | None = None
+    supersedes: SupersedesRef | None = None
+    supersedes_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +315,15 @@ class BlockExecution:
             Cadence counters scope by this field so executions
             from a prior run do not pollute a fresh run's
             counter.
+        rejected_outputs: Per-slot record of output slots that
+            failed validation, keyed by slot name.  Present only
+            on executions whose ``failure_phase`` is
+            ``"output_validate"``.  Each entry carries the
+            validator's rejection ``reason`` and the
+            workspace-relative ``quarantine_path`` (when
+            quarantine I/O succeeded).  Empty dict by default;
+            absent on disk for executions with no rejected
+            slots.  See :class:`RejectedOutput`.
     """
 
     id: str
@@ -223,6 +353,8 @@ class BlockExecution:
     failure_phase: str | None = None
     state_lineage_id: str | None = None
     run_id: str | None = None
+    rejected_outputs: dict[str, RejectedOutput] = field(
+        default_factory=dict)
 
 
 @dataclass(frozen=True)
