@@ -148,7 +148,13 @@ used at every other artifact-finalization site.
   validation failure rather than an opaque crash.
 
 Names without a registered validator are accepted
-unconditionally; flywheel never invents a default. See
+unconditionally; flywheel never invents a default. The
+validator is also the only check on the staged tree's
+*contents*: flywheel does not enforce required files, forbid
+unexpected files or sub-directories, or apply a layout schema
+of its own.  If a project wants `--name checkpoint` to mean
+"exactly `model.pt` and nothing else", its validator must
+walk the staged directory and reject anything extra.  See
 [../architecture.md](../architecture.md) § "Artifact validation"
 for the broader contract — in particular, how the same registry
 is consulted after every block execution.

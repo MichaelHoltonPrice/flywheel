@@ -179,6 +179,21 @@ incremental appends, and leaves room for a future tag-based
 collection model in which each contribution is naturally a
 separate instance (see "Future work").
 
+**The validator owns all content policy.**  Flywheel does not
+look inside the staged directory at all — it does not check
+for required files, forbid unexpected files or
+sub-directories, enforce a particular layout, or apply any
+kind of schema.  Whether an extra ``logs/`` sub-directory or
+an unrecognized ``notes.txt`` should be allowed is a
+project-and-artifact-specific question, not a flywheel one,
+so the validator must answer it.  If a project wants strict
+"exactly these files and nothing else" semantics, the
+validator must walk the tree and reject anything unexpected;
+if it wants permissive semantics, it just doesn't check.
+If no validator is registered for an artifact name, the
+candidate is accepted as-is — flywheel does not perform any
+content checks of its own.
+
 **Container assembles its own outputs.**  Flywheel does not
 provide a project-supplied "post-run hook" that runs in the
 container or on the host to transform raw output into the

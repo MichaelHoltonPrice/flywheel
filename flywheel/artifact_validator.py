@@ -16,6 +16,20 @@ a container's output tempdir, a staged copy of an operator's
 import, or anywhere else — that is flywheel's concern, not the
 validator's.
 
+**The validator owns every policy decision about what counts
+as a valid artifact.**  Flywheel does not inspect the staged
+directory's contents at all: it does not check for required
+files, forbid unexpected files or sub-directories, enforce a
+particular layout, or apply any kind of schema.  All of that
+is the validator's job.  If the project cares whether the
+staged tree contains exactly ``model.pt`` and nothing else, or
+whether an extra ``logs/`` sub-directory is allowed, the
+validator must check for it explicitly and raise
+:class:`ArtifactValidationError` when its rules are not met.
+If no validator is registered for an artifact name, the
+candidate is accepted as-is — flywheel performs no content
+checks of its own.
+
 Validators are plain Python callables.  Each maps to one
 artifact declaration name and is invoked exactly once per
 candidate artifact, *before* the candidate becomes a permanent
@@ -105,7 +119,13 @@ commit as the artifact instance if the validator accepts it.  How
 those bytes got there — a container output tempdir, a staged copy
 of an operator's import — is flywheel's concern, not the
 validator's.  The callable must treat ``staged_path`` as
-read-only."""
+read-only.
+
+The validator is the *only* gate on what counts as valid
+content for ``name``.  Flywheel does not inspect ``staged_path``
+itself: required files, forbidden extra files or sub-directories,
+expected layout, schema — every such rule lives in the validator
+and must be checked explicitly here."""
 
 
 class ArtifactValidatorRegistry:
