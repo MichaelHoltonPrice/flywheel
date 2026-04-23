@@ -83,6 +83,13 @@ FAILURE_OUTPUT_COLLECT: Final[str] = "output_collect"
 """Container exited but one or more declared output dirs could
 not be read or registered."""
 
+FAILURE_OUTPUT_VALIDATE: Final[str] = "output_validate"
+"""Container exited and outputs were read, but a project-declared
+validator (see :mod:`flywheel.artifact_validator`) rejected one
+or more declared output slots.  Slots whose validator passed are
+still committed; rejected slots are not.  The ledger
+``error`` field carries the per-slot rejection reasons."""
+
 FAILURE_ARTIFACT_COMMIT: Final[str] = "artifact_commit"
 """Outputs were read but the workspace commit failed (e.g., disk
 full, concurrent write race, invalid instance shape)."""
@@ -92,6 +99,7 @@ FAILURE_PHASES: Final[frozenset[str]] = frozenset({
     FAILURE_INVOKE,
     FAILURE_STATE_CAPTURE,
     FAILURE_OUTPUT_COLLECT,
+    FAILURE_OUTPUT_VALIDATE,
     FAILURE_ARTIFACT_COMMIT,
 })
 """All valid non-``None`` ``BlockExecution.failure_phase`` values.

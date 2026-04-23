@@ -9,12 +9,17 @@ and concepts.
 
 * [create-workspace.md](create-workspace.md) — `flywheel create
   workspace`. Materialize a fresh workspace from a template.
+* [import-artifact.md](import-artifact.md) — `flywheel import
+  artifact`. Register an external directory as a `copy`-kind
+  artifact instance inside an existing workspace, optionally
+  subject to a project-supplied validator. (Artifact instances
+  are always directory-shaped; wrap single files first.)
 
-The remaining three user-facing commands (`import artifact`,
-`run block`, `run pattern`) gain their per-command docs as the
-underlying behavior is pinned. Until then, agents should read the
-argparse setup at the top of [`flywheel/cli.py`](../../flywheel/cli.py)
-and use `--help`.
+The remaining two user-facing commands (`run block`, `run
+pattern`) gain their per-command docs as the underlying behavior
+is pinned. Until then, agents should read the argparse setup at
+the top of [`flywheel/cli.py`](../../flywheel/cli.py) and use
+`--help`.
 
 ## Conventions used in command docs
 

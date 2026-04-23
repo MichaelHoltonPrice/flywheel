@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
@@ -27,7 +28,8 @@ from flywheel.artifact import (
     LifecycleEvent,
     RunRecord,
 )
-from flywheel.template import Template
+from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.template import ArtifactDeclaration, Template
 from flywheel.validation import validate_name as _validate_name
 
 
@@ -529,28 +531,72 @@ class Workspace:
         name: str,
         source_path: Path,
         source: str | None = None,
+        *,
+        validator_registry: ArtifactValidatorRegistry | None = None,
+        declaration: ArtifactDeclaration | None = None,
     ) -> ArtifactInstance:
-        """Import an external file or directory as an artifact instance.
+        """Import an external directory as an artifact instance.
 
-        Copies the source into the workspace's artifact storage and
-        records it as a new artifact instance with provenance metadata.
-        The imported artifact binds identically to block-produced
-        artifacts.
+        Stages the source's contents into a flywheel-owned
+        directory shaped like the canonical artifact directory
+        will be, runs the registered validator (if any) against
+        that staging directory, and on success atomically renames
+        it into the workspace's artifact storage.  The imported
+        artifact binds identically to block-produced artifacts.
+
+        Artifact instances are always directory-shaped, mirroring
+        the per-slot output directories block executions write
+        into.  ``source_path`` must be a directory; callers that
+        want to import a single file must wrap it in a directory
+        first (the artifact's structure is then explicit at the
+        call site).
+
+        The validator never sees the operator's source path — it
+        sees the staged candidate, which is structurally
+        identical to what the committed artifact will be.  This
+        matches the validator contract used at every other
+        finalization site (see :mod:`flywheel.artifact_validator`).
+
+        Undeclared artifacts are rejected: the workspace's
+        :attr:`artifact_declarations` is the single source of
+        truth for what shapes a workspace knows how to track.
+        See ``docs/architecture.md`` § "Undeclared artifacts are
+        rejected".
 
         Args:
             name: The artifact declaration name (must be a declared
                 copy artifact).
-            source_path: Path to the file or directory to import.
+            source_path: Path to the directory whose contents
+                become the new artifact instance.  Must be a
+                directory; single-file imports are not supported
+                (wrap the file in a directory first).
             source: Free-text description of where the artifact came
                 from. Defaults to the resolved source path.
+            validator_registry: Project-supplied validator registry
+                consulted against the staged candidate before
+                commit.  When the registered validator (if any) for
+                ``name`` raises
+                :class:`flywheel.artifact_validator.ArtifactValidationError`,
+                the staging directory is removed, no artifact is
+                written, and the exception propagates to the
+                caller.  Optional: omitted (or ``None``) means
+                "no validation".
+            declaration: The full artifact declaration the registry
+                was registered against.  Forwarded to the
+                validator so it can branch on declaration metadata.
+                Optional — validators that ignore the declaration
+                tolerate ``None``.
 
         Returns:
             The created ArtifactInstance.
 
         Raises:
-            ValueError: If the name is not declared or is not a copy
-                artifact.
+            ValueError: If the name is not declared, is not a copy
+                artifact, or ``source_path`` is not a directory.
             FileNotFoundError: If source_path does not exist.
+            flywheel.artifact_validator.ArtifactValidationError:
+                If a validator is registered for ``name`` and rejects
+                the staged candidate.
         """
         if name not in self.artifact_declarations:
             raise ValueError(
@@ -565,37 +611,58 @@ class Workspace:
             raise FileNotFoundError(
                 f"Source path does not exist: {source_path}"
             )
+        if not source_path.is_dir():
+            raise ValueError(
+                f"Artifact source must be a directory; "
+                f"{source_path} is not.  Wrap a single file in a "
+                f"directory and pass that — artifacts are always "
+                f"directory-shaped, mirroring block output slots."
+            )
 
-        artifact_id = self.generate_artifact_id(name)
-        target_dir = self.path / "artifacts" / artifact_id
-        target_dir.mkdir(parents=True)
-
+        # Stage the source contents into a flywheel-owned
+        # directory shaped exactly like the canonical artifact
+        # directory will be.  Staging lives under
+        # <workspace>/artifacts/ so the eventual move into place
+        # is a same-filesystem atomic rename, and the validator
+        # (if any) sees the candidate artifact in its final shape
+        # — never the operator's source path.
+        artifacts_dir = self.path / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(
+            prefix=f"_staging-{name}-", dir=artifacts_dir,
+        ))
         try:
-            if source_path.is_file():
-                shutil.copy2(source_path, target_dir / source_path.name)
-            else:
-                shutil.copytree(
-                    source_path, target_dir, dirs_exist_ok=True
+            shutil.copytree(
+                source_path, staging_dir, dirs_exist_ok=True,
+            )
+
+            if validator_registry is not None:
+                validator_registry.validate(
+                    name, declaration, staging_dir,
                 )
 
-            if source is None:
-                source = f"imported from {source_path.resolve()}"
-
-            instance = ArtifactInstance(
-                id=artifact_id,
-                name=name,
-                kind="copy",
-                created_at=datetime.now(UTC),
-                produced_by=None,
-                source=source,
-                copy_path=artifact_id,
-            )
-            self.add_artifact(instance)
-            self.save()
-            return instance
+            artifact_id = self.generate_artifact_id(name)
+            target_dir = artifacts_dir / artifact_id
+            staging_dir.rename(target_dir)
         except Exception:
-            shutil.rmtree(target_dir, ignore_errors=True)
+            shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+
+        if source is None:
+            source = f"imported from {source_path.resolve()}"
+
+        instance = ArtifactInstance(
+            id=artifact_id,
+            name=name,
+            kind="copy",
+            created_at=datetime.now(UTC),
+            produced_by=None,
+            source=source,
+            copy_path=artifact_id,
+        )
+        self.add_artifact(instance)
+        self.save()
+        return instance
 
     @classmethod
     def create(cls, name: str, template: Template, foundry_dir: Path) -> Workspace:

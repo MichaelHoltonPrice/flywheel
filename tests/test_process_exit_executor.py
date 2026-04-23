@@ -27,6 +27,10 @@ import pytest
 
 from flywheel import runtime
 from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
 from flywheel.executor import (
     INVOKE_FAILURE_EXIT_CODE,
     ProcessExitExecutor,
@@ -1514,3 +1518,121 @@ class TestStopConcurrency:
             result = handle.wait()
 
         assert result.status == "succeeded"
+
+
+class TestArtifactValidation:
+    """Validator-registry integration with ProcessExitExecutor.
+
+    Covers commit-A: passing slots are committed, the
+    rejected-slot is dropped, and the BlockExecution lands as
+    failed with ``failure_phase=output_validate``.
+    """
+
+    def test_validator_pass_commits(self, tmp_path: Path):
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+
+        seen: list[tuple[str, Path]] = []
+
+        def validator(name, decl, path):
+            seen.append((name, path))
+
+        registry = ArtifactValidatorRegistry({"result": validator})
+        executor = ProcessExitExecutor(
+            template, validator_registry=registry,
+        )
+
+        def _fake(config, args=None, name=None, **_):
+            for host, container, _mode in config.mounts:
+                if container == "/output/result":
+                    (Path(host) / "out.txt").write_text("ok")
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake,
+        ):
+            result = executor.launch(
+                "train", ws, input_bindings={}).wait()
+
+        assert result.status == "succeeded"
+        assert "result" in result.output_bindings
+        assert len(seen) == 1
+        assert seen[0][0] == "result"
+
+    def test_validator_reject_records_failure_and_drops_slot(
+        self, tmp_path: Path,
+    ):
+        template = _make_template(outputs=["result"])
+        ws = _make_workspace(tmp_path, template)
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("bad payload")
+
+        registry = ArtifactValidatorRegistry({"result": reject})
+        executor = ProcessExitExecutor(
+            template, validator_registry=registry,
+        )
+
+        def _fake(config, args=None, name=None, **_):
+            for host, container, _mode in config.mounts:
+                if container == "/output/result":
+                    (Path(host) / "out.txt").write_text("nope")
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake,
+        ):
+            result = executor.launch(
+                "train", ws, input_bindings={}).wait()
+
+        assert result.status == "failed"
+        assert result.output_bindings == {}
+        ex = ws.executions[result.execution_id]
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert "bad payload" in (ex.error or "")
+        # The rejected slot did not commit a copy artifact.
+        assert ws.instances_for("result") == []
+
+    def test_validator_partial_commit_keeps_passing_slot(
+        self, tmp_path: Path,
+    ):
+        template = _make_template(outputs=["good", "bad"])
+        ws = _make_workspace(tmp_path, template)
+
+        def validator(name, decl, path):
+            if name == "bad":
+                raise ArtifactValidationError("rejected")
+
+        registry = ArtifactValidatorRegistry(
+            {"good": validator, "bad": validator},
+        )
+        executor = ProcessExitExecutor(
+            template, validator_registry=registry,
+        )
+
+        def _fake(config, args=None, name=None, **_):
+            for host, container, _mode in config.mounts:
+                if container == "/output/good":
+                    (Path(host) / "g.txt").write_text("g")
+                if container == "/output/bad":
+                    (Path(host) / "b.txt").write_text("b")
+            return FakePopen(returncode=0)
+
+        with patch(
+            "flywheel.executor.start_container",
+            side_effect=_fake,
+        ):
+            result = executor.launch(
+                "train", ws, input_bindings={}).wait()
+
+        assert result.status == "failed"
+        # Commit-A: the passing slot still appears in the
+        # recorded output bindings.
+        assert "good" in result.output_bindings
+        assert "bad" not in result.output_bindings
+        assert len(ws.instances_for("good")) == 1
+        assert ws.instances_for("bad") == []
+        ex = ws.executions[result.execution_id]
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE

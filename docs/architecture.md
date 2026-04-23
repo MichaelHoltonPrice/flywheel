@@ -30,10 +30,10 @@ of those types as blocks execute.
 
 There are three storage kinds:
 
-- **Copy artifacts** are files or directories stored directly in
-  the workspace. Block executions produce them — checkpoints,
-  scores, and logs are typical examples.  Each instance is
-  immutable.
+- **Copy artifacts** are directories stored directly in the
+  workspace (see "Artifact instances are directory-shaped").
+  Block executions produce them — checkpoints, scores, and logs
+  are typical examples.  Each instance is immutable.
 - **Git artifacts** are references to version-controlled code,
   recorded as repo, commit SHA, and path. They are used to
   inject source code, configurations, or prompts into a
@@ -107,12 +107,114 @@ the container sees the newer code.
 
 Users and agents can import externally created artifacts into a
 workspace via ``Workspace.register_artifact()`` or the CLI command
-``flywheel import artifact``. Imported artifacts are copied into
-the workspace (preserving immutability) and recorded as normal
-artifact instances. They have ``produced_by=None`` (like baseline
-git snapshots) but carry a ``source`` field describing their
-origin. Once registered, they bind identically to block-produced
-artifacts.
+``flywheel import artifact``. The source is always a directory
+(see "Artifact instances are directory-shaped"); flywheel
+stages its contents into a workspace-owned directory, runs the
+registered validator (if any) against the staging directory,
+and on success atomically renames it into the canonical
+artifact location.  Imported artifacts have ``produced_by=None``
+(like baseline git snapshots) but carry a ``source`` field
+describing their origin.  Once registered, they bind identically
+to block-produced artifacts.
+
+### Undeclared artifacts are rejected
+
+Every artifact name a workspace tracks is declared in the
+template under ``artifacts:``.  Both ``Workspace.register_artifact``
+(``flywheel import artifact``) and post-block output collection
+(``_collect_outputs`` / ``flywheel.execution.run_block``) reject
+names that are not in the workspace's declarations.
+
+The point is not that undeclared artifacts are never useful —
+some projects could plausibly want a "scratch" channel — but
+that admitting them would weaken every other guarantee in this
+section.  Without a declaration there is no agreed kind, no
+declared validator, no documented downstream consumer; the
+ledger silently grows shapes nobody promised to maintain.  When
+that need becomes pressing we will revisit it explicitly rather
+than letting it leak in through the import path.
+
+### Artifact instances are directory-shaped
+
+Every artifact instance is a directory.  Block executions write
+into per-slot output directories at ``/output/<slot>/`` and
+``flywheel import artifact`` requires a directory source.
+Importing a single file is unsupported on purpose — the caller
+wraps the file in a directory first, which makes the artifact's
+structure explicit at the call site rather than implicit in
+flywheel's behavior.  Mirroring the block-output shape this way
+is what lets every consumer (validators, mounts, downstream
+blocks) see one shape regardless of how the artifact got
+there.
+
+### Artifact validation
+
+Projects can declare validation logic for any artifact name by
+registering a callable on
+:class:`flywheel.artifact_validator.ArtifactValidatorRegistry`
+and pointing ``flywheel.yaml``'s ``artifact_validators:`` key at
+a zero-arg factory that returns one.  See
+:mod:`flywheel.artifact_validator` for the validator signature
+(``(name, declaration, staged_path) -> None``; raise
+:class:`ArtifactValidationError` to reject) and
+:doc:`cli/import-artifact` for the CLI side.
+
+The same registry is consulted at every artifact-finalization
+site so a project gets one rule for "what counts as a valid
+``checkpoint``" regardless of whether the artifact arrived
+through ``flywheel import artifact`` or rolled out of a block
+execution.  Names with no registered validator are accepted
+unconditionally; flywheel never invents a default.
+
+The validator's contract is uniform: it is given a directory
+containing the bytes that would become the artifact instance,
+and decides yes or no.  How those bytes got there — a
+container's per-slot output tempdir, a staged copy of an
+operator's import — is flywheel's concern, not the validator's.
+Validators are **stateless and candidate-only**: they see the
+staged candidate and the artifact declaration, never the
+workspace's prior state for the same name.  This keeps the
+contract identical across imports, copy outputs, and
+incremental appends, and leaves room for a future tag-based
+collection model in which each contribution is naturally a
+separate instance (see "Future work").
+
+**Container assembles its own outputs.**  Flywheel does not
+provide a project-supplied "post-run hook" that runs in the
+container or on the host to transform raw output into the
+artifact's final shape.  Whatever shape the block wants the
+artifact to have, its container puts those bytes at
+``/output/<slot>/`` before exit — using whatever scripting,
+enrichment, or post-processing the entrypoint wants.  Flywheel
+reads what's there after exit and does not transform it.  This
+keeps the substrate's surface area small (no hook registry, no
+in-template transform field) and pushes the "how do I assemble
+this artifact" question to the place that actually knows the
+answer: the container.
+
+**Failure semantics for block-produced outputs.**  When a block
+emits multiple output slots and one of them fails its
+validator, flywheel commits the slots that *passed* and rejects
+only the slot that failed.  The execution is still recorded as
+``failed`` with ``failure_phase=output_validate`` and an
+``error`` field that names every rejected slot, so an operator
+can tell at a glance which slots survived and which need
+fixing.  The rationale is that a long-running block (training
+run, agent session) often produces several useful artifacts
+plus one invariant we wanted to catch — discarding everything
+because the invariant fired would punish the block's other
+work.
+
+The opposite policy — reject the entire execution if any slot
+fails — is equally defensible for projects whose output slots
+are tightly coupled (e.g., a checkpoint and its scoring
+manifest must agree or neither is useful).  Commit-passing-slots
+is the single global default; making this a project-level
+(or per-block) choice is left to "Future work".
+
+For ``flywheel import artifact`` the question does not arise —
+there is exactly one slot per call, so a rejection always
+aborts the import without committing anything.
 
 ### Immutability
 
@@ -953,6 +1055,102 @@ Block executions can be interrupted (e.g., by Ctrl+C). The
 execution is recorded with "interrupted" status, and orphaned
 output directories are cleaned up. Partial outputs from
 interrupted executions are not preserved as artifact instances.
+
+### Project-selectable artifact commit policy
+
+The artifact-validation rules above bake in a single global
+choice for what to do when one of an execution's output slots
+fails its validator: commit the slots that passed and drop only
+the failing one.  Some projects will want the opposite — reject
+the entire execution if any slot fails — typically when the
+slots are tightly coupled and a partial commit would be a worse
+outcome than no commit.  A future project-level (or per-block)
+policy declaration would let each project pick.  Until then,
+projects that need all-or-nothing semantics can layer a
+validator that *deliberately* fails every paired slot together
+— clumsy but workable.
+
+### Rejected-artifact preservation and amendment
+
+Today, when a block-output validator rejects a slot, the
+staged bytes are destroyed during normal tempdir cleanup.  An
+operator who wants to inspect or correct a rejected output has
+no recourse short of re-running the block.  The intended
+direction is **preserve-on-reject** plus
+**amendment-as-versioning**:
+
+- Rejected slot bytes are moved into
+  ``<workspace>/quarantine/<execution-id>/<slot-name>/`` as
+  part of finalization.  The execution still records
+  ``failure_phase=output_validate``; quarantine is purely
+  operator-visible state.
+- A ``flywheel amend`` (or ``fix``) verb registers a *new*
+  ``copy`` artifact instance whose provenance points at a
+  predecessor — either an existing artifact id or a
+  quarantined slot.  The original is never mutated.
+- Lineage is recorded as a durable ledger reference
+  (artifact id, or ``(execution_id, slot_name)`` for a
+  quarantined predecessor), never as a filesystem path.
+  Paths are storage details; lineage is ledger truth.
+- The schema carries a single backward pointer (``amends``)
+  and never a forward pointer or "current child" mutation on
+  the predecessor, so multiple amendments may point at the
+  same parent without schema changes when forking is
+  eventually exposed via the CLI.
+- The validator must pass on the amended instance; a failed
+  amendment registers nothing.
+- Imports do not quarantine — the operator's source path is
+  still on disk.
+- Quarantine I/O failures are deliberately handled simply:
+  log, proceed with the validation-failure record without a
+  quarantine path.  Schema fields for "preservation
+  succeeded?" or "preservation error" are not added until we
+  observe a real need.
+
+A sweep / GC story for quarantine is left for later, on the
+same principle: design it once we have enough quarantine
+volume in the wild to know what we'd be sweeping.
+
+### Incremental artifacts replaced by tagged copy instances
+
+The ``incremental`` storage kind ("one growing instance per
+name; appends never produce a new instance") is on the table
+for retirement.  The motivating problems are that amendment
+cannot naturally mean "register a corrected new instance"
+when there is only one instance, that cross-entry invariants
+pretend to be a substrate feature when they are really a
+project concern, and that concurrent appends require a
+workspace-level lock.
+
+The candidate replacement is a **tag** mechanism layered over
+plain ``copy`` instances:
+
+- Each block execution that would have appended to an
+  incremental instead produces an ordinary ``copy`` instance
+  containing just that cycle's contribution.
+- A project-declared **tag** (e.g. ``game_history``) names a
+  collection of copy instances and is the unit consumers
+  depend on.  A block input referencing a tag receives the
+  matching set as a collective input, ordered by creation
+  time.
+- Amendment, quarantine, validation, and concurrency become
+  uniform across all artifacts.  Cross-entry invariants stop
+  pretending to be a substrate feature; they are embedded in
+  entry data.
+
+The known cost is per-mount staging proportional to
+collection size rather than file size; long-running
+collections (thousands of game histories) will require either
+manifest-style mounts, lazy resolution, or explicit
+compaction (fold N instances into one merged copy).  The
+exact mount layout and the rules for declaring tags are
+deliberately left open here — the point is to record the
+direction, not commit to a shape.
+
+Until we take this on, amendment of incremental artifacts is
+out of scope and the ``amends`` schema is kept kind-agnostic
+so the future migration is a substrate change rather than a
+schema change.
 
 ### Commit-pinned git mounts
 

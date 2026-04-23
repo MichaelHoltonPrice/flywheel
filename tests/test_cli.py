@@ -261,9 +261,11 @@ class TestMainImportArtifact:
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
-        # Write a file to import
-        src = tmp_path / "myfile.txt"
-        src.write_text("hello")
+        # Write a directory to import (artifacts are
+        # directory-shaped; single files are rejected).
+        src = tmp_path / "data_dir"
+        src.mkdir()
+        (src / "myfile.txt").write_text("hello")
 
         ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
         main(["import", "artifact",
@@ -290,8 +292,9 @@ class TestMainImportArtifact:
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
-        src = tmp_path / "myfile.txt"
-        src.write_text("hello")
+        src = tmp_path / "data_dir"
+        src.mkdir()
+        (src / "myfile.txt").write_text("hello")
 
         ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
         main(["import", "artifact",

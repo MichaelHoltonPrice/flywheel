@@ -45,6 +45,10 @@ from typing import Any, Protocol, runtime_checkable
 
 from flywheel import runtime
 from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
 from flywheel.post_check import (
     HaltDirective,
     PostCheckCallable,
@@ -59,7 +63,11 @@ from flywheel.input_staging import (
     cleanup_staged_inputs,
     stage_artifact_instances,
 )
-from flywheel.template import BlockDefinition, Template
+from flywheel.template import (
+    ArtifactDeclaration,
+    BlockDefinition,
+    Template,
+)
 from flywheel.workspace import Workspace
 
 # Sentinel exit code for "the container never produced one."
@@ -347,6 +355,8 @@ class ContainerExecutionHandle(ExecutionHandle):
         log_dir: Path | None = None,
         total_timeout_s: float | None = None,
         on_stdout_line: Callable[[str], None] | None = None,
+        validator_registry: ArtifactValidatorRegistry | None = None,
+        template: Template | None = None,
     ):
         """Capture every piece of state :meth:`wait` will need.
 
@@ -392,6 +402,8 @@ class ContainerExecutionHandle(ExecutionHandle):
         self._log_dir = log_dir
         self._total_timeout_s = total_timeout_s
         self._on_stdout_line = on_stdout_line
+        self._validator_registry = validator_registry
+        self._template = template
         self._stop_reason: str | None = None
         self._stop_lock = threading.Lock()
         self._stop_initiated = False
@@ -638,7 +650,20 @@ class ContainerExecutionHandle(ExecutionHandle):
                     self._output_tempdirs,
                     self._execution_id,
                     finished_at,
+                    validator_registry=self._validator_registry,
+                    template=self._template,
                 )
+            except ArtifactValidationError as e:
+                # Commit-A: slots that passed validation are
+                # already in ``e.partial_bindings``; record
+                # them on the failed execution so an operator
+                # can still inspect what was produced.
+                output_bindings = getattr(
+                    e, "partial_bindings", {}) or {}
+                if failure_phase is None:
+                    failure_phase = (
+                        runtime.FAILURE_OUTPUT_VALIDATE)
+                    error = f"output_validate: {e}"
             except Exception as e:
                 if failure_phase is None:
                     failure_phase = runtime.FAILURE_OUTPUT_COLLECT
@@ -734,6 +759,8 @@ class ProcessExitExecutor:
         self,
         template: Template,
         overrides: dict[str, Any] | None = None,
+        *,
+        validator_registry: ArtifactValidatorRegistry | None = None,
     ):
         """Initialize with a template and optional overrides.
 
@@ -742,9 +769,16 @@ class ProcessExitExecutor:
             overrides: Default CLI flag overrides for containers;
                 merged with per-launch overrides at execution
                 time.
+            validator_registry: Project-supplied artifact
+                validator registry consulted by
+                :func:`_collect_outputs` for every block this
+                executor runs.  Optional: when omitted, output
+                slots are committed without validation.  See
+                :mod:`flywheel.artifact_validator`.
         """
         self._template = template
         self._overrides = overrides
+        self._validator_registry = validator_registry
 
     def launch(
         self,
@@ -1013,6 +1047,8 @@ class ProcessExitExecutor:
             log_dir=log_dir,
             total_timeout_s=total_timeout_s,
             on_stdout_line=on_stdout_line,
+            validator_registry=self._validator_registry,
+            template=self._template,
         )
 
 
@@ -1200,6 +1236,9 @@ def _collect_outputs(
     output_tempdirs: dict[str, Path],
     exec_id: str,
     finished_at: datetime,
+    *,
+    validator_registry: ArtifactValidatorRegistry | None = None,
+    template: Template | None = None,
 ) -> dict[str, str]:
     """Commit output tempdir contents per the artifact's declared kind.
 
@@ -1220,14 +1259,61 @@ def _collect_outputs(
     ``entries.jsonl`` are skipped silently — a block is free to
     declare optional outputs it doesn't always produce.
 
+    When a ``validator_registry`` is supplied, every slot whose
+    declaration name has a registered validator is validated
+    *before* commit.  The semantics are intentionally
+    "commit-A":
+
+    * Slots whose validator passes are committed normally and
+      appear in the returned bindings.
+    * Slots whose validator rejects the candidate are *not*
+      committed and do not appear in the returned bindings.
+    * If any slot was rejected, an
+      :class:`ArtifactValidationError` is raised after every
+      remaining slot has been processed.  The exception
+      carries the partial bindings on
+      ``ArtifactValidationError.partial_bindings`` so the
+      caller can record them on the failed
+      :class:`BlockExecution`.
+
     Returns the slot→artifact-instance-id map for the execution
     record's ``output_bindings``.
+
+    Raises:
+        ArtifactValidationError: When one or more declared
+            output slots failed validation.  All slots that
+            passed are still committed; the partial bindings
+            are attached to the exception.
     """
+    declarations: dict[str, ArtifactDeclaration] = {}
+    if template is not None:
+        declarations = {
+            decl.name: decl for decl in template.artifacts
+        }
+
     output_bindings: dict[str, str] = {}
+    rejection_messages: list[str] = []
     for slot in block_def.outputs:
         src = output_tempdirs.get(slot.name)
         if src is None or not any(src.iterdir()):
             continue
+        if validator_registry is not None:
+            try:
+                validator_registry.validate(
+                    slot.name,
+                    declarations.get(slot.name),
+                    src,
+                )
+            except ArtifactValidationError as exc:
+                rejection_messages.append(
+                    f"{slot.name}: {exc}",
+                )
+                # Reject this slot.  Continue processing the
+                # remaining slots so an execution that produced
+                # multiple outputs surfaces every problem at
+                # once rather than masking later failures
+                # behind the first.
+                continue
         kind = workspace.artifact_declarations.get(slot.name)
         if kind == "incremental":
             instance_id = _commit_incremental_output(
@@ -1242,6 +1328,14 @@ def _collect_outputs(
             # something operable rather than crashing.
             output_bindings[slot.name] = _commit_copy_output(
                 workspace, slot.name, src, exec_id, finished_at)
+    if rejection_messages:
+        exc = ArtifactValidationError(
+            "; ".join(rejection_messages),
+        )
+        # Attach partial commits so the caller can record them
+        # on the failed execution alongside the rejected slots.
+        exc.partial_bindings = output_bindings  # type: ignore[attr-defined]
+        raise exc
     return output_bindings
 
 
@@ -2066,6 +2160,8 @@ class _RequestExecutionHandle(ExecutionHandle):
         execute_timeout_s: float,
         cancel_timeout_s: float,
         post_check: PostCheckCallable | None = None,
+        validator_registry: ArtifactValidatorRegistry | None = None,
+        template: Template | None = None,
     ):
         """Capture the per-request state and start the POST thread."""
         self._runtime = runtime
@@ -2082,6 +2178,8 @@ class _RequestExecutionHandle(ExecutionHandle):
         self._execute_timeout_s = execute_timeout_s
         self._cancel_timeout_s = cancel_timeout_s
         self._post_check = post_check
+        self._validator_registry = validator_registry
+        self._template = template
 
         self._response: dict[str, Any] | None = None
         self._transport_error: ControlChannelError | None = None
@@ -2198,7 +2296,16 @@ class _RequestExecutionHandle(ExecutionHandle):
                     self._output_dirs,
                     self._execution_id,
                     finished_at,
+                    validator_registry=self._validator_registry,
+                    template=self._template,
                 )
+            except ArtifactValidationError as e:
+                output_bindings = getattr(
+                    e, "partial_bindings", {}) or {}
+                if failure_phase is None:
+                    failure_phase = (
+                        runtime.FAILURE_OUTPUT_VALIDATE)
+                    error = f"output_validate: {e}"
             except Exception as e:
                 if failure_phase is None:
                     failure_phase = (
@@ -2303,6 +2410,7 @@ class RequestResponseExecutor:
         cancel_timeout_s: float = 5.0,
         post_checks: (
             dict[str, "PostCheckCallable"] | None) = None,
+        validator_registry: ArtifactValidatorRegistry | None = None,
     ):
         """Initialize with a template and optional dependencies.
 
@@ -2332,6 +2440,11 @@ class RequestResponseExecutor:
                 ``runner: container`` blocks.  Callers pass
                 ``block_registry.post_checks`` here; an empty /
                 ``None`` dict disables the invocation.
+            validator_registry: Project-supplied artifact
+                validator registry consulted by
+                :func:`_collect_outputs` for every request this
+                executor finalizes.  Optional; see
+                :mod:`flywheel.artifact_validator` for semantics.
         """
         self._template = template
         self._overrides = overrides
@@ -2344,6 +2457,7 @@ class RequestResponseExecutor:
         self._cancel_timeout_s = cancel_timeout_s
         self._post_checks: dict[str, PostCheckCallable] = (
             dict(post_checks) if post_checks else {})
+        self._validator_registry = validator_registry
 
         self._runtimes: dict[str, _RuntimeHandle] = {}
         self._registry_lock = threading.Lock()
@@ -2514,6 +2628,8 @@ class RequestResponseExecutor:
             execute_timeout_s=self._execute_timeout_s,
             cancel_timeout_s=self._cancel_timeout_s,
             post_check=self._post_checks.get(block_name),
+            validator_registry=self._validator_registry,
+            template=self._template,
         )
 
     def shutdown(

@@ -13,6 +13,10 @@ from flywheel.artifact import (
     BlockExecution,
     LifecycleEvent,
 )
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
 from flywheel.template import Template
 from flywheel.validation import validate_name
 from flywheel.workspace import Workspace
@@ -370,17 +374,14 @@ class TestAddExecution:
 
 
 class TestRegisterArtifact:
-    def test_register_file(self, tmp_path: Path):
+    def test_file_source_rejected(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
         bot_file = tmp_path / "bot.py"
         bot_file.write_text("def player_fn(): pass")
 
-        inst = ws.register_artifact("checkpoint", bot_file)
-
-        target = ws.path / "artifacts" / inst.id / "bot.py"
-        assert target.exists()
-        assert target.read_text() == "def player_fn(): pass"
+        with pytest.raises(ValueError, match="must be a directory"):
+            ws.register_artifact("checkpoint", bot_file)
 
     def test_register_directory(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -395,6 +396,24 @@ class TestRegisterArtifact:
         target = ws.path / "artifacts" / inst.id
         assert (target / "bot.py").exists()
         assert (target / "helpers.py").exists()
+
+    def test_register_single_file_via_wrapper_directory(
+        self, tmp_path: Path,
+    ):
+        # Canonical pattern for callers that have a single file:
+        # wrap it in a directory and register that.  This makes
+        # the artifact's structure explicit at the call site.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        wrapper = tmp_path / "wrap"
+        wrapper.mkdir()
+        (wrapper / "bot.py").write_text("def player_fn(): pass")
+
+        inst = ws.register_artifact("checkpoint", wrapper)
+
+        target = ws.path / "artifacts" / inst.id / "bot.py"
+        assert target.exists()
+        assert target.read_text() == "def player_fn(): pass"
 
     def test_undeclared_name_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -424,10 +443,13 @@ class TestRegisterArtifact:
     def test_artifact_instance_fields(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "data.bin"
-        f.write_bytes(b"\x00")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "data.bin").write_bytes(b"\x00")
 
-        inst = ws.register_artifact("checkpoint", f, source="test import")
+        inst = ws.register_artifact(
+            "checkpoint", src, source="test import",
+        )
 
         assert inst.name == "checkpoint"
         assert inst.kind == "copy"
@@ -439,10 +461,11 @@ class TestRegisterArtifact:
     def test_default_source(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "bot.py"
-        f.write_text("pass")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-        inst = ws.register_artifact("checkpoint", f)
+        inst = ws.register_artifact("checkpoint", src)
 
         assert inst.source is not None
         assert "imported from" in inst.source
@@ -450,16 +473,105 @@ class TestRegisterArtifact:
     def test_round_trip_with_source(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "bot.py"
-        f.write_text("pass")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-        inst = ws.register_artifact("checkpoint", f, source="from agent")
+        inst = ws.register_artifact(
+            "checkpoint", src, source="from agent",
+        )
         loaded = Workspace.load(ws.path)
 
         assert inst.id in loaded.artifacts
         loaded_inst = loaded.artifacts[inst.id]
         assert loaded_inst.source == "from agent"
-        assert loaded_inst.produced_by is None
+
+    def test_validator_passes_through(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+
+        seen: list[Path] = []
+
+        def validator(name, decl, path):
+            seen.append(path)
+            # The validator sees a flywheel-owned staging
+            # directory, not the operator's source path, and
+            # the directory contains the file shaped exactly
+            # as it will appear in the committed artifact.
+            assert path.is_dir()
+            assert path != src
+            assert (path / "bot.py").read_text() == "pass"
+
+        registry = ArtifactValidatorRegistry(
+            {"checkpoint": validator},
+        )
+        inst = ws.register_artifact(
+            "checkpoint", src, validator_registry=registry,
+        )
+        assert inst.id in ws.artifacts
+        assert len(seen) == 1
+        # On success the staging directory is renamed into the
+        # canonical artifact directory; the staging path the
+        # validator saw is gone, and the bytes now live at
+        # artifacts/<inst.id>/.
+        assert not seen[0].exists()
+        canonical = ws.path / "artifacts" / inst.id
+        assert (canonical / "bot.py").read_text() == "pass"
+
+    def test_validator_rejection_aborts_import(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("nope")
+
+        registry = ArtifactValidatorRegistry({"checkpoint": reject})
+        with pytest.raises(ArtifactValidationError, match="nope"):
+            ws.register_artifact(
+                "checkpoint", src, validator_registry=registry,
+            )
+
+        # Workspace state is untouched: no checkpoint
+        # artifact, no canonical checkpoint dir, and no
+        # leftover staging dir under artifacts/.  (The git
+        # baseline created on workspace creation is still
+        # present — it predates this call.)
+        assert ws.instances_for("checkpoint") == []
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("checkpoint@")
+            or d.name.startswith("_staging-checkpoint-")
+        ]
+        assert leftover == []
+
+        # The operator's source path is also untouched.
+        assert (src / "bot.py").read_text() == "pass"
+
+    def test_validator_skipped_when_no_registration(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+
+        # Registry exists but has no validator for this name —
+        # import should still succeed.
+        registry = ArtifactValidatorRegistry()
+        inst = ws.register_artifact(
+            "checkpoint", src, validator_registry=registry,
+        )
+        assert inst.id in ws.artifacts
 
 
 class TestNameValidation:

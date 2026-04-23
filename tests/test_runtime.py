@@ -63,6 +63,7 @@ class TestFailurePhases:
         assert runtime.FAILURE_INVOKE == "invoke"
         assert runtime.FAILURE_STATE_CAPTURE == "state_capture"
         assert runtime.FAILURE_OUTPUT_COLLECT == "output_collect"
+        assert runtime.FAILURE_OUTPUT_VALIDATE == "output_validate"
         assert runtime.FAILURE_ARTIFACT_COMMIT == "artifact_commit"
 
     def test_failure_phases_set_contains_all_named(self):
@@ -74,6 +75,7 @@ class TestFailurePhases:
             runtime.FAILURE_INVOKE,
             runtime.FAILURE_STATE_CAPTURE,
             runtime.FAILURE_OUTPUT_COLLECT,
+            runtime.FAILURE_OUTPUT_VALIDATE,
             runtime.FAILURE_ARTIFACT_COMMIT,
         }
         assert expected == runtime.FAILURE_PHASES

@@ -7,6 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+from flywheel import runtime
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
 from flywheel.container import ContainerResult
 from flywheel.execution import run_block
 from flywheel.template import Template
@@ -499,3 +504,99 @@ class TestFailureCleanup:
         assert len(engine_instances) == 2
         engine_id = ex.input_bindings["engine"]
         assert engine_id in ws.artifacts
+
+
+class TestArtifactValidation:
+    """``run_block`` artifact-validator integration (commit-A)."""
+
+    def test_validator_pass_commits_output(self, tmp_path: Path):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "add workspace")
+
+        seen: list[tuple[str, Path]] = []
+
+        def validator(name, decl, path):
+            seen.append((name, path))
+
+        registry = ArtifactValidatorRegistry({"checkpoint": validator})
+
+        fake_run = _fake_run_with_output({"model.pt": "weights"})
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(
+                ws, "train", template, project_root,
+                validator_registry=registry,
+            )
+
+        assert len(seen) == 1
+        name, path = seen[0]
+        assert name == "checkpoint"
+        assert path.name.startswith("checkpoint@")
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "succeeded"
+        assert "checkpoint" in ex.output_bindings
+
+    def test_validator_rejection_records_failure(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "add workspace")
+
+        def reject(name, decl, path):
+            raise ArtifactValidationError("checkpoint missing")
+
+        registry = ArtifactValidatorRegistry({"checkpoint": reject})
+
+        fake_run = _fake_run_with_output({"model.pt": "weights"})
+        with (
+            patch(
+                "flywheel.execution.run_container",
+                side_effect=fake_run,
+            ),
+            pytest.raises(
+                ArtifactValidationError,
+                match="checkpoint missing",
+            ),
+        ):
+            run_block(
+                ws, "train", template, project_root,
+                validator_registry=registry,
+            )
+
+        # No checkpoint instance committed; execution recorded
+        # as failed with the validation phase.
+        assert ws.instances_for("checkpoint") == []
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "failed"
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert "checkpoint missing" in (ex.error or "")
+        assert ex.output_bindings == {}
+
+        # Reject path is cleaned up.
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("checkpoint@")
+        ]
+        assert leftover == []
+
+    def test_no_validator_registered_skips(self, tmp_path: Path):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "add workspace")
+
+        # Registry exists, but checkpoint is not registered: this
+        # is the documented "no validator => accepted" path.
+        registry = ArtifactValidatorRegistry()
+
+        fake_run = _fake_run_with_output({"model.pt": "weights"})
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(
+                ws, "train", template, project_root,
+                validator_registry=registry,
+            )
+
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "succeeded"
+        assert "checkpoint" in ex.output_bindings

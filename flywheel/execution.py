@@ -12,7 +12,12 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+from flywheel import runtime
 from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
 from flywheel.container import ContainerConfig, ContainerResult, run_container
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
@@ -174,6 +179,8 @@ def _record_execution(
     output_bindings: dict[str, str],
     exit_code: int | None, elapsed_s: float | None,
     image: str,
+    failure_phase: str | None = None,
+    error: str | None = None,
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -188,6 +195,11 @@ def _record_execution(
         exit_code: The container's exit code, if available.
         elapsed_s: Wall-clock time in seconds, if available.
         image: The Docker image that was used.
+        failure_phase: Which step of the pipeline failed.  Set
+            only when status is ``"failed"``.  See
+            :mod:`flywheel.runtime` for the canonical constants.
+        error: Human-readable error message recorded alongside
+            ``failure_phase`` for failed executions.
     """
     execution = BlockExecution(
         id=execution_id,
@@ -200,6 +212,8 @@ def _record_execution(
         exit_code=exit_code,
         elapsed_s=elapsed_s,
         image=image,
+        failure_phase=failure_phase,
+        error=error,
     )
     workspace.add_execution(execution)
     workspace.save()
@@ -212,6 +226,8 @@ def run_block(
     project_root: Path,
     input_bindings: dict[str, str] | None = None,
     args: list[str] | None = None,
+    *,
+    validator_registry: ArtifactValidatorRegistry | None = None,
 ) -> ContainerResult:
     """Execute a block within a workspace.
 
@@ -236,6 +252,11 @@ def run_block(
             artifact instance IDs. Each bound artifact must belong to
             the same declaration as the slot it is bound to.
         args: Optional extra arguments for the container entrypoint.
+        validator_registry: Project-supplied artifact validator
+            registry consulted before each output slot is committed.
+            See :mod:`flywheel.artifact_validator` for semantics.
+            Optional: when omitted, outputs are committed without
+            validation.
 
     Returns:
         A ContainerResult with exit code and wall-clock elapsed seconds.
@@ -248,6 +269,11 @@ def run_block(
         RuntimeError: If the container exits with non-zero code or
             a git repo has uncommitted changes.
         FileNotFoundError: If a git artifact path does not exist.
+        flywheel.artifact_validator.ArtifactValidationError: If a
+            project-declared validator rejects one or more output
+            slots.  The execution is recorded ``failed`` with
+            ``failure_phase=output_validate`` and the slots that
+            passed validation are still committed (commit-A).
     """
     if input_bindings is None:
         input_bindings = {}
@@ -385,24 +411,72 @@ def run_block(
             f"{result.exit_code}"
         )
 
-    # 7. Record output artifact instances (convention-based)
+    # 7. Record output artifact instances (convention-based).
+    #    Validate per-slot before commit.  Commit-A semantics:
+    #    slots that pass land in ``output_bindings`` and the
+    #    execution is recorded ``succeeded``; slots that fail
+    #    are not committed and the execution is recorded
+    #    ``failed`` with ``failure_phase=output_validate``.
+    declarations = {a.name: a for a in template.artifacts}
     output_bindings: dict[str, str] = {}
+    rejection_messages: list[str] = []
     for slot in block_def.outputs:
         artifact_id = output_artifact_ids[slot.name]
         output_dir = workspace.path / "artifacts" / artifact_id
-        if any(output_dir.iterdir()):
-            instance = ArtifactInstance(
-                id=artifact_id,
-                name=slot.name,
-                kind="copy",
-                created_at=finished_at,
-                produced_by=execution_id,
-                copy_path=artifact_id,
-            )
-            workspace.add_artifact(instance)
-            output_bindings[slot.name] = artifact_id
+        if not any(output_dir.iterdir()):
+            continue
+        if validator_registry is not None:
+            try:
+                validator_registry.validate(
+                    slot.name,
+                    declarations.get(slot.name),
+                    output_dir,
+                )
+            except ArtifactValidationError as exc:
+                rejection_messages.append(
+                    f"{slot.name}: {exc}",
+                )
+                # Reject this slot's pre-allocated dir so we
+                # don't leave half-committed artifact storage
+                # behind.
+                if output_dir.exists():
+                    shutil.rmtree(output_dir)
+                continue
+        instance = ArtifactInstance(
+            id=artifact_id,
+            name=slot.name,
+            kind="copy",
+            created_at=finished_at,
+            produced_by=execution_id,
+            copy_path=artifact_id,
+        )
+        workspace.add_artifact(instance)
+        output_bindings[slot.name] = artifact_id
 
-    # 8. Record successful execution and save
+    # Clean up any pre-allocated dirs that never received
+    # content (matches the prior behavior).
+    for slot in block_def.outputs:
+        artifact_id = output_artifact_ids[slot.name]
+        if artifact_id in output_bindings:
+            continue
+        leftover = workspace.path / "artifacts" / artifact_id
+        if leftover.exists() and not any(leftover.iterdir()):
+            shutil.rmtree(leftover)
+
+    # 8. Record execution and save.
+    if rejection_messages:
+        error_msg = (
+            f"output_validate: {'; '.join(rejection_messages)}"
+        )
+        _record_execution(
+            workspace, execution_id, block_name, started_at,
+            "failed", resolved_bindings, output_bindings,
+            result.exit_code, result.elapsed_s, block_def.image,
+            failure_phase=runtime.FAILURE_OUTPUT_VALIDATE,
+            error=error_msg,
+        )
+        raise ArtifactValidationError(error_msg)
+
     _record_execution(
         workspace, execution_id, block_name, started_at,
         "succeeded", resolved_bindings, output_bindings,

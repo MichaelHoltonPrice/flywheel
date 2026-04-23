@@ -19,7 +19,7 @@ Four commands form the supported user-facing surface:
 | Command | Purpose | Doc |
 | --- | --- | --- |
 | `flywheel create workspace` | Materialize a fresh workspace from a template. | [docs/cli/create-workspace.md](docs/cli/create-workspace.md) |
-| `flywheel import artifact` | Register an external file or directory as a workspace artifact instance. | (per-command doc not yet written) |
+| `flywheel import artifact` | Register an external directory as a workspace artifact instance (wrap single files first). | [docs/cli/import-artifact.md](docs/cli/import-artifact.md) |
 | `flywheel run block` | Execute one block ad hoc against a workspace. | (per-command doc not yet written) |
 | `flywheel run pattern` | Execute a declarative multi-instance pattern against a workspace. | (per-command doc not yet written) |
 
@@ -252,9 +252,10 @@ Before committing, also run a review pass to check for:
 * [docs/architecture.md](docs/architecture.md) — implementation
   decisions.
 * [docs/executors.md](docs/executors.md) — executor reference.
-* [docs/cli/](docs/cli/) — per-command reference. Currently
-  only `create-workspace.md`; the rest land as each command's
-  foundation work is pinned.
+* [docs/cli/](docs/cli/) — per-command reference. Today
+  covers `create workspace` and `import artifact`; the
+  remaining commands land as each one's foundation work is
+  pinned.
 * [`tests/integration/README.md`](tests/integration/README.md) —
   integration test conventions.
 * [`flywheel/cli.py`](flywheel/cli.py) — the canonical source for

@@ -66,7 +66,11 @@ def main(argv: list[str] | None = None) -> None:
     import_art_parser.add_argument("--name", required=True)
     import_art_parser.add_argument(
         "--from", dest="source_path", required=True,
-        help="Path to the file or directory to import.",
+        help=(
+            "Path to the directory whose contents become the new "
+            "artifact instance.  Must be a directory; wrap a "
+            "single file in a directory and pass that."
+        ),
     )
     import_art_parser.add_argument(
         "--source", default=None,
@@ -305,23 +309,52 @@ def import_artifact(
     source_path: str,
     source: str | None,
 ) -> None:
-    """Import an external file or directory as a workspace artifact.
+    """Import an external directory as a workspace artifact.
+
+    Artifact instances are always directory-shaped (mirroring
+    block output slots), so ``source_path`` must be a directory;
+    callers with a single file should wrap it in a directory
+    first.
 
     Args:
         workspace_path: Path to the workspace directory.
         name: Artifact declaration name.
-        source_path: Path to the file or directory to import.
+        source_path: Path to the directory whose contents
+            become the new artifact instance.
         source: Free-text provenance description.
 
     Raises:
         ValueError: If the workspace YAML is malformed, the artifact
-            name is not declared, or it is not a copy artifact.
+            name is not declared, it is not a copy artifact, or
+            ``source_path`` is not a directory.
         FileNotFoundError: If the workspace or source path does not
             exist.
+        flywheel.artifact_validator.ArtifactValidationError: If the
+            project registered a validator for ``name`` and the
+            source fails it.
     """
+    config = load_project_config(Path.cwd())
     ws = Workspace.load(Path(workspace_path))
+    validator_registry = config.load_artifact_validator_registry()
+    declaration = None
+    template_name = ws.template_name
+    if template_name:
+        template_path = (
+            config.templates_dir / f"{template_name}.yaml"
+        )
+        if template_path.is_file():
+            template = Template.from_yaml(
+                template_path,
+                block_registry=config.load_block_registry(),
+            )
+            for decl in template.artifacts:
+                if decl.name == name:
+                    declaration = decl
+                    break
     instance = ws.register_artifact(
         name, Path(source_path), source=source,
+        validator_registry=validator_registry,
+        declaration=declaration,
     )
     print(f"Imported {name!r} as {instance.id!r}")
 
@@ -360,10 +393,12 @@ def run_block_command(
     )
 
     ws = Workspace.load(Path(workspace_path))
+    validator_registry = config.load_artifact_validator_registry()
     result = run_block(
         ws, block_name, template, config.project_root,
         input_bindings=bindings or None,
         args=extra_args or None,
+        validator_registry=validator_registry,
     )
     print(
         f"Block {block_name!r} completed: "

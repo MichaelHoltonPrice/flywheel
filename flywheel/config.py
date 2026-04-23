@@ -7,10 +7,13 @@ changes happen in one place.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+from flywheel.artifact_validator import ArtifactValidatorRegistry
 
 CONFIG_FILENAME = "flywheel.yaml"
 
@@ -29,11 +32,21 @@ class ProjectConfig:
             :func:`flywheel.project_hooks.load_project_hooks_class`.
             Optional: a pure-pattern project that needs no
             project-side resource setup may omit it.
+        artifact_validators: Optional Python import path for a
+            zero-arg factory that returns an
+            :class:`flywheel.artifact_validator.ArtifactValidatorRegistry`,
+            in the form ``module.path:factory_name``.  The
+            registry is consulted at every artifact-finalization
+            site (``flywheel import artifact`` and post-block
+            output collection).  Optional: when omitted,
+            :meth:`load_artifact_validator_registry` returns an
+            empty registry that accepts everything.
     """
 
     project_root: Path
     foundry_dir: Path
     project_hooks: str | None = None
+    artifact_validators: str | None = None
 
     @property
     def templates_dir(self) -> Path:
@@ -75,6 +88,52 @@ class ProjectConfig:
         # Local import to avoid a config → blocks → template cycle.
         from flywheel.blocks.registry import BlockRegistry
         return BlockRegistry.from_directory(self.blocks_dir)
+
+    def load_artifact_validator_registry(
+        self,
+    ) -> ArtifactValidatorRegistry:
+        """Resolve the project's artifact validator registry.
+
+        Returns an empty registry (which accepts every name)
+        when ``artifact_validators`` is unset.  When set, the
+        configured ``module.path:factory`` is imported and
+        called with no arguments; the result must be an
+        :class:`ArtifactValidatorRegistry` instance.
+
+        Raises:
+            ValueError: If the import path is malformed, the
+                factory is not callable, or the factory returns
+                something other than an
+                :class:`ArtifactValidatorRegistry`.
+            ImportError: If the named module cannot be imported.
+            AttributeError: If the named attribute does not
+                exist on the imported module.
+        """
+        import_path = self.artifact_validators
+        if import_path is None:
+            return ArtifactValidatorRegistry()
+        if ":" not in import_path:
+            raise ValueError(
+                f"'artifact_validators' import path must be "
+                f"'module.path:factory_name', got "
+                f"{import_path!r}"
+            )
+        module_path, attr_name = import_path.rsplit(":", 1)
+        module = importlib.import_module(module_path)
+        factory = getattr(module, attr_name)
+        if not callable(factory):
+            raise ValueError(
+                f"'artifact_validators' target {import_path!r} "
+                f"resolved to a non-callable {type(factory).__name__}"
+            )
+        registry = factory()
+        if not isinstance(registry, ArtifactValidatorRegistry):
+            raise ValueError(
+                f"'artifact_validators' factory {import_path!r} "
+                f"returned {type(registry).__name__}, expected "
+                f"ArtifactValidatorRegistry"
+            )
+        return registry
 
 
 def load_project_config(project_root: Path) -> ProjectConfig:
@@ -151,8 +210,18 @@ def load_project_config(project_root: Path) -> ProjectConfig:
             f"{type(project_hooks).__name__}"
         )
 
+    artifact_validators = data.get("artifact_validators")
+    if artifact_validators is not None and not isinstance(
+            artifact_validators, str):
+        raise ValueError(
+            f"'artifact_validators' in {config_path} must be a "
+            f"string in the form 'module.path:factory_name', "
+            f"got {type(artifact_validators).__name__}"
+        )
+
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
         project_hooks=project_hooks,
+        artifact_validators=artifact_validators,
     )
