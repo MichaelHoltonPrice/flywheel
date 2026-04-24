@@ -20,6 +20,7 @@ from flywheel.artifact_validator import (
     ArtifactValidationError,
     ArtifactValidatorRegistry,
 )
+from flywheel.run_record import RunMemberRecord, RunStepRecord
 from flywheel.template import Template
 from flywheel.validation import validate_name
 from flywheel.workspace import Workspace
@@ -1107,6 +1108,39 @@ class TestRuns:
         assert loaded.runs[record.id].config_snapshot == {"n": 3}
         assert loaded.runs[record.id].status == "succeeded"
 
+    def test_record_run_step_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:train-eval")
+
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="train",
+                min_successes="all",
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="train_dueling",
+                        block_name="train",
+                        status="succeeded",
+                        execution_id="exec_1",
+                        output_bindings={"checkpoint": "checkpoint@1"},
+                    )
+                ],
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        loaded = Workspace.load(ws.path)
+        step = loaded.runs[record.id].steps[0]
+        assert step.name == "train"
+        assert step.min_successes == "all"
+        assert step.members[0].execution_id == "exec_1"
+        assert step.members[0].output_bindings == {
+            "checkpoint": "checkpoint@1"
+        }
+
     def test_load_without_runs_key(self, tmp_path: Path):
         """Old workspace.yaml without runs key loads to empty dict."""
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -1198,7 +1232,12 @@ def _setup_incremental_project(
     return project_root, foundry_dir, template
 
 
-@pytest.mark.skip(reason="Incremental artifact kind has been excised; will be replaced by tagging system")
+@pytest.mark.skip(
+    reason=(
+        "Incremental artifact kind has been excised; will be "
+        "replaced by tagging system"
+    )
+)
 class TestIncrementalArtifacts:
     """Tests for the incremental artifact kind."""
 

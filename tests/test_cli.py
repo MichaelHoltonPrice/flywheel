@@ -9,6 +9,8 @@ import pytest
 
 from flywheel.artifact import BlockExecution, RejectedOutput
 from flywheel.cli import _parse_bindings, create_workspace, main
+from flywheel.config import load_project_config
+from flywheel.container import ContainerResult
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
@@ -545,11 +547,93 @@ class TestMainRunBlock:
 
 
 def _write_pattern(project_root: Path, name: str, body: str) -> Path:
-    patterns_dir = project_root / "patterns"
-    patterns_dir.mkdir(exist_ok=True)
+    patterns_dir = project_root / "foundry" / "patterns"
+    patterns_dir.mkdir(parents=True, exist_ok=True)
     path = patterns_dir / f"{name}.yaml"
     path.write_text(body)
     return path
+
+
+def test_run_pattern_uses_canonical_block_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    project_root = make_project(tmp_path)
+    (project_root / "workforce" / "blocks" / "train.yaml").write_text("""\
+name: train
+image: cyberloop-train:latest
+inputs:
+  - name: checkpoint
+    optional: true
+outputs: [checkpoint]
+""")
+    subprocess.run(
+        ["git", "-C", str(project_root), "add", "."],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_root), "commit", "-m", "adjust train"],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.chdir(project_root)
+    main(["create", "workspace", "--name", "ws",
+          "--template", "my_template"])
+    _write_pattern(project_root, "train_eval", """\
+name: train_eval
+steps:
+  - name: train
+    cohort:
+      min_successes: all
+      members:
+        - name: train_dueling
+          block: train
+  - name: eval
+    cohort:
+      min_successes: all
+      members:
+        - name: eval_dueling
+          block: eval
+          inputs:
+            checkpoint:
+              from_step: train
+              member: train_dueling
+              output: checkpoint
+""")
+
+    def fake_run_container(config, args=None):
+        del args
+        for host, container_path, mode in config.mounts:
+            if mode != "rw":
+                continue
+            path = Path(host)
+            if container_path == "/flywheel":
+                (path / "termination").write_text("normal")
+            elif container_path.endswith("checkpoint"):
+                (path / "checkpoint.pt").write_text("weights")
+            elif container_path.endswith("score"):
+                (path / "score.json").write_text('{"mean": 1.0}')
+        return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+    with patch(
+        "flywheel.execution.run_container",
+        side_effect=fake_run_container,
+    ):
+        main([
+            "run", "pattern", "train_eval",
+            "--workspace",
+            str(project_root / "foundry" / "workspaces" / "ws"),
+            "--template", "my_template",
+        ])
+
+    ws = Workspace.load(project_root / "foundry" / "workspaces" / "ws")
+    run = next(iter(ws.runs.values()))
+    assert run.status == "succeeded"
+    assert [step.name for step in run.steps] == ["train", "eval"]
+    assert {execution.block_name for execution in ws.executions.values()} == {
+        "train", "eval",
+    }
 
 
 @pytest.mark.skip(
@@ -737,7 +821,8 @@ roles:
       kind: continuous
 """)
 
-        sentinel = lambda _block_def: object()
+        def sentinel(_block_def):
+            return object()
 
         class _Hooks:
             def init(self, ws, template, pr, args):
@@ -836,19 +921,17 @@ class TestProjectConfigFields:
     def test_project_hooks_parsed(
         self, tmp_path: Path,
     ):
-        from flywheel.config import load_project_config
         (tmp_path / "flywheel.yaml").write_text(
             "foundry_dir: foundry\n"
             "project_hooks: my.module:Hooks\n"
         )
         cfg = load_project_config(tmp_path)
         assert cfg.project_hooks == "my.module:Hooks"
-        assert cfg.patterns_dir == tmp_path / "patterns"
+        assert cfg.patterns_dir == tmp_path / "foundry" / "patterns"
 
     def test_project_hooks_wrong_type_raises(
         self, tmp_path: Path,
     ):
-        from flywheel.config import load_project_config
         (tmp_path / "flywheel.yaml").write_text(
             "foundry_dir: foundry\n"
             "project_hooks: 42\n"

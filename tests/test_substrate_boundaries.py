@@ -1,4 +1,4 @@
-"""Boundary guards for substrate code and unsupported pattern execution."""
+"""Boundary guards for substrate code and pattern execution."""
 
 from __future__ import annotations
 
@@ -6,9 +6,6 @@ import ast
 import inspect
 from dataclasses import fields
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 from flywheel import cli
 from flywheel.artifact import BlockExecution
@@ -46,21 +43,8 @@ HIGHER_LAYER_MODULES = {
 }
 
 
-def test_run_pattern_is_unavailable_before_loading_project_config():
-    """The CLI must not load project configuration for unsupported commands."""
-    with patch(
-        "flywheel.cli.load_project_config",
-        side_effect=AssertionError("project config should not load"),
-    ), pytest.raises(NotImplementedError, match="not currently supported"):
-        cli.main([
-            "run", "pattern", "demo",
-            "--workspace", "foundry/workspaces/ws",
-            "--template", "template",
-        ])
-
-
 def test_run_pattern_command_does_not_reference_higher_layer_runners():
-    """The unsupported command must not import pattern/battery runners."""
+    """The pattern command must not import battery runners."""
     source = inspect.getsource(cli.run_pattern_command)
     forbidden = [
         "AgentExecutor",

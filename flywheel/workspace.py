@@ -27,10 +27,10 @@ from flywheel.artifact import (
     LifecycleEvent,
     RejectedOutput,
     RejectionRef,
-    RunRecord,
     SupersedesRef,
 )
 from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.run_record import RunMemberRecord, RunRecord, RunStepRecord
 from flywheel.runtime import FAILURE_PHASES
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.termination import derive_status
@@ -128,6 +128,74 @@ def _rejected_outputs_from_yaml(
             phase=rec.get("phase", "output_validate"),
         )
     return out
+
+
+def _run_member_to_yaml(member: RunMemberRecord) -> dict:
+    """Serialize a run member result for ``workspace.yaml``."""
+    entry: dict[str, Any] = {
+        "name": member.name,
+        "block_name": member.block_name,
+        "status": member.status,
+    }
+    if member.execution_id is not None:
+        entry["execution_id"] = member.execution_id
+    if member.output_bindings:
+        entry["output_bindings"] = dict(member.output_bindings)
+    if member.error is not None:
+        entry["error"] = member.error
+    return entry
+
+
+def _run_step_to_yaml(step: RunStepRecord) -> dict:
+    """Serialize a run step result for ``workspace.yaml``."""
+    return {
+        "name": step.name,
+        "min_successes": step.min_successes,
+        "status": step.status,
+        "members": [
+            _run_member_to_yaml(member) for member in step.members
+        ],
+    }
+
+
+def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
+    """Deserialize run step results from ``workspace.yaml``."""
+    if entry is None:
+        return []
+    if not isinstance(entry, list):
+        raise ValueError(
+            f"Run steps must be a list, got {type(entry).__name__}"
+        )
+    steps: list[RunStepRecord] = []
+    for raw_step in entry:
+        if not isinstance(raw_step, dict):
+            raise ValueError(
+                "Run step entries must be mappings, got "
+                f"{type(raw_step).__name__}"
+            )
+        members: list[RunMemberRecord] = []
+        for raw_member in raw_step.get("members", []):
+            if not isinstance(raw_member, dict):
+                raise ValueError(
+                    "Run member entries must be mappings, got "
+                    f"{type(raw_member).__name__}"
+                )
+            members.append(RunMemberRecord(
+                name=raw_member["name"],
+                block_name=raw_member["block_name"],
+                status=raw_member["status"],
+                execution_id=raw_member.get("execution_id"),
+                output_bindings=dict(
+                    raw_member.get("output_bindings", {})),
+                error=raw_member.get("error"),
+            ))
+        steps.append(RunStepRecord(
+            name=raw_step["name"],
+            min_successes=raw_step["min_successes"],
+            status=raw_step["status"],
+            members=members,
+        ))
+    return steps
 
 
 @dataclass
@@ -432,9 +500,47 @@ class Workspace:
                     if config_snapshot else None),
             )
             self.runs[candidate] = record
-            return record
+        self.save()
+        return record
 
-    def end_run(self, run_id: str, status: str) -> RunRecord:
+    def record_run_step(
+        self,
+        run_id: str,
+        step: RunStepRecord,
+    ) -> RunRecord:
+        """Append one step result to a running run."""
+        with self._lock:
+            current = self.runs.get(run_id)
+            if current is None:
+                raise KeyError(
+                    f"run {run_id!r} is not known to this "
+                    f"workspace"
+                )
+            if current.status != "running":
+                raise ValueError(
+                    f"record_run_step: run {run_id!r} is already "
+                    f"terminal (status={current.status!r})"
+                )
+            if any(existing.name == step.name for existing in current.steps):
+                raise ValueError(
+                    f"record_run_step: run {run_id!r} already has "
+                    f"a step named {step.name!r}"
+                )
+            updated = replace(
+                current,
+                steps=[*current.steps, step],
+            )
+            self.runs[run_id] = updated
+        self.save()
+        return updated
+
+    def end_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> RunRecord:
         """Close an open run and update its status.
 
         Thread-safe.  Replaces the existing :class:`RunRecord`
@@ -445,6 +551,7 @@ class Workspace:
         Args:
             run_id: The run to close.
             status: Terminal status.
+            error: Optional run-level error summary.
 
         Returns:
             The updated :class:`RunRecord`.
@@ -456,11 +563,11 @@ class Workspace:
                 (double-close).
         """
         if status not in (
-                "succeeded", "failed", "stopped"):
+                "succeeded", "failed", "stopped", "interrupted"):
             raise ValueError(
                 f"end_run: status {status!r} is not terminal; "
                 f"expected one of "
-                f"('succeeded', 'failed', 'stopped')"
+                f"('succeeded', 'failed', 'stopped', 'interrupted')"
             )
         with self._lock:
             current = self.runs.get(run_id)
@@ -479,9 +586,11 @@ class Workspace:
                 current,
                 finished_at=datetime.now(UTC),
                 status=status,
+                error=error,
             )
             self.runs[run_id] = updated
-            return updated
+        self.save()
+        return updated
 
     def events_for(self, kind: str) -> list[LifecycleEvent]:
         """Return all lifecycle events of a given kind, ordered by timestamp.
@@ -1090,6 +1199,8 @@ class Workspace:
                     if finished else None),
                 status=entry.get("status", "running"),
                 config_snapshot=entry.get("config_snapshot"),
+                steps=_run_steps_from_yaml(entry.get("steps")),
+                error=entry.get("error"),
             )
 
         return cls(
@@ -1189,6 +1300,12 @@ class Workspace:
                         run.finished_at.isoformat())
                 if run.config_snapshot is not None:
                     entry["config_snapshot"] = run.config_snapshot
+                if run.steps:
+                    entry["steps"] = [
+                        _run_step_to_yaml(step) for step in run.steps
+                    ]
+                if run.error is not None:
+                    entry["error"] = run.error
                 serialized_runs[rid] = entry
 
             data: dict = {

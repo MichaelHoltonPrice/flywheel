@@ -284,53 +284,6 @@ class BlockExecution:
 
 
 @dataclass(frozen=True)
-class RunRecord:
-    """A durable grouping of related block executions.
-
-    Run-level metadata lives here rather than on
-    :class:`BlockExecution`.  Block executions do not carry
-    run-specific fields.
-
-    A workspace can hold many runs.  Ad hoc work (direct
-    ``flywheel run block`` calls, or tests exercising execution
-    in isolation) does not create a ``RunRecord``.
-
-    Attributes:
-        id: Unique identifier within the workspace
-            (e.g., ``"run_a3f7b2e1"``).
-        kind: What opened this run.  Convention:
-            ``"pattern:<name>"`` for pattern-driven runs
-            (e.g., ``"pattern:play-brainstorm"``).  Ad-hoc
-            CLI invocations do not open a run, so there is
-            no ``"ad_hoc"`` kind today; future operator-
-            initiated groupings may add their own kinds.
-        started_at: When the run opened.
-        finished_at: When the run closed, or ``None`` if still
-            running.  An interrupted host process leaves the
-            record as ``"running"`` with ``finished_at=None``
-            until a reconciliation or resume command touches
-            it.
-        status: ``"running"``, ``"succeeded"``, ``"failed"``,
-            ``"stopped"``.  Set to ``"running"`` on open; close
-            through the workspace run APIs.
-        config_snapshot: Optional free-form mapping the caller
-            records alongside the run for later inspection
-            (model names, budgets, pattern overrides, etc.).
-            ``None`` when the caller had nothing worth
-            capturing.
-    """
-
-    id: str
-    kind: str
-    started_at: datetime
-    finished_at: datetime | None = None
-    status: Literal[
-        "running", "succeeded", "failed", "stopped"
-    ] = "running"
-    config_snapshot: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
 class LifecycleEvent:
     """An operational event recorded in the workspace.
 

@@ -10,9 +10,7 @@ Supports:
         [--input-artifact NAME=ARTIFACT_ID ...]
         [-- container override args...]
     flywheel run pattern PATTERN_NAME --workspace PATH
-        --template TEMPLATE [--project-hooks MODULE:CLASS]
-        [--model MODEL] [--max-runtime SECONDS]
-        [-- project-specific args...]
+        --template TEMPLATE
     flywheel import artifact --workspace PATH --name NAME
         --from SOURCE [--source TEXT]
     flywheel fix execution --workspace PATH --execution EXEC_ID
@@ -20,7 +18,8 @@ Supports:
     flywheel amend artifact --workspace PATH --artifact ARTIFACT_ID
         --from SOURCE_DIR [--reason TEXT]
 
-Pattern execution is not currently supported by this CLI.
+Pattern execution runs declared cohorts through canonical block
+execution.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ from flywheel.artifact import RejectionRef, SupersedesRef
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
+from flywheel.pattern_declaration import PatternDeclaration
+from flywheel.pattern_execution import PatternRunError, run_pattern
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
 
@@ -208,36 +209,9 @@ def main(argv: list[str] | None = None) -> None:
     pattern_parser = run_sub.add_parser("pattern")
     pattern_parser.add_argument(
         "pattern_name",
-        help="Pattern name (file stem under <project>/patterns/).")
+        help="Pattern name (file stem under <foundry_dir>/patterns/).")
     pattern_parser.add_argument("--workspace", required=True)
     pattern_parser.add_argument("--template", required=True)
-    pattern_parser.add_argument(
-        "--project-hooks", default=None,
-        dest="project_hooks",
-        help="Project hooks class as module.path:ClassName. "
-        "Overrides 'project_hooks' in flywheel.yaml.")
-    pattern_parser.add_argument("--model", default=None)
-    pattern_parser.add_argument(
-        "--max-runtime", type=int, default=None,
-        dest="max_runtime",
-        help="Hard wall-clock cap on the whole pattern run, in "
-        "seconds.  Default: wait until all continuous-role "
-        "agents finish naturally.")
-    pattern_parser.add_argument(
-        "--poll-interval", type=float, default=1.0,
-        dest="poll_interval",
-        help="Seconds between ledger scans for trigger "
-        "evaluation (default: 1.0).")
-    pattern_parser.add_argument(
-        "--total-timeout", type=int, default=14400,
-        help="Per-agent wall-clock cap (default: 14400 = 4h). "
-        "Roles can override this in their YAML.")
-    pattern_parser.add_argument(
-        "--max-turns", type=int, default=200)
-    pattern_parser.add_argument(
-        "--auth-volume", default="claude-auth")
-    pattern_parser.add_argument(
-        "--agent-image", default="flywheel-claude:latest")
 
     # flywheel container — manage persistent request-response runtimes
     container_parser = subparsers.add_parser(
@@ -750,10 +724,47 @@ def run_agent_command(args, extra_args: list[str]) -> None:
 
 
 def run_pattern_command(args, extra_args: list[str]) -> None:
-    """Report that pattern execution is not currently supported."""
-    del args, extra_args
-    raise NotImplementedError(
-        "flywheel run pattern is not currently supported"
+    """Run a pattern through canonical block execution."""
+    if extra_args:
+        print(
+            "ERROR: flywheel run pattern does not accept trailing "
+            f"arguments after --: {extra_args!r}"
+        )
+        sys.exit(1)
+
+    config = load_project_config(Path.cwd())
+    pattern_path = config.patterns_dir / f"{args.pattern_name}.yaml"
+    if not pattern_path.exists():
+        print(
+            f"ERROR: no pattern named {args.pattern_name!r} in "
+            f"{config.patterns_dir}"
+        )
+        sys.exit(1)
+
+    block_registry = config.load_block_registry()
+    template = Template.from_yaml(
+        config.templates_dir / f"{args.template}.yaml",
+        block_registry=block_registry,
+    )
+    workspace = Workspace.load(Path(args.workspace))
+    pattern = PatternDeclaration.from_yaml(pattern_path)
+    validator_registry = config.load_artifact_validator_registry()
+
+    try:
+        result = run_pattern(
+            workspace,
+            pattern,
+            template,
+            config.project_root,
+            validator_registry=validator_registry,
+        )
+    except PatternRunError as exc:
+        print(f"Pattern {pattern.name!r} failed: {exc}")
+        sys.exit(1)
+
+    print(
+        f"Pattern {pattern.name!r} completed: "
+        f"run_id={result.run_id}, status={result.status}"
     )
 
 

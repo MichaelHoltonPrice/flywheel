@@ -378,7 +378,7 @@ each mapped to a container path:
 ```yaml
 blocks:
   - name: train
-    image: cyberloop-train:latest
+    image: project-train:latest
     docker_args: ["--gpus", "all", "--shm-size", "8g"]
     inputs:
       - name: checkpoint
@@ -444,9 +444,8 @@ that reflects all entries appended so far, including those
 written by handoff blocks during the previous cycle.
 
 The cost is sequential file I/O proportional to total input
-size on every launch.  Today's largest inputs in cyberarc
-(``game_history``) reach a few MB after a long run; we accept
-the cost for the safety it buys.
+size on every launch.  Projects with large accumulated inputs
+pay that cost in exchange for snapshot isolation.
 
 ### Docker configuration
 
@@ -483,7 +482,6 @@ The container itself runs no host-facing services; nested blocks
 are produced by stopping the agent, running the block in the
 host's Python process, splicing the result into the agent's
 session history, and relaunching the agent against that spliced
-session (see "Nested block executions from agents" below).
 
 The single-launch lifecycle inside ``launch_agent_block``:
 
@@ -591,7 +589,6 @@ exiting.  On the next launch flywheel populates ``/state/`` from
 that captured snapshot and the runner resumes the same session.
 See ``substrate-contract.md`` for the ``/state/`` contract.
 
-**Handoff resume (nested blocks).**  The host-side handoff loop
 (:func:`flywheel.agent_handoff.run_agent_with_handoffs`) drives
 its own pause/resume cycle on top of cross-container resume.
 When the agent calls a tool listed in ``HANDOFF_TOOLS``, the
@@ -647,34 +644,23 @@ single ``begin`` context manager:
 Post-execution callbacks (see :mod:`flywheel.post_check`) fire
 synchronously after the execution record is durable.  When a callback returns
 a ``HaltDirective``, the recorder appends it to an internal halt
-queue.  The host-side handoff loop drains that queue between
 cycles via :meth:`LocalBlockRecorder.drain_halts` and refuses to
 relaunch the agent if a relevant directive is present, which is
 how a project signals "stop this run, the work it produced
 crossed a policy threshold."
 
-Host-side block runners (``PredictActionRunner``,
-``BrainstormRequestRunner``, ``ExplorationRequestRunner``) all
-use the recorder this way: they are plain ``BlockRunner``
-callables registered with the handoff loop, invoked when the
-agent's ``PreToolUse`` hook intercepts the corresponding tool,
-and they wrap their work in ``recorder.begin(...)`` so the
-resulting execution record, artifacts, and post-check are
-recorded under the same workspace lock as every other execution.
-The same pattern applies outside the agent loop:
-``cyberarc/tools/play_server.py`` uses a ``LocalBlockRecorder``
-to record human play sessions.  ``take_action`` dispatch lives
-in a different path — the pattern runner's ``on_tool`` trigger
-routes it to the ``ExecuteAction`` container block rather than
-a host-side runner.
+Host-side lifecycle integrations are project or battery code, not
+part of the substrate's container execution path. If such an
+integration records a block execution, it must enter through the
+recorder and the workspace write paths rather than mutating
+artifacts or executions directly.
+Container blocks use the canonical
+``flywheel.execution.run_block`` path instead.
 
-All artifact-recording flows ride either
-``LocalBlockRecorder`` (``runner: lifecycle`` blocks) or the
-canonical ``flywheel.execution.run_block`` path for
-``runner: container`` one-shot blocks.  There is no HTTP lifecycle API and no
-in-container recording proxy — agents trigger recordings
-exclusively through the host-side handoff loop (see "Nested
-block executions from agents" below).
+All artifact-recording flows ride either the host-side lifecycle
+recorder or the canonical ``flywheel.execution.run_block`` path
+for ``runner: container`` one-shot blocks.  There is no HTTP
+lifecycle API and no in-container recording proxy.
 
 ### Project-provided MCP servers
 
@@ -846,8 +832,7 @@ never through the workspace.  The function returns an
 When the caller does **not** pass ``agent_workspace_dir``, the
 function mints a unique name under ``agent_workspaces/`` using a
 short UUID; collisions trigger a redraw.  This is the default for
-``PatternRunner``, ``BlockGroup``, and the cyberarc explorer /
-brainstorm helpers — making cross-agent workspace contamination
+``PatternRunner`` and ``BlockGroup``, making cross-agent workspace
 structurally impossible during parallel runs.
 
 When the caller *does* pass an explicit name and the target
@@ -952,7 +937,6 @@ flywheel run pattern <pattern-name> \
 Patterns are discovered as ``<project_root>/patterns/<name>.yaml``.
 ``run pattern`` is the only multi-agent orchestration verb.
 
-## Nested block executions from agents
 
 Some agent tool calls trigger nested block executions (``predict``,
 ``game_step``, ``brainstorm_request``); others do not (workspace
@@ -971,7 +955,6 @@ a hang in one wedged the other.  We accepted some container-
 restart latency to make these failure modes structurally
 impossible.
 
-**Mechanism.**  The host-side handoff loop
 (:func:`flywheel.agent_handoff.run_agent_with_handoffs`) drives
 each cycle as follows:
 
@@ -1036,14 +1019,12 @@ interesting point, and fails loudly rather than silently.
 
 A **run** is a durable grouping of :class:`BlockExecution`
 records inside one workspace.  Every pattern invocation opens a
-run; ad-hoc executions (direct ``executor.launch`` calls, human
-play via ``tools/play_server.py``) are ungrouped —
-``BlockExecution.run_id`` is ``None``.
+run; ad-hoc executions are ungrouped.
 
 The data model:
 
-- :class:`flywheel.artifact.RunRecord` — one per run; fields
-  ``id``, ``kind`` (e.g. ``"pattern:play-brainstorm"``),
+- :class:`flywheel.run_record.RunRecord` — one per run; fields
+  ``id``, ``kind`` (e.g. ``"pattern:example"``),
   ``started_at``, ``finished_at``, ``status``
   (``running``/``succeeded``/``failed``/``stopped``), and an
   optional ``config_snapshot``.
@@ -1217,3 +1198,5 @@ mount implementation uses the live working tree. A future
 improvement could use ``git archive`` or ``git worktree`` to
 extract the exact committed state, making explicit bindings
 to historical git artifacts truly reproducible.
+
+

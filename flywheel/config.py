@@ -57,12 +57,12 @@ class ProjectConfig:
     def patterns_dir(self) -> Path:
         """Path to the patterns directory.
 
-        Convention: ``<project_root>/patterns/``.  Used by
+        Convention: ``<foundry_dir>/patterns/``.  Used by
         ``flywheel run pattern`` to discover declarative patterns
         by file stem.  The directory is optional; projects that
         ship no patterns yet have an implicit empty registry.
         """
-        return self.project_root / "patterns"
+        return self.foundry_dir / "patterns"
 
     @property
     def blocks_dir(self) -> Path:
@@ -86,7 +86,7 @@ class ProjectConfig:
         blocks are still inline in templates.
         """
         # Local import to avoid a config → blocks → template cycle.
-        from flywheel.blocks.registry import BlockRegistry
+        from flywheel.blocks.registry import BlockRegistry  # noqa: PLC0415
         return BlockRegistry.from_directory(self.blocks_dir)
 
     def load_artifact_validator_registry(
@@ -196,7 +196,7 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     if "hooks" in data:
         raise ValueError(
             f"'hooks' in {config_path} is not supported. "
-            f"Declare workflows under '<project>/patterns/' "
+            f"Declare workflows under '<foundry_dir>/patterns/' "
             f"and wire resource setup via 'project_hooks' "
             f"instead."
         )
