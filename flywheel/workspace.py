@@ -402,10 +402,10 @@ class Workspace:
     ) -> RunRecord:
         """Open a new run and append it to the workspace.
 
-        Thread-safe.  Returns the new :class:`RunRecord`; the
-        caller stores the id and tags executions it drives.
-        Status starts as ``"running"``; close with
-        :meth:`end_run`.
+        Thread-safe. Returns the new :class:`RunRecord`.
+        :class:`flywheel.artifact.BlockExecution` does not store
+        run membership. Status starts as ``"running"``; close
+        with :meth:`end_run`.
 
         Args:
             kind: What opened the run.  Convention:

@@ -287,21 +287,13 @@ class BlockExecution:
 class RunRecord:
     """A durable grouping of related block executions.
 
-    Sits between :class:`flywheel.workspace.Workspace` and
-    :class:`BlockExecution`.  Each ``PatternRunner`` invocation
-    opens one run record and tags every execution it drives
-    (including nested executions triggered through the host-side
-    handoff loop) with the run's id.  Cadence triggers like
-    ``every_n_executions`` scope their counters to
-    ``run_id == self._run_id`` so re-running a pattern in an
-    existing workspace does not fire a backlog of cohorts
-    against the prior run's execution count.
+    Run-level metadata lives here rather than on
+    :class:`BlockExecution`.  Block executions do not carry
+    run-specific fields.
 
-    A workspace can hold many runs.  Ad-hoc work (direct
-    ``flywheel run block`` / ``flywheel run agent`` calls, or
-    tests exercising the executor in isolation) produces
-    ``BlockExecution`` records with ``run_id=None``; no
-    ``RunRecord`` is created for them.
+    A workspace can hold many runs.  Ad hoc work (direct
+    ``flywheel run block`` calls, or tests exercising execution
+    in isolation) does not create a ``RunRecord``.
 
     Attributes:
         id: Unique identifier within the workspace
@@ -319,14 +311,13 @@ class RunRecord:
             until a reconciliation or resume command touches
             it.
         status: ``"running"``, ``"succeeded"``, ``"failed"``,
-            ``"stopped"``.  Set to ``"running"`` on open; the
-            pattern runner updates it in its outer
-            ``try/finally``.
+            ``"stopped"``.  Set to ``"running"`` on open; close
+            through the workspace run APIs.
         config_snapshot: Optional free-form mapping the caller
             records alongside the run for later inspection
             (model names, budgets, pattern overrides, etc.).
             ``None`` when the caller had nothing worth
-            capturing.  Not inspected by the runner.
+            capturing.
     """
 
     id: str

@@ -20,9 +20,7 @@ Supports:
     flywheel amend artifact --workspace PATH --artifact ARTIFACT_ID
         --from SOURCE_DIR [--reason TEXT]
 
-Multi-round / multi-agent workflows are expressed as patterns
-under ``<project>/patterns/`` and run via
-``flywheel run pattern``.
+Pattern execution is not currently supported by this CLI.
 """
 
 from __future__ import annotations
@@ -30,16 +28,12 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
 
 from flywheel.agent import run_agent_block
 from flywheel.artifact import RejectionRef, SupersedesRef
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
-from flywheel.pattern import Pattern, discover_patterns
-from flywheel.project_hooks import load_project_hooks_class
-from flywheel.run_defaults import RunDefaults
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
 
@@ -756,174 +750,11 @@ def run_agent_command(args, extra_args: list[str]) -> None:
 
 
 def run_pattern_command(args, extra_args: list[str]) -> None:
-    """Run a declarative pattern with optional project hooks.
-
-    Discovers ``<project_root>/patterns/<name>.yaml`` (mirrors
-    template discovery), loads project hooks if configured,
-    builds a :class:`RunDefaults` and an
-    :class:`flywheel.executor.BlockExecutor` factory from CLI
-    flags + hook overrides, and hands off to
-    :class:`PatternRunner`.
-
-    Project hooks are expected to return:
-
-    * ``executor_factory`` (optional): the
-      :class:`flywheel.pattern_runner.ExecutorFactory` the
-      runner will use for every block dispatch.  Hooks that
-      need agent-battery wiring (e.g. cyberarc's ``on_tool``
-      handoff loop) construct an
-      :class:`flywheel.agent_executor.AgentExecutor` here and
-      return a factory that hands it out.  When absent, the
-      CLI builds a default agent-only factory from CLI flags
-      + the legacy battery-shaped overrides below.
-    * ``per_instance_runtime_config`` (optional): forwarded
-      verbatim to the runner's same-named parameter.
-    * ``defaults`` (optional): a free-form dict merged into
-      :attr:`RunDefaults.defaults`.  Each executor reads what
-      it cares about and ignores the rest.
-    * Legacy battery-shaped keys (``agent_image``, ``model``,
-      ``mcp_servers``, ``extra_env``, ``extra_mounts``,
-      ``prompt_substitutions``, ...): consumed only when the
-      hooks did *not* supply ``executor_factory``.  In that
-      mode the CLI builds a single
-      :class:`flywheel.agent_executor.AgentExecutor` carrying
-      these defaults and uses it for every block.
-
-    Args:
-        args: Parsed argparse namespace with pattern-specific
-            fields.
-        extra_args: Project-specific arguments passed after
-            ``--``; forwarded verbatim to the project hooks'
-            ``init``.
-    """
-    # Deferred batteries.  ``AgentExecutor`` and ``PatternRunner``
-    # import the agent-tool-call modules excised by the
-    # block-execution rewrite spec; ``flywheel run pattern`` lands
-    # under a follow-on patterns spec.  Until then we keep the
-    # imports lazy so ``flywheel run block`` (the happy path) still
-    # works at module-load time.
-    from flywheel.agent_executor import AgentExecutor  # noqa: PLC0415
-    from flywheel.pattern_runner import PatternRunner  # noqa: PLC0415
-
-    config = load_project_config(Path.cwd())
-
-    template_path = config.templates_dir / f"{args.template}.yaml"
-    block_registry = config.load_block_registry()
-    template = Template.from_yaml(
-        template_path, block_registry=block_registry)
-
-    ws = Workspace.load(Path(args.workspace))
-
-    patterns = discover_patterns(config.patterns_dir)
-    if args.pattern_name not in patterns:
-        known = sorted(patterns) or ["<none>"]
-        print(
-            f"ERROR: no pattern named {args.pattern_name!r} in "
-            f"{config.patterns_dir}.  Known patterns: "
-            f"{', '.join(known)}"
-        )
-        sys.exit(1)
-
-    pattern = Pattern.from_yaml(
-        patterns[args.pattern_name],
-        block_registry=block_registry,
+    """Report that pattern execution is not currently supported."""
+    del args, extra_args
+    raise NotImplementedError(
+        "flywheel run pattern is not currently supported"
     )
-    print(
-        f"  [flywheel] running pattern {pattern.name!r} "
-        f"({len(pattern.roles)} role(s))"
-    )
-
-    hooks_path = args.project_hooks or config.project_hooks
-    hooks = None
-    overrides: dict[str, Any] = {}
-    if hooks_path:
-        hooks_cls = load_project_hooks_class(hooks_path)
-        hooks = hooks_cls()
-        if hasattr(hooks, "init"):
-            overrides = hooks.init(
-                ws, template, config.project_root, extra_args,
-            ) or {}
-    elif extra_args:
-        # Loud failure: project args were passed but nothing
-        # is wired up to receive them.  Better to fail than to
-        # let a typo silently drop a flag.
-        print(
-            f"ERROR: extra args {extra_args!r} were passed "
-            f"after `--` but no project_hooks are configured "
-            f"to consume them.  Set 'project_hooks' in "
-            f"flywheel.yaml or pass --project-hooks."
-        )
-        sys.exit(1)
-
-    executor_factory = overrides.get("executor_factory")
-    if executor_factory is None:
-        # No project-supplied factory: build a default
-        # AgentExecutor configured from CLI args + the legacy
-        # battery-shaped overrides hooks may still set.  This
-        # is the path agent-only patterns take when their
-        # project doesn't need any host-side dispatch beyond
-        # what the agent battery already provides.
-        agent_executor = AgentExecutor(
-            template=template,
-            project_root=config.project_root,
-            agent_image=overrides.get(
-                "agent_image", args.agent_image),
-            auth_volume=overrides.get(
-                "auth_volume", args.auth_volume),
-            model=overrides.get("model", args.model),
-            max_turns=overrides.get(
-                "max_turns", args.max_turns),
-            total_timeout=overrides.get(
-                "total_timeout", args.total_timeout),
-            mcp_servers=overrides.get("mcp_servers"),
-            allowed_tools=overrides.get("allowed_tools"),
-            extra_env=overrides.get("extra_env"),
-            extra_mounts=overrides.get("extra_mounts"),
-            isolated_network=overrides.get(
-                "isolated_network", True),
-        )
-        def executor_factory(_block_def):
-            return agent_executor
-
-    defaults_bag: dict[str, Any] = dict(
-        overrides.get("defaults") or {})
-    if "prompt_substitutions" in overrides:
-        defaults_bag.setdefault(
-            "prompt_substitutions",
-            overrides["prompt_substitutions"])
-
-    run_defaults = RunDefaults(
-        workspace=ws,
-        template=template,
-        project_root=config.project_root,
-        defaults=defaults_bag,
-    )
-
-    runner_kwargs: dict[str, Any] = {}
-    if "per_instance_runtime_config" in overrides:
-        runner_kwargs["per_instance_runtime_config"] = (
-            overrides["per_instance_runtime_config"])
-
-    try:
-        runner = PatternRunner(
-            pattern,
-            defaults=run_defaults,
-            executor_factory=executor_factory,
-            poll_interval_s=args.poll_interval,
-            max_total_runtime_s=args.max_runtime,
-            **runner_kwargs,
-        )
-        result = runner.run()
-    finally:
-        if hooks is not None and hasattr(hooks, "teardown"):
-            hooks.teardown()
-
-    print(
-        f"\nPattern {pattern.name!r} complete: "
-        f"{result.agents_launched} agent(s) launched"
-    )
-    for role_name, count in result.cohorts_by_role.items():
-        print(f"  {role_name}: {count} cohort(s)")
 
 
 def _parse_overrides(args: list[str]) -> dict[str, str]:
