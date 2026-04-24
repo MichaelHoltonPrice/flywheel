@@ -99,7 +99,7 @@ class PostCheckContext:
             not modify them.  Empty mapping when the execution is failed
             or when the block declared no outputs.  Note: this is
             *not* the canonical artifact directory — it's the
-            ephemeral per-execution staging dir, valid for the
+            temporary per-execution staging dir, valid for the
             duration of the post-check call.  For canonical
             access, use ``execution.output_bindings`` plus
             :meth:`flywheel.workspace.Workspace.instance_path`.

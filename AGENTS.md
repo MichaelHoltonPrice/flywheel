@@ -67,7 +67,7 @@ A flywheel-using project root contains:
     stored as an append-only `entries.jsonl`.
 
   Block bodies never call an emit-artifact API; they write files
-  into a per-execution ephemeral output directory and flywheel
+  into a per-execution per-execution output directory and flywheel
   registers from disk after the block exits. Canonical artifact
   directories are never bind-mounted directly; flywheel always
   copies into a per-mount staging tempdir first.

@@ -566,7 +566,7 @@ class TestFailureCleanup:
         assert engine_id in ws.artifacts
 
 
-class TestEphemeralContainerRunner:
+class TestOneShotContainerRunner:
     def test_run_block_delegates_body_run_to_container_runner(
         self, tmp_path: Path,
     ):

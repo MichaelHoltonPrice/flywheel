@@ -18,7 +18,7 @@ In scope:
 * Termination reasons as a first-class concept (see
   [Termination reasons](#termination-reasons)).
 * Container runtimes:
-  * ephemeral container runner — one container per execution
+  * one-shot container runner — one container per execution
     (the preferred default).
   * persistent container runner — one long-running container hosts
     many executions (kept only as a workaround for blocks whose
@@ -257,7 +257,7 @@ failed (`output_collect`, `output_validate`, or `artifact_commit`).
 | `exit_code` | The container's exit code, when one is available. |
 | `elapsed_s` | Wall-clock time in seconds. |
 | `image` | The container image used. |
-| `runner` | `"container_ephemeral"` or `"container_persistent"`. |
+| `runner` | `"container_one_shot"` or `"container_persistent"`. |
 | `failure_phase` | Set only when `status="failed"`. Values from `runtime.FAILURE_*`. |
 | `error` | Human-readable error message recorded alongside `failure_phase`. |
 | `rejected_outputs` | `dict[str, RejectedOutput]`. Each entry records a `reason`, the `phase` of failure (`output_collect`, `output_validate`, or `artifact_commit`), and a `quarantine_path` when quarantine I/O succeeded. |
@@ -379,7 +379,7 @@ its termination reason. The channel is part of the substrate
 contract, not an implementation detail — block authors and runtimes
 both depend on it.
 
-### Ephemeral Container Runner
+### One-Shot Container Runner
 
 * **Channel**: a sidecar file at `/flywheel/termination` inside the
   container. The path is part of the runtime contract.
@@ -502,7 +502,7 @@ def record_execution(
     termination_reason: str,
     input_bindings: dict[str, str],
     output_bindings: dict[str, str],
-    runner: Literal["container_ephemeral", "container_persistent"],
+    runner: Literal["container_one_shot", "container_persistent"],
     image: str,
     exit_code: int | None,
     elapsed_s: float | None,
@@ -528,7 +528,7 @@ parallel pipeline from being written.
 
 ## Runtime variants
 
-The substrate's preferred mode is **ephemeral containers** — one
+The substrate's preferred mode is **one-shot containers** — one
 container per block execution, hermetic by construction, no state
 carried between executions. This is the default the substrate would
 use for every block if it could.
@@ -545,7 +545,7 @@ containers can go away.
 
 Two implementations:
 
-* **ephemeral container runner** — starts a fresh container per
+* **one-shot container runner** — starts a fresh container per
   execution. Block runs, container exits, executor commits.
 * **persistent container runner** — starts a long-running container
   once and dispatches each execution as a request over an

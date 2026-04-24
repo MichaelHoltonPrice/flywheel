@@ -163,7 +163,7 @@ parser maps a legacy flat ``outputs:`` list to this label so
 existing single-reason blocks parse without YAML migration."""
 
 TERMINATION_PATH: Final[str] = "/flywheel/termination"
-"""Container-side path for the ephemeral runtime's termination
+"""Container-side path for the one-shot runtime's termination
 channel.  The block writes a single line of UTF-8 with the
 termination reason; the executor reads it after the container
 exits.  See ``flywheel/docs/specs/block-execution.md`` §

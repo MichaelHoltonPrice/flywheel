@@ -282,7 +282,7 @@ class Workspace:
         Canonical-mode invariants (enforced when
         ``execution.termination_reason`` is set):
 
-        * ``runner`` must be one of ``"container_ephemeral"`` or
+        * ``runner`` must be one of ``"container_one_shot"`` or
           ``"container_persistent"``.
         * ``failure_phase``, when set, must be a known phase from
           :data:`flywheel.runtime.FAILURE_PHASES`.
@@ -322,11 +322,11 @@ class Workspace:
     ) -> BlockExecution:
         """Apply canonical invariants and derive status."""
         if execution.runner not in (
-            "container_ephemeral", "container_persistent",
+            "container_one_shot", "container_persistent",
         ):
             raise ValueError(
                 f"BlockExecution {execution.id!r}: runner must be "
-                f"'container_ephemeral' or 'container_persistent'; "
+                f"'container_one_shot' or 'container_persistent'; "
                 f"got {execution.runner!r}"
             )
         if (execution.failure_phase is not None

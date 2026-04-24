@@ -33,7 +33,7 @@ from flywheel.runtime import (
 
 
 def read_termination_sidecar(termination_file: Path) -> str | None:
-    """Parse the ephemeral runtime's ``/flywheel/termination`` file.
+    """Parse the one-shot runtime's ``/flywheel/termination`` file.
 
     The file must contain a single non-empty line of UTF-8 text,
     optionally trailed by a newline.  Surrounding whitespace on

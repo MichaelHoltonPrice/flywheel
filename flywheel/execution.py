@@ -7,12 +7,12 @@ block-execution model:
 * :func:`prepare_block_execution` — resolves inputs, allocates
   per-slot proposal directories, builds the container mount set,
   and mints the execution ID.  Returns an :class:`ExecutionPlan`.
-* :func:`invoke_ephemeral_container` — runs a fresh container
+* :func:`invoke_one_shot_container` — runs a fresh container
   for this execution, waits for it to exit, and parses the
   termination announcement from the sidecar at
-  ``/flywheel/termination``.  This is the ephemeral-container
+  ``/flywheel/termination``.  This is the one-shot container
   invocation strategy.  Container-specific mechanics are hidden
-  behind :class:`EphemeralContainerRunner`.
+  behind :class:`OneShotContainerRunner`.
 * :func:`commit_block_execution` — forges validated proposals
   through ``Workspace.register_artifact`` (proposal-then-forge),
   quarantines rejections, and records the :class:`BlockExecution`
@@ -65,7 +65,7 @@ class ExecutionPlan:
     """Output of the prepare phase — everything invoke/commit need.
 
     A plan is constructed once per execution and threaded through
-    :func:`invoke_ephemeral_container` and
+    :func:`invoke_one_shot_container` and
     :func:`commit_block_execution`.  No
     field is mutated after construction; downstream phases only
     read.
@@ -125,7 +125,7 @@ class InvocationResult:
     error: str | None = None
 
 
-class EphemeralContainerRunner(Protocol):
+class OneShotContainerRunner(Protocol):
     """Container-specific runner for an already-prepared block body.
 
     Implementations consume a fully prepared :class:`ExecutionPlan`
@@ -232,7 +232,7 @@ def _record_execution(
         exit_code=exit_code,
         elapsed_s=elapsed_s,
         image=image,
-        runner="container_ephemeral",
+        runner="container_one_shot",
         failure_phase=failure_phase,
         error=error,
         rejected_outputs=rejected_outputs or {},
@@ -448,7 +448,7 @@ def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
     )
 
 
-def observe_ephemeral_container_exit(
+def observe_one_shot_container_exit(
     plan: ExecutionPlan,
     result: ContainerResult,
 ) -> InvocationResult:
@@ -479,24 +479,24 @@ def observe_ephemeral_container_exit(
 
 
 @dataclass(frozen=True)
-class DockerEphemeralContainerRunner:
-    """Default runner for ephemeral Docker container bodies."""
+class DockerOneShotContainerRunner:
+    """Default runner for one-shot Docker container bodies."""
 
     def run(
         self, plan: ExecutionPlan, args: list[str] | None = None,
     ) -> InvocationResult:
         """Run the prepared plan in a fresh container."""
         result = run_container(_container_config_for_plan(plan), args)
-        return observe_ephemeral_container_exit(plan, result)
+        return observe_one_shot_container_exit(plan, result)
 
 
-def invoke_ephemeral_container(
+def invoke_one_shot_container(
     plan: ExecutionPlan,
     args: list[str] | None = None,
     *,
-    container_runner: EphemeralContainerRunner | None = None,
+    container_runner: OneShotContainerRunner | None = None,
 ) -> InvocationResult:
-    """Run the block body once through an ephemeral container runner.
+    """Run the block body once through a one-shot container runner.
 
     Returns:
         An :class:`InvocationResult` with the normalized
@@ -508,7 +508,7 @@ def invoke_ephemeral_container(
             execution is the caller's responsibility (see
             :func:`run_block`).
     """
-    runner = container_runner or DockerEphemeralContainerRunner()
+    runner = container_runner or DockerOneShotContainerRunner()
     return runner.run(plan, args)
 
 
@@ -544,7 +544,7 @@ def commit_block_execution(
     Returns:
         The raw ``ContainerResult`` from the invocation on the
         happy path.  ``None`` is never returned for happy-path
-        ephemeral runs; the field exists so the persistent-runtime
+        one-shot runs; the field exists so the persistent-runtime
         adapter can return ``None`` for handle metadata it doesn't
         own.
 
@@ -747,14 +747,14 @@ def run_block(
     args: list[str] | None = None,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
-    container_runner: EphemeralContainerRunner | None = None,
+    container_runner: OneShotContainerRunner | None = None,
 ) -> ContainerResult:
     """Execute a block within a workspace.
 
     Thin orchestration over the canonical
     ``prepare → invoke → commit`` model.  See
     :func:`prepare_block_execution`,
-    :func:`invoke_ephemeral_container`, and
+    :func:`invoke_one_shot_container`, and
     :func:`commit_block_execution` for the per-phase contracts.
 
     Args:
@@ -767,7 +767,7 @@ def run_block(
         args: Optional extra arguments for the container entrypoint.
         validator_registry: Project-supplied artifact validator
             registry consulted before each output slot is committed.
-        container_runner: Optional runner for the prepared ephemeral
+        container_runner: Optional runner for the prepared one-shot
             container body.  Defaults to the Docker-backed runner.
 
     Returns:
@@ -804,13 +804,13 @@ def run_block(
         )
     if block_def.runner != "container":
         raise ValueError(
-            f"flywheel run block uses the ephemeral container "
+            f"flywheel run block uses the one-shot container "
             f"pipeline and requires runner 'container'; block "
             f"{block_name!r} has runner {block_def.runner!r}"
         )
     if block_def.lifecycle != "one_shot":
         raise ValueError(
-            f"flywheel run block uses the ephemeral container "
+            f"flywheel run block uses the one-shot container "
             f"pipeline and requires lifecycle 'one_shot'; block "
             f"{block_name!r} has lifecycle {block_def.lifecycle!r}"
         )
@@ -845,7 +845,7 @@ def run_block(
 
     # ── invoke ───────────────────────────────────────────────────
     try:
-        invocation = invoke_ephemeral_container(
+        invocation = invoke_one_shot_container(
             plan, args, container_runner=container_runner,
         )
     except KeyboardInterrupt:

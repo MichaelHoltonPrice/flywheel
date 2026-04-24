@@ -216,7 +216,7 @@ class BlockExecution:
         elapsed_s: Wall-clock time in seconds, if available.
         image: The Docker image that was used.
         runner: How this execution was physically performed:
-            ``"container_ephemeral"`` (one-shot container) or
+            ``"container_one_shot"`` (one-shot container) or
             ``"container_persistent"`` (long-lived container,
             multiple invocations over an HTTP loop).
         error: Error message if status is ``"failed"`` and the
@@ -274,8 +274,8 @@ class BlockExecution:
     elapsed_s: float | None = None
     image: str | None = None
     runner: Literal[
-        "container_ephemeral", "container_persistent"
-    ] = "container_ephemeral"
+        "container_one_shot", "container_persistent"
+    ] = "container_one_shot"
     error: str | None = None
     failure_phase: str | None = None
     rejected_outputs: dict[str, RejectedOutput] = field(

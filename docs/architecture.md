@@ -395,7 +395,7 @@ concern, not flywheel's.
 
 ### Per-execution output directories
 
-Each block execution gets a fresh, ephemeral output directory
+Each block execution gets a fresh, per-execution output directory
 created via ``tempfile.mkdtemp(prefix="flywheel-exec-")``.
 Inside that directory flywheel pre-creates one
 ``output/<output_name>/`` per declared output and either bind-
@@ -415,7 +415,7 @@ each declared output:
   files written there) is appended to the canonical incremental
   instance under a file lock, preserving registration order.
 
-The ephemeral output directory is removed after registration
+The per-execution output directory is removed after registration
 on success.  On failure it is retained for debugging.
 
 This avoids requiring containers to write a manifest or be
@@ -626,7 +626,7 @@ single ``begin`` context manager:
    bindings, host paths to each staged input, a per-execution
    scratch directory, and ``ctx.output_dir(name)`` returning a
    pre-created ``output/<name>/`` under the execution's
-   ephemeral output tempdir.  The body writes files there;
+   per-execution output tempdir.  The body writes files there;
    no ``set_output`` callback exists.
 3. On clean exit the recorder walks each declared output:
    ``copy`` outputs are registered as a new instance from the

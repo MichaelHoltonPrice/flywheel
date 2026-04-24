@@ -4,7 +4,7 @@ Invariant: **canonical artifacts are never directly read,
 mounted, or otherwise exposed to a downstream block or
 container**.  Every input slot is satisfied by a fresh
 per-mount copy of the artifact's contents, living in an
-ephemeral system tempdir for the lifetime of the consuming
+temporary system tempdir for the lifetime of the consuming
 execution.
 
 Two motivations:
