@@ -13,7 +13,7 @@ from flywheel.artifact_validator import (
     ArtifactValidatorRegistry,
 )
 from flywheel.container import ContainerResult
-from flywheel.execution import InvocationResult, run_block
+from flywheel.execution import RuntimeResult, run_block
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -567,12 +567,22 @@ class TestFailureCleanup:
 
 
 class TestOneShotContainerRunner:
-    def test_run_block_delegates_body_run_to_container_runner(
-        self, tmp_path: Path,
-    ):
+    @staticmethod
+    def _workspace_for_runner_test(tmp_path: Path):
         project_root, foundry_dir, template = _setup_git_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
         _commit_all(project_root, "add workspace")
+        return project_root, template, ws
+
+    @staticmethod
+    def _only_execution(ws: Workspace):
+        return next(iter(ws.executions.values()))
+
+    def test_run_block_delegates_body_run_to_container_runner(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
 
         class FakeContainerRunner:
             def __init__(self):
@@ -584,7 +594,7 @@ class TestOneShotContainerRunner:
                 self.seen_args = args
                 out = plan.proposal_dirs["checkpoint"]
                 (out / "model.pt").write_text("weights")
-                return InvocationResult(
+                return RuntimeResult(
                     termination_reason="normal",
                     container_result=ContainerResult(
                         exit_code=0, elapsed_s=0.25),
@@ -609,6 +619,270 @@ class TestOneShotContainerRunner:
         assert ex.status == "succeeded"
         assert ex.termination_reason == "normal"
         assert "checkpoint" in ex.output_bindings
+
+    def test_runner_reported_crash_records_runtime_failure(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class CrashRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=runtime.TERMINATION_REASON_CRASH,
+                    container_result=ContainerResult(
+                        exit_code=137, elapsed_s=0.5),
+                    error="OOM-killed",
+                )
+
+        with pytest.raises(RuntimeError, match="OOM-killed"):
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=CrashRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "failed"
+        assert ex.termination_reason == runtime.TERMINATION_REASON_CRASH
+        assert ex.failure_phase == runtime.FAILURE_INVOKE
+        assert ex.error == "OOM-killed"
+        assert ex.exit_code == 137
+        assert ex.output_bindings == {}
+
+    def test_runner_reported_timeout_surfaces_runner_error(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class TimeoutRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=runtime.TERMINATION_REASON_TIMEOUT,
+                    container_result=ContainerResult(
+                        exit_code=-1, elapsed_s=30.0),
+                    error="scheduler deadline exceeded",
+                )
+
+        with pytest.raises(
+            RuntimeError, match="scheduler deadline exceeded",
+        ):
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=TimeoutRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "failed"
+        assert ex.termination_reason == runtime.TERMINATION_REASON_TIMEOUT
+        assert ex.failure_phase == runtime.FAILURE_INVOKE
+        assert ex.error == "scheduler deadline exceeded"
+
+    def test_runner_reported_protocol_violation_records_protocol_failure(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class ProtocolViolationRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=(
+                        runtime.TERMINATION_REASON_PROTOCOL_VIOLATION
+                    ),
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.25),
+                    announcement="reserved:crash",
+                    error="reserved termination reason announced",
+                )
+
+        with pytest.raises(
+            RuntimeError, match="reserved termination reason announced",
+        ):
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=ProtocolViolationRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "failed"
+        assert (
+            ex.termination_reason
+            == runtime.TERMINATION_REASON_PROTOCOL_VIOLATION
+        )
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_PROTOCOL
+        assert ex.error == "reserved termination reason announced"
+        assert ex.output_bindings == {}
+
+    def test_runner_error_whitespace_uses_crash_fallback(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class WhitespaceErrorRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=runtime.TERMINATION_REASON_CRASH,
+                    container_result=ContainerResult(
+                        exit_code=2, elapsed_s=0.1),
+                    error="   ",
+                )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=WhitespaceErrorRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.error == "container exited with code 2"
+        assert str(exc_info.value) == (
+            "Block 'train' runtime failed: container exited with code 2"
+        )
+
+    def test_runner_crash_without_exit_metadata_uses_fallback(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class MissingExitMetadataRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=runtime.TERMINATION_REASON_CRASH,
+                    container_result=None,
+                )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=MissingExitMetadataRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.error == "container crashed without exit metadata"
+        assert str(exc_info.value) == (
+            "Block 'train' runtime failed: "
+            "container crashed without exit metadata"
+        )
+
+    def test_runner_protocol_violation_without_error_uses_fallback(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class ProtocolFallbackRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=(
+                        runtime.TERMINATION_REASON_PROTOCOL_VIOLATION
+                    ),
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                    announcement="unknown_reason",
+                )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=ProtocolFallbackRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_PROTOCOL
+        assert ex.error == (
+            "protocol violation: termination announcement "
+            "'unknown_reason' did not match any declared reason "
+            "['normal']"
+        )
+        assert str(exc_info.value) == f"Block 'train' runtime failed: {ex.error}"
+
+    def test_runner_returned_interrupted_records_interruption(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class InterruptedRunner:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason=(
+                        runtime.TERMINATION_REASON_INTERRUPTED
+                    ),
+                    container_result=None,
+                    error="scheduler cancelled mid-step",
+                )
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=InterruptedRunner(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "interrupted"
+        assert ex.termination_reason == (
+            runtime.TERMINATION_REASON_INTERRUPTED
+        )
+        assert ex.failure_phase == runtime.FAILURE_INVOKE
+        assert ex.error == "scheduler cancelled mid-step"
+        assert str(exc_info.value) == (
+            "Block 'train' runtime failed: scheduler cancelled mid-step"
+        )
+
+    def test_project_defined_success_ignores_runner_error(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class SuccessfulRunnerWithError:
+            def run(self, plan, args=None):
+                out = plan.proposal_dirs["checkpoint"]
+                (out / "model.pt").write_text("weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                    error="diagnostic that should not enter ledger",
+                )
+
+        run_block(
+            ws, "train", template, project_root,
+            container_runner=SuccessfulRunnerWithError(),
+        )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "succeeded"
+        assert ex.error is None
+
+    def test_project_defined_commit_failure_ignores_runner_error(
+        self, tmp_path: Path,
+    ):
+        project_root, template, ws = self._workspace_for_runner_test(
+            tmp_path)
+
+        class MissingOutputRunnerWithError:
+            def run(self, plan, args=None):
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                    error="runner diagnostic should not win",
+                )
+
+        with pytest.raises(RuntimeError, match="output_collect"):
+            run_block(
+                ws, "train", template, project_root,
+                container_runner=MissingOutputRunnerWithError(),
+            )
+
+        ex = self._only_execution(ws)
+        assert ex.status == "failed"
+        assert ex.failure_phase == runtime.FAILURE_OUTPUT_COLLECT
+        assert ex.error == "output_collect: checkpoint: no output bytes written"
 
 
 class TestArtifactValidation:

@@ -1,17 +1,17 @@
 """Block execution orchestration for flywheel.
 
 The public entry point is :func:`run_block`, which is a thin
-``prepare → invoke → commit`` orchestration over the canonical
+``prepare -> run -> commit`` orchestration over the canonical
 block-execution model:
 
 * :func:`prepare_block_execution` — resolves inputs, allocates
   per-slot proposal directories, builds the container mount set,
   and mints the execution ID.  Returns an :class:`ExecutionPlan`.
-* :func:`invoke_one_shot_container` — runs a fresh container
+* :func:`run_one_shot_container` — runs a fresh container
   for this execution, waits for it to exit, and parses the
   termination announcement from the sidecar at
   ``/flywheel/termination``.  This is the one-shot container
-  invocation strategy.  Container-specific mechanics are hidden
+  runtime strategy.  Container-specific mechanics are hidden
   behind :class:`OneShotContainerRunner`.
 * :func:`commit_block_execution` — forges validated proposals
   through ``Workspace.register_artifact`` (proposal-then-forge),
@@ -19,9 +19,9 @@ block-execution model:
   via ``Workspace.record_execution``.
 
 ``flywheel run block`` is the canonical happy-path call site
-today.  Container-specific code plugs into the invoke phase as a
+today.  Container-specific code plugs into the runtime phase as a
 narrow runner: it runs work described by an :class:`ExecutionPlan`
-and reports an :class:`InvocationResult`; it does not own input
+and reports an :class:`RuntimeResult`; it does not own input
 resolution, artifact forging, quarantine, or ledger semantics.
 """
 
@@ -57,15 +57,15 @@ from flywheel.termination import (
 )
 from flywheel.workspace import Workspace
 
-# ── Plan & invocation result ─────────────────────────────────────
+# ── Plan & runtime result ─────────────────────────────────────
 
 
 @dataclass
 class ExecutionPlan:
-    """Output of the prepare phase — everything invoke/commit need.
+    """Output of the prepare phase — everything runtime/commit need.
 
     A plan is constructed once per execution and threaded through
-    :func:`invoke_one_shot_container` and
+    :func:`run_one_shot_container` and
     :func:`commit_block_execution`.  No
     field is mutated after construction; downstream phases only
     read.
@@ -100,23 +100,40 @@ class ExecutionPlan:
 
 
 @dataclass
-class InvocationResult:
-    """Output of the invoke phase — what the runtime observed.
+class RuntimeResult:
+    """Output of the runtime phase -- what the runtime observed.
+
+    Constructed by a runtime-specific runner or adapter and consumed
+    by :func:`commit_block_execution`. Carries pure observation; no
+    policy decisions live here. Commit derives status, failure phase,
+    output handling, and user-facing exception text from these fields.
 
     Attributes:
         termination_reason: The normalized termination reason.
             Either a substrate-reserved value (``crash``,
             ``interrupted``, ``timeout``, ``protocol_violation``)
-            or a project-defined value the block declared.
+            or a project-defined value the block declared. Always
+            populated. This is the only field commit branches on.
         container_result: The raw ``ContainerResult`` from the
-            runtime, or ``None`` if the container never ran (e.g.,
-            ``KeyboardInterrupt`` before launch).
-        announcement: The raw bytes the block wrote to the
-            termination sidecar, before normalization.  ``None`` if
-            no sidecar was written.  Used for protocol-violation
-            error messages.
-        error: Runtime-level error text for invoke failures.  Commit
-            records this verbatim when present.
+            runtime, or ``None`` when no container exit metadata is
+            available.
+        announcement: The raw, stripped string the block wrote to
+            the termination sidecar, or ``None`` if no sidecar was
+            readable. This is an evidence field, preserved regardless
+            of how ``termination_reason`` normalized. Commit reads it
+            only when composing the canonical ``protocol_violation``
+            fallback message. Do not parse it for control flow.
+        error: Optional human-readable diagnostic from the runtime
+            layer. Consulted by commit only for substrate-reserved
+            failure-shaped reasons. Ignored for project-defined
+            reasons; commit owns per-slot rejection text on those
+            branches. When supplied it must be non-empty after
+            stripping whitespace. ``None`` or whitespace-only text
+            uses the canonical fallback for the termination reason.
+            The same text commit chooses is written to
+            ``BlockExecution.error`` and used in the raised exception
+            message. This field is intentionally unstructured and
+            must not be parsed for control flow.
     """
 
     termination_reason: str
@@ -129,14 +146,25 @@ class OneShotContainerRunner(Protocol):
     """Container-specific runner for an already-prepared block body.
 
     Implementations consume a fully prepared :class:`ExecutionPlan`
-    and return an :class:`InvocationResult`.  They must not resolve
+    and return an :class:`RuntimeResult`. They must not resolve
     inputs, commit artifacts, quarantine outputs, or record ledger
     entries; those are owned by prepare/commit.
+
+    Interrupt handling supports both local-process and scheduler-style
+    runners. A runner may raise ``KeyboardInterrupt`` from ``run``;
+    :func:`run_block` records the execution as interrupted. Or it
+    may return ``RuntimeResult(termination_reason="interrupted",
+    error=...)``; :func:`commit_block_execution` records the same
+    canonical interrupted outcome. Other reserved failure reasons
+    (``crash``, ``timeout``, ``protocol_violation``) are reported by
+    returning an :class:`RuntimeResult`. Exceptions other than
+    ``KeyboardInterrupt`` raised from ``run`` are recorded as
+    ``crash`` by :func:`run_block`.
     """
 
     def run(
         self, plan: ExecutionPlan, args: list[str] | None = None,
-    ) -> InvocationResult:
+    ) -> RuntimeResult:
         """Run the prepared container body and report how it ended."""
         ...
 
@@ -241,7 +269,7 @@ def _record_execution(
     workspace.record_execution(execution)
 
 
-# ── Failure recording helper (prepare/invoke phases) ─────────────
+# ── Failure recording helper (prepare/runtime phases) ─────────────
 
 
 def commit_failure(
@@ -262,7 +290,7 @@ def commit_failure(
     Used by :func:`run_block` for failures that occur after
     ``execution_id`` is minted but before the commit phase runs:
     proposal-allocation failures, input-resolution failures, and
-    invoke-time crashes that bubble out as exceptions.
+    runtime exceptions that bubble out.
 
     The ``status`` is derived from ``termination_reason`` via the
     canonical mapping; callers do not pass it.  ``output_bindings``
@@ -435,7 +463,7 @@ def prepare_block_execution(
     )
 
 
-# ── Phase 2: invoke ──────────────────────────────────────────────
+# ── Phase 2: run ──────────────────────────────────────────────
 
 
 def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
@@ -451,8 +479,8 @@ def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
 def observe_one_shot_container_exit(
     plan: ExecutionPlan,
     result: ContainerResult,
-) -> InvocationResult:
-    """Translate an exited one-shot container into invoke facts.
+) -> RuntimeResult:
+    """Translate an exited one-shot container into runtime facts.
 
     Non-zero exit is a runtime crash.  Zero exit must announce a
     project-defined termination reason through the sidecar mounted
@@ -460,10 +488,9 @@ def observe_one_shot_container_exit(
     are normalized to ``protocol_violation``.
     """
     if result.exit_code != 0:
-        return InvocationResult(
+        return RuntimeResult(
             termination_reason=runtime.TERMINATION_REASON_CRASH,
             container_result=result,
-            error=f"container exited with code {result.exit_code}",
         )
 
     announcement = read_termination_sidecar(plan.termination_file)
@@ -471,7 +498,7 @@ def observe_one_shot_container_exit(
         announcement=announcement,
         declared_reasons=set(plan.block_def.outputs.keys()),
     )
-    return InvocationResult(
+    return RuntimeResult(
         termination_reason=termination_reason,
         container_result=result,
         announcement=announcement,
@@ -484,22 +511,22 @@ class DockerOneShotContainerRunner:
 
     def run(
         self, plan: ExecutionPlan, args: list[str] | None = None,
-    ) -> InvocationResult:
+    ) -> RuntimeResult:
         """Run the prepared plan in a fresh container."""
         result = run_container(_container_config_for_plan(plan), args)
         return observe_one_shot_container_exit(plan, result)
 
 
-def invoke_one_shot_container(
+def run_one_shot_container(
     plan: ExecutionPlan,
     args: list[str] | None = None,
     *,
     container_runner: OneShotContainerRunner | None = None,
-) -> InvocationResult:
+) -> RuntimeResult:
     """Run the block body once through a one-shot container runner.
 
     Returns:
-        An :class:`InvocationResult` with the normalized
+        An :class:`RuntimeResult` with the normalized
         termination reason and the raw container result.
 
     Raises:
@@ -515,10 +542,55 @@ def invoke_one_shot_container(
 # ── Phase 3: commit ──────────────────────────────────────────────
 
 
+_RESERVED_FAILURE_PHASES: dict[str, str] = {
+    runtime.TERMINATION_REASON_CRASH: runtime.FAILURE_INVOKE,
+    runtime.TERMINATION_REASON_TIMEOUT: runtime.FAILURE_INVOKE,
+    runtime.TERMINATION_REASON_INTERRUPTED: runtime.FAILURE_INVOKE,
+    runtime.TERMINATION_REASON_PROTOCOL_VIOLATION: (
+        runtime.FAILURE_OUTPUT_PROTOCOL
+    ),
+}
+
+
+def _runtime_failure_error(
+    runtime_result: RuntimeResult,
+    block_def: BlockDefinition,
+    exit_code: int | None,
+) -> str:
+    """Return canonical diagnostic text for reserved runtime failures.
+
+    Runner-supplied non-empty text wins.  Otherwise commit owns the
+    fallback so the ledger error and raised exception text cannot drift.
+    """
+    if runtime_result.error is not None and runtime_result.error.strip():
+        return runtime_result.error.strip()
+
+    reason = runtime_result.termination_reason
+    if reason == runtime.TERMINATION_REASON_CRASH:
+        if exit_code is None:
+            return "container crashed without exit metadata"
+        return f"container exited with code {exit_code}"
+    if reason == runtime.TERMINATION_REASON_TIMEOUT:
+        return "container exceeded its execution deadline"
+    if reason == runtime.TERMINATION_REASON_INTERRUPTED:
+        return "container was interrupted"
+    if reason == runtime.TERMINATION_REASON_PROTOCOL_VIOLATION:
+        declared = sorted(block_def.outputs.keys())
+        return (
+            f"protocol violation: termination announcement "
+            f"{runtime_result.announcement!r} did not match any "
+            f"declared reason {declared!r}"
+        )
+    raise ValueError(
+        f"_runtime_failure_error called for non-reserved failure "
+        f"reason {reason!r}"
+    )
+
+
 def commit_block_execution(
     workspace: Workspace,
     plan: ExecutionPlan,
-    invocation: InvocationResult,
+    runtime_result: RuntimeResult,
     template: Template,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
@@ -542,7 +614,7 @@ def commit_block_execution(
        ``Workspace.record_execution``.
 
     Returns:
-        The raw ``ContainerResult`` from the invocation on the
+        The raw ``ContainerResult`` from the runtime result on the
         happy path.  ``None`` is never returned for happy-path
         one-shot runs; the field exists so the persistent-runtime
         adapter can return ``None`` for handle metadata it doesn't
@@ -558,14 +630,15 @@ def commit_block_execution(
     block_name = plan.block_name
     block_def = plan.block_def
     image = block_def.image
-    container_result = invocation.container_result
+    container_result = runtime_result.container_result
     exit_code = container_result.exit_code if container_result else None
     elapsed_s = container_result.elapsed_s if container_result else None
-    termination_reason = invocation.termination_reason
+    termination_reason = runtime_result.termination_reason
 
-    # ── Substrate-reserved failure-shaped reasons ────────────────
-    if termination_reason == runtime.TERMINATION_REASON_CRASH:
-        error = invocation.error or f"container exited with code {exit_code}"
+    # -- Substrate-reserved failure-shaped reasons -----------------
+    if termination_reason in _RESERVED_FAILURE_PHASES:
+        failure_phase = _RESERVED_FAILURE_PHASES[termination_reason]
+        error = _runtime_failure_error(runtime_result, block_def, exit_code)
         shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
@@ -573,67 +646,13 @@ def commit_block_execution(
             plan.resolved_bindings, {},
             exit_code, elapsed_s, image,
             all_expected_committed=True,
-            failure_phase=runtime.FAILURE_INVOKE,
+            failure_phase=failure_phase,
             error=error,
         )
-        raise RuntimeError(f"Block {block_name!r} invoke failed: {error}")
-
-    if termination_reason == runtime.TERMINATION_REASON_TIMEOUT:
-        error = (
-            invocation.error
-            or "container exceeded its execution deadline"
-        )
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
-        _record_execution(
-            workspace, plan.execution_id, block_name, plan.started_at,
-            termination_reason,
-            plan.resolved_bindings, {},
-            exit_code, elapsed_s, image,
-            all_expected_committed=True,
-            failure_phase=runtime.FAILURE_INVOKE,
-            error=error,
-        )
-        raise RuntimeError(
-            f"Block {block_name!r} container timed out"
-        )
-
-    if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
-        error = invocation.error or "container was interrupted"
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
-        _record_execution(
-            workspace, plan.execution_id, block_name, plan.started_at,
-            termination_reason,
-            plan.resolved_bindings, {},
-            exit_code, elapsed_s, image,
-            all_expected_committed=True,
-            failure_phase=runtime.FAILURE_INVOKE,
-            error=error,
-        )
-        raise KeyboardInterrupt(
-            f"Block {block_name!r} was interrupted"
-        )
-
-    if termination_reason == runtime.TERMINATION_REASON_PROTOCOL_VIOLATION:
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
-        declared = sorted(block_def.outputs.keys())
-        error = invocation.error or (
-            f"protocol violation: termination announcement "
-            f"{invocation.announcement!r} did not match any "
-            f"declared reason {declared!r}"
-        )
-        _record_execution(
-            workspace, plan.execution_id, block_name, plan.started_at,
-            termination_reason,
-            plan.resolved_bindings, {},
-            exit_code, elapsed_s, image,
-            all_expected_committed=True,
-            failure_phase=runtime.FAILURE_OUTPUT_PROTOCOL,
-            error=error,
-        )
-        raise RuntimeError(
-            f"Block {block_name!r} announced an invalid "
-            f"termination reason ({invocation.announcement!r})"
-        )
+        message = f"Block {block_name!r} runtime failed: {error}"
+        if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
+            raise KeyboardInterrupt(message)
+        raise RuntimeError(message)
 
     # ── Forge proposals into artifact instances ──────────────────
     declarations = {a.name: a for a in template.artifacts}
@@ -752,9 +771,9 @@ def run_block(
     """Execute a block within a workspace.
 
     Thin orchestration over the canonical
-    ``prepare → invoke → commit`` model.  See
+    ``prepare -> run -> commit`` model.  See
     :func:`prepare_block_execution`,
-    :func:`invoke_one_shot_container`, and
+    :func:`run_one_shot_container`, and
     :func:`commit_block_execution` for the per-phase contracts.
 
     Args:
@@ -843,12 +862,13 @@ def run_block(
         )
         raise
 
-    # ── invoke ───────────────────────────────────────────────────
+    # -- run -----------------------------------------------------
     try:
-        invocation = invoke_one_shot_container(
+        runtime_result = run_one_shot_container(
             plan, args, container_runner=container_runner,
         )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        error = str(exc) or "operator interrupt"
         commit_failure(
             workspace,
             execution_id=plan.execution_id,
@@ -856,7 +876,7 @@ def run_block(
             started_at=plan.started_at,
             image=block_def.image,
             phase=runtime.FAILURE_INVOKE,
-            error="operator interrupt",
+            error=error,
             termination_reason=runtime.TERMINATION_REASON_INTERRUPTED,
             resolved_bindings=plan.resolved_bindings,
             proposals_root=plan.proposals_root,
@@ -878,10 +898,10 @@ def run_block(
 
     # ── commit ───────────────────────────────────────────────────
     result = commit_block_execution(
-        workspace, plan, invocation, template,
+        workspace, plan, runtime_result, template,
         validator_registry=validator_registry,
     )
     # commit_block_execution returns the container_result on the
-    # happy path; for completeness, fall back to the invocation's
+    # happy path; for completeness, fall back to the runtime_result's
     # raw container result if we somehow get None.
-    return result or invocation.container_result  # type: ignore[return-value]
+    return result or runtime_result.container_result  # type: ignore[return-value]
