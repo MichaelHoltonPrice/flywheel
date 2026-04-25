@@ -70,8 +70,8 @@ def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     )
     foundry_dir = project_root / "foundry"
     foundry_dir.mkdir()
-    templates_dir = foundry_dir / "templates"
-    templates_dir.mkdir()
+    templates_dir = foundry_dir / "templates" / "workspaces"
+    templates_dir.mkdir(parents=True)
     template_path = templates_dir / "test_template.yaml"
     template_path.write_text(TEMPLATE_YAML)
     subprocess.run(

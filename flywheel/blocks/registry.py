@@ -1,7 +1,7 @@
 """Project-wide registry of declared blocks.
 
 A :class:`BlockRegistry` loads per-block YAML files from a
-``workforce/blocks/`` directory and exposes the parsed
+``templates/blocks/`` directory and exposes the parsed
 :class:`~flywheel.template.BlockDefinition` objects by name.
 Templates can then reference blocks by name in their ``blocks:``
 list and have them resolved at template-load time.
@@ -23,9 +23,9 @@ Example:
     from flywheel.template import Template
 
     registry = BlockRegistry.from_directory(
-        project_root / "workforce" / "blocks")
+        foundry_dir / "templates" / "blocks")
     template = Template.from_yaml(
-        templates_dir / "arc_play.yaml",
+        workspace_templates_dir / "arc_play.yaml",
         block_registry=registry,
     )
 """

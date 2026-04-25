@@ -19,6 +19,15 @@ class TestLoadProjectConfig:
         (tmp_path / CONFIG_FILENAME).write_text("foundry_dir: foundry\n")
         config = load_project_config(tmp_path)
         assert config.templates_dir == tmp_path / "foundry" / "templates"
+        assert config.workspace_templates_dir == (
+            tmp_path / "foundry" / "templates" / "workspaces"
+        )
+        assert config.block_templates_dir == (
+            tmp_path / "foundry" / "templates" / "blocks"
+        )
+        assert config.pattern_templates_dir == (
+            tmp_path / "foundry" / "templates" / "patterns"
+        )
 
     def test_missing_file_raises_with_helpful_message(self, tmp_path: Path):
         with pytest.raises(
@@ -62,7 +71,13 @@ class TestLoadProjectConfig:
         (tmp_path / CONFIG_FILENAME).write_text("foundry_dir: some/nested/dir\n")
         config = load_project_config(tmp_path)
         assert config.foundry_dir == tmp_path / "some" / "nested" / "dir"
-        assert config.templates_dir == tmp_path / "some" / "nested" / "dir" / "templates"
+        assert config.templates_dir == (
+            tmp_path / "some" / "nested" / "dir" / "templates"
+        )
+        assert config.workspace_templates_dir == (
+            tmp_path / "some" / "nested" / "dir"
+            / "templates" / "workspaces"
+        )
 
 
 class TestHooksKeyRejected:

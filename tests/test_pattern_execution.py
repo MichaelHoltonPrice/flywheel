@@ -49,7 +49,7 @@ def _setup_workspace(tmp_path: Path) -> tuple[Path, Template, Workspace]:
     project_root = tmp_path / "project"
     project_root.mkdir()
     foundry_dir = project_root / "foundry"
-    templates_dir = foundry_dir / "templates"
+    templates_dir = foundry_dir / "templates" / "workspaces"
     templates_dir.mkdir(parents=True)
     template_path = templates_dir / "test.yaml"
     template_path.write_text(TEMPLATE_YAML)

@@ -209,7 +209,10 @@ def main(argv: list[str] | None = None) -> None:
     pattern_parser = run_sub.add_parser("pattern")
     pattern_parser.add_argument(
         "pattern_name",
-        help="Pattern name (file stem under <foundry_dir>/patterns/).")
+        help=(
+            "Pattern name (file stem under "
+            "<foundry_dir>/templates/patterns/)."
+        ))
     pattern_parser.add_argument("--workspace", required=True)
     pattern_parser.add_argument("--template", required=True)
 
@@ -342,7 +345,8 @@ def create_workspace(name: str, template_name: str) -> None:
     """Create a workspace from project root (cwd).
 
     Reads flywheel.yaml to find the foundry dir (foundry_dir).
-    Looks for template at foundry_dir/templates/{template_name}.yaml.
+    Looks for the workspace template at
+    foundry_dir/templates/workspaces/{template_name}.yaml.
 
     Args:
         name: Workspace name.
@@ -355,7 +359,9 @@ def create_workspace(name: str, template_name: str) -> None:
     project_root = Path.cwd()
     config = load_project_config(project_root)
 
-    template_path = config.templates_dir / f"{template_name}.yaml"
+    template_path = (
+        config.workspace_templates_dir / f"{template_name}.yaml"
+    )
     template = Template.from_yaml(
         template_path,
         block_registry=config.load_block_registry(),
@@ -402,7 +408,7 @@ def import_artifact(
     template_name = ws.template_name
     if template_name:
         template_path = (
-            config.templates_dir / f"{template_name}.yaml"
+            config.workspace_templates_dir / f"{template_name}.yaml"
         )
         if template_path.is_file():
             template = Template.from_yaml(
@@ -455,7 +461,7 @@ def _resolve_validator_and_declaration(
     template_name = workspace.template_name
     if template_name:
         template_path = (
-            config.templates_dir / f"{template_name}.yaml"
+            config.workspace_templates_dir / f"{template_name}.yaml"
         )
         if template_path.is_file():
             template = Template.from_yaml(
@@ -614,7 +620,9 @@ def run_block_command(
     """
     config = load_project_config(Path.cwd())
 
-    template_path = config.templates_dir / f"{template_name}.yaml"
+    template_path = (
+        config.workspace_templates_dir / f"{template_name}.yaml"
+    )
     template = Template.from_yaml(
         template_path,
         block_registry=config.load_block_registry(),
@@ -645,7 +653,7 @@ def run_agent_command(args, extra_args: list[str]) -> None:
     """
     config = load_project_config(Path.cwd())
 
-    template_path = config.templates_dir / f"{args.template}.yaml"
+    template_path = config.workspace_templates_dir / f"{args.template}.yaml"
     block_registry = config.load_block_registry()
     template = Template.from_yaml(
         template_path,
@@ -733,17 +741,19 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         sys.exit(1)
 
     config = load_project_config(Path.cwd())
-    pattern_path = config.patterns_dir / f"{args.pattern_name}.yaml"
+    pattern_path = (
+        config.pattern_templates_dir / f"{args.pattern_name}.yaml"
+    )
     if not pattern_path.exists():
         print(
             f"ERROR: no pattern named {args.pattern_name!r} in "
-            f"{config.patterns_dir}"
+            f"{config.pattern_templates_dir}"
         )
         sys.exit(1)
 
     block_registry = config.load_block_registry()
     template = Template.from_yaml(
-        config.templates_dir / f"{args.template}.yaml",
+        config.workspace_templates_dir / f"{args.template}.yaml",
         block_registry=block_registry,
     )
     workspace = Workspace.load(Path(args.workspace))

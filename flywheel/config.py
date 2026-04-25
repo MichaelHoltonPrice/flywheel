@@ -50,44 +50,50 @@ class ProjectConfig:
 
     @property
     def templates_dir(self) -> Path:
-        """Path to the templates directory."""
+        """Path to the root templates directory."""
         return self.foundry_dir / "templates"
 
     @property
-    def patterns_dir(self) -> Path:
-        """Path to the patterns directory.
+    def workspace_templates_dir(self) -> Path:
+        """Path to workspace template YAML files."""
+        return self.templates_dir / "workspaces"
 
-        Convention: ``<foundry_dir>/patterns/``.  Used by
+    @property
+    def block_templates_dir(self) -> Path:
+        """Path to per-block template YAML files.
+
+        Convention: ``<foundry_dir>/templates/blocks/``.  Used by
+        :meth:`flywheel.blocks.BlockRegistry.from_directory` to
+        load block definitions referenced by name from workspace
+        templates.
+        The directory is optional; templates that only use inline
+        block definitions need not have it.
+        """
+        return self.templates_dir / "blocks"
+
+    @property
+    def pattern_templates_dir(self) -> Path:
+        """Path to pattern template YAML files.
+
+        Convention: ``<foundry_dir>/templates/patterns/``.  Used by
         ``flywheel run pattern`` to discover declarative patterns
         by file stem.  The directory is optional; projects that
         ship no patterns yet have an implicit empty registry.
         """
-        return self.foundry_dir / "patterns"
-
-    @property
-    def blocks_dir(self) -> Path:
-        """Path to the per-block YAML directory.
-
-        Convention: ``<project_root>/workforce/blocks/``.  Used by
-        :meth:`flywheel.blocks.BlockRegistry.from_directory` to
-        load block definitions referenced by name from templates.
-        The directory is optional; templates that only use inline
-        block definitions need not have it.
-        """
-        return self.project_root / "workforce" / "blocks"
+        return self.templates_dir / "patterns"
 
     def load_block_registry(self):  # type: ignore[no-untyped-def]
         """Load the project's :class:`BlockRegistry`.
 
         Convenience wrapper around
-        ``BlockRegistry.from_directory(self.blocks_dir)``.
+        ``BlockRegistry.from_directory(self.block_templates_dir)``.
         Returns an empty registry if the directory does not
         exist, which is the supported state for projects whose
         blocks are still inline in templates.
         """
         # Local import to avoid a config → blocks → template cycle.
         from flywheel.blocks.registry import BlockRegistry  # noqa: PLC0415
-        return BlockRegistry.from_directory(self.blocks_dir)
+        return BlockRegistry.from_directory(self.block_templates_dir)
 
     def load_artifact_validator_registry(
         self,
@@ -196,7 +202,8 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     if "hooks" in data:
         raise ValueError(
             f"'hooks' in {config_path} is not supported. "
-            f"Declare workflows under '<foundry_dir>/patterns/' "
+            f"Declare workflows under "
+            f"'<foundry_dir>/templates/patterns/' "
             f"and wire resource setup via 'project_hooks' "
             f"instead."
         )

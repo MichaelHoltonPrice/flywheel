@@ -692,8 +692,11 @@ project_root/
 ├── flywheel.yaml             ← project config (foundry_dir)
 ├── crates/                   ← project source code
 └── foundry/                  ← flywheel's folder
-    ├── templates/            ← workspace templates
-    │   └── train_eval.yaml
+    ├── templates/            ← reusable declarations
+    │   ├── workspaces/
+    │   │   └── cyberloop.yaml
+    │   ├── blocks/
+    │   └── patterns/
     └── workspaces/
         └── my_workspace/
             ├── workspace.yaml   ← metadata, artifacts, executions
@@ -707,7 +710,8 @@ project_root/
 
 A template defines the capabilities of a workspace: what
 artifacts can exist, what blocks can run, and how containers are
-configured. Templates live in `foundry/templates/`.
+configured. Workspace templates live in
+`foundry/templates/workspaces/`.
 
 A template declares:
 - **Artifact declarations**, which specify names and storage

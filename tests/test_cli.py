@@ -45,8 +45,10 @@ def make_project(tmp_path: Path) -> Path:
     flywheel_yaml = project_root / "flywheel.yaml"
     flywheel_yaml.write_text("foundry_dir: foundry\n")
 
-    # Create template directory and file
-    templates_dir = project_root / "foundry" / "templates"
+    # Create workspace template directory and file
+    templates_dir = (
+        project_root / "foundry" / "templates" / "workspaces"
+    )
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "my_template.yaml"
@@ -66,7 +68,7 @@ blocks:
   - eval
 """)
 
-    blocks_dir = project_root / "workforce" / "blocks"
+    blocks_dir = project_root / "foundry" / "templates" / "blocks"
     blocks_dir.mkdir(parents=True)
     (blocks_dir / "train.yaml").write_text("""\
 name: train
@@ -104,7 +106,9 @@ def make_copy_only_project(tmp_path: Path) -> Path:
     flywheel_yaml = project_root / "flywheel.yaml"
     flywheel_yaml.write_text("foundry_dir: foundry\n")
 
-    templates_dir = project_root / "foundry" / "templates"
+    templates_dir = (
+        project_root / "foundry" / "templates" / "workspaces"
+    )
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "simple.yaml"
@@ -261,7 +265,8 @@ class TestMainImportArtifact:
 
         # Create workspace (copy-only template, no git needed)
         template = from_yaml_with_inline_blocks(
-            project_root / "foundry" / "templates" / "simple.yaml")
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
@@ -292,7 +297,8 @@ class TestMainImportArtifact:
         monkeypatch.chdir(project_root)
 
         template = from_yaml_with_inline_blocks(
-            project_root / "foundry" / "templates" / "simple.yaml")
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
@@ -330,7 +336,8 @@ class TestMainFixExecution:
         Returns ``(workspace_path, execution_id, slot_name)``.
         """
         template = from_yaml_with_inline_blocks(
-            project_root / "foundry" / "templates" / "simple.yaml")
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         ws = Workspace.create("test_ws", template, foundry_dir)
 
@@ -443,7 +450,8 @@ class TestMainAmendArtifact:
         instance.  Returns ``(workspace_path, predecessor_id)``.
         """
         template = from_yaml_with_inline_blocks(
-            project_root / "foundry" / "templates" / "simple.yaml")
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
@@ -547,7 +555,7 @@ class TestMainRunBlock:
 
 
 def _write_pattern(project_root: Path, name: str, body: str) -> Path:
-    patterns_dir = project_root / "foundry" / "patterns"
+    patterns_dir = project_root / "foundry" / "templates" / "patterns"
     patterns_dir.mkdir(parents=True, exist_ok=True)
     path = patterns_dir / f"{name}.yaml"
     path.write_text(body)
@@ -559,7 +567,9 @@ def test_run_pattern_uses_canonical_block_execution(
     monkeypatch: pytest.MonkeyPatch,
 ):
     project_root = make_project(tmp_path)
-    (project_root / "workforce" / "blocks" / "train.yaml").write_text("""\
+    (
+        project_root / "foundry" / "templates" / "blocks" / "train.yaml"
+    ).write_text("""\
 name: train
 image: cyberloop-train:latest
 inputs:
@@ -927,7 +937,9 @@ class TestProjectConfigFields:
         )
         cfg = load_project_config(tmp_path)
         assert cfg.project_hooks == "my.module:Hooks"
-        assert cfg.patterns_dir == tmp_path / "foundry" / "patterns"
+        assert cfg.pattern_templates_dir == (
+            tmp_path / "foundry" / "templates" / "patterns"
+        )
 
     def test_project_hooks_wrong_type_raises(
         self, tmp_path: Path,

@@ -2,13 +2,13 @@
 
 Covers:
 
-- ``BlockRegistry.from_directory`` loads ``workforce/blocks/*.yaml``.
+- ``BlockRegistry.from_directory`` loads block template YAML files.
 - Block YAML schema validation (runner, image,
   runner_justification rules).
 - Template integration: string entries in ``blocks:`` resolve to
   registry blocks; inline-dict entries are rejected.
 - ``ProjectConfig.load_block_registry`` auto-discovers from
-  ``<project_root>/workforce/blocks``.
+  ``<foundry_dir>/templates/blocks``.
 """
 
 from __future__ import annotations
@@ -324,14 +324,14 @@ class TestInlineBlockRemoved:
                 tmpl_path, block_registry=registry)
 
 
-class TestProjectConfigBlocksDir:
-    def test_blocks_dir_default_path(self, tmp_path: Path):
+class TestProjectConfigBlockTemplatesDir:
+    def test_block_templates_dir_default_path(self, tmp_path: Path):
         (tmp_path / "flywheel.yaml").write_text(
             "foundry_dir: foundry\n")
         (tmp_path / "foundry").mkdir()
         config = load_project_config(tmp_path)
-        assert config.blocks_dir == (
-            tmp_path / "workforce" / "blocks")
+        assert config.block_templates_dir == (
+            tmp_path / "foundry" / "templates" / "blocks")
 
     def test_load_block_registry_empty_when_dir_missing(
             self, tmp_path: Path):
@@ -342,12 +342,12 @@ class TestProjectConfigBlocksDir:
         registry = config.load_block_registry()
         assert registry.names() == []
 
-    def test_load_block_registry_loads_workforce_blocks(
+    def test_load_block_registry_loads_block_templates(
             self, tmp_path: Path):
         (tmp_path / "flywheel.yaml").write_text(
             "foundry_dir: foundry\n")
         (tmp_path / "foundry").mkdir()
-        wf = tmp_path / "workforce" / "blocks"
+        wf = tmp_path / "foundry" / "templates" / "blocks"
         wf.mkdir(parents=True)
         _write_yaml(wf / "train.yaml", CONTAINER_BLOCK)
 

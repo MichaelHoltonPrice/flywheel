@@ -4,9 +4,10 @@ A template declares the capabilities of a workspace: what artifacts
 exist, what blocks can run, and their container images. Templates
 are parsed from YAML files and validated at load time.
 
-Block declarations live in ``workforce/blocks/<name>.yaml`` files
-and are loaded into a :class:`BlockRegistry`.  The template's
-``blocks:`` list contains string references to those blocks.
+Block declarations live in
+``<foundry_dir>/templates/blocks/<name>.yaml`` files and are
+loaded into a :class:`BlockRegistry`.  The template's ``blocks:``
+list contains string references to those blocks.
 """
 
 from __future__ import annotations
@@ -262,7 +263,7 @@ class Template:
                     f"unsupported type {type(entry).__name__!r}; "
                     f"templates must reference blocks by name "
                     f"(string).  Define each block in its own "
-                    f"workforce/blocks/<name>.yaml file."
+                    f"templates/blocks/<name>.yaml file."
                 )
             if block_registry is None:
                 raise ValueError(
@@ -759,5 +760,4 @@ def _validate_block_against_artifacts(
                 f"Block {block.name!r} output {slot.name!r} is a "
                 f"git artifact and cannot be a block output"
             )
-
 

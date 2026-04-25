@@ -8,7 +8,7 @@ workspace, or change what was recorded.
 
 Opt-in is per block, in YAML::
 
-    # workforce/blocks/<name>.yaml
+    # <foundry_dir>/templates/blocks/<name>.yaml
     name: <block>
     runner: lifecycle
     runner_justification: "..."

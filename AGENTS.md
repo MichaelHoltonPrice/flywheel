@@ -39,13 +39,11 @@ A flywheel-using project root contains:
   manages) and optionally `project_hooks` (`module.path:ClassName`
   for the project's `ProjectHooks` implementation, consumed by
   `flywheel run pattern`).
-* `<foundry_dir>/templates/<name>.yaml` — workspace templates.
+* `<foundry_dir>/templates/workspaces/<name>.yaml` — workspace templates.
+* `<foundry_dir>/templates/blocks/<name>.yaml` — block templates.
+* `<foundry_dir>/templates/patterns/<name>.yaml` — pattern templates.
 * `<foundry_dir>/workspaces/<name>/` — flywheel-managed workspace
   directories. Created by `flywheel create workspace`.
-* `workforce/blocks/<name>.yaml` — block definitions referenced by
-  templates by string name.
-* `patterns/<name>.yaml` — pattern definitions consumed by
-  `flywheel run pattern`.
 
 ## Key concepts
 
@@ -160,7 +158,7 @@ return.)
 
 Templates declare blocks by string reference (e.g.,
 `blocks: [Eval, TrainSegment]`). Block bodies live in
-`workforce/blocks/<name>.yaml` and are loaded into a
+`<foundry_dir>/templates/blocks/<name>.yaml` and are loaded into a
 `BlockRegistry`. Inline-dict block definitions in templates are
 rejected.
 

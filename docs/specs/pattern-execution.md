@@ -17,7 +17,7 @@ on `BlockExecution`.
 
 ## Pattern Shape
 
-Patterns live under `<foundry_dir>/patterns/<name>.yaml`:
+Patterns live under `<foundry_dir>/templates/patterns/<name>.yaml`:
 
 ```yaml
 name: train_eval

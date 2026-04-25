@@ -29,12 +29,12 @@ state restore) assumes a workspace exists.
   (the directory flywheel manages). Optionally
   `project_hooks: module.path:ClassName` for `flywheel run pattern`
   later; not required for `create workspace`.
-* **The template file exists** at
-  `<foundry_dir>/templates/<template_name>.yaml`.
+* **The workspace template file exists** at
+  `<foundry_dir>/templates/workspaces/<template_name>.yaml`.
 * **The template's referenced blocks exist** in
-  `workforce/blocks/<name>.yaml` (resolved by the project block
-  registry; missing blocks fail template loading, not workspace
-  creation, but the failure surfaces during this command).
+  `<foundry_dir>/templates/blocks/<name>.yaml` (resolved by the
+  project block registry; missing blocks fail template loading, not
+  workspace creation, but the failure surfaces during this command).
 * **For every `git`-kind artifact declared in the template:**
   * The referenced repository (`repo:` field) is on disk and is a
     git working tree.
@@ -61,7 +61,7 @@ that file. Run from the project root.
   hyphens, and underscores. Used as the directory name under
   `<foundry_dir>/workspaces/`.
 * `--template` — template name (without `.yaml`). Must match a
-  file at `<foundry_dir>/templates/<template>.yaml`.
+  file at `<foundry_dir>/templates/workspaces/<template>.yaml`.
 
 Example:
 
@@ -98,7 +98,7 @@ exit code zero.
 | Condition | Exception | Recovery |
 | --- | --- | --- |
 | `flywheel.yaml` missing or malformed at the cwd. | `FileNotFoundError` / `ValueError` from project config loader. | Run from the project root. Confirm `flywheel.yaml` exists and declares `foundry_dir`. |
-| Template file missing at `<foundry_dir>/templates/<template>.yaml`. | `FileNotFoundError`. | Confirm the template name matches the file name (without `.yaml`) and lives under the configured foundry. |
+| Template file missing at `<foundry_dir>/templates/workspaces/<template>.yaml`. | `FileNotFoundError`. | Confirm the template name matches the file name (without `.yaml`) and lives under the configured foundry. |
 | `--name` contains characters outside letters, digits, hyphens, or underscores. | `ValueError("invalid name…")`. | Pick a name that matches the allowed pattern. |
 | Workspace with that name already exists. | `FileExistsError`. | Pick a different name, or delete the existing workspace directory first. |
 | A `git`-kind artifact's repo has uncommitted changes. | `RuntimeError("uncommitted changes…")`. | Commit or stash the changes in that repo, then retry. |
