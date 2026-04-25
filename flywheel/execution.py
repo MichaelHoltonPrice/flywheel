@@ -45,6 +45,10 @@ from flywheel.artifact_validator import (
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
 from flywheel.quarantine import quarantine_slot
+from flywheel.state import (
+    StateMode,
+    state_compatibility_identity,
+)
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
@@ -86,6 +90,13 @@ class ExecutionPlan:
         termination_file: Path the block writes its
             termination-reason announcement to (sidecar at
             ``/flywheel/termination`` inside the container).
+        state_mode: Substrate-visible state mode for this execution.
+        state_lineage_key: Managed state lineage key, when applicable.
+        state_mount_dir: Host directory mounted at ``/flywheel/state``.
+        restored_state_snapshot_id: Snapshot restored into the state
+            mount, when one existed.
+        state_compatibility: Compatibility identity used to reject
+            restoring an incompatible snapshot.
     """
 
     execution_id: str
@@ -97,6 +108,11 @@ class ExecutionPlan:
     proposal_dirs: dict[str, Path]
     proposals_root: Path
     termination_file: Path
+    state_mode: StateMode = "none"
+    state_lineage_key: str | None = None
+    state_mount_dir: Path | None = None
+    restored_state_snapshot_id: str | None = None
+    state_compatibility: dict[str, str] | None = None
 
 
 @dataclass
@@ -224,6 +240,16 @@ def _mount_artifact_instance(
     return (host_path, container_path, "ro")
 
 
+def _copy_dir_contents(source: Path, target: Path) -> None:
+    """Copy a directory's contents into an existing target directory."""
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination)
+        else:
+            shutil.copy2(child, destination)
+
+
 def _record_execution(
     workspace: Workspace, execution_id: str, block_name: str,
     started_at: datetime,
@@ -237,6 +263,8 @@ def _record_execution(
     failure_phase: str | None = None,
     error: str | None = None,
     rejected_outputs: dict[str, RejectedOutput] | None = None,
+    state_mode: StateMode = "none",
+    state_snapshot_id: str | None = None,
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -265,6 +293,8 @@ def _record_execution(
         error=error,
         rejected_outputs=rejected_outputs or {},
         termination_reason=termination_reason,
+        state_mode=state_mode,
+        state_snapshot_id=state_snapshot_id,
     )
     workspace.record_execution(execution)
 
@@ -284,6 +314,7 @@ def commit_failure(
     termination_reason: str = runtime.TERMINATION_REASON_CRASH,
     resolved_bindings: dict[str, str] | None = None,
     proposals_root: Path | None = None,
+    state_mode: StateMode = "none",
 ) -> None:
     """Record a failure that happened upstream of the commit phase.
 
@@ -328,6 +359,7 @@ def commit_failure(
         all_expected_committed=True,
         failure_phase=phase,
         error=error,
+        state_mode=state_mode,
     )
 
 
@@ -343,6 +375,7 @@ def prepare_block_execution(
     *,
     execution_id: str,
     started_at: datetime,
+    state_lineage_key: str | None = None,
 ) -> ExecutionPlan:
     """Allocate proposal dirs, resolve inputs, build mounts.
 
@@ -398,6 +431,35 @@ def prepare_block_execution(
     mounts.append(
         (str(termination_dir.resolve()), "/flywheel", "rw")
     )
+
+    state_mode = block_def.state
+    state_mount_dir: Path | None = None
+    restored_state_snapshot_id: str | None = None
+    state_compatibility: dict[str, str] | None = None
+    if state_mode == "managed":
+        if state_lineage_key is None or not state_lineage_key.strip():
+            raise ValueError(
+                f"Block {block_def.name!r} declares managed state; "
+                "a state lineage key is required"
+            )
+        state_lineage_key = state_lineage_key.strip()
+        state_compatibility = state_compatibility_identity(block_def)
+        latest_snapshot = workspace.latest_state_snapshot(
+            state_lineage_key)
+        state_mount_dir = termination_dir / "state"
+        state_mount_dir.mkdir(parents=True, exist_ok=True)
+        if latest_snapshot is not None:
+            if latest_snapshot.compatibility != state_compatibility:
+                raise ValueError(
+                    f"Latest state snapshot {latest_snapshot.id!r} "
+                    f"for lineage {state_lineage_key!r} is not "
+                    f"compatible with block {block_def.name!r}"
+                )
+            _copy_dir_contents(
+                workspace.state_snapshot_path(latest_snapshot.id),
+                state_mount_dir,
+            )
+            restored_state_snapshot_id = latest_snapshot.id
 
     for slot in block_def.inputs:
         decl = _find_artifact_declaration(template, slot.name)
@@ -460,6 +522,11 @@ def prepare_block_execution(
         proposal_dirs=proposal_dirs,
         proposals_root=proposals_root,
         termination_file=termination_file,
+        state_mode=state_mode,
+        state_lineage_key=state_lineage_key,
+        state_mount_dir=state_mount_dir,
+        restored_state_snapshot_id=restored_state_snapshot_id,
+        state_compatibility=state_compatibility,
     )
 
 
@@ -648,6 +715,7 @@ def commit_block_execution(
             all_expected_committed=True,
             failure_phase=failure_phase,
             error=error,
+            state_mode=plan.state_mode,
         )
         message = f"Block {block_name!r} runtime failed: {error}"
         if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
@@ -655,6 +723,41 @@ def commit_block_execution(
         raise RuntimeError(message)
 
     # ── Forge proposals into artifact instances ──────────────────
+    state_snapshot_id: str | None = None
+    if plan.state_mode == "managed":
+        assert plan.state_lineage_key is not None
+        assert plan.state_mount_dir is not None
+        assert plan.state_compatibility is not None
+        try:
+            snapshot = workspace.register_state_snapshot(
+                lineage_key=plan.state_lineage_key,
+                source_path=plan.state_mount_dir,
+                produced_by=plan.execution_id,
+                compatibility=plan.state_compatibility,
+                predecessor_snapshot_id=plan.restored_state_snapshot_id,
+            )
+            state_snapshot_id = snapshot.id
+        except Exception as exc:
+            recovery_path = workspace.preserve_state_recovery(
+                execution_id=plan.execution_id,
+                source_path=plan.state_mount_dir,
+            )
+            shutil.rmtree(plan.proposals_root, ignore_errors=True)
+            error = f"state_capture: {type(exc).__name__}: {exc}"
+            if recovery_path is not None:
+                error = f"{error} (recovery: {recovery_path})"
+            _record_execution(
+                workspace, plan.execution_id, block_name, plan.started_at,
+                termination_reason,
+                plan.resolved_bindings, {},
+                exit_code, elapsed_s, image,
+                all_expected_committed=False,
+                failure_phase=runtime.FAILURE_STATE_CAPTURE,
+                error=error,
+                state_mode=plan.state_mode,
+            )
+            raise RuntimeError(error) from exc
+
     declarations = {a.name: a for a in template.artifacts}
     output_bindings: dict[str, str] = {}
     rejected_outputs: dict[str, RejectedOutput] = {}
@@ -738,6 +841,8 @@ def commit_block_execution(
             failure_phase=execution_phase,
             error=error_msg,
             rejected_outputs=rejected_outputs,
+            state_mode=plan.state_mode,
+            state_snapshot_id=state_snapshot_id,
         )
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
             raise ArtifactValidationError(error_msg)
@@ -749,6 +854,8 @@ def commit_block_execution(
         plan.resolved_bindings, output_bindings,
         exit_code, elapsed_s, image,
         all_expected_committed=all_expected_committed,
+        state_mode=plan.state_mode,
+        state_snapshot_id=state_snapshot_id,
     )
 
     return container_result
@@ -767,6 +874,7 @@ def run_block(
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
     container_runner: OneShotContainerRunner | None = None,
+    state_lineage_key: str | None = None,
 ) -> ContainerResult:
     """Execute a block within a workspace.
 
@@ -788,6 +896,9 @@ def run_block(
             registry consulted before each output slot is committed.
         container_runner: Optional runner for the prepared one-shot
             container body.  Defaults to the Docker-backed runner.
+        state_lineage_key: Required for blocks that declare
+            ``state: managed``; identifies the execution-lineage
+            state chain to restore from and capture into.
 
     Returns:
         A ContainerResult with exit code and wall-clock elapsed
@@ -848,6 +959,7 @@ def run_block(
             input_bindings,
             execution_id=execution_id,
             started_at=started_at,
+            state_lineage_key=state_lineage_key,
         )
     except Exception as exc:
         commit_failure(
@@ -859,6 +971,7 @@ def run_block(
             phase=runtime.FAILURE_STAGE_IN,
             error=f"{type(exc).__name__}: {exc}",
             proposals_root=proposals_root,
+            state_mode=block_def.state,
         )
         raise
 
@@ -880,6 +993,7 @@ def run_block(
             termination_reason=runtime.TERMINATION_REASON_INTERRUPTED,
             resolved_bindings=plan.resolved_bindings,
             proposals_root=plan.proposals_root,
+            state_mode=plan.state_mode,
         )
         raise
     except Exception as exc:
@@ -893,6 +1007,7 @@ def run_block(
             error=f"{type(exc).__name__}: {exc}",
             resolved_bindings=plan.resolved_bindings,
             proposals_root=plan.proposals_root,
+            state_mode=plan.state_mode,
         )
         raise
 

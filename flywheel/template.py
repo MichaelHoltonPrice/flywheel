@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal
 
 import yaml
 
+from flywheel.state import StateMode, normalize_state_mode
 from flywheel.validation import validate_name as _validate_name
 
 if TYPE_CHECKING:
@@ -126,15 +127,11 @@ class BlockDefinition:
             is executor policy.  State — whether a block has
             internal state that must survive across executions —
             is a separate concern, not implied by either value.
-        state: Whether the block has private memory that must
-            survive across executions.  When ``True``, flywheel
-            mounts a ``/state/`` directory in the container,
-            populates it at start with the prior successful
-            execution's captured state, and captures its
-            contents on clean exit.  See
-            ``cyber-root/substrate-contract.md``.  Mutually
-            exclusive with ``lifecycle: workspace_persistent``
-            (that lifecycle preserves state in-memory instead).
+        state: Substrate-visible state mode: ``"none"``,
+            ``"managed"``, or ``"unmanaged"``.  ``managed``
+            participates in Flywheel state snapshots.
+            ``unmanaged`` marks stateful behavior the substrate
+            cannot capture.
         stop_timeout_s: Seconds to wait after writing the
             cooperative stop sentinel before escalating to
             SIGTERM (and then SIGKILL after a short grace).
@@ -172,7 +169,7 @@ class BlockDefinition:
     post_check: str | None = None
     output_builder: str | None = None
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
-    state: bool = False
+    state: StateMode = "none"
     stop_timeout_s: int = 30
 
     def all_output_slots(self) -> list[OutputSlot]:
@@ -673,24 +670,16 @@ def parse_block_definition(
             f"expected one of {', '.join(_BLOCK_LIFECYCLES)}"
         )
 
-    state = entry.get("state", False)
-    if not isinstance(state, bool):
+    state = normalize_state_mode(entry.get("state", "none"), block_name=name)
+    if state != "none" and runner != "container":
         raise ValueError(
-            f"Block {name!r}: 'state' must be a boolean "
-            f"(got {type(state).__name__})"
-        )
-    if state and runner != "container":
-        raise ValueError(
-            f"Block {name!r}: 'state: true' is only valid for "
+            f"Block {name!r}: 'state' is only valid for "
             f"runner 'container' (got {runner!r})"
         )
-    # workspace_persistent preserves state in-memory; having a
-    # `/state/` mount too would address the same concern twice.
-    if state and lifecycle == "workspace_persistent":
+    if state == "managed" and lifecycle == "workspace_persistent":
         raise ValueError(
-            f"Block {name!r}: 'state: true' is mutually exclusive "
-            f"with 'lifecycle: workspace_persistent' (persistent "
-            f"containers preserve state in-memory, not on disk)"
+            f"Block {name!r}: 'state: managed' is mutually "
+            f"exclusive with 'lifecycle: workspace_persistent'"
         )
 
     # stop_timeout_s: seconds to wait for cooperative stop before
@@ -760,4 +749,3 @@ def _validate_block_against_artifacts(
                 f"Block {block.name!r} output {slot.name!r} is a "
                 f"git artifact and cannot be a block output"
             )
-

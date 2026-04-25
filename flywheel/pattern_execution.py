@@ -22,6 +22,7 @@ from flywheel.pattern_resolution import (
     resolve_next_step,
 )
 from flywheel.run_record import RunMemberRecord, RunStepRecord
+from flywheel.state import pattern_state_lineage_key
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -114,6 +115,7 @@ def _execute_step(
             template,
             project_root,
             run_id=run_id,
+            step_name=step.name,
             validator_registry=validator_registry,
         )
         members.append(result)
@@ -145,6 +147,7 @@ def _execute_member(
     project_root: Path,
     *,
     run_id: str,
+    step_name: str,
     validator_registry: ArtifactValidatorRegistry | None,
 ) -> RunMemberRecord:
     before = set(workspace.executions)
@@ -158,6 +161,8 @@ def _execute_member(
             input_bindings=input_bindings,
             args=member.args,
             validator_registry=validator_registry,
+            state_lineage_key=pattern_state_lineage_key(
+                run_id, step_name, member.name),
         )
     except Exception as exc:
         execution_id = _new_execution_id(workspace, before)

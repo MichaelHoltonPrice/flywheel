@@ -53,6 +53,22 @@ blocks:
         container_path: /output
 """
 
+STATE_TEMPLATE_YAML = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+
+blocks:
+  - name: stateful
+    image: stateful:latest
+    state: managed
+    inputs: []
+    outputs:
+      normal:
+        - name: checkpoint
+          container_path: /output
+"""
+
 
 def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     project_root = tmp_path / "project"
@@ -84,6 +100,22 @@ def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     )
     template = from_yaml_with_inline_blocks(template_path)
     return project_root, foundry_dir, template
+
+
+def _setup_state_project(
+    tmp_path: Path,
+    template_yaml: str = STATE_TEMPLATE_YAML,
+) -> tuple[Path, Path, Path, Template]:
+    project_root = tmp_path / "state_project"
+    project_root.mkdir()
+    foundry_dir = project_root / "foundry"
+    foundry_dir.mkdir()
+    templates_dir = foundry_dir / "templates" / "workspaces"
+    templates_dir.mkdir(parents=True)
+    template_path = templates_dir / "state_template.yaml"
+    template_path.write_text(template_yaml)
+    template = from_yaml_with_inline_blocks(template_path)
+    return project_root, foundry_dir, template_path, template
 
 
 def _commit_all(project_root: Path, message: str = "auto") -> None:
@@ -883,6 +915,234 @@ class TestOneShotContainerRunner:
         assert ex.status == "failed"
         assert ex.failure_phase == runtime.FAILURE_OUTPUT_COLLECT
         assert ex.error == "output_collect: checkpoint: no output bytes written"
+
+
+class TestManagedStateExecution:
+    """Managed state restore and capture through canonical run_block."""
+
+    def test_state_snapshot_restores_into_next_execution(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        seen_markers: list[str | None] = []
+
+        class StatefulRunner:
+            def __init__(self, next_marker: str):
+                self.next_marker = next_marker
+
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                assert not any(
+                    mount[1] == runtime.STATE_MOUNT_PATH
+                    for mount in plan.mounts
+                )
+                assert any(
+                    mount[1] == "/flywheel" for mount in plan.mounts
+                )
+                marker = plan.state_mount_dir / "marker.txt"
+                seen_markers.append(
+                    marker.read_text() if marker.exists() else None
+                )
+                marker.write_text(self.next_marker)
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    self.next_marker)
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=StatefulRunner("first"),
+        )
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=StatefulRunner("second"),
+        )
+
+        assert seen_markers == [None, "first"]
+        assert len(ws.state_snapshots) == 2
+        latest = ws.latest_state_snapshot("lineage_a")
+        assert latest is not None
+        assert (ws.state_snapshot_path(latest.id) / "marker.txt").read_text() == (
+            "second"
+        )
+        executions = list(ws.executions.values())
+        assert executions[0].state_mode == "managed"
+        assert executions[0].state_snapshot_id is not None
+        assert executions[1].state_snapshot_id == latest.id
+
+    def test_managed_state_requires_lineage_key(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(ValueError, match="state lineage key"):
+            run_block(ws, "stateful", template, project_root)
+
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "failed"
+        assert ex.failure_phase == runtime.FAILURE_STAGE_IN
+        assert ex.state_mode == "managed"
+
+    def test_reserved_failure_does_not_capture_state(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        seen_markers: list[str | None] = []
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("good")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        class CrashRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("bad")
+                return RuntimeResult(
+                    termination_reason=runtime.TERMINATION_REASON_CRASH,
+                    container_result=ContainerResult(
+                        exit_code=1, elapsed_s=0.1),
+                )
+
+        class ReadRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                marker = plan.state_mount_dir / "marker.txt"
+                seen_markers.append(
+                    marker.read_text() if marker.exists() else None
+                )
+                (plan.state_mount_dir / "marker.txt").write_text("after")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=SuccessRunner(),
+        )
+        with pytest.raises(RuntimeError):
+            run_block(
+                ws, "stateful", template, project_root,
+                state_lineage_key="lineage_a",
+                container_runner=CrashRunner(),
+            )
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=ReadRunner(),
+        )
+
+        assert seen_markers == ["good"]
+        assert len(ws.state_snapshots) == 2
+
+    def test_state_capture_failure_records_without_outputs(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("state")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        def fail_capture(**kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ws, "register_state_snapshot", fail_capture)
+
+        with pytest.raises(RuntimeError, match="state_capture"):
+            run_block(
+                ws, "stateful", template, project_root,
+                state_lineage_key="lineage_a",
+                container_runner=SuccessRunner(),
+            )
+
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "failed"
+        assert ex.failure_phase == runtime.FAILURE_STATE_CAPTURE
+        assert ex.output_bindings == {}
+        assert ws.instances_for("checkpoint") == []
+        assert len(ws.state_snapshots) == 0
+        assert (ws.path / "state_recovery" / ex.id / "state").exists()
+
+    def test_incompatible_snapshot_rejects_before_running(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template_path, template = (
+            _setup_state_project(tmp_path)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("state")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=SuccessRunner(),
+        )
+
+        changed_template_yaml = STATE_TEMPLATE_YAML.replace(
+            "stateful:latest", "stateful:v2")
+        template_path.write_text(changed_template_yaml)
+        changed_template = from_yaml_with_inline_blocks(template_path)
+
+        class ShouldNotRun:
+            def run(self, plan, args=None):
+                raise AssertionError("runtime should not start")
+
+        with pytest.raises(ValueError, match="not compatible"):
+            run_block(
+                ws, "stateful", changed_template, project_root,
+                state_lineage_key="lineage_a",
+                container_runner=ShouldNotRun(),
+            )
+
+        assert len(ws.state_snapshots) == 1
+        executions = list(ws.executions.values())
+        assert executions[-1].failure_phase == runtime.FAILURE_STAGE_IN
+        assert executions[-1].state_mode == "managed"
 
 
 class TestArtifactValidation:

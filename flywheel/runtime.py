@@ -16,8 +16,8 @@ from typing import Final
 
 STATE_MOUNT_PATH: Final[str] = "/flywheel/state"
 """Container-side path where flywheel mounts state for blocks that
-declare ``state: true``.  Populated at container start from the
-prior execution's state dir; captured at container exit.  Lives
+declare ``state: managed``.  Populated at container start from the
+latest compatible state snapshot; captured after clean exit.  Lives
 under ``/flywheel/`` so every flywheel-owned mount is under a
 single namespace distinct from the block body's inputs/outputs."""
 
@@ -75,8 +75,8 @@ FAILURE_INVOKE: Final[str] = "invoke"
 process-exit, error response for request-response."""
 
 FAILURE_STATE_CAPTURE: Final[str] = "state_capture"
-"""Container exited but ``/state/`` could not be captured into
-the workspace state dir.  The body may have succeeded; the
+"""Container exited but ``/flywheel/state`` could not be captured
+into a managed state snapshot.  The body may have succeeded; the
 execution is still recorded as failed."""
 
 FAILURE_OUTPUT_COLLECT: Final[str] = "output_collect"

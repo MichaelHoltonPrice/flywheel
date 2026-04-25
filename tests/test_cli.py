@@ -544,11 +544,13 @@ class TestMainRunBlock:
                 str(project_root / "foundry" / "workspaces" / "test_ws"),
                 "--block", "train",
                 "--template", "my_template",
+                "--state-lineage", "train_dueling",
                 "--", "--subclass", "dueling",
             ])
             mock_rb.assert_called_once()
             call_args = mock_rb.call_args
             assert call_args[0][1] == "train"
+            assert call_args.kwargs["state_lineage_key"] == "train_dueling"
 
 
 # ── flywheel run pattern ────────────────────────────────────────

@@ -17,6 +17,7 @@ from flywheel.pattern_resolution import (
     resolve_next_step,
 )
 from flywheel.run_record import RunMemberRecord, RunRecord, RunStepRecord
+from flywheel.state import pattern_state_lineage_key
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -45,14 +46,17 @@ blocks:
 """
 
 
-def _setup_workspace(tmp_path: Path) -> tuple[Path, Template, Workspace]:
+def _setup_workspace(
+    tmp_path: Path,
+    template_yaml: str = TEMPLATE_YAML,
+) -> tuple[Path, Template, Workspace]:
     project_root = tmp_path / "project"
     project_root.mkdir()
     foundry_dir = project_root / "foundry"
     templates_dir = foundry_dir / "templates" / "workspaces"
     templates_dir.mkdir(parents=True)
     template_path = templates_dir / "test.yaml"
-    template_path.write_text(TEMPLATE_YAML)
+    template_path.write_text(template_yaml)
     template = from_yaml_with_inline_blocks(template_path)
     workspace = Workspace.create("ws", template, foundry_dir)
     return project_root, template, workspace
@@ -68,6 +72,9 @@ def _fake_container(config, args=None):
         path = Path(host)
         if container_path == "/flywheel":
             (path / "termination").write_text("normal")
+            state_dir = path / "state"
+            if state_dir.exists():
+                (state_dir / "marker.txt").write_text("state")
         elif container_path.endswith("checkpoint"):
             (path / "checkpoint.pt").write_text("weights")
         elif container_path.endswith("score"):
@@ -237,6 +244,43 @@ def test_pattern_runner_uses_artifact_validators(tmp_path: Path):
         )
 
     assert seen == ["checkpoint", "score"]
+
+
+def test_pattern_runner_derives_managed_state_lineage(
+    tmp_path: Path,
+):
+    template_yaml = TEMPLATE_YAML.replace(
+        "    image: train:latest",
+        "    image: train:latest\n    state: managed",
+    )
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, template_yaml)
+
+    with patch("flywheel.execution.run_container", side_effect=_fake_container):
+        result = run_pattern(
+            workspace, _declaration(), template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    train_member = run.steps[0].members[0]
+    train_execution = reloaded.executions[train_member.execution_id]
+    assert train_execution.state_mode == "managed"
+    assert train_execution.state_snapshot_id is not None
+
+    snapshot = reloaded.state_snapshots[train_execution.state_snapshot_id]
+    assert snapshot.lineage_key == pattern_state_lineage_key(
+        result.run_id, "train", "train_dueling")
+    assert (
+        reloaded.state_snapshot_path(snapshot.id) / "marker.txt"
+    ).read_text() == "state"
+
+
+def test_pattern_state_lineage_key_is_injective_for_underscores():
+    run_id = "run_collision"
+
+    assert pattern_state_lineage_key(
+        run_id, "train_dueling", "a") != pattern_state_lineage_key(
+            run_id, "train", "dueling_a")
 
 
 def test_min_successes_one_runs_all_members_and_succeeds(tmp_path: Path):

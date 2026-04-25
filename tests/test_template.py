@@ -617,7 +617,7 @@ blocks:
 class TestStateField:
     """``state:`` on a block YAML declares private state support."""
 
-    def test_default_is_false(self, tmp_path: Path):
+    def test_default_is_none(self, tmp_path: Path):
         yaml_content = """\
 artifacts:
   - name: data
@@ -631,9 +631,9 @@ blocks:
         path = tmp_path / "default.yaml"
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
-        assert template.blocks[0].state is False
+        assert template.blocks[0].state == "none"
 
-    def test_state_true_parses(self, tmp_path: Path):
+    def test_state_true_parses_as_managed(self, tmp_path: Path):
         yaml_content = """\
 artifacts:
   - name: data
@@ -648,9 +648,26 @@ blocks:
         path = tmp_path / "stateful.yaml"
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
-        assert template.blocks[0].state is True
+        assert template.blocks[0].state == "managed"
 
-    def test_non_bool_raises(self, tmp_path: Path):
+    def test_named_state_modes_parse(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    state: unmanaged
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "stateful.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].state == "unmanaged"
+
+    def test_unknown_state_mode_raises(self, tmp_path: Path):
         yaml_content = """\
 artifacts:
   - name: data
@@ -664,7 +681,7 @@ blocks:
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
-        with pytest.raises(ValueError, match="'state' must be a boolean"):
+        with pytest.raises(ValueError, match="unknown state mode"):
             _from_yaml_with_inline_blocks(path)
 
     def test_state_rejected_on_non_container(self, tmp_path: Path):
@@ -687,12 +704,9 @@ blocks:
         ):
             _from_yaml_with_inline_blocks(path)
 
-    def test_state_with_workspace_persistent_rejected(
+    def test_managed_state_with_workspace_persistent_rejected(
         self, tmp_path: Path,
     ):
-        """Persistent lifecycle preserves state in-memory; declaring
-        state: true alongside addresses the same concern twice and
-        is a config error."""
         yaml_content = """\
 artifacts:
   - name: data
@@ -701,7 +715,7 @@ blocks:
   - name: proc
     image: proc:latest
     lifecycle: workspace_persistent
-    state: true
+    state: managed
     inputs: []
     outputs: [data]
 """
@@ -711,6 +725,26 @@ blocks:
             ValueError, match="mutually exclusive",
         ):
             _from_yaml_with_inline_blocks(path)
+
+    def test_unmanaged_state_with_workspace_persistent_parses(
+        self, tmp_path: Path,
+    ):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecycle: workspace_persistent
+    state: unmanaged
+    inputs: []
+    outputs: [data]
+"""
+        path = tmp_path / "persistent.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].state == "unmanaged"
 
 
 class TestStopTimeout:

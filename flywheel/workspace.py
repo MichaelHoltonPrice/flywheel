@@ -32,9 +32,12 @@ from flywheel.artifact import (
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.run_record import RunMemberRecord, RunRecord, RunStepRecord
 from flywheel.runtime import FAILURE_PHASES
+from flywheel.state import StateSnapshot
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.termination import derive_status
 from flywheel.validation import validate_name as _validate_name
+
+_PREDECESSOR_UNSPECIFIED = object()
 
 
 def _supersedes_to_yaml(ref: SupersedesRef) -> dict:
@@ -198,6 +201,46 @@ def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
     return steps
 
 
+def _state_snapshot_to_yaml(snapshot: StateSnapshot) -> dict:
+    """Serialize a managed state snapshot for ``workspace.yaml``."""
+    return {
+        "lineage_key": snapshot.lineage_key,
+        "created_at": snapshot.created_at.isoformat(),
+        "produced_by": snapshot.produced_by,
+        "predecessor_snapshot_id": snapshot.predecessor_snapshot_id,
+        "compatibility": dict(snapshot.compatibility),
+        "state_path": snapshot.state_path,
+    }
+
+
+def _state_snapshots_from_yaml(entry: object) -> dict[str, StateSnapshot]:
+    """Deserialize managed state snapshots from ``workspace.yaml``."""
+    if entry is None:
+        return {}
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"State snapshots must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    snapshots: dict[str, StateSnapshot] = {}
+    for snapshot_id, raw in entry.items():
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"State snapshot {snapshot_id!r} must be a mapping, "
+                f"got {type(raw).__name__}"
+            )
+        snapshots[snapshot_id] = StateSnapshot(
+            id=snapshot_id,
+            lineage_key=raw["lineage_key"],
+            created_at=datetime.fromisoformat(raw["created_at"]),
+            produced_by=raw["produced_by"],
+            predecessor_snapshot_id=raw.get("predecessor_snapshot_id"),
+            compatibility=dict(raw.get("compatibility", {})),
+            state_path=raw["state_path"],
+        )
+    return snapshots
+
+
 @dataclass
 class Workspace:
     """A workspace instance created from a template.
@@ -216,6 +259,7 @@ class Workspace:
     executions: dict[str, BlockExecution] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
     runs: dict[str, RunRecord] = field(default_factory=dict)
+    state_snapshots: dict[str, StateSnapshot] = field(default_factory=dict)
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False,
     )
@@ -250,6 +294,13 @@ class Workspace:
         while True:
             candidate = f"exec_{self._short_uuid()}"
             if candidate not in self.executions:
+                return candidate
+
+    def generate_state_snapshot_id(self) -> str:
+        """Generate a unique managed state snapshot ID."""
+        while True:
+            candidate = f"state_{self._short_uuid()}"
+            if candidate not in self.state_snapshots:
                 return candidate
 
     def _add_artifact(self, instance: ArtifactInstance) -> None:
@@ -336,6 +387,16 @@ class Workspace:
                 )
             self.executions[execution.id] = execution
 
+    def _add_state_snapshot(self, snapshot: StateSnapshot) -> None:
+        """Add a managed state snapshot record to the workspace."""
+        with self._lock:
+            if snapshot.id in self.state_snapshots:
+                raise ValueError(
+                    f"State snapshot {snapshot.id!r} already "
+                    f"exists in workspace"
+                )
+            self.state_snapshots[snapshot.id] = snapshot
+
     def record_execution(
         self, execution: BlockExecution,
     ) -> BlockExecution:
@@ -397,6 +458,20 @@ class Workspace:
                 f"'container_one_shot' or 'container_persistent'; "
                 f"got {execution.runner!r}"
             )
+        if execution.state_mode not in ("none", "managed", "unmanaged"):
+            raise ValueError(
+                f"BlockExecution {execution.id!r}: state_mode must "
+                f"be 'none', 'managed', or 'unmanaged'; got "
+                f"{execution.state_mode!r}"
+            )
+        if (
+            execution.state_snapshot_id is not None
+            and execution.state_mode != "managed"
+        ):
+            raise ValueError(
+                f"BlockExecution {execution.id!r}: state_snapshot_id "
+                "requires state_mode 'managed'"
+            )
         if (execution.failure_phase is not None
                 and execution.failure_phase not in FAILURE_PHASES):
             raise ValueError(
@@ -405,7 +480,10 @@ class Workspace:
                 f"runtime.FAILURE_PHASES"
             )
 
-        all_expected_committed = not execution.rejected_outputs
+        all_expected_committed = (
+            not execution.rejected_outputs
+            and execution.failure_phase is None
+        )
         derived = derive_status(
             execution.termination_reason,  # type: ignore[arg-type]
             all_expected_committed=all_expected_committed,
@@ -619,6 +697,141 @@ class Workspace:
             [a for a in self.artifacts.values() if a.name == artifact_name],
             key=lambda a: a.created_at,
         )
+
+    def latest_state_snapshot(
+        self, lineage_key: str,
+    ) -> StateSnapshot | None:
+        """Return the latest managed state snapshot for a lineage."""
+        return self._latest_state_snapshot_unlocked(lineage_key)
+
+    def _latest_state_snapshot_unlocked(
+        self, lineage_key: str,
+    ) -> StateSnapshot | None:
+        """Return the latest snapshot; caller owns synchronization."""
+        snapshots = [
+            snapshot for snapshot in self.state_snapshots.values()
+            if snapshot.lineage_key == lineage_key
+        ]
+        if not snapshots:
+            return None
+        return max(snapshots, key=lambda s: (s.created_at, s.id))
+
+    def state_snapshot_path(self, snapshot_id: str) -> Path:
+        """Return the on-disk directory for a managed state snapshot."""
+        snapshot = self.state_snapshots.get(snapshot_id)
+        if snapshot is None:
+            raise KeyError(snapshot_id)
+        return self.path / snapshot.state_path
+
+    def register_state_snapshot(
+        self,
+        *,
+        lineage_key: str,
+        source_path: Path,
+        produced_by: str,
+        compatibility: dict[str, str],
+        predecessor_snapshot_id: str | None | object = (
+            _PREDECESSOR_UNSPECIFIED
+        ),
+    ) -> StateSnapshot:
+        """Capture a managed state snapshot into workspace storage.
+
+        State snapshots use a write path separate from artifacts:
+        they are not declared artifacts, are not artifact-validator
+        inputs, and are not eligible as block input bindings.
+        """
+        if not lineage_key:
+            raise ValueError("State lineage key must be non-empty")
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"State source path does not exist: {source_path}"
+            )
+        if not source_path.is_dir():
+            raise ValueError(
+                f"State source must be a directory; got {source_path}"
+            )
+
+        latest = self.latest_state_snapshot(lineage_key)
+        expected_predecessor = latest.id if latest is not None else None
+        if predecessor_snapshot_id is _PREDECESSOR_UNSPECIFIED:
+            predecessor_id = expected_predecessor
+        elif predecessor_snapshot_id != expected_predecessor:
+            raise ValueError(
+                f"State lineage {lineage_key!r} latest snapshot is "
+                f"{expected_predecessor!r}, not "
+                f"{predecessor_snapshot_id!r}"
+            )
+        else:
+            predecessor_id = predecessor_snapshot_id
+
+        states_dir = self.path / "states"
+        states_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_id = self.generate_state_snapshot_id()
+        staging_dir = Path(tempfile.mkdtemp(
+            prefix=f"_staging-{snapshot_id}-", dir=states_dir,
+        ))
+        try:
+            shutil.copytree(
+                source_path, staging_dir, dirs_exist_ok=True,
+            )
+            target_dir = states_dir / snapshot_id
+            staging_dir.rename(target_dir)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+        snapshot = StateSnapshot(
+            id=snapshot_id,
+            lineage_key=lineage_key,
+            created_at=datetime.now(UTC),
+            produced_by=produced_by,
+            predecessor_snapshot_id=predecessor_id,
+            compatibility=dict(compatibility),
+            state_path=f"states/{snapshot_id}",
+        )
+        try:
+            with self._lock:
+                latest = self._latest_state_snapshot_unlocked(lineage_key)
+                expected_predecessor = (
+                    latest.id if latest is not None else None
+                )
+                if snapshot.predecessor_snapshot_id != expected_predecessor:
+                    raise ValueError(
+                        f"State lineage {lineage_key!r} latest "
+                        f"snapshot is {expected_predecessor!r}, "
+                        f"not {snapshot.predecessor_snapshot_id!r}"
+                    )
+                if snapshot.id in self.state_snapshots:
+                    raise ValueError(
+                        f"State snapshot {snapshot.id!r} already "
+                        "exists in workspace"
+                    )
+                self.state_snapshots[snapshot.id] = snapshot
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+        self.save()
+        return snapshot
+
+    def preserve_state_recovery(
+        self,
+        *,
+        execution_id: str,
+        source_path: Path,
+    ) -> str | None:
+        """Best-effort preservation for state bytes that failed capture."""
+        if not source_path.exists() or not source_path.is_dir():
+            return None
+        recovery_dir = self.path / "state_recovery" / execution_id
+        target = recovery_dir / "state"
+        try:
+            recovery_dir.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(source_path, target)
+        except Exception:
+            return None
+        return target.relative_to(self.path).as_posix()
 
     def instance_path(self, instance_id: str) -> Path:
         """Return the on-disk directory for a copy artifact.
@@ -1038,6 +1251,7 @@ class Workspace:
 
         ws_path.mkdir(parents=True)
         (ws_path / "artifacts").mkdir()
+        (ws_path / "states").mkdir()
 
         try:
             project_root = foundry_dir.parent
@@ -1174,6 +1388,8 @@ class Workspace:
                 rejected_outputs=_rejected_outputs_from_yaml(
                     entry.get("rejected_outputs")),
                 termination_reason=entry.get("termination_reason"),
+                state_mode=entry.get("state_mode", "none"),
+                state_snapshot_id=entry.get("state_snapshot_id"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -1213,6 +1429,8 @@ class Workspace:
             executions=executions,
             events=events,
             runs=runs,
+            state_snapshots=_state_snapshots_from_yaml(
+                data.get("state_snapshots")),
         )
 
     def save(self) -> None:
@@ -1274,6 +1492,10 @@ class Workspace:
                             ex.rejected_outputs))
                 if ex.termination_reason is not None:
                     entry["termination_reason"] = ex.termination_reason
+                if ex.state_mode != "none":
+                    entry["state_mode"] = ex.state_mode
+                if ex.state_snapshot_id is not None:
+                    entry["state_snapshot_id"] = ex.state_snapshot_id
                 serialized_executions[eid] = entry
 
             serialized_events = {}
@@ -1320,6 +1542,11 @@ class Workspace:
                 data["events"] = serialized_events
             if serialized_runs:
                 data["runs"] = serialized_runs
+            if self.state_snapshots:
+                data["state_snapshots"] = {
+                    sid: _state_snapshot_to_yaml(snapshot)
+                    for sid, snapshot in self.state_snapshots.items()
+                }
 
             yaml_path = self.path / "workspace.yaml"
             tmp_path = yaml_path.with_suffix(".yaml.tmp")

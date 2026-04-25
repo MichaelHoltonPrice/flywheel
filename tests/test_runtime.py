@@ -15,7 +15,7 @@ from flywheel import runtime
 class TestPathConstants:
     def test_state_mount_path(self):
         # Block authors look for this path; the executor mounts
-        # there when a block declares ``state: true``.
+        # there when a block declares ``state: managed``.
         assert runtime.STATE_MOUNT_PATH == "/flywheel/state"
 
     def test_flywheel_control_mount(self):

@@ -84,6 +84,7 @@ class TestWorkspaceCreate:
         ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.path.exists()
         assert (ws.path / "artifacts").exists()
+        assert (ws.path / "states").exists()
         assert (ws.path / "workspace.yaml").exists()
 
     def test_name_and_template(self, tmp_path: Path):
@@ -152,6 +153,115 @@ class TestWorkspaceLoadSave:
         assert loaded.template_name == ws.template_name
         assert loaded.artifact_declarations == ws.artifact_declarations
         assert len(loaded.artifacts) == len(ws.artifacts)
+
+    def test_state_snapshot_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "counter.txt").write_text("1")
+
+        snapshot = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_abc123",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        loaded = Workspace.load(ws.path)
+        loaded_snapshot = loaded.state_snapshots[snapshot.id]
+        assert loaded_snapshot.lineage_key == "lineage_a"
+        assert loaded_snapshot.produced_by == "exec_abc123"
+        assert loaded_snapshot.predecessor_snapshot_id is None
+        assert loaded_snapshot.compatibility == {
+            "block_template_hash": "hash-a",
+        }
+        assert (
+            loaded.state_snapshot_path(snapshot.id) / "counter.txt"
+        ).read_text() == "1"
+        assert loaded.artifacts == ws.artifacts
+
+    def test_state_snapshot_lineage_chains_to_latest(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+
+        first = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+        second = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_2",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        assert second.predecessor_snapshot_id == first.id
+        assert ws.latest_state_snapshot("lineage_a") == second
+
+    def test_state_snapshot_rejects_forked_predecessor(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+        first = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+        ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_2",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        with pytest.raises(ValueError, match="latest snapshot"):
+            ws.register_state_snapshot(
+                lineage_key="lineage_a",
+                source_path=source,
+                produced_by="exec_3",
+                compatibility={"block_template_hash": "hash-a"},
+                predecessor_snapshot_id=first.id,
+            )
+
+    def test_state_snapshot_rejects_explicit_none_after_latest(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+        ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+
+        with pytest.raises(ValueError, match="latest snapshot"):
+            ws.register_state_snapshot(
+                lineage_key="lineage_a",
+                source_path=source,
+                produced_by="exec_2",
+                compatibility={"block_template_hash": "hash-a"},
+                predecessor_snapshot_id=None,
+            )
 
     def test_round_trip_with_execution(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)

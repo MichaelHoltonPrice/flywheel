@@ -164,6 +164,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Bind an input slot to a specific artifact ID, "
         "as SLOT=ARTIFACT_ID (repeatable).",
     )
+    block_parser.add_argument(
+        "--state-lineage",
+        default=None,
+        help=(
+            "State lineage key for blocks that declare "
+            "state: managed."
+        ),
+    )
 
     # flywheel run agent
     agent_parser = run_sub.add_parser("agent")
@@ -171,10 +179,7 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--template", required=True)
     agent_parser.add_argument(
         "--block-name", required=True,
-        help=(
-            "Block name to record this execution under.  "
-            "Also keys the /state/ restore chain."
-        ),
+        help="Block name to record this execution under.",
     )
     agent_parser.add_argument("--prompt-file", required=True,
                               help="Path to the agent system prompt file.")
@@ -292,6 +297,7 @@ def main(argv: list[str] | None = None) -> None:
         run_block_command(
             args.workspace, args.block, args.template,
             bindings, extra_container_args,
+            state_lineage_key=args.state_lineage,
         )
     elif args.command == "run" and getattr(args, "target", None) == "agent":
         run_agent_command(args, extra_container_args)
@@ -599,6 +605,8 @@ def run_block_command(
     template_name: str,
     bindings: dict[str, str],
     extra_args: list[str],
+    *,
+    state_lineage_key: str | None = None,
 ) -> None:
     """Run a block within an existing workspace.
 
@@ -635,6 +643,7 @@ def run_block_command(
         input_bindings=bindings or None,
         args=extra_args or None,
         validator_registry=validator_registry,
+        state_lineage_key=state_lineage_key,
     )
     print(
         f"Block {block_name!r} completed: "

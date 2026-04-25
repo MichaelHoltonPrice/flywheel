@@ -95,8 +95,8 @@ A snapshot record contains, at minimum:
 State snapshots are not `ArtifactInstance`s and do not appear in the
 artifact graph.
 
-The only sanctioned write path for a managed snapshot is a future
-`Workspace.register_state_snapshot(...)` API.  Private mutators may
+The only sanctioned write path for a managed snapshot is
+`Workspace.register_state_snapshot(...)`.  Private mutators may
 exist underneath it, following the same privacy discipline as
 artifact and execution records.
 
@@ -105,7 +105,7 @@ artifact and execution records.
 Before restoring a prior snapshot, Flywheel checks that it is
 compatible with the execution about to run.
 
-The M1 compatibility identity is:
+The compatibility identity is:
 
 * block name
 * state mode
@@ -160,7 +160,7 @@ fails:
 * the lineage's latest snapshot remains unchanged
 * output artifacts from this execution are not accepted
 * Flywheel preserves the would-be state bytes in a best-effort recovery
-  area
+  area: `state_recovery/<execution_id>/state`
 
 The recovery area is not artifact quarantine.  Recovery bytes are not a
 snapshot, are not restored automatically, and are not part of the
@@ -171,11 +171,18 @@ If capture succeeds, Flywheel registers a new snapshot whose
 predecessor is the previous latest snapshot for the same lineage, then
 continues with output artifact commit.
 
+Output commit can still fail after state capture succeeds.  In that
+case the execution is failed for the output phase, but the state
+lineage has advanced.  This reflects the separation between state
+continuity and artifact validity: state capture records what the block
+will see on its next execution, while output validation controls what
+other executions may consume as artifacts.
+
 ## Validation
 
 Artifact validators do not apply to state.
 
-M1 managed state has only substrate-level checks: the substrate can
+Managed state has only substrate-level checks: the substrate can
 copy restored bytes into the mount and can copy captured bytes into the
 workspace-owned snapshot location.
 
@@ -187,7 +194,7 @@ canonical state-capture path.
 
 Patterns own state-lineage policy for pattern-driven executions.
 
-The default M1 derivation is lineage per pattern run, step, and member.
+The default derivation is lineage per pattern run, step, and member.
 This prevents two unrelated members using the same block template from
 silently sharing state.
 

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from flywheel.state import StateMode
+
 
 @dataclass(frozen=True)
 class RejectionRef:
@@ -244,6 +246,13 @@ class BlockExecution:
             project-defined value the block announced via the
             per-runtime termination channel.  ``None`` for legacy
             executions that predate the field.
+        state_mode: Whether this execution had no substrate-visible
+            state, managed state snapshots, or unmanaged runtime
+            state.
+        state_snapshot_id: Managed state snapshot captured by this
+            execution, when one was captured.  ``None`` for
+            ``state_mode`` values other than ``"managed"`` and for
+            managed executions that did not capture a snapshot.
 
     Fields removed in the block-execution refactor (see
     ``flywheel/docs/specs/block-execution.md``):
@@ -281,6 +290,8 @@ class BlockExecution:
     rejected_outputs: dict[str, RejectedOutput] = field(
         default_factory=dict)
     termination_reason: str | None = None
+    state_mode: StateMode = "none"
+    state_snapshot_id: str | None = None
 
 
 @dataclass(frozen=True)
