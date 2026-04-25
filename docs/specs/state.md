@@ -24,8 +24,9 @@ Consequences:
 * A block that wants other blocks to consume state-like data must
   publish that data as an output artifact.
 
-State validators may be introduced later, but they are a distinct
-project hook from artifact validators.
+State validators are distinct from artifact validators.  They validate
+candidate managed-state snapshots for a block, not named artifact
+instances.
 
 ## State Modes
 
@@ -165,9 +166,11 @@ state only for clean termination reasons:
   `interrupted`, `protocol_violation`) do not capture state
 
 State capture happens before output artifacts are accepted.  If capture
-fails:
+or state validation fails:
 
-* the execution is recorded with `failure_phase=state_capture`
+* the execution is recorded with `failure_phase=state_capture` for
+  substrate copy/write failures, or `failure_phase=state_validate` for
+  project state-validator rejection
 * no new state snapshot is registered
 * the lineage's latest snapshot remains unchanged
 * output artifacts from this execution are not accepted
@@ -194,13 +197,26 @@ other executions may consume as artifacts.
 
 Artifact validators do not apply to state.
 
-Managed state has only substrate-level checks: the substrate can
-copy restored bytes into the mount and can copy captured bytes into the
+Managed state always has substrate-level checks: the substrate can copy
+restored bytes into the mount and can copy captured bytes into the
 workspace-owned snapshot location.
 
-Project-owned state validators are deferred.  If introduced, they must
-be separate from `ArtifactValidatorRegistry` and must run through the
-canonical state-capture path.
+Projects may also provide a `StateValidatorRegistry` through
+`flywheel.yaml` using the `state_validators` key.  The registry maps
+block names to validators.  A state validator receives the block name,
+the block declaration, an isolated candidate state directory, and the
+state lineage key.  The candidate directory contains the bytes the
+substrate would commit as the next snapshot for this lineage.
+Validators must treat it as read-only; mutations are ignored.  A
+validator returns normally to accept the snapshot or raises
+`StateValidationError` to reject it.
+
+State validators run through the canonical state-capture path after the
+container exits cleanly and before `Workspace.register_state_snapshot`.
+A rejection records the execution with
+`failure_phase=state_validate`, preserves the candidate bytes in the
+state recovery area, does not advance the lineage, and does not accept
+output artifacts from the execution.
 
 ## Patterns
 
@@ -230,7 +246,6 @@ execution records, or managed state snapshots directly.
 
 ## Open Follow-Up
 
-* State validator hook design.
 * Operator commands for inspecting, pruning, promoting, or discarding
   state snapshots and recovery bytes.
 * Retention policy for old snapshots.

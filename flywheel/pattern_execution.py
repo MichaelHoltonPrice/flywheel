@@ -23,6 +23,7 @@ from flywheel.pattern_resolution import (
 )
 from flywheel.run_record import RunMemberRecord, RunStepRecord
 from flywheel.state import pattern_state_lineage_key
+from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -46,6 +47,7 @@ def run_pattern(
     project_root: Path,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
+    state_validator_registry: StateValidatorRegistry | None = None,
 ) -> PatternRunResult:
     """Execute a pattern through canonical block execution."""
     if template.name != workspace.template_name:
@@ -85,6 +87,7 @@ def run_pattern(
                 project_root,
                 run_id=run.id,
                 validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
             )
             workspace.record_run_step(run.id, step_result)
     except KeyboardInterrupt:
@@ -105,6 +108,7 @@ def _execute_step(
     *,
     run_id: str,
     validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
 ) -> RunStepRecord:
     members: list[RunMemberRecord] = []
     min_successes = step.cohort.min_successes
@@ -117,6 +121,7 @@ def _execute_step(
             run_id=run_id,
             step_name=step.name,
             validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
         )
         members.append(result)
         if min_successes == "all" and result.status != "succeeded":
@@ -149,6 +154,7 @@ def _execute_member(
     run_id: str,
     step_name: str,
     validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
 ) -> RunMemberRecord:
     try:
         input_bindings = _resolve_member_inputs(workspace, member, run_id)
@@ -160,6 +166,7 @@ def _execute_member(
             input_bindings=input_bindings,
             args=member.args,
             validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
             state_lineage_key=pattern_state_lineage_key(
                 run_id, step_name, member.name),
         )

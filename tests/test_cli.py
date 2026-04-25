@@ -11,6 +11,7 @@ from flywheel.artifact import BlockExecution, RejectedOutput
 from flywheel.cli import _parse_bindings, create_workspace, main
 from flywheel.config import load_project_config
 from flywheel.container import ContainerResult
+from flywheel.state_validator import StateValidatorRegistry
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
@@ -551,10 +552,10 @@ class TestMainRunBlock:
             call_args = mock_rb.call_args
             assert call_args[0][1] == "train"
             assert call_args.kwargs["state_lineage_key"] == "train_dueling"
-
-
-# ── flywheel run pattern ────────────────────────────────────────
-
+            assert isinstance(
+                call_args.kwargs["state_validator_registry"],
+                StateValidatorRegistry,
+            )
 
     def test_managed_state_missing_lineage_records_execution(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -606,6 +607,9 @@ outputs: [checkpoint]
         assert execution.status == "failed"
         assert execution.failure_phase == "stage_in"
         assert execution.state_mode == "managed"
+
+
+# ── flywheel run pattern ────────────────────────────────────────
 
 
 def _write_pattern(project_root: Path, name: str, body: str) -> Path:

@@ -79,6 +79,10 @@ FAILURE_STATE_CAPTURE: Final[str] = "state_capture"
 into a managed state snapshot.  The body may have succeeded; the
 execution is still recorded as failed."""
 
+FAILURE_STATE_VALIDATE: Final[str] = "state_validate"
+"""Container exited cleanly but a project state validator rejected
+the candidate state before it was registered as a snapshot."""
+
 FAILURE_OUTPUT_COLLECT: Final[str] = "output_collect"
 """Container exited but one or more declared output dirs could
 not be read or registered."""
@@ -105,6 +109,7 @@ FAILURE_PHASES: Final[frozenset[str]] = frozenset({
     FAILURE_STAGE_IN,
     FAILURE_INVOKE,
     FAILURE_STATE_CAPTURE,
+    FAILURE_STATE_VALIDATE,
     FAILURE_OUTPUT_COLLECT,
     FAILURE_OUTPUT_VALIDATE,
     FAILURE_ARTIFACT_COMMIT,

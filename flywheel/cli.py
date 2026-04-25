@@ -638,11 +638,13 @@ def run_block_command(
 
     ws = Workspace.load(Path(workspace_path))
     validator_registry = config.load_artifact_validator_registry()
+    state_validator_registry = config.load_state_validator_registry()
     result = run_block(
         ws, block_name, template, config.project_root,
         input_bindings=bindings or None,
         args=extra_args or None,
         validator_registry=validator_registry,
+        state_validator_registry=state_validator_registry,
         state_lineage_key=state_lineage_key,
     )
     print(
@@ -769,6 +771,7 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
     workspace = Workspace.load(Path(args.workspace))
     pattern = PatternDeclaration.from_yaml(pattern_path)
     validator_registry = config.load_artifact_validator_registry()
+    state_validator_registry = config.load_state_validator_registry()
 
     try:
         result = run_pattern(
@@ -777,6 +780,7 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             template,
             config.project_root,
             validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
         )
     except PatternRunError as exc:
         print(f"Pattern {pattern.name!r} failed: {exc}")

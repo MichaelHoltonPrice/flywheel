@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.state_validator import StateValidatorRegistry
 
 CONFIG_FILENAME = "flywheel.yaml"
 
@@ -41,12 +42,17 @@ class ProjectConfig:
             output collection).  Optional: when omitted,
             :meth:`load_artifact_validator_registry` returns an
             empty registry that accepts everything.
+        state_validators: Optional Python import path for a zero-arg
+            factory that returns a
+            :class:`flywheel.state_validator.StateValidatorRegistry`.
+            The registry is consulted during managed-state capture.
     """
 
     project_root: Path
     foundry_dir: Path
     project_hooks: str | None = None
     artifact_validators: str | None = None
+    state_validators: str | None = None
 
     @property
     def templates_dir(self) -> Path:
@@ -141,6 +147,34 @@ class ProjectConfig:
             )
         return registry
 
+    def load_state_validator_registry(self) -> StateValidatorRegistry:
+        """Resolve the project's managed-state validator registry."""
+        import_path = self.state_validators
+        if import_path is None:
+            return StateValidatorRegistry()
+        if ":" not in import_path:
+            raise ValueError(
+                f"'state_validators' import path must be "
+                f"'module.path:factory_name', got "
+                f"{import_path!r}"
+            )
+        module_path, attr_name = import_path.rsplit(":", 1)
+        module = importlib.import_module(module_path)
+        factory = getattr(module, attr_name)
+        if not callable(factory):
+            raise ValueError(
+                f"'state_validators' target {import_path!r} "
+                f"resolved to a non-callable {type(factory).__name__}"
+            )
+        registry = factory()
+        if not isinstance(registry, StateValidatorRegistry):
+            raise ValueError(
+                f"'state_validators' factory {import_path!r} "
+                f"returned {type(registry).__name__}, expected "
+                f"StateValidatorRegistry"
+            )
+        return registry
+
 
 def load_project_config(project_root: Path) -> ProjectConfig:
     """Load flywheel.yaml from a project root directory.
@@ -226,9 +260,19 @@ def load_project_config(project_root: Path) -> ProjectConfig:
             f"got {type(artifact_validators).__name__}"
         )
 
+    state_validators = data.get("state_validators")
+    if state_validators is not None and not isinstance(
+            state_validators, str):
+        raise ValueError(
+            f"'state_validators' in {config_path} must be a "
+            f"string in the form 'module.path:factory_name', "
+            f"got {type(state_validators).__name__}"
+        )
+
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
         project_hooks=project_hooks,
         artifact_validators=artifact_validators,
+        state_validators=state_validators,
     )

@@ -14,6 +14,10 @@ from flywheel.artifact_validator import (
 )
 from flywheel.container import ContainerResult
 from flywheel.execution import RuntimeResult, run_block
+from flywheel.state_validator import (
+    StateValidationError,
+    StateValidatorRegistry,
+)
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
@@ -1138,6 +1142,131 @@ class TestManagedStateExecution:
         assert ws.instances_for("checkpoint") == []
         assert len(ws.state_snapshots) == 0
         assert (ws.path / "state_recovery" / ex.id / "state").exists()
+
+    def test_state_validator_rejection_records_recovery(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("bad")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        def reject_state(name, block_def, path, lineage_key):
+            assert name == "stateful"
+            assert block_def.name == "stateful"
+            assert lineage_key == "lineage_a"
+            assert (path / "marker.txt").read_text() == "bad"
+            (path / "marker.txt").write_text("mutated by validator")
+            raise StateValidationError("marker rejected")
+
+        registry = StateValidatorRegistry({"stateful": reject_state})
+
+        with pytest.raises(
+            StateValidationError, match="marker rejected",
+        ) as exc_info:
+            run_block(
+                ws, "stateful", template, project_root,
+                state_lineage_key="lineage_a",
+                state_validator_registry=registry,
+                container_runner=SuccessRunner(),
+            )
+
+        ex = next(iter(ws.executions.values()))
+        assert ex.status == "failed"
+        assert ex.failure_phase == runtime.FAILURE_STATE_VALIDATE
+        assert ex.output_bindings == {}
+        assert "state_validate: marker rejected" in (ex.error or "")
+        assert ws.instances_for("checkpoint") == []
+        assert len(ws.state_snapshots) == 0
+        recovery = ws.path / "state_recovery" / ex.id / "state"
+        assert exc_info.value.path == recovery
+        assert (recovery / "marker.txt").read_text() == "bad"
+
+    def test_state_validator_mutation_does_not_change_snapshot(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("original")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        def mutating_validator(name, block_def, path, lineage_key):
+            assert (path / "marker.txt").read_text() == "original"
+            (path / "marker.txt").write_text("mutated by validator")
+            (path / "extra.txt").write_text("validator side effect")
+
+        registry = StateValidatorRegistry({"stateful": mutating_validator})
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            state_validator_registry=registry,
+            container_runner=SuccessRunner(),
+        )
+
+        latest = ws.latest_state_snapshot("lineage_a")
+        assert latest is not None
+        snapshot_path = ws.state_snapshot_path(latest.id)
+        assert (snapshot_path / "marker.txt").read_text() == "original"
+        assert not (snapshot_path / "extra.txt").exists()
+
+    def test_artifact_validators_do_not_validate_state(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        class SuccessRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("state")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        def stateful_artifact_validator(name, declaration, path):
+            raise AssertionError("artifact validator saw state")
+
+        registry = ArtifactValidatorRegistry({
+            "stateful": stateful_artifact_validator,
+        })
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            validator_registry=registry,
+            container_runner=SuccessRunner(),
+        )
+
+        assert len(ws.state_snapshots) == 1
+        assert ws.instances_for("checkpoint")
 
     def test_incompatible_snapshot_rejects_before_running(
         self, tmp_path: Path,

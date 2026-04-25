@@ -30,7 +30,7 @@ Not covered by this spec (each addressed by its own normative spec):
 
 * State (`state_lineage_key`, the `/flywheel/state` mount, state
   snapshot records, state restore/capture, the `state_capture` failure
-  phase); see [state.md](state.md).
+  and `state_validate` failure phases); see [state.md](state.md).
 * Handoffs (a block triggering a child block execution; the
   `invoking_execution_id` field; any handoff-related declaration
   syntax). The substrate uses termination reasons today purely to

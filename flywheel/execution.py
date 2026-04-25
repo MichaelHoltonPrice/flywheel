@@ -49,6 +49,10 @@ from flywheel.state import (
     StateMode,
     state_compatibility_identity,
 )
+from flywheel.state_validator import (
+    StateValidationError,
+    StateValidatorRegistry,
+)
 from flywheel.template import (
     ArtifactDeclaration,
     BlockDefinition,
@@ -252,6 +256,13 @@ def _mount_artifact_instance(
 def _restore_state_snapshot(source: Path, target: Path) -> None:
     """Copy state bytes into an existing mount, preserving symlinks."""
     shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
+
+
+def _copy_state_validation_candidate(source: Path, target: Path) -> None:
+    """Copy state bytes for validator inspection, preserving symlinks."""
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target, symlinks=True)
 
 
 def _record_execution(
@@ -674,6 +685,7 @@ def commit_block_execution(
     template: Template,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
+    state_validator_registry: StateValidatorRegistry | None = None,
 ) -> ContainerResult | None:
     """Forge proposals, record the execution, and clean up.
 
@@ -706,6 +718,8 @@ def commit_block_execution(
         flywheel.artifact_validator.ArtifactValidationError: When
             ``output_validate`` is the most-downstream rejection
             phase.
+        flywheel.state_validator.StateValidationError: When a
+            project state validator rejects managed state.
     """
     block_name = plan.block_name
     block_def = plan.block_def
@@ -742,7 +756,24 @@ def commit_block_execution(
         assert plan.state_lineage_key is not None
         assert plan.state_mount_dir is not None
         assert plan.state_compatibility is not None
+        validation_candidate_dir = (
+            plan.proposals_root / "_state_validation_candidate"
+        )
         try:
+            if (
+                state_validator_registry is not None
+                and state_validator_registry.has(block_name)
+            ):
+                _copy_state_validation_candidate(
+                    plan.state_mount_dir,
+                    validation_candidate_dir,
+                )
+                state_validator_registry.validate(
+                    block_name,
+                    block_def,
+                    validation_candidate_dir,
+                    plan.state_lineage_key,
+                )
             snapshot = workspace.register_state_snapshot(
                 lineage_key=plan.state_lineage_key,
                 source_path=plan.state_mount_dir,
@@ -752,6 +783,38 @@ def commit_block_execution(
                 persist=False,
             )
             state_snapshot_id = snapshot.id
+        except StateValidationError as exc:
+            recovery_path = workspace.preserve_state_recovery(
+                execution_id=plan.execution_id,
+                source_path=plan.state_mount_dir,
+            )
+            shutil.rmtree(plan.proposals_root, ignore_errors=True)
+            error = f"state_validate: {exc}"
+            if recovery_path is not None:
+                error = f"{error} (recovery: {recovery_path})"
+            error_path = (
+                workspace.path / recovery_path
+                if recovery_path is not None else exc.path
+            )
+            _record_execution(
+                workspace, plan.execution_id, block_name, plan.started_at,
+                termination_reason,
+                plan.resolved_bindings, {},
+                exit_code, elapsed_s, image,
+                all_expected_committed=False,
+                failure_phase=runtime.FAILURE_STATE_VALIDATE,
+                error=error,
+                state_mode=plan.state_mode,
+            )
+            raise _with_execution_id(
+                StateValidationError(
+                    error,
+                    block_name=exc.block_name,
+                    lineage_key=exc.lineage_key,
+                    path=error_path,
+                ),
+                plan.execution_id,
+            ) from exc
         except Exception as exc:
             recovery_path = workspace.preserve_state_recovery(
                 execution_id=plan.execution_id,
@@ -892,6 +955,7 @@ def run_block(
     args: list[str] | None = None,
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
+    state_validator_registry: StateValidatorRegistry | None = None,
     container_runner: OneShotContainerRunner | None = None,
     state_lineage_key: str | None = None,
 ) -> BlockRunResult:
@@ -913,6 +977,8 @@ def run_block(
         args: Optional extra arguments for the container entrypoint.
         validator_registry: Project-supplied artifact validator
             registry consulted before each output slot is committed.
+        state_validator_registry: Project-supplied state validator
+            registry consulted before managed state is captured.
         container_runner: Optional runner for the prepared one-shot
             container body.  Defaults to the Docker-backed runner.
         state_lineage_key: Required for blocks that declare
@@ -1037,6 +1103,7 @@ def run_block(
     result = commit_block_execution(
         workspace, plan, runtime_result, template,
         validator_registry=validator_registry,
+        state_validator_registry=state_validator_registry,
     )
     container_result = result or runtime_result.container_result
     if container_result is None:
