@@ -199,7 +199,7 @@ def test_resolver_stops_failed_after_failed_step():
         status="failed", error="step 'train' failed")
 
 
-def test_pattern_runner_records_train_eval_membership(tmp_path: Path):
+def test_run_pattern_records_train_eval_membership(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(tmp_path)
 
     with patch("flywheel.execution.run_container", side_effect=_fake_container):
@@ -221,7 +221,7 @@ def test_pattern_runner_records_train_eval_membership(tmp_path: Path):
     }
 
 
-def test_pattern_runner_uses_artifact_validators(tmp_path: Path):
+def test_run_pattern_uses_artifact_validators(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(tmp_path)
     seen: list[str] = []
     registry = ArtifactValidatorRegistry()
@@ -246,7 +246,7 @@ def test_pattern_runner_uses_artifact_validators(tmp_path: Path):
     assert seen == ["checkpoint", "score"]
 
 
-def test_pattern_runner_derives_managed_state_lineage(
+def test_run_pattern_derives_managed_state_lineage(
     tmp_path: Path,
 ):
     template_yaml = TEMPLATE_YAML.replace(

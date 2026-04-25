@@ -29,17 +29,8 @@ SUBSTRATE_MODULES = [
 ]
 
 HIGHER_LAYER_MODULES = {
-    "flywheel.agent",
-    "flywheel.agent_executor",
-    "flywheel.agent_group",
-    "flywheel.block_group",
     "flywheel.executor",
-    "flywheel.pattern",
-    "flywheel.pattern_handoff",
-    "flywheel.pattern_runner",
     "flywheel.post_check",
-    "flywheel.project_hooks",
-    "flywheel.run_defaults",
 }
 
 
@@ -47,11 +38,7 @@ def test_run_pattern_command_does_not_reference_higher_layer_runners():
     """The pattern command must not import battery runners."""
     source = inspect.getsource(cli.run_pattern_command)
     forbidden = [
-        "AgentExecutor",
-        "PatternRunner",
         "discover_patterns",
-        "load_project_hooks_class",
-        "RunDefaults",
     ]
     for token in forbidden:
         assert token not in source

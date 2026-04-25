@@ -112,7 +112,7 @@ STOP_FILE = WORKSPACE / ".stop"
 # ``/output/<slot>/`` mounts that carry real artifact outputs.
 # Flywheel mounts a host tempdir here; the runner reads/writes
 # the files listed below and flywheel collects them after exit
-# via :class:`flywheel.agent.AgentHandle.wait`.  Nothing under
+# by battery-level recovery code.  Nothing under
 # ``/flywheel/control/`` is an artifact.
 CONTROL_DIR = Path("/flywheel/control")
 RESUME_FILE = CONTROL_DIR / ".agent_resume"

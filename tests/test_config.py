@@ -84,10 +84,7 @@ class TestLoadProjectConfig:
 class TestHooksKeyRejected:
     """A ``hooks:`` key in ``flywheel.yaml`` must be rejected.
 
-    The supported key is ``project_hooks``; accepting ``hooks``
-    would silently route the project through the wrong
-    configuration path, so the loader raises a directional
-    error pointing at the correct key.
+    Project hooks are no longer a supported Flywheel config surface.
     """
 
     def test_hooks_key_present_raises(self, tmp_path: Path):
@@ -101,7 +98,14 @@ class TestHooksKeyRejected:
         (tmp_path / CONFIG_FILENAME).write_text(
             "foundry_dir: foundry\n")
         config = load_project_config(tmp_path)
-        assert config.project_hooks is None
+        assert config.foundry_dir == tmp_path / "foundry"
+
+    def test_project_hooks_key_present_raises(self, tmp_path: Path):
+        (tmp_path / CONFIG_FILENAME).write_text(
+            "foundry_dir: foundry\nproject_hooks: mymod:MyClass\n")
+        with pytest.raises(
+                ValueError, match="project_hooks"):
+            load_project_config(tmp_path)
 
 
 class TestArtifactValidators:

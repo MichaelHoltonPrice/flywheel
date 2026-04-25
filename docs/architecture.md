@@ -226,9 +226,6 @@ The resolver is separate from execution. It reads the current pattern
 and run prefix, chooses the next step, and does not mutate the
 workspace.
 
-Older modules such as `flywheel/pattern_runner.py` remain as deferred
-source material and should not be treated as the current architecture.
-
 ## Batteries
 
 Batteries are solve-once capabilities bundled with Flywheel for reuse.
@@ -247,8 +244,7 @@ artifacts, auth and other launch details live in the block declaration,
 and the durable outputs remain ordinary block execution records,
 artifact instances, and state snapshots.
 
-Agent handoff, richer battery selection, and moving all Claude-specific
-runner wiring out of `flywheel/agent.py` are deferred.
+Agent handoff and richer battery selection are deferred.
 
 ## Future Work
 

@@ -19,7 +19,7 @@ Two motivations:
    the reader mid-run.
 
 This module is the staging primitive both
-:mod:`flywheel.agent` (for container input mounts) and
+:mod:`flywheel.execution` (for container input mounts) and
 :mod:`flywheel.local_block` (for in-process input bindings) use.
 The trade-off is explicit: a full copy on every mount is the
 price of guaranteed isolation.  The user reviewed and accepted
@@ -154,7 +154,7 @@ def stage_artifact_instances(
     Convenience wrapper around :func:`stage_artifact_instance`
     that walks a ``{slot_name: artifact_id}`` mapping (the same
     shape :class:`flywheel.local_block.LocalExecutionContext`
-    and :func:`flywheel.agent.launch_agent_block` consume) and
+    and battery adapters consume) and
     returns ``{slot_name: staging_path}``.
 
     Bindings whose artifact id is unknown to the workspace are

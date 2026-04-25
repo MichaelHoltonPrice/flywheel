@@ -26,13 +26,6 @@ class ProjectConfig:
     Attributes:
         project_root: The project root directory containing flywheel.yaml.
         foundry_dir: Path to the foundry directory.
-        project_hooks: Optional Python import path for the
-            project-side hooks consumed by ``flywheel run
-            pattern``, in the form ``module.path:ClassName``.
-            Resolved by
-            :func:`flywheel.project_hooks.load_project_hooks_class`.
-            Optional: a pure-pattern project that needs no
-            project-side resource setup may omit it.
         artifact_validators: Optional Python import path for a
             zero-arg factory that returns an
             :class:`flywheel.artifact_validator.ArtifactValidatorRegistry`,
@@ -50,7 +43,6 @@ class ProjectConfig:
 
     project_root: Path
     foundry_dir: Path
-    project_hooks: str | None = None
     artifact_validators: str | None = None
     state_validators: str | None = None
 
@@ -237,18 +229,13 @@ def load_project_config(project_root: Path) -> ProjectConfig:
         raise ValueError(
             f"'hooks' in {config_path} is not supported. "
             f"Declare workflows under "
-            f"'<foundry_dir>/templates/patterns/' "
-            f"and wire resource setup via 'project_hooks' "
-            f"instead."
+            f"'<foundry_dir>/templates/patterns/' instead."
         )
 
-    project_hooks = data.get("project_hooks")
-    if project_hooks is not None and not isinstance(
-            project_hooks, str):
+    if "project_hooks" in data:
         raise ValueError(
-            f"'project_hooks' in {config_path} must be a string "
-            f"in the form 'module.path:ClassName', got "
-            f"{type(project_hooks).__name__}"
+            f"'project_hooks' in {config_path} is not supported by "
+            f"the canonical pattern runner."
         )
 
     artifact_validators = data.get("artifact_validators")
@@ -272,7 +259,6 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     return ProjectConfig(
         project_root=project_root,
         foundry_dir=foundry_dir,
-        project_hooks=project_hooks,
         artifact_validators=artifact_validators,
         state_validators=state_validators,
     )

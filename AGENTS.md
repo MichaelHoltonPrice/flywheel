@@ -107,10 +107,9 @@ Important boundary:
 * Battery code must enter durable state through the same
   sanctioned workspace write paths as every other block.
 
-The old modules `flywheel/agent_executor.py`,
-`flywheel/agent_group.py`, `flywheel/pattern_runner.py`, and
-related tests are deferred/legacy source material. Do not treat
-them as the current architecture.
+The old handle-based agent modules have been removed. Batteries should
+keep their code under `batteries/<name>/` and enter the durable
+substrate through ordinary block declarations and `flywheel run block`.
 
 ## Validation
 
