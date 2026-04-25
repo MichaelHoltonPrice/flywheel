@@ -16,7 +16,6 @@ from flywheel.execution import (
     ExecutionPlan,
     RuntimeResult,
     observe_one_shot_container_exit,
-    run_block,
 )
 from flywheel.executor import ExecutionHandle
 from flywheel.state_validator import StateValidatorRegistry
@@ -645,41 +644,20 @@ def run_agent_block(
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
 ) -> AgentResult:
-    """Run an agent block through canonical block execution."""
-    runner = _CanonicalAgentRunner(
-        prompt=prompt,
-        agent_image=agent_image,
-        auth_volume=auth_volume,
-        model=model,
-        max_turns=max_turns,
-        source_dirs=source_dirs,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        extra_env=extra_env,
-        extra_mounts=extra_mounts,
-        isolated_network=isolated_network,
-        project_root=project_root,
+    """Deprecated compatibility entry point.
+
+    Claude batteries are invoked as ordinary blocks through
+    ``flywheel run block`` using battery-provided images and block
+    declarations.
+    """
+    del (
+        workspace, template, project_root, prompt, block_name,
+        agent_image, auth_volume, model, max_turns, source_dirs,
+        input_artifacts, mcp_servers, allowed_tools, extra_env,
+        extra_mounts, isolated_network, state_lineage_key,
+        validator_registry, state_validator_registry,
     )
-    result = run_block(
-        workspace,
-        block_name,
-        template,
-        project_root,
-        input_bindings=input_artifacts,
-        validator_registry=validator_registry,
-        state_validator_registry=state_validator_registry,
-        state_lineage_key=state_lineage_key,
-        container_runner=runner,
-    )
-    exit_reason, stop_reason = _classify_exit(
-        workspace, result.execution_id, runner.observation.exit_state)
-    return AgentResult(
-        exit_code=result.container_result.exit_code,
-        elapsed_s=result.container_result.elapsed_s,
-        evals_run=0,
-        execution_id=result.execution_id,
-        stop_reason=stop_reason,
-        exit_reason=exit_reason,
-        exit_state=runner.observation.exit_state,
-        pending_tool_calls=runner.observation.pending_tool_calls,
+    raise NotImplementedError(
+        "agent blocks are invoked through flywheel run block with "
+        "a battery image and block declaration"
     )

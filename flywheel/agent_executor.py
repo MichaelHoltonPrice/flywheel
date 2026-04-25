@@ -1,33 +1,9 @@
-"""Agent battery wrapped as a :class:`BlockExecutor`.
+"""Legacy handle-based agent executor.
 
-The agent block is a "battery" — a block whose body is performed
-by a prepackaged implementation (Claude Code in a container,
-prompt mounting, auth volume, MCP server wiring, allowed-tools
-whitelist, isolated network, host-side handoff pause/resume
-loop).  Today's callers reach that machinery directly through
-:func:`flywheel.agent.launch_agent_block` and
-:func:`flywheel.agent_handoff.launch_agent_with_handoffs`.
-
-This module wraps that machinery as a
-:class:`flywheel.executor.BlockExecutor` so runners can launch
-agent blocks through the same protocol they use for any other
-block.  From the runner's vantage point an :class:`AgentExecutor`
-and any other executor are
-interchangeable when they implement ``launch()`` and return an
-:class:`flywheel.executor.ExecutionHandle`.
-
-Constructor takes battery-level defaults the project supplies
-once (image, auth volume, model, max_turns, ...).  Per-instance
-knobs flow through ``launch(overrides=...)`` and are layered on
-top of the constructor defaults at launch time.
-
-Slice-2 scope: purely additive.  No existing caller is changed.
-The pattern runner and CLI continue to invoke
-``launch_agent_block`` / ``launch_agent_with_handoffs``
-directly.  Slice 3 will route the pattern runner through
-:class:`AgentExecutor`; slice 5 will retire ``flywheel run agent``
-in favour of ``flywheel run block`` against a battery-declared
-agent block.
+Claude batteries are invoked as ordinary blocks through canonical
+block execution. This module remains as deferred source material
+for older pattern and handoff code that still expects a
+``BlockExecutor``-shaped adapter.
 """
 
 from __future__ import annotations

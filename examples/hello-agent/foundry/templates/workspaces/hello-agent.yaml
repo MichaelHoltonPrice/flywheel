@@ -1,4 +1,6 @@
 name: hello-agent
-artifacts: []
+artifacts:
+  - name: prompt
+    kind: copy
 blocks:
   - HelloAgent

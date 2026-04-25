@@ -4,11 +4,6 @@ Supports:
     flywheel create workspace --name NAME --template TEMPLATE
     flywheel run block --workspace PATH --block BLOCK --template TEMPLATE
         [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
-    flywheel run agent --workspace PATH --template TEMPLATE
-        --prompt-file FILE [--model MODEL]
-        [--allowed-block BLOCK ...]
-        [--input-artifact NAME=ARTIFACT_ID ...]
-        [-- container override args...]
     flywheel run pattern PATTERN_NAME --workspace PATH
         --template TEMPLATE
     flywheel import artifact --workspace PATH --name NAME
@@ -28,7 +23,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from flywheel.agent import run_agent_block
 from flywheel.artifact import RejectionRef, SupersedesRef
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
@@ -173,49 +167,6 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
-    # flywheel run agent
-    agent_parser = run_sub.add_parser("agent")
-    agent_parser.add_argument("--workspace", required=True)
-    agent_parser.add_argument("--template", required=True)
-    agent_parser.add_argument(
-        "--block-name", required=True,
-        help="Block name to record this execution under.",
-    )
-    agent_parser.add_argument("--prompt-file", required=True,
-                              help="Path to the agent system prompt file.")
-    agent_parser.add_argument("--model", default=None)
-    agent_parser.add_argument("--max-turns", type=int, default=None)
-    agent_parser.add_argument("--auth-volume", default="claude-auth")
-    agent_parser.add_argument("--agent-image", default="flywheel-claude:latest")
-    agent_parser.add_argument(
-        "--state-lineage",
-        default=None,
-        help=(
-            "State lineage key for agent blocks that declare "
-            "state: managed."
-        ),
-    )
-    agent_parser.add_argument(
-        "--source-dir", action="append", default=[],
-        help="Source directory to mount read-only (repeatable).")
-    agent_parser.add_argument(
-        "--mcp-servers", default=None,
-        help="Comma-separated MCP server names (default: eval).")
-    agent_parser.add_argument(
-        "--allowed-tools", default=None,
-        help="Comma-separated tool whitelist (default: Read,Write,Edit,Glob,Grep).")
-    agent_parser.add_argument(
-        "--env", action="append", default=[], dest="extra_env",
-        help="Extra env var as KEY=VALUE (repeatable).")
-    agent_parser.add_argument(
-        "--mount", action="append", default=[], dest="extra_mounts",
-        help="Extra mount as HOST:CONTAINER:MODE (repeatable).")
-    agent_parser.add_argument(
-        "--input-artifact", action="append", default=[],
-        dest="input_artifacts",
-        help="Mount a workspace artifact at /input/NAME inside "
-        "the agent container, as NAME=ARTIFACT_ID (repeatable).")
-
     # flywheel run pattern
     pattern_parser = run_sub.add_parser("pattern")
     pattern_parser.add_argument(
@@ -305,8 +256,6 @@ def main(argv: list[str] | None = None) -> None:
             bindings, extra_container_args,
             state_lineage_key=args.state_lineage,
         )
-    elif args.command == "run" and getattr(args, "target", None) == "agent":
-        run_agent_command(args, extra_container_args)
     elif args.command == "run" and getattr(args, "target", None) == "pattern":
         run_pattern_command(args, extra_container_args)
     elif (
@@ -625,6 +574,7 @@ def run_block_command(
         template_name: Name of the template file (without .yaml extension).
         bindings: Explicit input bindings mapping slot names to artifact IDs.
         extra_args: Extra arguments passed to the container entrypoint.
+        state_lineage_key: State lineage key for managed-state blocks.
 
     Raises:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
@@ -657,96 +607,6 @@ def run_block_command(
         f"Block {block_name!r} completed: "
         f"exit_code={result.container_result.exit_code}, "
         f"elapsed={result.container_result.elapsed_s:.1f}s"
-    )
-
-
-def run_agent_command(args, extra_args: list[str]) -> None:
-    """Run an agent block within an existing workspace.
-
-    Reads the prompt file and launches the agent container.
-
-    Args:
-        args: Parsed argparse namespace with agent-specific fields.
-        extra_args: Extra arguments passed to invoked containers.
-    """
-    config = load_project_config(Path.cwd())
-
-    template_path = config.workspace_templates_dir / f"{args.template}.yaml"
-    block_registry = config.load_block_registry()
-    template = Template.from_yaml(
-        template_path,
-        block_registry=block_registry,
-    )
-
-    ws = Workspace.load(Path(args.workspace))
-
-    prompt_path = Path(args.prompt_file)
-    prompt = prompt_path.read_text(encoding="utf-8")
-
-    # Parse extra_args as --key value overrides for invoked containers.
-    overrides = _parse_overrides(extra_args)
-
-    # Substitute {{KEY}} placeholders in the prompt with override values.
-    for key, value in overrides.items():
-        prompt = prompt.replace("{{" + key.upper() + "}}", value)
-
-    # Parse --env KEY=VALUE arguments into a dict.
-    extra_env = {}
-    for entry in args.extra_env:
-        if "=" in entry:
-            k, v = entry.split("=", 1)
-            extra_env[k] = v
-
-    # Parse --mount HOST:CONTAINER:MODE arguments into tuples.
-    extra_mounts = []
-    for entry in args.extra_mounts:
-        parts = entry.split(":")
-        if len(parts) >= 3:
-            # Rejoin first parts in case of Windows drive letter (C:...)
-            # Format: HOST:CONTAINER:MODE
-            mode = parts[-1]
-            container_path = parts[-2]
-            host_path = ":".join(parts[:-2])
-            extra_mounts.append((host_path, container_path, mode))
-
-    # Parse --input-artifact NAME=ARTIFACT_ID arguments into a dict.
-    # Mirrors --bind on `flywheel run block`, but expressed as
-    # --input-artifact since these become /input/NAME mounts inside
-    # the agent container rather than slot-bound block inputs.
-    input_artifacts: dict[str, str] = {}
-    for entry in args.input_artifacts:
-        if "=" not in entry:
-            raise ValueError(
-                f"Invalid --input-artifact format {entry!r}, "
-                f"expected NAME=ARTIFACT_ID"
-            )
-        name, artifact_id = entry.split("=", 1)
-        input_artifacts[name] = artifact_id
-
-    result = run_agent_block(
-        workspace=ws,
-        template=template,
-        project_root=config.project_root,
-        prompt=prompt,
-        block_name=args.block_name,
-        agent_image=args.agent_image,
-        auth_volume=args.auth_volume,
-        model=args.model,
-        max_turns=args.max_turns,
-        source_dirs=args.source_dir or None,
-        input_artifacts=input_artifacts or None,
-        mcp_servers=args.mcp_servers,
-        allowed_tools=args.allowed_tools,
-        extra_env=extra_env or None,
-        extra_mounts=extra_mounts or None,
-        state_lineage_key=args.state_lineage,
-        validator_registry=config.load_artifact_validator_registry(),
-        state_validator_registry=config.load_state_validator_registry(),
-    )
-    print(
-        f"Agent completed: exit_code={result.exit_code}, "
-        f"elapsed={result.elapsed_s:.1f}s, "
-        f"invocations={result.evals_run}"
     )
 
 

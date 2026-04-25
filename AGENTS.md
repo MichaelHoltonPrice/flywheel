@@ -92,13 +92,11 @@ Flywheel. They are not substrate abstractions.
 
 The current bundled battery is `batteries/claude/`: a Dockerfile,
 entrypoint, and Claude SDK runner that can be used as a block
-image. `flywheel run agent` is the current Claude-battery invocation
-path, implemented on top of canonical block execution. The long-term
-battery surface is not settled; once that replacement exists,
-`flywheel run agent` should be removed rather than preserved as a
-parallel agent-specific surface. Artifact finalization, state
-snapshots, validation, quarantine, and `BlockExecution` records are
-not battery-owned.
+image. Projects invoke it as an ordinary block by declaring a block
+that uses the battery image, mounts the prompt as a normal input
+artifact, and sets any needed env or Docker arguments in the block
+declaration. Artifact finalization, state snapshots, validation,
+quarantine, and `BlockExecution` records are not battery-owned.
 
 Important boundary:
 

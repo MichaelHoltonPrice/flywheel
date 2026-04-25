@@ -156,6 +156,7 @@ chown -R root:root /flywheel/state
 # /flywheel/control is a write-only handoff drop for the agent
 # runner; claude needs to write JSON files here, the launcher
 # reads them after container exit.
+mkdir -p /flywheel/control /flywheel/mcp_servers
 chown -R claude:claude /flywheel/control
 chmod 700 /flywheel/control
 

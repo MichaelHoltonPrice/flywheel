@@ -1,30 +1,38 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import patch
 
-from flywheel.agent import run_agent_block
 from flywheel.container import ContainerResult
+from flywheel.execution import run_block
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 
-
 AGENT_TEMPLATE_YAML = """\
-artifacts: []
+artifacts:
+  - name: prompt
+    kind: copy
 
 blocks:
   - name: agent
     image: agent:latest
     env:
       BASE_ENV: base
+      MAX_TURNS: "3"
+      MODEL: test-model
+    docker_args:
+      - -v
+      - claude-auth:/home/claude/.claude:rw
     state: managed
+    inputs:
+      - name: prompt
+        container_path: /prompt
     outputs:
       normal: []
 """
 
 
-def test_run_agent_block_uses_canonical_managed_state_path(
+def test_claude_battery_uses_canonical_managed_state_path(
     tmp_path: Path,
 ):
     project_root = tmp_path / "project"
@@ -35,6 +43,10 @@ def test_run_agent_block_uses_canonical_managed_state_path(
     template_path.write_text(AGENT_TEMPLATE_YAML)
     template = from_yaml_with_inline_blocks(template_path)
     workspace = Workspace.create("ws", template, foundry_dir)
+    prompt_dir = project_root / "prompt"
+    prompt_dir.mkdir()
+    (prompt_dir / "prompt.md").write_text("hello agent")
+    workspace.register_artifact("prompt", prompt_dir)
 
     seen: dict[str, object] = {}
 
@@ -44,6 +56,7 @@ def test_run_agent_block_uses_canonical_managed_state_path(
         seen["args"] = args
         seen["env"] = dict(config.env)
         seen["mounts"] = dict(mounts)
+        seen["docker_args"] = list(config.docker_args)
 
         flywheel_dir = Path(mounts["/flywheel"])
         flywheel_dir.mkdir(parents=True, exist_ok=True)
@@ -55,35 +68,26 @@ def test_run_agent_block_uses_canonical_managed_state_path(
 
         control_dir = flywheel_dir / "control"
         control_dir.mkdir(parents=True, exist_ok=True)
-        (control_dir / "agent_exit_state.json").write_text(json.dumps({
-            "status": "complete",
-            "reason": "done",
-        }))
-        (control_dir / "pending_tool_calls.json").write_text(json.dumps({
-            "pending": [],
-        }))
+        (control_dir / "agent_exit_state.json").write_text("{}")
+        (control_dir / "pending_tool_calls.json").write_text(
+            '{"pending": []}')
         assert (Path(mounts["/prompt"]) / "prompt.md").read_text() == (
             "hello agent"
         )
         return ContainerResult(exit_code=0, elapsed_s=1.25)
 
-    with patch("flywheel.agent.run_container", side_effect=fake_run_container):
-        result = run_agent_block(
+    with patch("flywheel.execution.run_container",
+               side_effect=fake_run_container):
+        result = run_block(
             workspace=workspace,
+            block_name="agent",
             template=template,
             project_root=project_root,
-            prompt="hello agent",
-            block_name="agent",
-            model="test-model",
-            max_turns=3,
             state_lineage_key="agent-session",
         )
 
-    assert result.exit_code == 0
-    assert result.elapsed_s == 1.25
-    assert result.exit_reason == "completed"
-    assert result.exit_state == {"status": "complete", "reason": "done"}
-    assert result.pending_tool_calls == []
+    assert result.container_result.exit_code == 0
+    assert result.container_result.elapsed_s == 1.25
 
     execution = workspace.executions[result.execution_id]
     assert execution.block_name == "agent"
@@ -104,6 +108,8 @@ def test_run_agent_block_uses_canonical_managed_state_path(
     assert env["BASE_ENV"] == "base"
     assert env["MODEL"] == "test-model"
     assert env["MAX_TURNS"] == "3"
+    assert "-v" in seen["docker_args"]
+    assert "claude-auth:/home/claude/.claude:rw" in seen["docker_args"]
     assert "/flywheel" in seen["mounts"]
     assert "/flywheel/control" not in seen["mounts"]
     assert "/prompt" in seen["mounts"]

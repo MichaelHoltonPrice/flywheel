@@ -23,11 +23,10 @@ and concepts.
   artifact instance; records lineage at the predecessor's
   artifact id.
 
-The remaining two user-facing commands (`run block`, `run
-pattern`) gain their per-command docs as the underlying behavior
-is pinned. Until then, agents should read the argparse setup at
-the top of [`flywheel/cli.py`](../../flywheel/cli.py) and use
-`--help`.
+The remaining user-facing commands (`run block` and `run pattern`)
+gain their per-command docs as the underlying behavior is pinned.
+Until then, agents should read the argparse setup at the top of
+[`flywheel/cli.py`](../../flywheel/cli.py) and use `--help`.
 
 ## Conventions used in command docs
 

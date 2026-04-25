@@ -18,10 +18,14 @@ def test_hello_agent_example_templates_parse():
     )
 
     assert template.name == "hello-agent"
+    assert [artifact.name for artifact in template.artifacts] == ["prompt"]
     assert [block.name for block in template.blocks] == ["HelloAgent"]
     block = template.blocks[0]
     assert block.image == "flywheel-claude:latest"
     assert block.state == "managed"
+    assert block.inputs[0].name == "prompt"
+    assert block.inputs[0].container_path == "/prompt"
+    assert "claude-auth:/home/claude/.claude:rw" in block.docker_args
     assert block.outputs_for("normal") == []
 
 

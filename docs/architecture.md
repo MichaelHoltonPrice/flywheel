@@ -241,12 +241,10 @@ The bundled Claude battery currently includes:
 * `batteries/claude/agent_runner.py`;
 * `examples/hello-agent/`.
 
-`flywheel run agent` is the current invocation path for this battery.
-It is implemented by calling canonical block execution with a
-Claude-specific runtime runner. The long-term battery surface is not
-settled; once a replacement exists, `flywheel run agent` should be
-removed rather than preserved as a parallel agent-specific product
-surface. The durable outputs remain ordinary block execution records,
+Projects invoke the battery as an ordinary block by declaring a block
+that uses the Claude battery image. Prompt bytes are ordinary input
+artifacts, auth and other launch details live in the block declaration,
+and the durable outputs remain ordinary block execution records,
 artifact instances, and state snapshots.
 
 Agent handoff, richer battery selection, and moving all Claude-specific
@@ -256,9 +254,9 @@ runner wiring out of `flywheel/agent.py` are deferred.
 
 ### Battery Boundaries
 
-Move Claude-specific runner wiring into `batteries/claude/`. Decide
-whether the CLI should expose batteries through `flywheel run battery`
-or ordinary battery-provided block templates plus `flywheel run block`.
+Continue moving Claude-specific conventions into `batteries/claude/`
+and battery-provided templates. Batteries should be invoked through
+ordinary `flywheel run block` execution.
 
 Do not add agent-shaped fields to `BlockExecution` unless the field is
 meaningful for ordinary block executions.

@@ -42,9 +42,8 @@ start at [AGENTS.md](AGENTS.md). Design rationale is in
 Versioned examples live under [examples/](examples/). Start with
 [examples/hello-agent](examples/hello-agent/), a smoke test for the
 Flywheel-provided Claude battery image and managed state
-restore/capture. The example uses the current `flywheel run agent`
-Claude-battery invocation path; the long-term battery surface is still
-being settled.
+restore/capture. The example invokes the battery as an ordinary block
+with `flywheel run block`.
 
 ## Setup
 

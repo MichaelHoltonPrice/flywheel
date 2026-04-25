@@ -1,12 +1,12 @@
 # Hello Agent Example
 
 This example is a smoke test for the Flywheel-provided Claude agent
-battery. It uses the current `flywheel run agent` Claude-battery
-invocation path while the long-term battery surface is still being
-settled. It demonstrates:
+battery. The battery is invoked as an ordinary Flywheel block whose
+block declaration uses the Claude battery image. It demonstrates:
 
-* the current `flywheel run agent` Claude-battery invocation path
+* ordinary `flywheel run block` execution with a battery image
 * the Flywheel-provided `batteries/claude` Docker image
+* prompt delivery through a regular `copy` artifact mounted at `/prompt`
 * managed state through `/flywheel/state`
 * agent control files under `/flywheel/control`
 * normal termination through `/flywheel/termination`
@@ -35,9 +35,11 @@ cd examples\hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
 
-python -m flywheel run agent --workspace foundry\workspaces\ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel import artifact --workspace foundry\workspaces\ws --name prompt --from .\prompt
 
-python -m flywheel run agent --workspace foundry\workspaces\ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
+
+python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
 findstr /C:"block_name" /C:"status" /C:"state_snapshot_id" /C:"state_snapshots" foundry\workspaces\ws\workspace.yaml
 ```
@@ -47,6 +49,11 @@ Reset the example workspace:
 ```bat
 rmdir /s /q foundry\workspaces\ws
 ```
+
+The prompt artifact source is a directory; `prompt\prompt.md` is
+mounted inside the container as `/prompt/prompt.md`. If you edit the
+block image or environment after the first run, reset the workspace
+before reusing the same `--state-lineage`.
 
 ## Windows PowerShell
 
@@ -65,9 +72,11 @@ Set-Location examples\hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
 
-python -m flywheel run agent --workspace foundry\workspaces\ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel import artifact --workspace foundry\workspaces\ws --name prompt --from .\prompt
 
-python -m flywheel run agent --workspace foundry\workspaces\ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
+
+python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
 Select-String -Path foundry\workspaces\ws\workspace.yaml -Pattern "block_name","status","state_snapshot_id","state_snapshots"
 ```
@@ -77,6 +86,11 @@ Reset the example workspace:
 ```powershell
 Remove-Item -Recurse -Force foundry\workspaces\ws
 ```
+
+The prompt artifact source is a directory; `prompt\prompt.md` is
+mounted inside the container as `/prompt/prompt.md`. If you edit the
+block image or environment after the first run, reset the workspace
+before reusing the same `--state-lineage`.
 
 ## macOS / Linux
 
@@ -95,9 +109,11 @@ cd examples/hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
 
-python -m flywheel run agent --workspace foundry/workspaces/ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel import artifact --workspace foundry/workspaces/ws --name prompt --from ./prompt
 
-python -m flywheel run agent --workspace foundry/workspaces/ws --template hello-agent --block-name HelloAgent --prompt-file prompt.md --state-lineage hello-agent --max-turns 1
+python -m flywheel run block --workspace foundry/workspaces/ws --template hello-agent --block HelloAgent --state-lineage hello-agent
+
+python -m flywheel run block --workspace foundry/workspaces/ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
 grep -E "block_name|status|state_snapshot_id|state_snapshots" foundry/workspaces/ws/workspace.yaml
 ```
@@ -107,3 +123,8 @@ Reset the example workspace:
 ```bash
 rm -rf foundry/workspaces/ws
 ```
+
+The prompt artifact source is a directory; `prompt/prompt.md` is
+mounted inside the container as `/prompt/prompt.md`. If you edit the
+block image or environment after the first run, reset the workspace
+before reusing the same `--state-lineage`.

@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from flywheel.artifact import BlockExecution, RejectedOutput
-from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.cli import _parse_bindings, create_workspace, main
 from flywheel.config import load_project_config
 from flywheel.container import ContainerResult
@@ -590,17 +589,19 @@ outputs: [checkpoint]
             project_root / "foundry" / "workspaces" / "test_ws"
         )
 
-        with patch(
-            "flywheel.execution.run_container",
-            side_effect=AssertionError("container should not run"),
+        with (
+            patch(
+                "flywheel.execution.run_container",
+                side_effect=AssertionError("container should not run"),
+            ),
+            pytest.raises(ValueError, match="state lineage key"),
         ):
-            with pytest.raises(ValueError, match="state lineage key"):
-                main([
-                    "run", "block",
-                    "--workspace", str(workspace_path),
-                    "--block", "train",
-                    "--template", "my_template",
-                ])
+            main([
+                "run", "block",
+                "--workspace", str(workspace_path),
+                "--block", "train",
+                "--template", "my_template",
+            ])
 
         ws = Workspace.load(workspace_path)
         execution = next(iter(ws.executions.values()))
@@ -610,55 +611,22 @@ outputs: [checkpoint]
         assert execution.state_mode == "managed"
 
 
-# ── flywheel run agent ──────────────────────────────────────────
-
-
-class TestMainRunAgent:
-    def test_argument_parsing_threads_canonical_state_inputs(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+class TestRemovedAgentSurfaces:
+    def test_run_agent_is_not_a_cli_surface(
+        self, capsys: pytest.CaptureFixture[str],
     ):
-        project_root = make_project(tmp_path)
-        prompt = tmp_path / "prompt.md"
-        prompt.write_text("hello {{NAME}}")
-        monkeypatch.chdir(project_root)
-        main(["create", "workspace", "--name", "test_ws",
-              "--template", "my_template"])
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "agent", "--help"])
+        assert exc_info.value.code != 0
+        assert "invalid choice" in capsys.readouterr().err
 
-        mock_result = MagicMock()
-        mock_result.exit_code = 0
-        mock_result.elapsed_s = 1.0
-        mock_result.evals_run = 0
-
-        with patch(
-            "flywheel.cli.run_agent_block",
-            return_value=mock_result,
-        ) as mock_run:
-            main([
-                "run", "agent",
-                "--workspace",
-                str(project_root / "foundry" / "workspaces" / "test_ws"),
-                "--template", "my_template",
-                "--block-name", "train",
-                "--prompt-file", str(prompt),
-                "--state-lineage", "agent-session",
-                "--model", "test-model",
-                "--", "--name", "agent",
-            ])
-
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args.kwargs
-        assert call_args["prompt"] == "hello agent"
-        assert call_args["state_lineage_key"] == "agent-session"
-        assert isinstance(
-            call_args["validator_registry"],
-            ArtifactValidatorRegistry,
-        )
-        assert isinstance(
-            call_args["state_validator_registry"],
-            StateValidatorRegistry,
-        )
-        assert "overrides" not in call_args
-        assert "total_timeout" not in call_args
+    def test_run_battery_is_not_a_cli_surface(
+        self, capsys: pytest.CaptureFixture[str],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "battery", "claude", "--help"])
+        assert exc_info.value.code != 0
+        assert "invalid choice" in capsys.readouterr().err
 
 
 # ── flywheel run pattern ────────────────────────────────────────
