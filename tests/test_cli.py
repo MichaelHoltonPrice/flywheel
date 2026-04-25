@@ -556,6 +556,58 @@ class TestMainRunBlock:
 # ── flywheel run pattern ────────────────────────────────────────
 
 
+    def test_managed_state_missing_lineage_records_execution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_project(tmp_path)
+        train_yaml = (
+            project_root / "foundry" / "templates" / "blocks"
+            / "train.yaml"
+        )
+        train_yaml.write_text("""\
+name: train
+image: cyberloop-train:latest
+state: managed
+inputs: []
+outputs: [checkpoint]
+""")
+        subprocess.run(
+            ["git", "-C", str(project_root), "add", "."],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(project_root), "commit", "-m", "stateful train"],
+            check=True,
+            capture_output=True,
+        )
+        monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "test_ws",
+              "--template", "my_template"])
+        workspace_path = (
+            project_root / "foundry" / "workspaces" / "test_ws"
+        )
+
+        with patch(
+            "flywheel.execution.run_container",
+            side_effect=AssertionError("container should not run"),
+        ):
+            with pytest.raises(ValueError, match="state lineage key"):
+                main([
+                    "run", "block",
+                    "--workspace", str(workspace_path),
+                    "--block", "train",
+                    "--template", "my_template",
+                ])
+
+        ws = Workspace.load(workspace_path)
+        execution = next(iter(ws.executions.values()))
+        assert execution.block_name == "train"
+        assert execution.status == "failed"
+        assert execution.failure_phase == "stage_in"
+        assert execution.state_mode == "managed"
+
+
 def _write_pattern(project_root: Path, name: str, body: str) -> Path:
     patterns_dir = project_root / "foundry" / "templates" / "patterns"
     patterns_dir.mkdir(parents=True, exist_ok=True)

@@ -142,6 +142,8 @@ During prepare, if the block's state mode is `managed`:
 5. If a compatible snapshot exists, copy its bytes into that mount.
 6. Mount the directory into the container at `/flywheel/state`.
 
+Restore preserves filesystem symlinks rather than dereferencing them.
+
 If no snapshot exists, the block receives an empty state mount.  Empty
 state is the first-execution signal.
 

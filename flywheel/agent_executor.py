@@ -231,7 +231,7 @@ class AgentExecutor:
         execution_id: str | None = None,
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
-        state_lineage_id: str | None = None,
+        state_lineage_key: str | None = None,
         run_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         extra_mounts: list[tuple[str, str, str]] | None = None,
@@ -249,7 +249,7 @@ class AgentExecutor:
         (legacy battery-shape) are honoured for compatibility,
         with explicit kwargs taking precedence.
         ``execution_id``, ``allowed_blocks``,
-        ``state_lineage_id`` are accepted for protocol parity
+        ``state_lineage_key`` are accepted for protocol parity
         but not consumed by today's agent machinery (the
         underlying launcher mints its own ids and the agent's
         container does not honour an external block whitelist).
@@ -257,7 +257,7 @@ class AgentExecutor:
         :class:`flywheel.artifact.BlockExecution` is stamped
         with the caller's run grouping.
         """
-        del execution_id, allowed_blocks, state_lineage_id
+        del execution_id, allowed_blocks, state_lineage_key
 
         plan = self._resolve_plan(
             overrides,

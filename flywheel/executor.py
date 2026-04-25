@@ -88,7 +88,7 @@ class BlockExecutor(Protocol):
         execution_id: str | None = None,
         overrides: dict[str, Any] | None = None,
         allowed_blocks: list[str] | None = None,
-        state_lineage_id: str | None = None,
+        state_lineage_key: str | None = None,
         run_id: str | None = None,
     ) -> ExecutionHandle:
         """Launch a block execution and return a waitable handle."""

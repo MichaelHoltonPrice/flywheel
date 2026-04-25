@@ -249,14 +249,9 @@ def _mount_artifact_instance(
     return (host_path, container_path, "ro")
 
 
-def _copy_dir_contents(source: Path, target: Path) -> None:
-    """Copy a directory's contents into an existing target directory."""
-    for child in source.iterdir():
-        destination = target / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination)
-        else:
-            shutil.copy2(child, destination)
+def _restore_state_snapshot(source: Path, target: Path) -> None:
+    """Copy state bytes into an existing mount, preserving symlinks."""
+    shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
 
 
 def _record_execution(
@@ -464,7 +459,7 @@ def prepare_block_execution(
                     f"for lineage {state_lineage_key!r} is not "
                     f"compatible with block {block_def.name!r}"
                 )
-            _copy_dir_contents(
+            _restore_state_snapshot(
                 workspace.state_snapshot_path(latest_snapshot.id),
                 state_mount_dir,
             )

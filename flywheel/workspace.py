@@ -701,7 +701,7 @@ class Workspace:
     def latest_state_snapshot(
         self, lineage_key: str,
     ) -> StateSnapshot | None:
-        """Return the latest managed state snapshot for a lineage."""
+        """Return the latest snapshot by timestamp, then id tie-break."""
         return self._latest_state_snapshot_unlocked(lineage_key)
 
     def _latest_state_snapshot_unlocked(
