@@ -1,10 +1,11 @@
 # Hello Agent Example
 
-This example is a minimal Flywheel project that runs the
-Flywheel-provided Claude agent battery through the canonical block
-execution path. It demonstrates:
+This example is a smoke test for the Flywheel-provided Claude agent
+battery. It uses the current `flywheel run agent` Claude-battery
+invocation path while the long-term battery surface is still being
+settled. It demonstrates:
 
-* `flywheel run agent`
+* the current `flywheel run agent` Claude-battery invocation path
 * the Flywheel-provided `batteries/claude` Docker image
 * managed state through `/flywheel/state`
 * agent control files under `/flywheel/control`

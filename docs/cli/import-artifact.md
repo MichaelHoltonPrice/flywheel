@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Register an external directory as a fresh `copy`-kind artifact
-instance inside an existing workspace. The directory's contents
-are copied (never aliased) into the workspace's artifact store,
-get a fresh artifact id, and bind identically from that point
-on to artifacts produced by block executions.
+Add files to an existing workspace as a fresh immutable `copy`
+artifact instance. The source directory's contents are copied
+(never aliased) into the workspace's artifact store, get a fresh
+artifact id, and bind identically from that point on to artifacts
+produced by block executions.
 
 Artifact instances are always directory-shaped, mirroring the
 per-slot output directories block executions write into. To

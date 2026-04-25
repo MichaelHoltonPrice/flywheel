@@ -10,10 +10,10 @@ and concepts.
 * [create-workspace.md](create-workspace.md) — `flywheel create
   workspace`. Materialize a fresh workspace from a template.
 * [import-artifact.md](import-artifact.md) — `flywheel import
-  artifact`. Register an external directory as a `copy`-kind
-  artifact instance inside an existing workspace, optionally
-  subject to a project-supplied validator. (Artifact instances
-  are always directory-shaped; wrap single files first.)
+  artifact`. Add files to an existing workspace as an immutable
+  `copy` artifact instance, optionally subject to a project-supplied
+  validator. (Artifact instances are always directory-shaped; wrap
+  single files first.)
 * [fix-execution.md](fix-execution.md) — `flywheel fix
   execution`. Register a corrected artifact instance for an
   output slot that an earlier execution's validator rejected;

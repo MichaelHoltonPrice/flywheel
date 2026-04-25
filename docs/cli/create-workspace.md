@@ -26,9 +26,9 @@ state restore) assumes a workspace exists.
 ## Prerequisites
 
 * **`flywheel.yaml` at the project root** declaring `foundry_dir`
-  (the directory flywheel manages). Optionally
-  `project_hooks: module.path:ClassName` for `flywheel run pattern`
-  later; not required for `create workspace`.
+  (the directory flywheel manages). Optional validator registry
+  factories may also be declared there; they are not required for
+  `create workspace`.
 * **The workspace template file exists** at
   `<foundry_dir>/templates/workspaces/<template_name>.yaml`.
 * **The template's referenced blocks exist** in
@@ -87,6 +87,7 @@ A new directory at `<foundry_dir>/workspaces/<name>/` containing:
     and `incremental` declarations produce no instances at
     create time.
   * `executions` — empty.
+  * `state_snapshots` — empty.
   * `events` — empty.
   * `runs` — empty.
 
@@ -131,11 +132,9 @@ is stable enough to grep.
 
 ## Typical next steps
 
-* `flywheel import artifact` — register an external file or
-  directory as a `copy` artifact instance (e.g., a starting
-  checkpoint, a fixture). Per-command doc not yet written; see
-  the argparse setup at [`flywheel/cli.py`](../../flywheel/cli.py)
-  line ~60.
+* `flywheel import artifact` — add files to the workspace as an
+  immutable `copy` artifact instance (e.g., a starting checkpoint,
+  a fixture). See [import-artifact.md](import-artifact.md).
 * `flywheel run block` — execute one block ad hoc against the
   workspace. Per-command doc not yet written; see argparse setup
   at [`flywheel/cli.py`](../../flywheel/cli.py) line ~76.
