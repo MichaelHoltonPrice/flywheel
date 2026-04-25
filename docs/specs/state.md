@@ -112,6 +112,16 @@ The compatibility identity is:
 * image string
 * block template content hash
 
+`block_template_hash` is the SHA-256 hash of the operational fields in
+the block declaration that affect state restore/capture expectations:
+inputs, outputs, `docker_args`, `env`, `runner`, `post_check`,
+`output_builder`, `lifecycle`, and `stop_timeout_s`.
+
+The top-level identity already carries block name, state mode, and
+image string, so those fields are not duplicated inside the hash.
+Free-text rationale fields, such as `runner_justification`, do not
+participate in compatibility.
+
 If the latest snapshot for a lineage does not match the current
 execution's compatibility identity, Flywheel rejects the execution
 before invoke.  It does not try to migrate state, silently start over,
