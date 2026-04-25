@@ -9,10 +9,6 @@ from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 
 AGENT_TEMPLATE_YAML = """\
-artifacts:
-  - name: prompt
-    kind: copy
-
 blocks:
   - name: agent
     image: agent:latest
@@ -24,9 +20,6 @@ blocks:
       - -v
       - claude-auth:/home/claude/.claude:rw
     state: managed
-    inputs:
-      - name: prompt
-        container_path: /prompt
     outputs:
       normal: []
 """
@@ -43,10 +36,6 @@ def test_claude_battery_uses_canonical_managed_state_path(
     template_path.write_text(AGENT_TEMPLATE_YAML)
     template = from_yaml_with_inline_blocks(template_path)
     workspace = Workspace.create("ws", template, foundry_dir)
-    prompt_dir = project_root / "prompt"
-    prompt_dir.mkdir()
-    (prompt_dir / "prompt.md").write_text("hello agent")
-    workspace.register_artifact("prompt", prompt_dir)
 
     seen: dict[str, object] = {}
 
@@ -71,9 +60,6 @@ def test_claude_battery_uses_canonical_managed_state_path(
         (control_dir / "agent_exit_state.json").write_text("{}")
         (control_dir / "pending_tool_calls.json").write_text(
             '{"pending": []}')
-        assert (Path(mounts["/prompt"]) / "prompt.md").read_text() == (
-            "hello agent"
-        )
         return ContainerResult(exit_code=0, elapsed_s=1.25)
 
     with patch("flywheel.execution.run_container",
@@ -112,4 +98,4 @@ def test_claude_battery_uses_canonical_managed_state_path(
     assert "claude-auth:/home/claude/.claude:rw" in seen["docker_args"]
     assert "/flywheel" in seen["mounts"]
     assert "/flywheel/control" not in seen["mounts"]
-    assert "/prompt" in seen["mounts"]
+    assert "/prompt" not in seen["mounts"]

@@ -27,6 +27,17 @@ def test_claude_battery_image_owns_runtime_env_defaults():
 
     assert "ENV PYTHONUNBUFFERED=1" in text
     assert "ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000" in text
+    assert "ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md" in text
+
+
+def test_hello_agent_image_bakes_prompt_into_battery_convention():
+    dockerfile = ROOT / "examples" / "hello-agent" / (
+        "Dockerfile.hello-agent"
+    )
+    text = dockerfile.read_text(encoding="utf-8")
+
+    assert "FROM flywheel-claude:latest" in text
+    assert "COPY prompt/prompt.md /app/agent/prompt.md" in text
 
 
 def test_claude_battery_entrypoint_creates_framework_subdirs():

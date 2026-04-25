@@ -6,14 +6,14 @@ block declaration uses the Claude battery image. It demonstrates:
 
 * ordinary `flywheel run block` execution with a battery image
 * the Flywheel-provided `batteries/claude` Docker image
-* prompt delivery through a regular `copy` artifact mounted at `/prompt`
+* prompt delivery through an example image derived from the Claude battery
 * managed state through `/flywheel/state`
 * agent control files under `/flywheel/control`
 * normal termination through `/flywheel/termination`
 
 Run the commands from the Flywheel repository root. The example uses
-the local Docker image tag `flywheel-claude:latest` and the Docker
-volume `claude-auth`.
+the local Docker image tags `flywheel-claude:latest` and
+`flywheel-hello-agent:latest`, plus the Docker volume `claude-auth`.
 
 The `claude-auth` volume is shared across runs. Re-run the volume
 bootstrap command whenever the host Claude credentials rotate.
@@ -27,6 +27,7 @@ python -m venv .venv
 python -m pip install -e .
 
 docker build -t flywheel-claude:latest -f batteries\claude\Dockerfile.claude batteries\claude
+docker build -t flywheel-hello-agent:latest -f examples\hello-agent\Dockerfile.hello-agent examples\hello-agent
 
 docker volume create claude-auth
 docker run --rm -v claude-auth:/auth -v "%USERPROFILE%\.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
@@ -34,8 +35,6 @@ docker run --rm -v claude-auth:/auth -v "%USERPROFILE%\.claude:/host-claude:ro" 
 cd examples\hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
-
-python -m flywheel import artifact --workspace foundry\workspaces\ws --name prompt --from .\prompt
 
 python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
@@ -50,8 +49,8 @@ Reset the example workspace:
 rmdir /s /q foundry\workspaces\ws
 ```
 
-The prompt artifact source is a directory; `prompt\prompt.md` is
-mounted inside the container as `/prompt/prompt.md`. If you edit the
+The example agent image derives from `flywheel-claude:latest` and
+copies `prompt\prompt.md` into `/app/agent/prompt.md`. If you edit the
 block image or environment after the first run, reset the workspace
 before reusing the same `--state-lineage`.
 
@@ -64,6 +63,7 @@ python -m venv .venv
 python -m pip install -e .
 
 docker build -t flywheel-claude:latest -f batteries\claude\Dockerfile.claude batteries\claude
+docker build -t flywheel-hello-agent:latest -f examples\hello-agent\Dockerfile.hello-agent examples\hello-agent
 
 docker volume create claude-auth
 docker run --rm -v claude-auth:/auth -v "$env:USERPROFILE\.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
@@ -71,8 +71,6 @@ docker run --rm -v claude-auth:/auth -v "$env:USERPROFILE\.claude:/host-claude:r
 Set-Location examples\hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
-
-python -m flywheel import artifact --workspace foundry\workspaces\ws --name prompt --from .\prompt
 
 python -m flywheel run block --workspace foundry\workspaces\ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
@@ -87,8 +85,8 @@ Reset the example workspace:
 Remove-Item -Recurse -Force foundry\workspaces\ws
 ```
 
-The prompt artifact source is a directory; `prompt\prompt.md` is
-mounted inside the container as `/prompt/prompt.md`. If you edit the
+The example agent image derives from `flywheel-claude:latest` and
+copies `prompt\prompt.md` into `/app/agent/prompt.md`. If you edit the
 block image or environment after the first run, reset the workspace
 before reusing the same `--state-lineage`.
 
@@ -101,6 +99,7 @@ source .venv/bin/activate
 python -m pip install -e .
 
 docker build -t flywheel-claude:latest -f batteries/claude/Dockerfile.claude batteries/claude
+docker build -t flywheel-hello-agent:latest -f examples/hello-agent/Dockerfile.hello-agent examples/hello-agent
 
 docker volume create claude-auth
 docker run --rm -v claude-auth:/auth -v "$HOME/.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
@@ -108,8 +107,6 @@ docker run --rm -v claude-auth:/auth -v "$HOME/.claude:/host-claude:ro" python:3
 cd examples/hello-agent
 
 python -m flywheel create workspace --name ws --template hello-agent
-
-python -m flywheel import artifact --workspace foundry/workspaces/ws --name prompt --from ./prompt
 
 python -m flywheel run block --workspace foundry/workspaces/ws --template hello-agent --block HelloAgent --state-lineage hello-agent
 
@@ -124,7 +121,7 @@ Reset the example workspace:
 rm -rf foundry/workspaces/ws
 ```
 
-The prompt artifact source is a directory; `prompt/prompt.md` is
-mounted inside the container as `/prompt/prompt.md`. If you edit the
+The example agent image derives from `flywheel-claude:latest` and
+copies `prompt/prompt.md` into `/app/agent/prompt.md`. If you edit the
 block image or environment after the first run, reset the workspace
 before reusing the same `--state-lineage`.

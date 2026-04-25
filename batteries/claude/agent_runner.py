@@ -27,6 +27,12 @@ Pause/resume
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
+    FLYWHEEL_AGENT_PROMPT
+                    — Path to the prompt file inside the battery image.
+                      Defaults to /app/agent/prompt.md.  Projects
+                      normally provide this by deriving an image from
+                      the Claude battery and copying their prompt into
+                      that path.
     ALLOWED_TOOLS   — Comma-separated tool whitelist
     MAX_TURNS       — Total turn budget for the agent (optional)
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
@@ -139,12 +145,7 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # ``cyber-root/substrate-contract.md`` for the runtime contract.
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-# Prompt delivery: the pattern runner renders the prompt into a
-# tempdir and mounts it read-only at ``/prompt``.  Reading the
-# prompt from a file (rather than stdin) frees stdin for log
-# capture and matches the runtime contract's "inputs arrive via
-# file mounts" convention.
-PROMPT_FILE = Path("/prompt/prompt.md")
+DEFAULT_PROMPT_FILE = Path("/app/agent/prompt.md")
 
 # Orchestration control outputs.  The runner writes them to
 # ``/flywheel/control/`` and flywheel's agent launcher reads them
@@ -443,18 +444,21 @@ def _get_input_tokens(message) -> int:
 
 async def main() -> None:
     """Run the Claude Code agent with mid-session compaction."""
-    # --- Read initial prompt from the /prompt/ mount ---
-    if not PROMPT_FILE.is_file():
+    # --- Read initial prompt from the agent image ---
+    prompt_file = Path(
+        os.environ.get("FLYWHEEL_AGENT_PROMPT", str(DEFAULT_PROMPT_FILE)))
+    if not prompt_file.is_file():
         _emit({
             "type": "error",
             "message": (
-                f"Prompt file not found at {PROMPT_FILE}; the "
-                f"launcher must mount a read-only prompt "
-                f"directory at /prompt/ with a prompt.md file."
+                f"Prompt file not found at {prompt_file}; derive an "
+                "agent image from the Claude battery and copy the "
+                "project prompt into that path, or set "
+                "FLYWHEEL_AGENT_PROMPT to the image-local prompt file."
             ),
         })
         sys.exit(1)
-    prompt = PROMPT_FILE.read_text(encoding="utf-8")
+    prompt = prompt_file.read_text(encoding="utf-8")
     if not prompt.strip():
         _emit({"type": "error", "message": "Empty prompt"})
         sys.exit(1)
