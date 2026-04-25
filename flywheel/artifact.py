@@ -220,7 +220,7 @@ class BlockExecution:
         runner: How this execution was physically performed:
             ``"container_one_shot"`` (one-shot container) or
             ``"container_persistent"`` (long-lived container,
-            multiple invocations over an HTTP loop).
+            multiple runtime requests over a persistent interface).
         error: Error message if status is ``"failed"`` and the
             failure produced a string description. None otherwise.
         failure_phase: When ``status == "failed"``, identifies
@@ -253,6 +253,8 @@ class BlockExecution:
             execution, when one was captured.  ``None`` for
             ``state_mode`` values other than ``"managed"`` and for
             managed executions that did not capture a snapshot.
+        invoking_execution_id: The execution that caused this one
+            to run through a termination-route invocation, if any.
 
     Fields removed in the block-execution refactor (see
     ``flywheel/docs/specs/block-execution.md``):
@@ -260,8 +262,6 @@ class BlockExecution:
     * ``caller`` and ``agent_workspace_dir`` — agent/MCP-shaped,
       removed entirely from the substrate schema.  Will live in
       whatever batteries-layer record the agent runtime owns.
-    * ``parent_execution_id`` — handoff-shaped; will return as
-      ``invoking_execution_id`` when the handoff primitive lands.
     * ``params``, ``synthetic``, ``halt_directive``,
       ``post_check_error``, ``state_dir``, ``state_lineage_id``,
       ``run_id``, ``predecessor_id``, ``stop_reason`` — out of
@@ -292,6 +292,23 @@ class BlockExecution:
     termination_reason: str | None = None
     state_mode: StateMode = "none"
     state_snapshot_id: str | None = None
+    invoking_execution_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BlockInvocation:
+    """A durable link from one execution to an invoked execution."""
+
+    id: str
+    invoking_execution_id: str
+    termination_reason: str
+    invoked_block_name: str
+    invoked_at: datetime
+    status: Literal["succeeded", "failed"]
+    invoked_execution_id: str | None = None
+    input_bindings: dict[str, str] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 @dataclass(frozen=True)

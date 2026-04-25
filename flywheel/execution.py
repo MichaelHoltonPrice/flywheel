@@ -44,6 +44,7 @@ from flywheel.artifact_validator import (
     ArtifactValidatorRegistry,
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
+from flywheel.invocation import dispatch_invocations
 from flywheel.quarantine import quarantine_slot
 from flywheel.state import (
     StateMode,
@@ -280,6 +281,7 @@ def _record_execution(
     rejected_outputs: dict[str, RejectedOutput] | None = None,
     state_mode: StateMode = "none",
     state_snapshot_id: str | None = None,
+    invoking_execution_id: str | None = None,
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -310,6 +312,7 @@ def _record_execution(
         termination_reason=termination_reason,
         state_mode=state_mode,
         state_snapshot_id=state_snapshot_id,
+        invoking_execution_id=invoking_execution_id,
     )
     workspace.record_execution(execution)
 
@@ -330,6 +333,7 @@ def commit_failure(
     resolved_bindings: dict[str, str] | None = None,
     proposals_root: Path | None = None,
     state_mode: StateMode = "none",
+    invoking_execution_id: str | None = None,
 ) -> None:
     """Record a failure that happened upstream of the commit phase.
 
@@ -363,6 +367,9 @@ def commit_failure(
             empty mapping.
         proposals_root: Per-execution proposals tree to clean up,
             if one was allocated before the failure.
+        state_mode: State mode to record on the failed execution.
+        invoking_execution_id: Execution that routed to this one,
+            if the failed attempt was invoked by another block.
     """
     if proposals_root is not None:
         shutil.rmtree(proposals_root, ignore_errors=True)
@@ -375,6 +382,7 @@ def commit_failure(
         failure_phase=phase,
         error=error,
         state_mode=state_mode,
+        invoking_execution_id=invoking_execution_id,
     )
 
 
@@ -629,7 +637,7 @@ def _with_execution_id(
     execution_id: str,
 ) -> BaseException:
     """Annotate an exception with the ledger execution it recorded."""
-    setattr(exc, "flywheel_execution_id", execution_id)
+    exc.flywheel_execution_id = execution_id  # type: ignore[attr-defined]
     return exc
 
 
@@ -686,6 +694,7 @@ def commit_block_execution(
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
+    invoking_execution_id: str | None = None,
 ) -> ContainerResult | None:
     """Forge proposals, record the execution, and clean up.
 
@@ -743,6 +752,7 @@ def commit_block_execution(
             failure_phase=failure_phase,
             error=error,
             state_mode=plan.state_mode,
+            invoking_execution_id=invoking_execution_id,
         )
         message = f"Block {block_name!r} runtime failed: {error}"
         if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
@@ -805,6 +815,7 @@ def commit_block_execution(
                 failure_phase=runtime.FAILURE_STATE_VALIDATE,
                 error=error,
                 state_mode=plan.state_mode,
+                invoking_execution_id=invoking_execution_id,
             )
             raise _with_execution_id(
                 StateValidationError(
@@ -833,6 +844,7 @@ def commit_block_execution(
                 failure_phase=runtime.FAILURE_STATE_CAPTURE,
                 error=error,
                 state_mode=plan.state_mode,
+                invoking_execution_id=invoking_execution_id,
             )
             raise _with_execution_id(
                 RuntimeError(error), plan.execution_id) from exc
@@ -923,6 +935,7 @@ def commit_block_execution(
             rejected_outputs=rejected_outputs,
             state_mode=plan.state_mode,
             state_snapshot_id=state_snapshot_id,
+            invoking_execution_id=invoking_execution_id,
         )
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
             raise _with_execution_id(
@@ -938,6 +951,7 @@ def commit_block_execution(
         all_expected_committed=all_expected_committed,
         state_mode=plan.state_mode,
         state_snapshot_id=state_snapshot_id,
+        invoking_execution_id=invoking_execution_id,
     )
 
     return container_result
@@ -958,6 +972,8 @@ def run_block(
     state_validator_registry: StateValidatorRegistry | None = None,
     container_runner: OneShotContainerRunner | None = None,
     state_lineage_key: str | None = None,
+    invoking_execution_id: str | None = None,
+    dispatch_child_invocations: bool = True,
 ) -> BlockRunResult:
     """Execute a block within a workspace.
 
@@ -984,6 +1000,12 @@ def run_block(
         state_lineage_key: Required for blocks that declare
             ``state: managed``; identifies the execution-lineage
             state chain to restore from and capture into.
+        invoking_execution_id: Execution that routed to this block,
+            if this execution was invoked by another block.
+        dispatch_child_invocations: Whether to fire routes declared
+            for this block's committed termination reason before
+            returning.  Invoked children disable this in v1 so
+            iteration remains a pattern-level concern.
 
     Returns:
         A BlockRunResult with the ledger execution and raw
@@ -1057,6 +1079,7 @@ def run_block(
             error=f"{type(exc).__name__}: {exc}",
             proposals_root=proposals_root,
             state_mode=block_def.state,
+            invoking_execution_id=invoking_execution_id,
         )
         _with_execution_id(exc, execution_id)
         raise
@@ -1080,6 +1103,7 @@ def run_block(
             resolved_bindings=plan.resolved_bindings,
             proposals_root=plan.proposals_root,
             state_mode=plan.state_mode,
+            invoking_execution_id=invoking_execution_id,
         )
         _with_execution_id(exc, plan.execution_id)
         raise
@@ -1095,6 +1119,7 @@ def run_block(
             resolved_bindings=plan.resolved_bindings,
             proposals_root=plan.proposals_root,
             state_mode=plan.state_mode,
+            invoking_execution_id=invoking_execution_id,
         )
         _with_execution_id(exc, plan.execution_id)
         raise
@@ -1104,6 +1129,7 @@ def run_block(
         workspace, plan, runtime_result, template,
         validator_registry=validator_registry,
         state_validator_registry=state_validator_registry,
+        invoking_execution_id=invoking_execution_id,
     )
     container_result = result or runtime_result.container_result
     if container_result is None:
@@ -1115,6 +1141,16 @@ def run_block(
             plan.execution_id,
         )
     execution = workspace.executions[plan.execution_id]
+    if dispatch_child_invocations:
+        dispatch_invocations(
+            workspace=workspace,
+            template=template,
+            project_root=project_root,
+            parent_block=block_def,
+            parent_execution=execution,
+            validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
+        )
     return BlockRunResult(
         execution_id=plan.execution_id,
         execution=execution,

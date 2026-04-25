@@ -244,7 +244,11 @@ artifacts, auth and other launch details live in the block declaration,
 and the durable outputs remain ordinary block execution records,
 artifact instances, and state snapshots.
 
-Agent handoff and richer battery selection are deferred.
+If an agent block needs another block to run next, it announces a
+project termination reason whose block declaration routes to the child.
+Flywheel commits the agent block first, then invokes the child through
+the same canonical block execution path.
+Richer battery selection is deferred.
 
 ## Future Work
 
@@ -257,12 +261,13 @@ ordinary `flywheel run block` execution.
 Do not add agent-shaped fields to `BlockExecution` unless the field is
 meaningful for ordinary block executions.
 
-### Handoffs
+### Block Invocation
 
-Define block-to-block handoffs. Decide whether handoff is pattern-level
-or runtime-level. Pending tool calls from the Claude battery should
-become a canonical persisted surface before host-side handoff execution
-returns.
+Block invocation routes from a committed execution outcome to child
+block execution. Future work should add operator-facing inspection
+commands, decide whether pending tool calls from batteries need their
+own durable record, and rely on the pattern resolver for loops,
+limits, and conditional iteration.
 
 ### Persistent Containers
 

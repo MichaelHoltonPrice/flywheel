@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +20,7 @@ from flywheel.state_validator import (
     StateValidationError,
     StateValidatorRegistry,
 )
-from flywheel.template import Template
+from flywheel.template import InvocationBinding, Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
@@ -71,6 +73,114 @@ blocks:
       normal:
         - name: checkpoint
           container_path: /output
+"""
+
+INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+            args: ["--episodes", "2"]
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
+"""
+
+MULTI_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+  - name: audit
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval_bad
+            bind:
+              bot: bot
+          - block: audit
+            bind:
+              bot: bot
+  - name: eval_bad
+    image: eval-bad:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
+  - name: audit
+    image: audit:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: audit
+        container_path: /output/audit
+"""
+
+IMPLICIT_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+  - name: config
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+      - name: config
+        container_path: /input/config
+    outputs:
+      - name: score
+        container_path: /output/score
 """
 
 
@@ -182,6 +292,281 @@ class TestBlockLookup:
         assert result.container_result.exit_code == 0
         assert result.execution_id in ws.executions
         assert result.execution == ws.executions[result.execution_id]
+
+
+class TestBlockInvocation:
+    def test_termination_route_invokes_child_block(self, tmp_path: Path):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        seen: dict[str, object] = {}
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                seen["parent_mounts"] = dict(mounts)
+                bot_dir = mounts["/output/bot"]
+                bot_dir.mkdir(parents=True, exist_ok=True)
+                (bot_dir / "bot.py").write_text(
+                    "def player_fn(env, obs_json, action_labels):\n"
+                    "    return 0\n",
+                    encoding="utf-8",
+                )
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=3.0)
+
+            if config.image == "eval:latest":
+                seen["child_args"] = args
+                bot_path = mounts["/input/bot"] / "bot.py"
+                assert bot_path.read_text(encoding="utf-8").startswith(
+                    "def player_fn")
+                score_dir = mounts["/output/score"]
+                score_dir.mkdir(parents=True, exist_ok=True)
+                (score_dir / "scores.json").write_text(json.dumps({
+                    "mean": 2,
+                    "episodes": 2,
+                }))
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "agent", template, project_root)
+
+        assert result.execution.status == "succeeded"
+        assert result.execution.termination_reason == "eval_requested"
+        assert "bot" in result.execution.output_bindings
+        assert len(ws.invocations) == 1
+        invocation = next(iter(ws.invocations.values()))
+        assert invocation.invoking_execution_id == result.execution_id
+        assert invocation.termination_reason == "eval_requested"
+        assert invocation.status == "succeeded"
+        assert invocation.invoked_execution_id in ws.executions
+        child = ws.executions[invocation.invoked_execution_id]
+        assert child.block_name == "eval"
+        assert child.invoking_execution_id == result.execution_id
+        assert child.input_bindings["bot"] == (
+            result.execution.output_bindings["bot"])
+        assert seen["child_args"] == ["--episodes", "2"]
+        assert ws.artifacts[invocation.input_bindings["bot"]].name == "bot"
+        assert "/scratch" not in seen["parent_mounts"]
+
+        reloaded = Workspace.load(ws.path)
+        loaded_invocation = reloaded.invocations[invocation.id]
+        assert loaded_invocation.invoked_execution_id == (
+            invocation.invoked_execution_id)
+        assert loaded_invocation.input_bindings == invocation.input_bindings
+        loaded_child = reloaded.executions[invocation.invoked_execution_id]
+        assert loaded_child.invoking_execution_id == result.execution_id
+
+    def test_no_route_for_termination_reason_runs_only_parent(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            assert config.image == "agent:latest"
+            bot_dir = mounts["/output/bot"]
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=1.0)
+
+        block = next(block for block in template.blocks if block.name == "agent")
+        template = Template(
+            name=template.name,
+            artifacts=template.artifacts,
+            blocks=[
+                block.__class__(
+                    **{
+                        **block.__dict__,
+                        "on_termination": {},
+                    },
+                ),
+                next(block for block in template.blocks if block.name == "eval"),
+            ],
+        )
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(ws, "agent", template, project_root)
+
+        assert len(ws.executions) == 1
+        assert ws.invocations == {}
+
+    def test_child_failure_records_invocation_and_continues_routes(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, MULTI_INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                bot_dir = mounts["/output/bot"]
+                bot_dir.mkdir(parents=True, exist_ok=True)
+                (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            if config.image == "eval-bad:latest":
+                assert (mounts["/input/bot"] / "bot.py").exists()
+                (mounts["/flywheel"] / "termination").write_text(
+                    "normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            if config.image == "audit:latest":
+                assert (mounts["/input/bot"] / "bot.py").exists()
+                audit_dir = mounts["/output/audit"]
+                audit_dir.mkdir(parents=True, exist_ok=True)
+                (audit_dir / "audit.txt").write_text("checked")
+                (mounts["/flywheel"] / "termination").write_text(
+                    "normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "agent", template, project_root)
+
+        assert result.execution.status == "succeeded"
+        assert result.execution.block_name == "agent"
+        invocations = sorted(
+            ws.invocations.values(), key=lambda inv: inv.invoked_block_name)
+        assert [inv.invoked_block_name for inv in invocations] == [
+            "audit", "eval_bad"]
+        audit_inv = invocations[0]
+        eval_inv = invocations[1]
+        assert audit_inv.status == "succeeded"
+        assert ws.executions[audit_inv.invoked_execution_id].status == (
+            "succeeded")
+        assert eval_inv.status == "failed"
+        assert eval_inv.error is not None
+        assert "no output bytes written" in eval_inv.error
+        assert eval_inv.invoked_execution_id in ws.executions
+        assert ws.executions[eval_inv.invoked_execution_id].status == "failed"
+
+        reloaded = Workspace.load(ws.path)
+        loaded_eval_inv = reloaded.invocations[eval_inv.id]
+        assert loaded_eval_inv.status == "failed"
+        assert loaded_eval_inv.error == eval_inv.error
+
+    def test_invocation_supports_implicit_child_input_resolution(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, IMPLICIT_INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        config_source = tmp_path / "config"
+        config_source.mkdir()
+        (config_source / "settings.json").write_text("{}")
+        config_artifact = ws.register_artifact("config", config_source)
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                bot_dir = mounts["/output/bot"]
+                bot_dir.mkdir(parents=True, exist_ok=True)
+                (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            if config.image == "eval:latest":
+                assert (mounts["/input/bot"] / "bot.py").exists()
+                assert (mounts["/input/config"] / "settings.json").exists()
+                score_dir = mounts["/output/score"]
+                score_dir.mkdir(parents=True, exist_ok=True)
+                (score_dir / "scores.json").write_text('{"mean": 1}')
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(ws, "agent", template, project_root)
+
+        invocation = next(iter(ws.invocations.values()))
+        assert invocation.input_bindings["config"] == config_artifact.id
+
+    def test_invocation_supports_concrete_artifact_id_binding(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        bot_source = tmp_path / "bot"
+        bot_source.mkdir()
+        (bot_source / "bot.py").write_text("def player_fn(*_): return 1")
+        seed_bot = ws.register_artifact("bot", bot_source)
+
+        agent = next(block for block in template.blocks if block.name == "agent")
+        eval_block = next(block for block in template.blocks if block.name == "eval")
+        route = agent.on_termination["eval_requested"][0]
+        agent = replace(
+            agent,
+            outputs={"eval_requested": []},
+            on_termination={
+                "eval_requested": [
+                    replace(
+                        route,
+                        bind={
+                            "bot": InvocationBinding(
+                                artifact_id=seed_bot.id)
+                        },
+                    )
+                ]
+            },
+        )
+        template = Template(
+            name=template.name,
+            artifacts=template.artifacts,
+            blocks=[agent, eval_block],
+        )
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            if config.image == "eval:latest":
+                assert (mounts["/input/bot"] / "bot.py").read_text() == (
+                    "def player_fn(*_): return 1")
+                score_dir = mounts["/output/score"]
+                score_dir.mkdir(parents=True, exist_ok=True)
+                (score_dir / "scores.json").write_text('{"mean": 1}')
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(ws, "agent", template, project_root)
+
+        invocation = next(iter(ws.invocations.values()))
+        assert invocation.input_bindings["bot"] == seed_bot.id
 
 
 class TestInputResolution:
@@ -680,7 +1065,7 @@ class TestOneShotContainerRunner:
             )
 
         ex = self._only_execution(ws)
-        assert getattr(exc_info.value, "flywheel_execution_id") == ex.id
+        assert exc_info.value.flywheel_execution_id == ex.id
         assert ex.status == "failed"
         assert ex.termination_reason == runtime.TERMINATION_REASON_CRASH
         assert ex.failure_phase == runtime.FAILURE_INVOKE

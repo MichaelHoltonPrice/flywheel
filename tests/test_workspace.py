@@ -11,6 +11,7 @@ import yaml
 from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
+    BlockInvocation,
     LifecycleEvent,
     RejectedOutput,
     RejectionRef,
@@ -180,6 +181,29 @@ class TestWorkspaceLoadSave:
             loaded.state_snapshot_path(snapshot.id) / "counter.txt"
         ).read_text() == "1"
         assert loaded.artifacts == ws.artifacts
+
+    def test_failed_block_invocation_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        invocation = BlockInvocation(
+            id="inv_abc123",
+            invoking_execution_id="exec_parent",
+            termination_reason="eval_requested",
+            invoked_block_name="EvalBot",
+            invoked_at=datetime.now(UTC),
+            status="failed",
+            input_bindings={"bot": "bot@seed"},
+            args=["--episodes", "10"],
+            error="RuntimeError: child failed",
+        )
+        ws.record_invocation(invocation)
+
+        loaded = Workspace.load(ws.path)
+        loaded_invocation = loaded.invocations[invocation.id]
+        assert loaded_invocation.status == "failed"
+        assert loaded_invocation.invoked_execution_id is None
+        assert loaded_invocation.input_bindings == {"bot": "bot@seed"}
+        assert loaded_invocation.error == "RuntimeError: child failed"
 
     def test_state_snapshot_lineage_chains_to_latest(
         self, tmp_path: Path,

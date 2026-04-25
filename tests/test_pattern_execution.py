@@ -45,6 +45,36 @@ blocks:
         container_path: /output/score
 """
 
+INVOCATION_FAILURE_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval_bad
+            bind:
+              bot: bot
+  - name: eval_bad
+    image: eval-bad:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
+"""
+
 
 def _setup_workspace(
     tmp_path: Path,
@@ -219,6 +249,61 @@ def test_run_pattern_records_train_eval_membership(tmp_path: Path):
     assert eval_execution.input_bindings == {
         "checkpoint": train_execution.output_bindings["checkpoint"]
     }
+
+
+def test_pattern_member_stays_parent_when_invoked_child_fails(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, INVOCATION_FAILURE_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "min_successes": "all",
+                    "members": [
+                        {"name": "agent", "block": "agent"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "agent:latest":
+            bot_dir = mounts["/output/bot"]
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval-bad:latest":
+            assert (mounts["/input/bot"] / "bot.py").exists()
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    assert run.status == "succeeded"
+    member = run.steps[0].members[0]
+    assert member.status == "succeeded"
+    parent_execution = reloaded.executions[member.execution_id]
+    assert parent_execution.block_name == "agent"
+    invocation = next(iter(reloaded.invocations.values()))
+    assert invocation.status == "failed"
+    assert invocation.invoked_execution_id in reloaded.executions
+    assert reloaded.executions[invocation.invoked_execution_id].block_name == (
+        "eval_bad")
 
 
 def test_run_pattern_uses_artifact_validators(tmp_path: Path):

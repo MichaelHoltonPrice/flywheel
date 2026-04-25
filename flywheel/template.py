@@ -73,6 +73,23 @@ class OutputSlot:
 
 
 @dataclass(frozen=True)
+class InvocationBinding:
+    """A child input binding for a termination-route invocation."""
+
+    parent_output: str | None = None
+    artifact_id: str | None = None
+
+
+@dataclass(frozen=True)
+class InvocationDeclaration:
+    """A child block execution fired after a termination reason."""
+
+    block: str
+    bind: dict[str, InvocationBinding] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class BlockDefinition:
     """A declared block in a template — image, Docker flags, and I/O slots.
 
@@ -132,6 +149,11 @@ class BlockDefinition:
             participates in Flywheel state snapshots.
             ``unmanaged`` marks stateful behavior the substrate
             cannot capture.
+        on_termination: Child block executions to invoke after this
+            block commits with a specific project-defined termination
+            reason.  Children still run through canonical block
+            execution; this declaration only routes from the
+            committed parent outcome to child inputs.
         stop_timeout_s: Seconds to wait after writing the
             cooperative stop sentinel before escalating to
             SIGTERM (and then SIGKILL after a short grace).
@@ -170,6 +192,8 @@ class BlockDefinition:
     output_builder: str | None = None
     lifecycle: Literal["one_shot", "workspace_persistent"] = "one_shot"
     state: StateMode = "none"
+    on_termination: dict[str, list[InvocationDeclaration]] = field(
+        default_factory=dict)
     stop_timeout_s: int = 30
 
     def all_output_slots(self) -> list[OutputSlot]:
@@ -217,6 +241,13 @@ class Template:
     name: str
     artifacts: list[ArtifactDeclaration]
     blocks: list[BlockDefinition]
+
+    def artifact_declaration(self, name: str) -> ArtifactDeclaration | None:
+        """Return the artifact declaration named ``name``, if present."""
+        for declaration in self.artifacts:
+            if declaration.name == name:
+                return declaration
+        return None
 
     @classmethod
     def from_yaml(
@@ -285,6 +316,7 @@ class Template:
             _validate_block_against_artifacts(
                 block, artifact_names, artifact_kinds, path.name)
             blocks.append(block)
+        _validate_invocations(blocks, path.name)
 
         return cls(
             name=path.stem,
@@ -351,6 +383,17 @@ _INPUT_SLOT_KEYS: frozenset[str] = frozenset({
 _OUTPUT_SLOT_KEYS: frozenset[str] = frozenset({
     "name",
     "container_path",
+})
+
+_INVOCATION_ROUTE_KEYS: frozenset[str] = frozenset({
+    "block",
+    "bind",
+    "args",
+})
+
+_INVOCATION_BINDING_KEYS: frozenset[str] = frozenset({
+    "artifact_id",
+    "parent_output",
 })
 
 
@@ -529,6 +572,161 @@ def _parse_output_groups(
     )
 
 
+def _parse_invocation_binding(
+    raw: object, *, block_name: str, child_input: str, reason: str,
+) -> InvocationBinding:
+    """Parse one child-input binding in an invocation route."""
+    if isinstance(raw, str):
+        _validate_name(raw, "Output slot")
+        return InvocationBinding(parent_output=raw)
+    if isinstance(raw, dict):
+        unknown = set(raw) - _INVOCATION_BINDING_KEYS
+        if unknown:
+            raise ValueError(
+                f"Block {block_name!r} on_termination[{reason!r}] "
+                f"binding for {child_input!r}: unknown key(s) "
+                f"{sorted(unknown)!r}; valid keys are "
+                f"{sorted(_INVOCATION_BINDING_KEYS)!r}"
+            )
+        parent_output = raw.get("parent_output")
+        artifact_id = raw.get("artifact_id")
+        if parent_output is not None and artifact_id is not None:
+            raise ValueError(
+                f"Block {block_name!r} on_termination[{reason!r}] "
+                f"binding for {child_input!r}: specify exactly one "
+                "of 'parent_output' or 'artifact_id'"
+            )
+        if parent_output is not None:
+            if not isinstance(parent_output, str) or not parent_output.strip():
+                raise ValueError(
+                    f"Block {block_name!r} on_termination[{reason!r}] "
+                    f"binding for {child_input!r}: 'parent_output' must "
+                    "be a non-empty string"
+                )
+            _validate_name(parent_output, "Output slot")
+            return InvocationBinding(parent_output=parent_output)
+        artifact_id = raw.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id.strip():
+            raise ValueError(
+                f"Block {block_name!r} on_termination[{reason!r}] "
+                f"binding for {child_input!r}: binding must specify "
+                "'parent_output' or 'artifact_id'"
+            )
+        return InvocationBinding(artifact_id=artifact_id)
+    raise ValueError(
+        f"Block {block_name!r} on_termination[{reason!r}] binding "
+        f"for {child_input!r} must be an output-slot name or an "
+        f"artifact_id mapping"
+    )
+
+
+def _parse_invocation_route(
+    entry: object, *, block_name: str, reason: str,
+) -> InvocationDeclaration:
+    """Parse one child-block route under ``on_termination``."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            "invoke entries must be mappings"
+        )
+    if "block" not in entry:
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            "invoke entries require 'block'"
+        )
+    child_block = entry["block"]
+    _validate_name(child_block, "Block")
+    unknown = set(entry) - _INVOCATION_ROUTE_KEYS
+    if unknown:
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: unknown key(s) "
+            f"{sorted(unknown)!r}; valid keys are "
+            f"{sorted(_INVOCATION_ROUTE_KEYS)!r}"
+        )
+
+    raw_bind = entry.get("bind", {})
+    if not isinstance(raw_bind, dict):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: 'bind' must map child "
+            "input names to parent output slots or artifact ids"
+        )
+    bind: dict[str, InvocationBinding] = {}
+    for child_input, raw_binding in raw_bind.items():
+        if not isinstance(child_input, str):
+            raise ValueError(
+                f"Block {block_name!r} on_termination[{reason!r}] "
+                "bind keys must be child input slot names"
+            )
+        _validate_name(child_input, "Input slot")
+        bind[child_input] = _parse_invocation_binding(
+            raw_binding,
+            block_name=block_name,
+            child_input=child_input,
+            reason=reason,
+        )
+
+    args = entry.get("args", [])
+    if not isinstance(args, list) or not all(
+        isinstance(item, str) for item in args
+    ):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: 'args' must be a "
+            "list of strings"
+        )
+    return InvocationDeclaration(
+        block=child_block,
+        bind=bind,
+        args=list(args),
+    )
+
+
+def _parse_on_termination(
+    raw: object, *, block_name: str,
+) -> dict[str, list[InvocationDeclaration]]:
+    """Parse termination-reason routes to child block executions."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Block {block_name!r}: 'on_termination' must be a mapping"
+        )
+    routes_by_reason: dict[str, list[InvocationDeclaration]] = {}
+    for reason, route_group in raw.items():
+        if not isinstance(reason, str):
+            raise ValueError(
+                f"Block {block_name!r}: on_termination keys must be "
+                "termination-reason strings"
+            )
+        _validate_name(reason, "Termination reason")
+        if not isinstance(route_group, dict):
+            raise ValueError(
+                f"Block {block_name!r}: on_termination[{reason!r}] "
+                "must be a mapping"
+            )
+        unknown = set(route_group) - {"invoke"}
+        if unknown:
+            raise ValueError(
+                f"Block {block_name!r}: on_termination[{reason!r}] "
+                f"has unknown key(s) {sorted(unknown)!r}; valid keys "
+                "are ['invoke']"
+            )
+        raw_invocations = route_group.get("invoke", [])
+        if not isinstance(raw_invocations, list):
+            raise ValueError(
+                f"Block {block_name!r}: on_termination[{reason!r}]."
+                "invoke must be a list"
+            )
+        routes_by_reason[reason] = [
+            _parse_invocation_route(
+                entry, block_name=block_name, reason=reason)
+            for entry in raw_invocations
+        ]
+    return routes_by_reason
+
+
 # Top-level keys accepted in a per-block YAML (or inline block
 # definition).  ``parse_block_definition`` rejects anything
 # outside this set so typos — e.g., ``lifecylce`` for
@@ -547,6 +745,7 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
     "output_builder",
     "lifecycle",
     "state",
+    "on_termination",
     "stop_timeout_s",
 })
 
@@ -719,6 +918,8 @@ def parse_block_definition(
         output_builder=output_builder,
         lifecycle=lifecycle,
         state=state,
+        on_termination=_parse_on_termination(
+            entry.get("on_termination"), block_name=name),
         stop_timeout_s=stop_timeout_s,
     )
 
@@ -749,3 +950,92 @@ def _validate_block_against_artifacts(
                 f"Block {block.name!r} output {slot.name!r} is a "
                 f"git artifact and cannot be a block output"
             )
+
+
+def _validate_invocations(blocks: list[BlockDefinition], template_label: str) -> None:
+    """Validate child block invocation routes within a template."""
+    by_name = {block.name: block for block in blocks}
+    for block in blocks:
+        for reason, invocations in block.on_termination.items():
+            if reason not in block.outputs:
+                raise ValueError(
+                    f"Block {block.name!r} routes on termination "
+                    f"reason {reason!r}, but that reason is not "
+                    "declared under outputs"
+                )
+            parent_outputs = {
+                slot.name for slot in block.outputs_for(reason)
+            }
+            for invocation in invocations:
+                child = by_name.get(invocation.block)
+                if child is None:
+                    raise ValueError(
+                        f"Block {block.name!r} on_termination[{reason!r}] "
+                        f"references unknown block {invocation.block!r} "
+                        f"in template {template_label!r}"
+                    )
+                if child.state == "managed":
+                    raise ValueError(
+                        f"Block {block.name!r} on_termination[{reason!r}] "
+                        f"references managed-state child block "
+                        f"{child.name!r}; invocation routes do not yet "
+                        "declare child state lineage keys"
+                    )
+                child_inputs = {slot.name for slot in child.inputs}
+                for child_input, binding in invocation.bind.items():
+                    if child_input not in child_inputs:
+                        raise ValueError(
+                            f"Block {block.name!r} "
+                            f"on_termination[{reason!r}] maps input "
+                            f"{child_input!r}, but child block "
+                            f"{child.name!r} has no such input"
+                        )
+                    if (
+                        binding.parent_output is not None
+                        and binding.parent_output not in parent_outputs
+                    ):
+                        raise ValueError(
+                            f"Block {block.name!r} "
+                            f"on_termination[{reason!r}] binds child "
+                            f"input {child_input!r} from parent output "
+                            f"{binding.parent_output!r}, but that output "
+                            "is not declared for the termination reason"
+                        )
+    _validate_invocation_route_cycles(blocks, template_label)
+
+
+def _validate_invocation_route_cycles(
+    blocks: list[BlockDefinition], template_label: str,
+) -> None:
+    """Reject cycles in declared termination-route invocations."""
+    graph = {
+        block.name: {
+            invocation.block
+            for invocations in block.on_termination.values()
+            for invocation in invocations
+        }
+        for block in blocks
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str, path: list[str]) -> None:
+        if name in visiting:
+            cycle_start = path.index(name)
+            cycle = " -> ".join([*path[cycle_start:], name])
+            raise ValueError(
+                f"Invocation route cycle in template {template_label!r}: "
+                f"{cycle}"
+            )
+        if name in visited:
+            return
+        visiting.add(name)
+        path.append(name)
+        for child in graph.get(name, set()):
+            visit(child, path)
+        path.pop()
+        visiting.remove(name)
+        visited.add(name)
+
+    for block in blocks:
+        visit(block.name, [])

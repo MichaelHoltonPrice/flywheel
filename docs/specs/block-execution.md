@@ -31,11 +31,10 @@ Not covered by this spec (each addressed by its own normative spec):
 * State (`state_lineage_key`, the `/flywheel/state` mount, state
   snapshot records, state restore/capture, the `state_capture` failure
   and `state_validate` failure phases); see [state.md](state.md).
-* Handoffs (a block triggering a child block execution; the
-  `invoking_execution_id` field; any handoff-related declaration
-  syntax). The substrate uses termination reasons today purely to
-  index expected outputs; handoff support will later associate
-  termination reasons with handoff targets at the project level.
+* Block invocation (a committed execution outcome triggering a child
+  block execution; the `invoking_execution_id` field; declaration
+  syntax associating termination reasons with child blocks); see
+  [block-invocation.md](block-invocation.md).
 * Tagging.
 * Patterns, pattern runners, pattern handoff.
 * Block groups (parallel scheduling).
@@ -300,9 +299,8 @@ outputs:
 Termination reason names (`normal`, `defer`, etc.) are project-defined
 labels. Flywheel does not interpret them.
 
-Handoff associations between termination reasons and target blocks
-are not part of declaration syntax in this spec. They will be added
-when handoff support lands.
+Associations between termination reasons and invoked child blocks are
+specified separately in [block-invocation.md](block-invocation.md).
 
 ## Termination reasons
 
@@ -601,12 +599,9 @@ deliberately defers. They land in their own normative passes.
 * **State.** The full state lifecycle is specified in
   [state.md](state.md). State is orthogonal to artifacts and belongs
   to execution lineages, not artifact bindings.
-* **Handoffs.** A block triggering a child block execution; the
-  `invoking_execution_id` field on `BlockExecution`; declaration
-  syntax for associating handoff targets with termination reasons;
-  the `dispatch` failure phase; the runtime mechanism for a block to
-  request a handoff. Termination reasons are in this spec precisely
-  because handoffs will need them.
+* **Pattern control flow.** Invocation is specified in
+  [block-invocation.md](block-invocation.md), but loops, limits, and
+  conditional iteration belong to the pattern resolver.
 * **Tags** (replacing the older incremental-artifact concept).
 * **Patterns** and the pattern runner.
 * **Block groups** (parallel scheduling).

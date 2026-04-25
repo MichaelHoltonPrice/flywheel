@@ -193,6 +193,15 @@ if [ "$RC" -eq 0 ]; then
 import json
 from pathlib import Path
 
+override = Path("/flywheel/control/termination_reason")
+try:
+    reason = override.read_text(encoding="utf-8").strip()
+except Exception:
+    reason = ""
+if reason:
+    print(reason)
+    raise SystemExit(0)
+
 path = Path("/flywheel/control/agent_exit_state.json")
 try:
     status = json.loads(path.read_text(encoding="utf-8")).get("status")

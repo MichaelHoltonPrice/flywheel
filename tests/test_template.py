@@ -186,6 +186,191 @@ blocks:
             _from_yaml_with_inline_blocks(path)
 
 
+class TestInvocationRouteValidation:
+    BASE = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    {route}
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
+"""
+
+    def _write(self, tmp_path: Path, route: str) -> Path:
+        path = tmp_path / "invocation.yaml"
+        path.write_text(self.BASE.format(route=route))
+        return path
+
+    def test_parses_parent_output_binding(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot""")
+        template = _from_yaml_with_inline_blocks(path)
+        agent = template.blocks[0]
+        route = agent.on_termination["eval_requested"][0]
+        assert route.block == "eval"
+        assert route.bind["bot"].parent_output == "bot"
+
+    def test_rejects_route_for_undeclared_reason(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      done:
+        invoke:
+          - block: eval""")
+        with pytest.raises(ValueError, match="not declared under outputs"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejects_unknown_child_block(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: missing""")
+        with pytest.raises(ValueError, match="unknown block"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejects_unknown_child_input(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              missing: bot""")
+        with pytest.raises(ValueError, match="has no such input"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejects_parent_output_not_declared_for_reason(
+        self, tmp_path: Path,
+    ):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: score""")
+        with pytest.raises(ValueError, match="not declared"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_parses_long_form_parent_output_binding(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot:
+                parent_output: bot""")
+        template = _from_yaml_with_inline_blocks(path)
+        route = template.blocks[0].on_termination["eval_requested"][0]
+        assert route.bind["bot"].parent_output == "bot"
+
+    def test_rejects_unknown_long_form_binding_key(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot:
+                source: bot""")
+        with pytest.raises(ValueError, match="unknown key"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejects_managed_state_child(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: bot
+    kind: copy
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: stateful
+            bind:
+              bot: bot
+  - name: stateful
+    image: stateful:latest
+    state: managed
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs: []
+"""
+        path = tmp_path / "managed_child.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="managed-state child"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_rejects_invocation_route_cycle(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: bot
+    kind: copy
+blocks:
+  - name: first
+    image: first:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      next:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      next:
+        invoke:
+          - block: second
+            bind:
+              bot: bot
+  - name: second
+    image: second:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      next:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      next:
+        invoke:
+          - block: first
+            bind:
+              bot: bot
+"""
+        path = tmp_path / "cycle.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="route cycle"):
+            _from_yaml_with_inline_blocks(path)
+
+
 class TestDataclassProperties:
     def test_artifact_declaration_frozen(self):
         decl = ArtifactDeclaration(name="x", kind="copy")

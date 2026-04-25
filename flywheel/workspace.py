@@ -24,6 +24,7 @@ import yaml
 from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
+    BlockInvocation,
     LifecycleEvent,
     RejectedOutput,
     RejectionRef,
@@ -257,6 +258,7 @@ class Workspace:
     artifact_declarations: dict[str, str]  # declaration name -> kind
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
+    invocations: dict[str, BlockInvocation] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
     runs: dict[str, RunRecord] = field(default_factory=dict)
     state_snapshots: dict[str, StateSnapshot] = field(default_factory=dict)
@@ -294,6 +296,13 @@ class Workspace:
         while True:
             candidate = f"exec_{self._short_uuid()}"
             if candidate not in self.executions:
+                return candidate
+
+    def generate_invocation_id(self) -> str:
+        """Generate a unique block invocation ID."""
+        while True:
+            candidate = f"inv_{self._short_uuid()}"
+            if candidate not in self.invocations:
                 return candidate
 
     def generate_state_snapshot_id(self) -> str:
@@ -444,6 +453,24 @@ class Workspace:
         self._add_execution(execution)
         self.save()
         return execution
+
+    def record_invocation(
+        self, invocation: BlockInvocation,
+    ) -> BlockInvocation:
+        """Record a completed or skipped block invocation."""
+        with self._lock:
+            if invocation.id in self.invocations:
+                raise ValueError(
+                    f"Invocation {invocation.id!r} already exists "
+                    "in workspace"
+                )
+            if invocation.status not in ("succeeded", "failed"):
+                raise ValueError(
+                    f"Unknown invocation status {invocation.status!r}"
+                )
+            self.invocations[invocation.id] = invocation
+        self.save()
+        return invocation
 
     @staticmethod
     def _validate_and_normalize_execution(
@@ -1402,6 +1429,22 @@ class Workspace:
                 termination_reason=entry.get("termination_reason"),
                 state_mode=entry.get("state_mode", "none"),
                 state_snapshot_id=entry.get("state_snapshot_id"),
+                invoking_execution_id=entry.get("invoking_execution_id"),
+            )
+
+        invocations: dict[str, BlockInvocation] = {}
+        for iid, entry in data.get("invocations", {}).items():
+            invocations[iid] = BlockInvocation(
+                id=iid,
+                invoking_execution_id=entry["invoking_execution_id"],
+                termination_reason=entry["termination_reason"],
+                invoked_block_name=entry["invoked_block_name"],
+                invoked_at=datetime.fromisoformat(entry["invoked_at"]),
+                status=entry["status"],
+                invoked_execution_id=entry.get("invoked_execution_id"),
+                input_bindings=entry.get("input_bindings", {}),
+                args=entry.get("args", []),
+                error=entry.get("error"),
             )
 
         events: dict[str, LifecycleEvent] = {}
@@ -1439,6 +1482,7 @@ class Workspace:
             artifact_declarations=declarations,
             artifacts=artifacts,
             executions=executions,
+            invocations=invocations,
             events=events,
             runs=runs,
             state_snapshots=_state_snapshots_from_yaml(
@@ -1508,7 +1552,26 @@ class Workspace:
                     entry["state_mode"] = ex.state_mode
                 if ex.state_snapshot_id is not None:
                     entry["state_snapshot_id"] = ex.state_snapshot_id
+                if ex.invoking_execution_id is not None:
+                    entry["invoking_execution_id"] = ex.invoking_execution_id
                 serialized_executions[eid] = entry
+
+            serialized_invocations = {}
+            for iid, inv in self.invocations.items():
+                entry = {
+                    "invoking_execution_id": inv.invoking_execution_id,
+                    "termination_reason": inv.termination_reason,
+                    "invoked_block_name": inv.invoked_block_name,
+                    "invoked_at": inv.invoked_at.isoformat(),
+                    "status": inv.status,
+                    "input_bindings": inv.input_bindings,
+                    "args": inv.args,
+                }
+                if inv.invoked_execution_id is not None:
+                    entry["invoked_execution_id"] = inv.invoked_execution_id
+                if inv.error is not None:
+                    entry["error"] = inv.error
+                serialized_invocations[iid] = entry
 
             serialized_events = {}
             for evid, ev in self.events.items():
@@ -1550,6 +1613,8 @@ class Workspace:
                 "artifacts": serialized_artifacts,
                 "executions": serialized_executions,
             }
+            if serialized_invocations:
+                data["invocations"] = serialized_invocations
             if serialized_events:
                 data["events"] = serialized_events
             if serialized_runs:
