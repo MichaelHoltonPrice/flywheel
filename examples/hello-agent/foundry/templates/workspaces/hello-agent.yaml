@@ -1,0 +1,4 @@
+name: hello-agent
+artifacts: []
+blocks:
+  - HelloAgent

@@ -1,11 +1,4 @@
-"""Agent battery block execution types.
-
-The agent battery has not yet been rebuilt on the canonical
-block-execution pipeline. This module keeps the agent result and
-handle types importable for deferred pattern code, but
-``launch_agent_block`` now fails explicitly instead of depending on the
-removed handle-based container executor.
-"""
+"""Agent battery block execution types."""
 
 from __future__ import annotations
 
@@ -17,7 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from flywheel.artifact import LifecycleEvent
+from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.container import ContainerConfig, run_container
+from flywheel.execution import (
+    ExecutionPlan,
+    RuntimeResult,
+    observe_one_shot_container_exit,
+    run_block,
+)
 from flywheel.executor import ExecutionHandle
+from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 
@@ -201,9 +203,8 @@ def _build_agent_mounts(
 ) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Build the agent-specific extra mounts + docker_args.
 
-    Returns ``(mounts, docker_args)``.  This helper is retained
-    for the deferred agent battery rebuild; ``docker_args``
-    extends ``block_def.docker_args`` for network-isolation runs.
+    Returns ``(mounts, docker_args)``. ``docker_args`` extends
+    ``block_def.docker_args`` for network-isolation runs.
     """
     mounts: list[tuple[str, str, str]] = [
         (auth_volume, "/home/claude/.claude", "rw"),
@@ -303,6 +304,101 @@ def _read_pending_list(
     return [p for p in pending if isinstance(p, dict)]
 
 
+@dataclass
+class _AgentRuntimeObservation:
+    """Agent-specific files observed after the container exits."""
+
+    exit_state: dict[str, Any] | None = None
+    pending_tool_calls: list[dict[str, Any]] | None = None
+
+
+class _CanonicalAgentRunner:
+    """One-shot runner that adds agent mounts/env, not commit logic."""
+
+    def __init__(
+        self,
+        *,
+        prompt: str,
+        agent_image: str,
+        auth_volume: str,
+        model: str | None,
+        max_turns: int | None,
+        source_dirs: list[str] | None,
+        mcp_servers: str | None,
+        allowed_tools: str | None,
+        extra_env: dict[str, str] | None,
+        extra_mounts: list[tuple[str, str, str]] | None,
+        isolated_network: bool,
+        project_root: Path,
+    ) -> None:
+        """Capture agent-specific runtime configuration."""
+        self._prompt = prompt
+        self._agent_image = agent_image
+        self._auth_volume = auth_volume
+        self._model = model
+        self._max_turns = max_turns
+        self._source_dirs = source_dirs
+        self._mcp_servers = mcp_servers
+        self._allowed_tools = allowed_tools
+        self._extra_env = extra_env
+        self._extra_mounts = extra_mounts
+        self._isolated_network = isolated_network
+        self._project_root = project_root
+        self.observation = _AgentRuntimeObservation()
+
+    def run(
+        self, plan: ExecutionPlan, args: list[str] | None = None,
+    ) -> RuntimeResult:
+        """Run the prepared plan with agent-specific runtime wiring."""
+        prompt_dir = plan.proposals_root / "_agent_prompt"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        (prompt_dir / "prompt.md").write_text(
+            self._prompt, encoding="utf-8")
+
+        control_dir = plan.termination_file.parent / "control"
+        control_dir.mkdir(parents=True, exist_ok=True)
+
+        agent_mounts, agent_docker_args = _build_agent_mounts(
+            project_root=self._project_root,
+            auth_volume=self._auth_volume,
+            source_dirs=self._source_dirs,
+            prompt_dir=prompt_dir,
+            extra_mounts=self._extra_mounts,
+            isolated_network=self._isolated_network,
+        )
+        mounts = [*plan.mounts, *agent_mounts]
+        env = dict(plan.block_def.env)
+        env.update(_build_agent_env(
+            model=self._model,
+            max_turns=self._max_turns,
+            mcp_servers=self._mcp_servers,
+            allowed_tools=self._allowed_tools,
+            isolated_network=self._isolated_network,
+            extra_env=self._extra_env,
+        ))
+        image = plan.block_def.image or self._agent_image
+        config = ContainerConfig(
+            image=image,
+            docker_args=[*plan.block_def.docker_args, *agent_docker_args],
+            env=env,
+            mounts=mounts,
+        )
+        try:
+            result = run_container(config, args)
+        finally:
+            self.observation = _AgentRuntimeObservation(
+                exit_state=_read_control_json(
+                    control_dir / "agent_exit_state.json",
+                    preserve_dir=None,
+                ),
+                pending_tool_calls=_read_pending_list(
+                    control_dir / "pending_tool_calls.json",
+                    preserve_dir=None,
+                ),
+            )
+        return observe_one_shot_container_exit(plan, result)
+
+
 def _classify_exit(
     workspace: Workspace,
     execution_id: str | None,
@@ -379,13 +475,12 @@ class AgentHandle:
     ) -> None:
         """Capture references the adapter needs to build AgentResult.
 
-        ``control_tempdir`` is the host-side directory that was
-        bind-mounted into the container at
-        :data:`runtime.FLYWHEEL_CONTROL_MOUNT`.  ``None`` when the
+        ``control_tempdir`` is the host-side directory visible to
+        the container at ``/flywheel/control``. ``None`` when the
         launcher skipped the mount (pre-container failure path
-        where the inner handle is synchronous).  :meth:`wait`
-        reads ``pending_tool_calls.json`` and
-        ``agent_exit_state.json`` from it before cleanup.
+        where the inner handle is synchronous). :meth:`wait` reads
+        ``pending_tool_calls.json`` and ``agent_exit_state.json``
+        from it before cleanup.
 
         ``log_dir`` is the per-block log directory.  If a control
         file is present but malformed, :meth:`wait` copies it here
@@ -535,32 +630,56 @@ def run_agent_block(
     project_root: Path,
     prompt: str,
     block_name: str,
-    **kwargs: Any,
+    agent_image: str = "flywheel-claude:latest",
+    auth_volume: str = "claude-auth",
+    model: str | None = None,
+    max_turns: int | None = None,
+    source_dirs: list[str] | None = None,
+    input_artifacts: dict[str, str] | None = None,
+    mcp_servers: str | None = None,
+    allowed_tools: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    extra_mounts: list[tuple[str, str, str]] | None = None,
+    isolated_network: bool = False,
+    state_lineage_key: str | None = None,
+    validator_registry: ArtifactValidatorRegistry | None = None,
+    state_validator_registry: StateValidatorRegistry | None = None,
 ) -> AgentResult:
-    """Run an agent block to completion (blocking).
-
-    Convenience wrapper: launch, wait, return the result.  On
-    KeyboardInterrupt, requests a graceful stop before
-    propagating the exception so the container's teardown path
-    runs.
-    """
-    handle = launch_agent_block(
-        workspace=workspace,
-        template=template,
-        project_root=project_root,
+    """Run an agent block through canonical block execution."""
+    runner = _CanonicalAgentRunner(
         prompt=prompt,
-        block_name=block_name,
-        **kwargs,
+        agent_image=agent_image,
+        auth_volume=auth_volume,
+        model=model,
+        max_turns=max_turns,
+        source_dirs=source_dirs,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        extra_env=extra_env,
+        extra_mounts=extra_mounts,
+        isolated_network=isolated_network,
+        project_root=project_root,
     )
-    try:
-        return handle.wait()
-    except KeyboardInterrupt:
-        # The inner handle's wait() raised after setting the
-        # single-wait sentinel on the adapter, so a second
-        # ``handle.wait()`` would error.  Forward the operator
-        # signal as a stop() so the substrate's two-phase
-        # cancellation has a chance to terminate the container
-        # if it is still running, then propagate the interrupt.
-        print("  [agent] interrupted -- requesting graceful stop")
-        handle.stop(reason="keyboard_interrupt")
-        raise
+    result = run_block(
+        workspace,
+        block_name,
+        template,
+        project_root,
+        input_bindings=input_artifacts,
+        validator_registry=validator_registry,
+        state_validator_registry=state_validator_registry,
+        state_lineage_key=state_lineage_key,
+        container_runner=runner,
+    )
+    exit_reason, stop_reason = _classify_exit(
+        workspace, result.execution_id, runner.observation.exit_state)
+    return AgentResult(
+        exit_code=result.container_result.exit_code,
+        elapsed_s=result.container_result.elapsed_s,
+        evals_run=0,
+        execution_id=result.execution_id,
+        stop_reason=stop_reason,
+        exit_reason=exit_reason,
+        exit_state=runner.observation.exit_state,
+        pending_tool_calls=runner.observation.pending_tool_calls,
+    )

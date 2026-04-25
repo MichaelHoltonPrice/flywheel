@@ -185,10 +185,16 @@ def main(argv: list[str] | None = None) -> None:
                               help="Path to the agent system prompt file.")
     agent_parser.add_argument("--model", default=None)
     agent_parser.add_argument("--max-turns", type=int, default=None)
-    agent_parser.add_argument("--total-timeout", type=int, default=14400,
-                              help="Max wall-clock seconds (default: 14400 = 4h).")
     agent_parser.add_argument("--auth-volume", default="claude-auth")
     agent_parser.add_argument("--agent-image", default="flywheel-claude:latest")
+    agent_parser.add_argument(
+        "--state-lineage",
+        default=None,
+        help=(
+            "State lineage key for agent blocks that declare "
+            "state: managed."
+        ),
+    )
     agent_parser.add_argument(
         "--source-dir", action="append", default=[],
         help="Source directory to mount read-only (repeatable).")
@@ -727,14 +733,15 @@ def run_agent_command(args, extra_args: list[str]) -> None:
         auth_volume=args.auth_volume,
         model=args.model,
         max_turns=args.max_turns,
-        total_timeout=args.total_timeout,
         source_dirs=args.source_dir or None,
         input_artifacts=input_artifacts or None,
-        overrides=overrides or None,
         mcp_servers=args.mcp_servers,
         allowed_tools=args.allowed_tools,
         extra_env=extra_env or None,
         extra_mounts=extra_mounts or None,
+        state_lineage_key=args.state_lineage,
+        validator_registry=config.load_artifact_validator_registry(),
+        state_validator_registry=config.load_state_validator_registry(),
     )
     print(
         f"Agent completed: exit_code={result.exit_code}, "

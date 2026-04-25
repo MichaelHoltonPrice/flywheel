@@ -1,0 +1,5 @@
+name: HelloAgent
+image: flywheel-claude:latest
+state: managed
+outputs:
+  normal: []

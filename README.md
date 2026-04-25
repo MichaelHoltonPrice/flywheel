@@ -19,9 +19,9 @@ orchestrator can read between calls.
 
 Humans use the same surface and read the same workspaces.
 
-## CLI surface
+## CLI Surface
 
-Four user-facing commands:
+Core user-facing commands:
 
 * `flywheel create workspace` — materialize a fresh workspace from
   a template.
@@ -30,6 +30,8 @@ Four user-facing commands:
   directory as a workspace artifact instance.
 * `flywheel run block` — execute one block ad hoc against a
   workspace.
+* `flywheel run agent` — execute an agent-shaped container block
+  through the canonical block execution path.
 * `flywheel run pattern` — execute a declarative multi-instance
   pattern against a workspace.
 
@@ -39,10 +41,20 @@ should start at [AGENTS.md](AGENTS.md). Design rationale is in
 [docs/vision.md](docs/vision.md); implementation decisions are
 in [docs/architecture.md](docs/architecture.md).
 
+## Examples
+
+Versioned examples live under [examples/](examples/).  Start with
+[examples/hello-agent](examples/hello-agent/), which builds the
+Flywheel-provided Claude battery image and runs it twice through
+`flywheel run agent` to demonstrate managed state restore/capture.
+
 ## Setup
 
 ```bash
 python -m venv .venv
+
+# Windows (cmd)
+.venv\Scripts\activate.bat
 
 # Windows (Git Bash)
 source .venv/Scripts/activate

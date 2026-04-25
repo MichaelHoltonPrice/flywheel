@@ -171,7 +171,6 @@ echo "[entrypoint] /flywheel/state locked to root; running agent as claude"
 set +e
 su -s /bin/bash claude -c "python3 /app/agent_runner.py"
 RC=$?
-set -e
 
 # Sync the latest SDK session back to /flywheel/state so the
 # next launch can populate from it.  The SDK may have written a
@@ -179,10 +178,29 @@ set -e
 # pick the most recently modified ``*.jsonl``.
 LATEST=$(ls -t "$SDK_SESSION_DIR"/*.jsonl 2>/dev/null | head -1)
 if [ -n "$LATEST" ]; then
-    cp "$LATEST" "$PERSISTED_SESSION"
-    chown root:root "$PERSISTED_SESSION"
-    chmod 600 "$PERSISTED_SESSION"
-    echo "[entrypoint] persisted SDK session $(basename "$LATEST" .jsonl)"
+    if cp "$LATEST" "$PERSISTED_SESSION" 2>/dev/null; then
+        chown root:root "$PERSISTED_SESSION" 2>/dev/null || true
+        chmod 600 "$PERSISTED_SESSION" 2>/dev/null || true
+        echo "[entrypoint] persisted SDK session $(basename "$LATEST" .jsonl)"
+    else
+        echo "[entrypoint] failed to persist SDK session" >&2
+    fi
+fi
+
+if [ "$RC" -eq 0 ]; then
+    REASON=$(python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("/flywheel/control/agent_exit_state.json")
+try:
+    status = json.loads(path.read_text(encoding="utf-8")).get("status")
+except Exception:
+    status = None
+print("normal" if status in (None, "", "complete") else status)
+PY
+)
+    echo "$REASON" > /flywheel/termination
 fi
 
 exit "$RC"

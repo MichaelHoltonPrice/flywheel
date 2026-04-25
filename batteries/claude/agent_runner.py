@@ -381,14 +381,7 @@ def _emit(data: dict) -> None:
 
 
 def _save_state(session_id: str, status: str, reason: str = "") -> None:
-    """Persist agent exit state into the declared output slot.
-
-    The host-side handoff loop reads the resulting artifact to
-    classify ``AgentResult.exit_reason`` and to decide whether to
-    relaunch after a handoff.  Written into
-    ``/output/agent_exit_state/`` so it lands as a first-class
-    artifact instance tied to this execution.
-    """
+    """Persist agent exit state into the framework control channel."""
     state = {
         "session_id": session_id,
         "status": status,
