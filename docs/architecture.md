@@ -67,6 +67,26 @@ not from the spliced ``tool_result``.  This invariant is what
 keeps the artifact store the single source of truth for what a
 run produced.
 
+### Artifacts versus state
+
+Artifacts and state are distinct even though both are represented by
+files in a workspace.
+
+Artifacts model edge relationships between block executions: one
+execution produces an immutable, named value that another execution may
+consume through a binding or artifact-selection rule.  Artifacts are
+the cross-block data surface.
+
+State models node-local continuity across an execution lineage: bytes
+are restored into a block execution because that execution continues a
+specific state lineage, not because another block selected them as an
+input artifact.  State is internal continuity for a sequence of
+executions.  If another block needs to inspect or consume the bytes,
+the producing block must publish them as an artifact instead.
+
+The normative state lifecycle is specified in
+[docs/specs/state.md](specs/state.md).
+
 ### Artifact IDs
 
 Each artifact instance has a unique ID in the form

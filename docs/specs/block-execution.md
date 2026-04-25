@@ -26,11 +26,11 @@ In scope:
     [Runtime variants](#runtime-variants)).
 * Validation, quarantine, and `SupersedesRef` lineage.
 
-Not covered by this spec (each addressed by its own follow-on spec):
+Not covered by this spec (each addressed by its own normative spec):
 
-* State (`state_dir`, `state_lineage_id`, the `/flywheel/state` mount,
-  `populate_state_mount`, `capture_state`, the `state_capture` failure
-  phase).
+* State (`state_lineage_key`, the `/flywheel/state` mount, state
+  snapshot records, state restore/capture, the `state_capture` failure
+  phase); see [state.md](state.md).
 * Handoffs (a block triggering a child block execution; the
   `invoking_execution_id` field; any handoff-related declaration
   syntax). The substrate uses termination reasons today purely to
@@ -272,8 +272,8 @@ at least one termination reason.
 block: SomeBlock
 image: some/image:tag
 inputs:
-  - name: state
-    container_path: /scratch/state
+  - name: source
+    container_path: /scratch/source
 outputs:
   normal:
     - name: result
@@ -286,8 +286,8 @@ A block with multiple termination reasons:
 block: PlayAgent
 image: some/image:tag
 inputs:
-  - name: state
-    container_path: /scratch/state
+  - name: observation
+    container_path: /scratch/observation
 outputs:
   normal:
     - name: turn_summary
@@ -529,19 +529,18 @@ parallel pipeline from being written.
 ## Runtime variants
 
 The substrate's preferred mode is **one-shot containers** — one
-container per block execution, hermetic by construction, no state
-carried between executions. This is the default the substrate would
-use for every block if it could.
+container per block execution. Stateless one-shot execution is
+hermetic by construction. Managed one-shot state is specified
+separately in [state.md](state.md).
 
 The substrate also supports **persistent containers** — one
 long-lived container hosting many executions over its lifetime — but
-only as a necessity. Some blocks hold internal in-container state
-that the substrate cannot yet serialize and restore between
+only as a necessity. Some blocks hold unmanaged internal state that
+the substrate cannot serialize and restore between
 executions, so the container has to stay up across executions to
 preserve that state. Persistent containers are not a performance
-optimization; they are a workaround for a state-portability gap.
-If/when the affected blocks become serialize-restorable, persistent
-containers can go away.
+optimization; they are a workaround for state the substrate cannot
+manage.
 
 Two implementations:
 
@@ -599,11 +598,9 @@ phase information lives on each `RejectedOutput.phase`.
 Each item below is a real substrate concern that this spec
 deliberately defers. They land in their own normative passes.
 
-* **State.** The full state lifecycle: `state_dir`,
-  `state_lineage_id`, the `/flywheel/state` mount,
-  `populate_state_mount`, `capture_state`, the `state_capture`
-  failure phase. State is orthogonal to artifacts and deserves its
-  own normative model.
+* **State.** The full state lifecycle is specified in
+  [state.md](state.md). State is orthogonal to artifacts and belongs
+  to execution lineages, not artifact bindings.
 * **Handoffs.** A block triggering a child block execution; the
   `invoking_execution_id` field on `BlockExecution`; declaration
   syntax for associating handoff targets with termination reasons;
