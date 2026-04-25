@@ -263,6 +263,30 @@ class TestWorkspaceLoadSave:
                 predecessor_snapshot_id=None,
             )
 
+    def test_state_snapshot_can_defer_workspace_persistence(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("state")
+
+        snapshot = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+            persist=False,
+        )
+
+        assert snapshot.id in ws.state_snapshots
+        loaded = Workspace.load(ws.path)
+        assert snapshot.id not in loaded.state_snapshots
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert snapshot.id in loaded.state_snapshots
+
     def test_round_trip_with_execution(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
@@ -510,6 +534,25 @@ class TestRegisterArtifact:
         target = ws.path / "artifacts" / inst.id
         assert (target / "bot.py").exists()
         assert (target / "helpers.py").exists()
+
+    def test_register_artifact_can_defer_workspace_persistence(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src_dir = tmp_path / "bot_dir"
+        src_dir.mkdir()
+        (src_dir / "bot.py").write_text("def player_fn(): pass")
+
+        inst = ws.register_artifact(
+            "checkpoint", src_dir, produced_by="exec_1", persist=False)
+
+        assert inst.id in ws.artifacts
+        loaded = Workspace.load(ws.path)
+        assert inst.id not in loaded.artifacts
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert inst.id in loaded.artifacts
 
     def test_register_single_file_via_wrapper_directory(
         self, tmp_path: Path,

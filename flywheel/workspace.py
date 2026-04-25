@@ -733,12 +733,17 @@ class Workspace:
         predecessor_snapshot_id: str | None | object = (
             _PREDECESSOR_UNSPECIFIED
         ),
+        persist: bool = True,
     ) -> StateSnapshot:
         """Capture a managed state snapshot into workspace storage.
 
         State snapshots use a write path separate from artifacts:
         they are not declared artifacts, are not artifact-validator
         inputs, and are not eligible as block input bindings.
+        When ``persist`` is ``False``, the snapshot is added to
+        the in-memory ledger but not written to ``workspace.yaml``;
+        canonical block commit uses this to save the snapshot and
+        producing execution row atomically.
         """
         if not lineage_key:
             raise ValueError("State lineage key must be non-empty")
@@ -810,7 +815,8 @@ class Workspace:
         except Exception:
             shutil.rmtree(target_dir, ignore_errors=True)
             raise
-        self.save()
+        if persist:
+            self.save()
         return snapshot
 
     def preserve_state_recovery(
@@ -873,6 +879,7 @@ class Workspace:
         supersedes: SupersedesRef | None = None,
         supersedes_reason: str | None = None,
         produced_by: str | None = None,
+        persist: bool = True,
     ) -> ArtifactInstance:
         """Import an external directory as an artifact instance.
 
@@ -952,6 +959,10 @@ class Workspace:
                 from a block execution; ``None`` (the default) for
                 operator-driven imports.  Recorded verbatim on
                 the instance.
+            persist: Whether to write ``workspace.yaml`` before
+                returning.  Canonical block commit passes
+                ``False`` so produced artifacts and the producing
+                execution row are persisted by the same final save.
 
         Returns:
             The created ArtifactInstance.
@@ -1040,7 +1051,8 @@ class Workspace:
             supersedes_reason=supersedes_reason,
         )
         self._add_artifact(instance)
-        self.save()
+        if persist:
+            self.save()
         return instance
 
     def register_git_artifact(

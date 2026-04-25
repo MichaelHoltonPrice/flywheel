@@ -980,6 +980,45 @@ class TestManagedStateExecution:
         assert executions[0].state_snapshot_id is not None
         assert executions[1].state_snapshot_id == latest.id
 
+    def test_produced_artifact_and_state_persist_with_execution(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root, foundry_dir, _, template = _setup_state_project(
+            tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        original_save = ws.save
+
+        def assert_no_dangling_produced_by():
+            for artifact in ws.artifacts.values():
+                if artifact.produced_by is not None:
+                    assert artifact.produced_by in ws.executions
+            for snapshot in ws.state_snapshots.values():
+                assert snapshot.produced_by in ws.executions
+            original_save()
+
+        monkeypatch.setattr(ws, "save", assert_no_dangling_produced_by)
+
+        class StatefulRunner:
+            def run(self, plan, args=None):
+                assert plan.state_mount_dir is not None
+                (plan.state_mount_dir / "marker.txt").write_text("state")
+                (plan.proposal_dirs["checkpoint"] / "model.pt").write_text(
+                    "weights")
+                return RuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                )
+
+        run_block(
+            ws, "stateful", template, project_root,
+            state_lineage_key="lineage_a",
+            container_runner=StatefulRunner(),
+        )
+
+        assert len(ws.state_snapshots) == 1
+        assert len(ws.instances_for("checkpoint")) == 1
+
     def test_managed_state_requires_lineage_key(
         self, tmp_path: Path,
     ):

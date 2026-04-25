@@ -754,6 +754,7 @@ def commit_block_execution(
                 produced_by=plan.execution_id,
                 compatibility=plan.state_compatibility,
                 predecessor_snapshot_id=plan.restored_state_snapshot_id,
+                persist=False,
             )
             state_snapshot_id = snapshot.id
         except Exception as exc:
@@ -805,6 +806,7 @@ def commit_block_execution(
                 validator_registry=validator_registry,
                 declaration=declarations.get(slot.name),
                 produced_by=plan.execution_id,
+                persist=False,
             )
         except ArtifactValidationError as exc:
             reason = str(exc)
