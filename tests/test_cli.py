@@ -534,8 +534,8 @@ class TestMainRunBlock:
               "--template", "my_template"])
 
         mock_result = MagicMock()
-        mock_result.exit_code = 0
-        mock_result.elapsed_s = 1.0
+        mock_result.container_result.exit_code = 0
+        mock_result.container_result.elapsed_s = 1.0
 
         with patch("flywheel.cli.run_block", return_value=mock_result) as mock_rb:
             main([

@@ -150,10 +150,9 @@ def _execute_member(
     step_name: str,
     validator_registry: ArtifactValidatorRegistry | None,
 ) -> RunMemberRecord:
-    before = set(workspace.executions)
     try:
         input_bindings = _resolve_member_inputs(workspace, member, run_id)
-        run_block(
+        result = run_block(
             workspace,
             member.block,
             template,
@@ -165,7 +164,7 @@ def _execute_member(
                 run_id, step_name, member.name),
         )
     except Exception as exc:
-        execution_id = _new_execution_id(workspace, before)
+        execution_id = getattr(exc, "flywheel_execution_id", None)
         execution = (
             workspace.executions.get(execution_id)
             if execution_id is not None else None
@@ -182,13 +181,7 @@ def _execute_member(
             error=str(exc),
         )
 
-    execution_id = _new_execution_id(workspace, before)
-    if execution_id is None:
-        raise PatternRunError(
-            f"member {member.name!r} completed without recording "
-            "a block execution"
-        )
-    execution = workspace.executions[execution_id]
+    execution = result.execution
     return RunMemberRecord(
         name=member.name,
         block_name=member.block,
@@ -196,7 +189,7 @@ def _execute_member(
             "succeeded"
             if execution.status == "succeeded" else "failed"
         ),
-        execution_id=execution_id,
+        execution_id=result.execution_id,
         output_bindings=dict(execution.output_bindings),
         error=execution.error,
     )
@@ -265,20 +258,6 @@ def _cohort_status(
             else "failed"
         )
     return "succeeded" if successes >= min_successes else "failed"
-
-
-def _new_execution_id(
-    workspace: Workspace,
-    before: set[str],
-) -> str | None:
-    new_ids = [eid for eid in workspace.executions if eid not in before]
-    if not new_ids:
-        return None
-    if len(new_ids) > 1:
-        raise PatternRunError(
-            f"expected one block execution, found {len(new_ids)}"
-        )
-    return new_ids[0]
 
 
 def _close_running_run(

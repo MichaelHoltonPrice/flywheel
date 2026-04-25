@@ -158,6 +158,15 @@ class RuntimeResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class BlockRunResult:
+    """Result of a completed ``run_block`` call."""
+
+    execution_id: str
+    execution: BlockExecution
+    container_result: ContainerResult
+
+
 class OneShotContainerRunner(Protocol):
     """Container-specific runner for an already-prepared block body.
 
@@ -609,6 +618,15 @@ def run_one_shot_container(
 # ── Phase 3: commit ──────────────────────────────────────────────
 
 
+def _with_execution_id(
+    exc: BaseException,
+    execution_id: str,
+) -> BaseException:
+    """Annotate an exception with the ledger execution it recorded."""
+    setattr(exc, "flywheel_execution_id", execution_id)
+    return exc
+
+
 _RESERVED_FAILURE_PHASES: dict[str, str] = {
     runtime.TERMINATION_REASON_CRASH: runtime.FAILURE_INVOKE,
     runtime.TERMINATION_REASON_TIMEOUT: runtime.FAILURE_INVOKE,
@@ -719,8 +737,9 @@ def commit_block_execution(
         )
         message = f"Block {block_name!r} runtime failed: {error}"
         if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
-            raise KeyboardInterrupt(message)
-        raise RuntimeError(message)
+            raise _with_execution_id(
+                KeyboardInterrupt(message), plan.execution_id)
+        raise _with_execution_id(RuntimeError(message), plan.execution_id)
 
     # ── Forge proposals into artifact instances ──────────────────
     state_snapshot_id: str | None = None
@@ -756,7 +775,8 @@ def commit_block_execution(
                 error=error,
                 state_mode=plan.state_mode,
             )
-            raise RuntimeError(error) from exc
+            raise _with_execution_id(
+                RuntimeError(error), plan.execution_id) from exc
 
     declarations = {a.name: a for a in template.artifacts}
     output_bindings: dict[str, str] = {}
@@ -845,8 +865,10 @@ def commit_block_execution(
             state_snapshot_id=state_snapshot_id,
         )
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
-            raise ArtifactValidationError(error_msg)
-        raise RuntimeError(error_msg)
+            raise _with_execution_id(
+                ArtifactValidationError(error_msg), plan.execution_id)
+        raise _with_execution_id(
+            RuntimeError(error_msg), plan.execution_id)
 
     _record_execution(
         workspace, plan.execution_id, block_name, plan.started_at,
@@ -875,7 +897,7 @@ def run_block(
     validator_registry: ArtifactValidatorRegistry | None = None,
     container_runner: OneShotContainerRunner | None = None,
     state_lineage_key: str | None = None,
-) -> ContainerResult:
+) -> BlockRunResult:
     """Execute a block within a workspace.
 
     Thin orchestration over the canonical
@@ -901,8 +923,8 @@ def run_block(
             state chain to restore from and capture into.
 
     Returns:
-        A ContainerResult with exit code and wall-clock elapsed
-        seconds.
+        A BlockRunResult with the ledger execution and raw
+        container result.
 
     Raises:
         KeyError: If block_name is not found in the template.
@@ -973,6 +995,7 @@ def run_block(
             proposals_root=proposals_root,
             state_mode=block_def.state,
         )
+        _with_execution_id(exc, execution_id)
         raise
 
     # -- run -----------------------------------------------------
@@ -995,6 +1018,7 @@ def run_block(
             proposals_root=plan.proposals_root,
             state_mode=plan.state_mode,
         )
+        _with_execution_id(exc, plan.execution_id)
         raise
     except Exception as exc:
         commit_failure(
@@ -1009,6 +1033,7 @@ def run_block(
             proposals_root=plan.proposals_root,
             state_mode=plan.state_mode,
         )
+        _with_execution_id(exc, plan.execution_id)
         raise
 
     # ── commit ───────────────────────────────────────────────────
@@ -1016,7 +1041,18 @@ def run_block(
         workspace, plan, runtime_result, template,
         validator_registry=validator_registry,
     )
-    # commit_block_execution returns the container_result on the
-    # happy path; for completeness, fall back to the runtime_result's
-    # raw container result if we somehow get None.
-    return result or runtime_result.container_result  # type: ignore[return-value]
+    container_result = result or runtime_result.container_result
+    if container_result is None:
+        raise _with_execution_id(
+            RuntimeError(
+                f"Block {block_name!r} completed without "
+                "container metadata"
+            ),
+            plan.execution_id,
+        )
+    execution = workspace.executions[plan.execution_id]
+    return BlockRunResult(
+        execution_id=plan.execution_id,
+        execution=execution,
+        container_result=container_result,
+    )

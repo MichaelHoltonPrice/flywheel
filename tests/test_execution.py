@@ -175,7 +175,9 @@ class TestBlockLookup:
         fake_run = _fake_run_with_output({"model.pt": "weights"})
         with patch("flywheel.execution.run_container", side_effect=fake_run):
             result = run_block(ws, "train", template, project_root)
-        assert result.exit_code == 0
+        assert result.container_result.exit_code == 0
+        assert result.execution_id in ws.executions
+        assert result.execution == ws.executions[result.execution_id]
 
 
 class TestInputResolution:
@@ -643,7 +645,7 @@ class TestOneShotContainerRunner:
                 container_runner=runner,
             )
 
-        assert result.exit_code == 0
+        assert result.container_result.exit_code == 0
         assert runner.seen_args == ["--example-flag", "example-value"]
         assert runner.seen_plan is not None
         assert runner.seen_plan.block_name == "train"
@@ -667,13 +669,14 @@ class TestOneShotContainerRunner:
                     error="OOM-killed",
                 )
 
-        with pytest.raises(RuntimeError, match="OOM-killed"):
+        with pytest.raises(RuntimeError, match="OOM-killed") as exc_info:
             run_block(
                 ws, "train", template, project_root,
                 container_runner=CrashRunner(),
             )
 
         ex = self._only_execution(ws)
+        assert getattr(exc_info.value, "flywheel_execution_id") == ex.id
         assert ex.status == "failed"
         assert ex.termination_reason == runtime.TERMINATION_REASON_CRASH
         assert ex.failure_phase == runtime.FAILURE_INVOKE

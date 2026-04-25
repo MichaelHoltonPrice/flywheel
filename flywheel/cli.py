@@ -647,7 +647,8 @@ def run_block_command(
     )
     print(
         f"Block {block_name!r} completed: "
-        f"exit_code={result.exit_code}, elapsed={result.elapsed_s:.1f}s"
+        f"exit_code={result.container_result.exit_code}, "
+        f"elapsed={result.container_result.elapsed_s:.1f}s"
     )
 
 
