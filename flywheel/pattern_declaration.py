@@ -14,6 +14,7 @@ from typing import Literal
 import yaml
 
 from flywheel.bindings import ArtifactIdBinding
+from flywheel.pattern_params import ParamType, coerce_param_value
 from flywheel.pattern_lanes import DEFAULT_LANE
 from flywheel.validation import validate_name
 
@@ -29,6 +30,15 @@ class PriorOutputBinding:
 
 InputBinding = ArtifactIdBinding | PriorOutputBinding
 MinSuccesses = Literal["all"] | int
+
+
+@dataclass(frozen=True)
+class PatternParam:
+    """Operator-supplied pattern input declared by a pattern."""
+
+    name: str
+    type: ParamType
+    default: str | int | float | bool | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +58,7 @@ class PatternMember:
     lane: str = DEFAULT_LANE
     inputs: dict[str, InputBinding] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -71,6 +82,7 @@ class PatternDeclaration:
     """A parsed pattern declaration."""
 
     name: str
+    params: dict[str, PatternParam]
     lanes: list[str]
     fixtures: dict[str, PatternFixture]
     steps: list[PatternStep]
@@ -93,7 +105,7 @@ def parse_pattern_declaration(
     source: str = "<pattern>",
 ) -> PatternDeclaration:
     """Parse and validate a pattern declaration mapping."""
-    unknown = set(data) - {"name", "lanes", "fixtures", "steps"}
+    unknown = set(data) - {"name", "params", "lanes", "fixtures", "steps"}
     if unknown:
         raise ValueError(
             f"Pattern {source}: unknown top-level key(s) "
@@ -103,6 +115,7 @@ def parse_pattern_declaration(
     if not isinstance(name, str):
         raise ValueError(f"Pattern {source}: missing string 'name'")
     validate_name(name, "Pattern")
+    params = _parse_params(data.get("params", {}), pattern_name=name)
     lanes = _parse_lanes(data.get("lanes"), pattern_name=name)
     fixtures = _parse_fixtures(data.get("fixtures", {}), pattern_name=name)
     raw_steps = data.get("steps")
@@ -124,10 +137,63 @@ def parse_pattern_declaration(
         steps.append(step)
     return PatternDeclaration(
         name=name,
+        params=params,
         lanes=lanes,
         fixtures=fixtures,
         steps=steps,
     )
+
+
+def _parse_params(
+    raw: object,
+    *,
+    pattern_name: str,
+) -> dict[str, PatternParam]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: 'params' must be a mapping"
+        )
+    params: dict[str, PatternParam] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: param names must be strings"
+            )
+        validate_name(name, "Pattern param")
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: param {name!r} must be "
+                "a mapping"
+            )
+        unknown = set(spec) - {"type", "default"}
+        if unknown:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: param {name!r} has "
+                f"unknown key(s) {sorted(unknown)!r}"
+            )
+        param_type = spec.get("type")
+        if param_type not in ("string", "int", "float", "bool"):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: param {name!r} type "
+                "must be one of string, int, float, bool"
+            )
+        default = spec.get("default")
+        if default is not None:
+            default = coerce_param_value(
+                pattern_name=pattern_name,
+                name=name,
+                value=default,
+                param_type=param_type,
+                source="default",
+            )
+        params[name] = PatternParam(
+            name=name,
+            type=param_type,
+            default=default,
+        )
+    return params
 
 
 def _parse_lanes(raw: object, *, pattern_name: str) -> list[str]:
@@ -220,6 +286,7 @@ def _parse_cohort(
         )
     unknown = set(raw) - {
         "min_successes", "members", "foreach", "block", "inputs", "args",
+        "env",
     }
     if unknown:
         raise ValueError(
@@ -287,6 +354,7 @@ def _parse_foreach_cohort(
             f"Pattern step {step_name!r}: foreach 'args' must be a "
             "list of strings"
         )
+    env = _parse_env(raw.get("env", {}), owner=f"Pattern step {step_name!r}")
     return PatternCohort(
         min_successes=_parse_min_successes(
             raw.get("min_successes", "all"),
@@ -299,6 +367,7 @@ def _parse_foreach_cohort(
                 lane=lane,
                 inputs=dict(inputs),
                 args=list(args),
+                env=dict(env),
             )
             for lane in lanes
         ],
@@ -329,7 +398,7 @@ def _parse_member(
             f"Pattern step {step_name!r}: member entries must be "
             "mappings"
         )
-    unknown = set(raw) - {"name", "block", "lane", "inputs", "args"}
+    unknown = set(raw) - {"name", "block", "lane", "inputs", "args", "env"}
     if unknown:
         raise ValueError(
             f"Pattern step {step_name!r}: member has unknown "
@@ -367,13 +436,30 @@ def _parse_member(
             "strings"
         )
     inputs = _parse_inputs(raw.get("inputs", {}), member_name=name)
+    env = _parse_env(raw.get("env", {}), owner=f"Pattern member {name!r}")
     return PatternMember(
         name=name,
         block=block,
         lane=lane,
         inputs=inputs,
         args=list(args),
+        env=env,
     )
+
+
+def _parse_env(raw: object, *, owner: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{owner}: 'env' must be a mapping")
+    parsed: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{owner}: env keys must be non-empty strings")
+        if not isinstance(value, str):
+            raise ValueError(f"{owner}: env value for {key!r} must be a string")
+        parsed[key] = value
+    return parsed
 
 
 def _parse_inputs(

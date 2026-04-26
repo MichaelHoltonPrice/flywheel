@@ -65,6 +65,9 @@ class RunRecord:
             ``"stopped"``, or ``"interrupted"``.
         config_snapshot: Optional free-form mapping the caller
             records alongside the run for later inspection.
+        params: Resolved pattern parameters supplied by the
+            operator or defaults at run start.  These are durable
+            orchestration inputs, not block outputs.
         lanes: Declared run-scoped artifact lanes.
         fixtures: Fixture artifacts materialized for the run.
         steps: Ordered step results recorded for the run.
@@ -79,6 +82,7 @@ class RunRecord:
         "running", "succeeded", "failed", "stopped", "interrupted"
     ] = "running"
     config_snapshot: dict[str, Any] | None = None
+    params: dict[str, Any] = field(default_factory=dict)
     lanes: list[str] = field(default_factory=lambda: [DEFAULT_LANE])
     fixtures: list[RunFixtureRecord] = field(default_factory=list)
     steps: list[RunStepRecord] = field(default_factory=list)

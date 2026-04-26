@@ -81,6 +81,16 @@ def test_lanes_fixtures_and_foreach_parse():
     pattern = parse_pattern_declaration({
         "name": "improve",
         "lanes": ["A", "B"],
+        "params": {
+            "model": {
+                "type": "string",
+                "default": "claude-sonnet",
+            },
+            "eval_episodes": {
+                "type": "int",
+                "default": 4000,
+            },
+        },
         "fixtures": {
             "bot": "foundry/templates/assets/bot",
         },
@@ -90,18 +100,27 @@ def test_lanes_fixtures_and_foreach_parse():
                 "cohort": {
                     "foreach": "lanes",
                     "block": "ImproveBot",
+                    "env": {
+                        "MODEL": "${params.model}",
+                    },
                 },
             }
         ],
     })
 
     assert pattern.lanes == ["A", "B"]
+    assert pattern.params["model"].default == "claude-sonnet"
+    assert pattern.params["eval_episodes"].default == 4000
     assert pattern.fixtures["bot"].source == (
         "foundry/templates/assets/bot")
     members = pattern.steps[0].cohort.members
     assert [(member.name, member.lane, member.block) for member in members] == [
         ("A", "A", "ImproveBot"),
         ("B", "B", "ImproveBot"),
+    ]
+    assert [member.env["MODEL"] for member in members] == [
+        "${params.model}",
+        "${params.model}",
     ]
 
 

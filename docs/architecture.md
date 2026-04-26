@@ -219,6 +219,9 @@ The current pattern implementation is intentionally lean:
   resolution contexts.
 * Pattern fixtures materialize ordinary copy artifacts per lane at run
   start.
+* Pattern parameters are resolved once at run start, recorded on the
+  `RunRecord`, and may be substituted into member environment values,
+  member args, and invocation route args.
 * Execution is sequential today, even when a cohort is semantically
   parallel.
 
@@ -227,6 +230,11 @@ member's output in the same run. Unbound copy inputs resolve to the
 latest artifact in the member's lane, not the latest workspace-global
 artifact by name. The pattern runner records fixture, member, lane, and
 step results on the `RunRecord`.
+
+Ad hoc `flywheel run block` may also pass `--param KEY=VALUE`; those
+values are used only for `${params.KEY}` placeholders in invocation
+route args. Pattern-only member env/arg substitution remains a pattern
+surface.
 
 The resolver is separate from execution. It reads the current pattern
 and run prefix, chooses the next step, and does not mutate the

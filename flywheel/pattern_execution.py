@@ -16,6 +16,12 @@ from flywheel.pattern_declaration import (
     PatternStep,
     PriorOutputBinding,
 )
+from flywheel.pattern_params import (
+    PatternParamError,
+    coerce_param_value,
+    referenced_params,
+    substitute_params,
+)
 from flywheel.pattern_resolution import (
     RunPrefix,
     StopDecision,
@@ -53,6 +59,7 @@ def run_pattern(
     *,
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
+    param_overrides: dict[str, str] | None = None,
 ) -> PatternRunResult:
     """Execute a pattern through canonical block execution."""
     if template.name != workspace.template_name:
@@ -62,8 +69,11 @@ def run_pattern(
         )
 
     _validate_pattern_fixtures(pattern, template)
+    _validate_pattern_param_references(pattern, template)
+    params = resolve_pattern_params(pattern, param_overrides or {})
     run = workspace.begin_run(
         kind=f"pattern:{pattern.name}",
+        params=params,
         lanes=list(pattern.lanes),
     )
     try:
@@ -105,6 +115,7 @@ def run_pattern(
                 run_id=run.id,
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
+                params=params,
             )
             workspace.record_run_step(run.id, step_result)
     except KeyboardInterrupt:
@@ -126,6 +137,7 @@ def _execute_step(
     run_id: str,
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
 ) -> RunStepRecord:
     members: list[RunMemberRecord] = []
     min_successes = step.cohort.min_successes
@@ -140,6 +152,7 @@ def _execute_step(
             lane_name=member.lane,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
+            params=params,
         )
         members.append(result)
         if min_successes == "all" and result.status != "succeeded":
@@ -175,6 +188,7 @@ def _execute_member(
     lane_name: str,
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
 ) -> RunMemberRecord:
     try:
         input_bindings = _resolve_member_inputs(
@@ -184,18 +198,25 @@ def _execute_member(
             lane_name,
             template,
         )
+        args = [substitute_params(arg, params) for arg in member.args]
+        env_overlay = {
+            key: substitute_params(value, params)
+            for key, value in member.env.items()
+        }
         result = run_block(
             workspace,
             member.block,
             template,
             project_root,
             input_bindings=input_bindings,
-            args=member.args,
+            args=args,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             state_lineage_key=pattern_state_lineage_key(
                 run_id, lane_name, step_name, member.name),
             allow_workspace_latest=False,
+            env_overlay=env_overlay,
+            invocation_params=params,
         )
     except Exception as exc:
         execution_id = getattr(exc, "flywheel_execution_id", None)
@@ -232,6 +253,83 @@ def _execute_member(
         invocation_ids=invocation_ids,
         error=execution.error,
     )
+
+
+def resolve_pattern_params(
+    pattern: PatternDeclaration,
+    overrides: dict[str, str],
+) -> dict[str, object]:
+    """Resolve operator overrides plus defaults for one pattern run."""
+    unknown = set(overrides) - set(pattern.params)
+    if unknown:
+        raise PatternParamError(
+            f"Pattern {pattern.name!r}: unknown param(s) "
+            f"{sorted(unknown)!r}"
+        )
+    resolved: dict[str, object] = {}
+    for name, param in pattern.params.items():
+        if name in overrides:
+            resolved[name] = _coerce_param_override(
+                pattern.name, param, overrides[name])
+        elif param.default is not None:
+            resolved[name] = param.default
+        else:
+            raise PatternParamError(
+                f"Pattern {pattern.name!r}: required param "
+                f"{name!r} was not supplied"
+            )
+    return resolved
+
+
+def _coerce_param_override(
+    pattern_name: str,
+    param,
+    value: str,
+) -> object:
+    return coerce_param_value(
+        pattern_name=pattern_name,
+        name=param.name,
+        value=value,
+        param_type=param.type,
+        source="value",
+    )
+
+
+def _validate_pattern_param_references(
+    pattern: PatternDeclaration,
+    template: Template,
+) -> None:
+    declared = set(pattern.params)
+
+    def check(value: str, context: str) -> None:
+        unknown = referenced_params(value) - declared
+        if unknown:
+            raise PatternParamError(
+                f"Pattern {pattern.name!r}: {context} references "
+                f"unknown param(s) {sorted(unknown)!r}"
+            )
+
+    used_blocks: set[str] = set()
+    for step in pattern.steps:
+        for member in step.cohort.members:
+            used_blocks.add(member.block)
+            for arg in member.args:
+                check(arg, f"member {member.name!r} arg")
+            for key, value in member.env.items():
+                check(value, f"member {member.name!r} env {key!r}")
+
+    for block_name in sorted(used_blocks):
+        block = _block_definition(template, block_name)
+        for reason, routes in block.on_termination.items():
+            for route in routes:
+                for arg in route.args:
+                    check(
+                        arg,
+                        (
+                            f"block {block.name!r} "
+                            f"on_termination[{reason!r}] arg"
+                        ),
+                    )
 
 
 def _resolve_member_inputs(

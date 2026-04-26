@@ -365,6 +365,122 @@ class TestBlockInvocation:
         loaded_child = reloaded.executions[invocation.invoked_execution_id]
         assert loaded_child.invoking_execution_id == result.execution_id
 
+    def test_ad_hoc_invocation_route_substitutes_params(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        agent = next(block for block in template.blocks if block.name == "agent")
+        eval_block = next(block for block in template.blocks if block.name == "eval")
+        route = agent.on_termination["eval_requested"][0]
+        agent = replace(
+            agent,
+            on_termination={
+                "eval_requested": [
+                    replace(
+                        route,
+                        args=[
+                            "--episodes",
+                            "${params.eval_episodes}",
+                            "--dry-run",
+                            "${params.dry_run}",
+                        ],
+                    )
+                ]
+            },
+        )
+        template = Template(
+            name=template.name,
+            artifacts=template.artifacts,
+            blocks=[agent, eval_block],
+        )
+        seen_args: list[str] | None = None
+
+        def fake_run(config, args=None):
+            nonlocal seen_args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                bot_dir = mounts["/output/bot"]
+                bot_dir.mkdir(parents=True, exist_ok=True)
+                (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            if config.image == "eval:latest":
+                seen_args = list(args or [])
+                score_dir = mounts["/output/score"]
+                score_dir.mkdir(parents=True, exist_ok=True)
+                (score_dir / "scores.json").write_text("{}")
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=1.0)
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            run_block(
+                ws,
+                "agent",
+                template,
+                project_root,
+                invocation_params={
+                    "eval_episodes": 4000,
+                    "dry_run": True,
+                },
+            )
+
+        assert seen_args == ["--episodes", "4000", "--dry-run", "true"]
+
+    def test_missing_ad_hoc_invocation_param_records_failed_invocation(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        agent = next(block for block in template.blocks if block.name == "agent")
+        eval_block = next(block for block in template.blocks if block.name == "eval")
+        route = agent.on_termination["eval_requested"][0]
+        agent = replace(
+            agent,
+            on_termination={
+                "eval_requested": [
+                    replace(route, args=["${params.eval_episodes}"])
+                ]
+            },
+        )
+        template = Template(
+            name=template.name,
+            artifacts=template.artifacts,
+            blocks=[agent, eval_block],
+        )
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            assert config.image == "agent:latest"
+            bot_dir = mounts["/output/bot"]
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            (bot_dir / "bot.py").write_text("def player_fn(*_): return 0")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=1.0)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "agent", template, project_root)
+
+        assert result.execution.status == "succeeded"
+        invocation = next(iter(ws.invocations.values()))
+        assert invocation.status == "failed"
+        assert invocation.invoked_execution_id is None
+        assert "unknown pattern param 'eval_episodes'" in invocation.error
+
     def test_no_route_for_termination_reason_runs_only_parent(
         self, tmp_path: Path,
     ):

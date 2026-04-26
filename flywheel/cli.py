@@ -3,7 +3,8 @@
 Supports:
     flywheel create workspace --name NAME --template TEMPLATE
     flywheel run block --workspace PATH --block BLOCK --template TEMPLATE
-        [--bind SLOT=ARTIFACT_ID ...] [-- extra container args...]
+        [--bind SLOT=ARTIFACT_ID ...] [--param KEY=VALUE ...]
+        [-- extra container args...]
     flywheel run pattern PATTERN_NAME --workspace PATH
         --template TEMPLATE
     flywheel import artifact --workspace PATH --name NAME
@@ -28,6 +29,7 @@ from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
 from flywheel.pattern_declaration import PatternDeclaration
+from flywheel.pattern_params import PatternParamError
 from flywheel.pattern_execution import PatternRunError, run_pattern
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
@@ -166,6 +168,15 @@ def main(argv: list[str] | None = None) -> None:
             "state: managed."
         ),
     )
+    block_parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        help=(
+            "Invocation-route parameter as KEY=VALUE. Repeatable; "
+            "used for ${params.KEY} placeholders in child route args."
+        ),
+    )
 
     # flywheel run pattern
     pattern_parser = run_sub.add_parser("pattern")
@@ -177,6 +188,15 @@ def main(argv: list[str] | None = None) -> None:
         ))
     pattern_parser.add_argument("--workspace", required=True)
     pattern_parser.add_argument("--template", required=True)
+    pattern_parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        help=(
+            "Pattern parameter override as KEY=VALUE. Repeatable; "
+            "keys must be declared by the pattern."
+        ),
+    )
 
     # flywheel container — manage persistent request-response runtimes
     container_parser = subparsers.add_parser(
@@ -255,6 +275,7 @@ def main(argv: list[str] | None = None) -> None:
             args.workspace, args.block, args.template,
             bindings, extra_container_args,
             state_lineage_key=args.state_lineage,
+            invocation_params=_parse_params(args.param),
         )
     elif args.command == "run" and getattr(args, "target", None) == "pattern":
         run_pattern_command(args, extra_container_args)
@@ -562,6 +583,7 @@ def run_block_command(
     extra_args: list[str],
     *,
     state_lineage_key: str | None = None,
+    invocation_params: dict[str, str] | None = None,
 ) -> None:
     """Run a block within an existing workspace.
 
@@ -602,6 +624,7 @@ def run_block_command(
         validator_registry=validator_registry,
         state_validator_registry=state_validator_registry,
         state_lineage_key=state_lineage_key,
+        invocation_params=invocation_params,
     )
     print(
         f"Block {block_name!r} completed: "
@@ -641,6 +664,7 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
     state_validator_registry = config.load_state_validator_registry()
 
     try:
+        param_overrides = _parse_params(args.param)
         result = run_pattern(
             workspace,
             pattern,
@@ -648,8 +672,9 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             config.project_root,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
+            param_overrides=param_overrides,
         )
-    except PatternRunError as exc:
+    except (PatternRunError, PatternParamError) as exc:
         print(f"Pattern {pattern.name!r} failed: {exc}")
         sys.exit(1)
 
@@ -657,6 +682,23 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
         f"Pattern {pattern.name!r} completed: "
         f"run_id={result.run_id}, status={result.status}"
     )
+
+
+def _parse_params(raw: list[str]) -> dict[str, str]:
+    """Parse --param KEY=VALUE arguments."""
+    params: dict[str, str] = {}
+    for entry in raw:
+        if "=" not in entry:
+            raise PatternParamError(
+                f"Invalid --param format {entry!r}, expected KEY=VALUE"
+            )
+        key, value = entry.split("=", 1)
+        if not key:
+            raise PatternParamError(
+                f"Invalid --param format {entry!r}, key is empty"
+            )
+        params[key] = value
+    return params
 
 
 def _parse_overrides(args: list[str]) -> dict[str, str]:

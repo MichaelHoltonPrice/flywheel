@@ -102,6 +102,8 @@ class ExecutionPlan:
             mount, when one existed.
         state_compatibility: Compatibility identity used to reject
             restoring an incompatible snapshot.
+        env_overlay: Per-execution environment values layered over the
+            block template's static env.
     """
 
     execution_id: str
@@ -118,6 +120,7 @@ class ExecutionPlan:
     state_mount_dir: Path | None = None
     restored_state_snapshot_id: str | None = None
     state_compatibility: dict[str, str] | None = None
+    env_overlay: dict[str, str] | None = None
 
 
 @dataclass
@@ -400,6 +403,7 @@ def prepare_block_execution(
     started_at: datetime,
     state_lineage_key: str | None = None,
     allow_workspace_latest: bool = True,
+    env_overlay: dict[str, str] | None = None,
 ) -> ExecutionPlan:
     """Allocate proposal dirs, resolve inputs, build mounts.
 
@@ -559,6 +563,7 @@ def prepare_block_execution(
         state_mount_dir=state_mount_dir,
         restored_state_snapshot_id=restored_state_snapshot_id,
         state_compatibility=state_compatibility,
+        env_overlay=dict(env_overlay or {}),
     )
 
 
@@ -567,10 +572,13 @@ def prepare_block_execution(
 
 def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
     """Build the runtime container config from a prepared plan."""
+    env = dict(plan.block_def.env)
+    if plan.env_overlay:
+        env.update(plan.env_overlay)
     return ContainerConfig(
         image=plan.block_def.image,
         docker_args=plan.block_def.docker_args,
-        env=plan.block_def.env,
+        env=env,
         mounts=plan.mounts,
     )
 
@@ -984,6 +992,8 @@ def run_block(
     invoking_execution_id: str | None = None,
     dispatch_child_invocations: bool = True,
     allow_workspace_latest: bool = True,
+    env_overlay: dict[str, str] | None = None,
+    invocation_params: dict[str, object] | None = None,
 ) -> BlockRunResult:
     """Execute a block within a workspace.
 
@@ -1020,6 +1030,10 @@ def run_block(
             back to the workspace-global latest instance. Pattern
             execution disables this so lane-scoped resolution cannot
             leak across lanes.
+        env_overlay: Optional per-execution environment values layered
+            over the block declaration's static env.
+        invocation_params: Optional run-scoped values used only to
+            substitute invocation route args for child executions.
 
     Returns:
         A BlockRunResult with the ledger execution and raw
@@ -1082,6 +1096,7 @@ def run_block(
             started_at=started_at,
             state_lineage_key=state_lineage_key,
             allow_workspace_latest=allow_workspace_latest,
+            env_overlay=env_overlay,
         )
     except Exception as exc:
         commit_failure(
@@ -1165,6 +1180,7 @@ def run_block(
             parent_execution=execution,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
+            params=invocation_params or {},
         )
     return BlockRunResult(
         execution_id=plan.execution_id,

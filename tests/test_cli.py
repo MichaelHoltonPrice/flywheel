@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from flywheel.artifact import BlockExecution, RejectedOutput
-from flywheel.cli import _parse_bindings, create_workspace, main
+from flywheel.cli import _parse_bindings, _parse_params, create_workspace, main
 from flywheel.container import ContainerResult
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.workspace import Workspace
@@ -256,6 +256,22 @@ class TestParseBindings:
     def test_value_with_at_sign(self):
         result = _parse_bindings(["checkpoint=checkpoint@abc123"])
         assert result["checkpoint"] == "checkpoint@abc123"
+
+
+class TestParseParams:
+    def test_multiple_params(self):
+        result = _parse_params([
+            "model=claude-opus",
+            "eval_episodes=4000",
+        ])
+        assert result == {
+            "model": "claude-opus",
+            "eval_episodes": "4000",
+        }
+
+    def test_malformed_raises(self):
+        with pytest.raises(ValueError, match="Invalid --param format"):
+            _parse_params(["model"])
 
 
 class TestMainImportArtifact:
@@ -545,12 +561,16 @@ class TestMainRunBlock:
                 "--block", "train",
                 "--template", "my_template",
                 "--state-lineage", "train_dueling",
+                "--param", "eval_episodes=4000",
                 "--", "--subclass", "dueling",
             ])
             mock_rb.assert_called_once()
             call_args = mock_rb.call_args
             assert call_args[0][1] == "train"
             assert call_args.kwargs["state_lineage_key"] == "train_dueling"
+            assert call_args.kwargs["invocation_params"] == {
+                "eval_episodes": "4000",
+            }
             assert isinstance(
                 call_args.kwargs["state_validator_registry"],
                 StateValidatorRegistry,

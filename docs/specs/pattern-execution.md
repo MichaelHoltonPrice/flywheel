@@ -21,6 +21,13 @@ Patterns live under `<foundry_dir>/templates/patterns/<name>.yaml`:
 
 ```yaml
 name: train_eval
+params:
+  model:
+    type: string
+    default: claude-sonnet-4-6
+  eval_episodes:
+    type: int
+    default: 4000
 steps:
   - name: train
     cohort:
@@ -62,6 +69,65 @@ steps:
 pattern. Member names are unique within a step. Pattern members are
 block executions. If omitted, `lanes` defaults to a single implicit
 `default` lane.
+
+## Parameters
+
+Patterns may declare typed run parameters under `params`. Supported
+types are `string`, `int`, `float`, and `bool`. A parameter may provide
+a default; parameters without defaults must be supplied by the caller at
+run start. The CLI supplies overrides with repeated
+`--param KEY=VALUE` flags.
+
+Resolved parameters are recorded on the `RunRecord` before the first
+fixture or block execution. They are durable orchestration inputs: a
+run can be inspected later to see which model, episode count, budget,
+or other project-level knob was used.
+
+Pattern member `args` and `env` values may reference parameters with
+`${params.name}` placeholders:
+
+```yaml
+params:
+  model:
+    type: string
+    default: claude-sonnet-4-6
+  eval_episodes:
+    type: int
+    default: 4000
+
+steps:
+  - name: improve
+    cohort:
+      foreach: lanes
+      block: ImproveBot
+      env:
+        MODEL: ${params.model}
+```
+
+Invocation route args may also use the same placeholder syntax. Unknown
+parameter names are errors; Flywheel does not silently pass unresolved
+placeholders into containers.
+
+### Placeholder Grammar
+
+The only supported placeholder form is `${params.name}`. Parameter
+names use the same name rules as other Flywheel identifiers: they must
+start with a letter or digit and may contain letters, digits, hyphens,
+and underscores. There is no escaping syntax; strings that need a
+literal `${params.name}` should avoid that exact form.
+
+Values render as strings for container environment variables and argv.
+Boolean values render as lowercase `true` or `false`; integers and
+floats render with Python's normal string representation.
+
+Flywheel validates parameter references before opening the run record.
+A typo in a member env value, member arg, or routed block invocation arg
+rejects the pattern run before any fixture is materialized or container
+starts.
+
+Input resolution runs before parameter substitution. This keeps
+substitution failures from creating partial input artifacts or changing
+which lane artifact a member consumes.
 
 ## Lanes
 
@@ -177,6 +243,7 @@ lane resolver to consider.
 * run id;
 * kind, conventionally `pattern:<name>`;
 * status and timestamps;
+* resolved run parameters;
 * declared lanes;
 * fixture materializations by lane;
 * ordered step results;

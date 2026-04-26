@@ -29,7 +29,7 @@ on_termination:
       - block: EvalBot
         bind:
           bot: bot
-        args: ["--episodes", "200"]
+        args: ["--episodes", "${params.eval_episodes}"]
 ```
 
 `on_termination.<reason>` must name a termination reason declared under
@@ -44,6 +44,12 @@ and optional `bind` entries. A binding maps a child input slot to either:
 
 If a child input is omitted from `bind`, the child uses the same input
 resolution rules as `flywheel run block`.
+
+Invocation route args may contain `${params.name}` placeholders. Pattern runs
+validate those references against the pattern's declared params and substitute
+the resolved run values. Ad hoc `flywheel run block` can provide route-arg
+values with repeated `--param KEY=VALUE` flags; ad hoc params do not affect
+block environment or direct block argv.
 
 Invoked child blocks may not declare `state: managed` in the first
 implementation because routes do not yet declare child state lineage keys.

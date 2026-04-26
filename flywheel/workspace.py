@@ -637,6 +637,7 @@ class Workspace:
         self,
         kind: str,
         config_snapshot: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         lanes: list[str] | None = None,
     ) -> RunRecord:
         """Open a new run and append it to the workspace.
@@ -652,6 +653,7 @@ class Workspace:
             config_snapshot: Optional config mapping recorded
                 for later inspection (model names, budgets,
                 etc.).
+            params: Resolved operator-supplied pattern parameters.
             lanes: Optional list of run-scoped artifact lanes.
                 Defaults to the implicit default lane.
 
@@ -671,6 +673,7 @@ class Workspace:
                 config_snapshot=(
                     dict(config_snapshot)
                     if config_snapshot else None),
+                params=dict(params or {}),
                 lanes=(
                     list(lanes) if lanes is not None else [DEFAULT_LANE]
                 ),
@@ -1606,6 +1609,7 @@ class Workspace:
                     if finished else None),
                 status=entry.get("status", "running"),
                 config_snapshot=entry.get("config_snapshot"),
+                params=dict(entry.get("params", {})),
                 lanes=list(entry.get("lanes", [DEFAULT_LANE])),
                 fixtures=_run_fixtures_from_yaml(
                     entry.get("fixtures")),
@@ -1738,6 +1742,8 @@ class Workspace:
                         run.finished_at.isoformat())
                 if run.config_snapshot is not None:
                     entry["config_snapshot"] = run.config_snapshot
+                if run.params:
+                    entry["params"] = dict(run.params)
                 if run.lanes != [DEFAULT_LANE]:
                     entry["lanes"] = list(run.lanes)
                 if run.fixtures:

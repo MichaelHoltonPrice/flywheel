@@ -8,6 +8,7 @@ from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.container import ContainerResult
 from flywheel.pattern_declaration import parse_pattern_declaration
 from flywheel.pattern_execution import (
+    resolve_pattern_params,
     run_pattern,
 )
 from flywheel.pattern_lanes import DEFAULT_LANE
@@ -153,6 +154,39 @@ blocks:
     outputs:
       - name: bot
         container_path: /output/bot
+"""
+
+PARAM_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: improve
+    image: improve:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+            args:
+              - --episodes
+              - ${params.eval_episodes}
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
 """
 
 
@@ -329,6 +363,334 @@ def test_run_pattern_records_train_eval_membership(tmp_path: Path):
     assert eval_execution.input_bindings == {
         "checkpoint": train_execution.output_bindings["checkpoint"]
     }
+
+
+def test_pattern_params_persist_and_substitute_into_env_args_and_invocations(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {
+                "type": "string",
+                "default": "claude-sonnet",
+            },
+            "eval_episodes": {
+                "type": "int",
+                "default": 4000,
+            },
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "min_successes": "all",
+                    "members": [
+                        {
+                            "name": "agent",
+                            "block": "improve",
+                            "args": [
+                                "--budget",
+                                "${params.eval_episodes}",
+                            ],
+                            "env": {
+                                "MODEL": "${params.model}",
+                            },
+                        },
+                    ],
+                },
+            }
+        ],
+    })
+    seen: list[tuple[str, list[str] | None, dict[str, str]]] = []
+
+    def fake_container(config, args=None):
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        seen.append((config.image, args, dict(config.env)))
+        if config.image == "improve:latest":
+            assert config.env["MODEL"] == "claude-opus"
+            assert args == ["--budget", "123"]
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("BOT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            assert args == ["--episodes", "123"]
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={
+                "model": "claude-opus",
+                "eval_episodes": "123",
+            },
+        )
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    assert run.params == {
+        "model": "claude-opus",
+        "eval_episodes": 123,
+    }
+    assert [item[0] for item in seen] == ["improve:latest", "eval:latest"]
+    invocation = next(iter(reloaded.invocations.values()))
+    assert invocation.args == ["--episodes", "123"]
+
+
+def test_pattern_param_resolution_coerces_defaults_and_overrides():
+    pattern = parse_pattern_declaration({
+        "name": "params",
+        "params": {
+            "model": {"type": "string", "default": "sonnet"},
+            "episodes": {"type": "int", "default": 100},
+            "threshold": {"type": "float", "default": 1},
+            "dry_run": {"type": "bool", "default": "false"},
+        },
+        "steps": [
+            {
+                "name": "noop",
+                "cohort": {
+                    "members": [
+                        {"name": "member", "block": "train"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    assert resolve_pattern_params(pattern, {
+        "episodes": "4000",
+        "dry_run": "yes",
+    }) == {
+        "model": "sonnet",
+        "episodes": 4000,
+        "threshold": 1.0,
+        "dry_run": True,
+    }
+
+
+def test_required_pattern_param_without_default_fails_before_run(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {"type": "string"},
+            "eval_episodes": {"type": "int", "default": 10},
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "improve"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except ValueError as exc:
+        assert "required param 'model'" in str(exc)
+    else:
+        raise AssertionError("expected required param failure")
+
+    assert Workspace.load(workspace.path).runs == {}
+
+
+def test_pattern_param_override_type_failure_happens_before_run(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "eval_episodes": {"type": "int"},
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "improve"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={"eval_episodes": "foo"},
+        )
+    except ValueError as exc:
+        assert "not a valid int" in str(exc)
+    else:
+        raise AssertionError("expected type failure")
+
+    assert Workspace.load(workspace.path).runs == {}
+
+
+def test_bool_pattern_param_round_trips_through_workspace_yaml(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(tmp_path)
+    pattern = parse_pattern_declaration({
+        "name": "train_eval",
+        "params": {
+            "dry_run": {"type": "bool", "default": False},
+        },
+        "steps": [
+            {
+                "name": "train",
+                "cohort": {
+                    "members": [
+                        {"name": "train_dueling", "block": "train"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    with patch("flywheel.execution.run_container", side_effect=_fake_container):
+        result = run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={"dry_run": "true"},
+        )
+
+    assert Workspace.load(workspace.path).runs[result.run_id].params == {
+        "dry_run": True,
+    }
+
+
+def test_unknown_member_param_reference_fails_before_run(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {"type": "string", "default": "m"},
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {
+                            "name": "agent",
+                            "block": "improve",
+                            "args": ["${params.mdoel}"],
+                        },
+                    ],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except ValueError as exc:
+        assert "unknown param" in str(exc)
+        assert "mdoel" in str(exc)
+    else:
+        raise AssertionError("expected param reference failure")
+
+    assert Workspace.load(workspace.path).runs == {}
+
+
+def test_unknown_invocation_route_param_reference_fails_before_run(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "episodes": {"type": "int", "default": 10},
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "improve"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except ValueError as exc:
+        assert "unknown param" in str(exc)
+        assert "eval_episodes" in str(exc)
+    else:
+        raise AssertionError("expected route param reference failure")
+
+    assert Workspace.load(workspace.path).runs == {}
+
+
+def test_unknown_pattern_param_override_is_rejected(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {"type": "string"},
+        },
+        "steps": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "improve"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={"unknown": "x", "model": "m"},
+        )
+    except ValueError as exc:
+        assert "unknown param" in str(exc)
+    else:
+        raise AssertionError("expected unknown param failure")
 
 
 def test_pattern_lanes_keep_artifact_pedigrees_separate(tmp_path: Path):

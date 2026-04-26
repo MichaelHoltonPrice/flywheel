@@ -12,9 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from flywheel.artifact import BlockExecution, BlockInvocation
 from flywheel.artifact_validator import ArtifactValidatorRegistry
+from flywheel.pattern_params import substitute_params
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import (
     BlockDefinition,
@@ -69,6 +71,7 @@ def dispatch_invocations(
     parent_execution: BlockExecution,
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
+    params: dict[str, Any] | None = None,
 ) -> list[InvocationDispatchResult]:
     """Run child blocks routed from a committed parent execution.
 
@@ -87,10 +90,15 @@ def dispatch_invocations(
     from flywheel.execution import run_block  # noqa: PLC0415
 
     results: list[InvocationDispatchResult] = []
+    params = dict(params or {})
     for route in routes:
         invocation_id = workspace.generate_invocation_id()
         input_bindings: dict[str, str] = {}
+        route_args = list(route.args)
         try:
+            route_args = [
+                substitute_params(arg, params) for arg in route.args
+            ]
             input_bindings = _resolve_child_bindings(
                 parent=parent_execution,
                 route=route,
@@ -102,7 +110,7 @@ def dispatch_invocations(
                 template,
                 project_root,
                 input_bindings=input_bindings,
-                args=route.args,
+                args=route_args,
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 invoking_execution_id=parent_execution.id,
@@ -117,7 +125,7 @@ def dispatch_invocations(
                 status="succeeded",
                 invoked_execution_id=child_result.execution_id,
                 input_bindings=dict(child_result.execution.input_bindings),
-                args=list(route.args),
+                args=list(route_args),
             )
             workspace.record_invocation(invocation)
             results.append(InvocationDispatchResult(invocation=invocation))
@@ -135,7 +143,7 @@ def dispatch_invocations(
                 status="failed",
                 invoked_execution_id=child_id,
                 input_bindings=input_bindings,
-                args=list(route.args),
+                args=list(route_args),
                 error=f"{type(exc).__name__}: {exc}",
             )
             workspace.record_invocation(invocation)
