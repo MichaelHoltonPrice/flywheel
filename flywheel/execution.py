@@ -399,6 +399,7 @@ def prepare_block_execution(
     execution_id: str,
     started_at: datetime,
     state_lineage_key: str | None = None,
+    allow_workspace_latest: bool = True,
 ) -> ExecutionPlan:
     """Allocate proposal dirs, resolve inputs, build mounts.
 
@@ -413,7 +414,8 @@ def prepare_block_execution(
 
     1. Explicit binding wins.
     2. Git-kind slots are re-resolved against the working tree.
-    3. Otherwise the most recent ``copy`` instance is used.
+    3. Otherwise the most recent ``copy`` instance is used when
+       ``allow_workspace_latest`` is true.
     4. If no instance is found and the slot is optional, skip it.
     5. Required-with-no-instance raises ``ValueError``.
 
@@ -516,7 +518,7 @@ def prepare_block_execution(
                     git_instance, slot.container_path, workspace)
             )
 
-        else:
+        elif allow_workspace_latest:
             instances = workspace.instances_for(slot.name)
             copy_instances = [
                 i for i in instances if i.kind == "copy"]
@@ -534,6 +536,13 @@ def prepare_block_execution(
                     f"Required input artifact {slot.name!r} for "
                     f"block {block_def.name!r} is not available"
                 )
+        elif slot.optional:
+            continue
+        else:
+            raise ValueError(
+                f"Required input artifact {slot.name!r} for "
+                f"block {block_def.name!r} is not available"
+            )
 
     return ExecutionPlan(
         execution_id=execution_id,
@@ -974,6 +983,7 @@ def run_block(
     state_lineage_key: str | None = None,
     invoking_execution_id: str | None = None,
     dispatch_child_invocations: bool = True,
+    allow_workspace_latest: bool = True,
 ) -> BlockRunResult:
     """Execute a block within a workspace.
 
@@ -1006,6 +1016,10 @@ def run_block(
             for this block's committed termination reason before
             returning.  Invoked children disable this in v1 so
             iteration remains a pattern-level concern.
+        allow_workspace_latest: Whether unbound copy inputs may fall
+            back to the workspace-global latest instance. Pattern
+            execution disables this so lane-scoped resolution cannot
+            leak across lanes.
 
     Returns:
         A BlockRunResult with the ledger execution and raw
@@ -1067,6 +1081,7 @@ def run_block(
             execution_id=execution_id,
             started_at=started_at,
             state_lineage_key=state_lineage_key,
+            allow_workspace_latest=allow_workspace_latest,
         )
     except Exception as exc:
         commit_failure(

@@ -14,6 +14,7 @@ from typing import Literal
 import yaml
 
 from flywheel.bindings import ArtifactIdBinding
+from flywheel.pattern_lanes import DEFAULT_LANE
 from flywheel.validation import validate_name
 
 
@@ -31,11 +32,20 @@ MinSuccesses = Literal["all"] | int
 
 
 @dataclass(frozen=True)
+class PatternFixture:
+    """Project source materialized into one artifact per lane."""
+
+    name: str
+    source: str
+
+
+@dataclass(frozen=True)
 class PatternMember:
     """One block execution request within a cohort."""
 
     name: str
     block: str
+    lane: str = DEFAULT_LANE
     inputs: dict[str, InputBinding] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
 
@@ -61,6 +71,8 @@ class PatternDeclaration:
     """A parsed pattern declaration."""
 
     name: str
+    lanes: list[str]
+    fixtures: dict[str, PatternFixture]
     steps: list[PatternStep]
 
     @classmethod
@@ -81,7 +93,7 @@ def parse_pattern_declaration(
     source: str = "<pattern>",
 ) -> PatternDeclaration:
     """Parse and validate a pattern declaration mapping."""
-    unknown = set(data) - {"name", "steps"}
+    unknown = set(data) - {"name", "lanes", "fixtures", "steps"}
     if unknown:
         raise ValueError(
             f"Pattern {source}: unknown top-level key(s) "
@@ -91,6 +103,8 @@ def parse_pattern_declaration(
     if not isinstance(name, str):
         raise ValueError(f"Pattern {source}: missing string 'name'")
     validate_name(name, "Pattern")
+    lanes = _parse_lanes(data.get("lanes"), pattern_name=name)
+    fixtures = _parse_fixtures(data.get("fixtures", {}), pattern_name=name)
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ValueError(
@@ -100,7 +114,7 @@ def parse_pattern_declaration(
     steps: list[PatternStep] = []
     step_names: set[str] = set()
     for raw_step in raw_steps:
-        step = _parse_step(raw_step, pattern_name=name)
+        step = _parse_step(raw_step, pattern_name=name, lanes=lanes)
         if step.name in step_names:
             raise ValueError(
                 f"Pattern {name!r}: duplicate step name "
@@ -108,10 +122,72 @@ def parse_pattern_declaration(
             )
         step_names.add(step.name)
         steps.append(step)
-    return PatternDeclaration(name=name, steps=steps)
+    return PatternDeclaration(
+        name=name,
+        lanes=lanes,
+        fixtures=fixtures,
+        steps=steps,
+    )
 
 
-def _parse_step(raw: object, *, pattern_name: str) -> PatternStep:
+def _parse_lanes(raw: object, *, pattern_name: str) -> list[str]:
+    if raw is None:
+        return [DEFAULT_LANE]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: 'lanes' must be a "
+            "non-empty list"
+        )
+    lanes: list[str] = []
+    seen: set[str] = set()
+    for lane in raw:
+        if not isinstance(lane, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: lane names must be strings"
+            )
+        validate_name(lane, "Pattern lane")
+        if lane in seen:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: duplicate lane {lane!r}"
+            )
+        seen.add(lane)
+        lanes.append(lane)
+    return lanes
+
+
+def _parse_fixtures(
+    raw: object,
+    *,
+    pattern_name: str,
+) -> dict[str, PatternFixture]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: 'fixtures' must be a mapping"
+        )
+    fixtures: dict[str, PatternFixture] = {}
+    for name, source in raw.items():
+        if not isinstance(name, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: fixture names must be strings"
+            )
+        validate_name(name, "Fixture artifact")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(
+                f"Pattern {pattern_name!r}: fixture {name!r} source "
+                "must be a non-empty string"
+            )
+        fixtures[name] = PatternFixture(name=name, source=source)
+    return fixtures
+
+
+def _parse_step(
+    raw: object,
+    *,
+    pattern_name: str,
+    lanes: list[str],
+) -> PatternStep:
     if not isinstance(raw, dict):
         raise ValueError(
             f"Pattern {pattern_name!r}: step entries must be mappings"
@@ -128,28 +204,39 @@ def _parse_step(raw: object, *, pattern_name: str) -> PatternStep:
             f"Pattern {pattern_name!r}: step missing string 'name'"
         )
     validate_name(name, "Pattern step")
-    cohort = _parse_cohort(raw.get("cohort"), step_name=name)
+    cohort = _parse_cohort(raw.get("cohort"), step_name=name, lanes=lanes)
     return PatternStep(name=name, cohort=cohort)
 
 
-def _parse_cohort(raw: object, *, step_name: str) -> PatternCohort:
+def _parse_cohort(
+    raw: object,
+    *,
+    step_name: str,
+    lanes: list[str],
+) -> PatternCohort:
     if not isinstance(raw, dict):
         raise ValueError(
             f"Pattern step {step_name!r}: 'cohort' must be a mapping"
         )
-    unknown = set(raw) - {"min_successes", "members"}
+    unknown = set(raw) - {
+        "min_successes", "members", "foreach", "block", "inputs", "args",
+    }
     if unknown:
         raise ValueError(
             f"Pattern step {step_name!r}: cohort has unknown key(s) "
             f"{sorted(unknown)!r}"
         )
     min_successes = raw.get("min_successes", "all")
-    if min_successes != "all" and min_successes != 1:
-        raise ValueError(
-            f"Pattern step {step_name!r}: min_successes must be "
-            "'all' or 1"
-        )
+    min_successes = _parse_min_successes(
+        min_successes, step_name=step_name)
     raw_members = raw.get("members")
+    if raw_members is not None and "foreach" in raw:
+        raise ValueError(
+            f"Pattern step {step_name!r}: cohort must not declare "
+            "both members and foreach"
+        )
+    if "foreach" in raw:
+        return _parse_foreach_cohort(raw, step_name=step_name, lanes=lanes)
     if not isinstance(raw_members, list) or not raw_members:
         raise ValueError(
             f"Pattern step {step_name!r}: members must be a "
@@ -158,7 +245,8 @@ def _parse_cohort(raw: object, *, step_name: str) -> PatternCohort:
     members: list[PatternMember] = []
     member_names: set[str] = set()
     for raw_member in raw_members:
-        member = _parse_member(raw_member, step_name=step_name)
+        member = _parse_member(
+            raw_member, step_name=step_name, lanes=lanes)
         if member.name in member_names:
             raise ValueError(
                 f"Pattern step {step_name!r}: duplicate member "
@@ -172,13 +260,76 @@ def _parse_cohort(raw: object, *, step_name: str) -> PatternCohort:
     )
 
 
-def _parse_member(raw: object, *, step_name: str) -> PatternMember:
+def _parse_foreach_cohort(
+    raw: dict,
+    *,
+    step_name: str,
+    lanes: list[str],
+) -> PatternCohort:
+    target = raw.get("foreach")
+    if target != "lanes":
+        raise ValueError(
+            f"Pattern step {step_name!r}: foreach must be 'lanes'"
+        )
+    block = raw.get("block")
+    if not isinstance(block, str):
+        raise ValueError(
+            f"Pattern step {step_name!r}: foreach cohort missing "
+            "string 'block'"
+        )
+    validate_name(block, "Block")
+    inputs = _parse_inputs(raw.get("inputs", {}), member_name=block)
+    args = raw.get("args", [])
+    if not isinstance(args, list) or not all(
+        isinstance(item, str) for item in args
+    ):
+        raise ValueError(
+            f"Pattern step {step_name!r}: foreach 'args' must be a "
+            "list of strings"
+        )
+    return PatternCohort(
+        min_successes=_parse_min_successes(
+            raw.get("min_successes", "all"),
+            step_name=step_name,
+        ),
+        members=[
+            PatternMember(
+                name=lane,
+                block=block,
+                lane=lane,
+                inputs=dict(inputs),
+                args=list(args),
+            )
+            for lane in lanes
+        ],
+    )
+
+
+def _parse_min_successes(
+    value: object,
+    *,
+    step_name: str,
+) -> MinSuccesses:
+    if value == "all" or value == 1:
+        return value
+    raise ValueError(
+        f"Pattern step {step_name!r}: min_successes must be "
+        "'all' or 1"
+    )
+
+
+def _parse_member(
+    raw: object,
+    *,
+    step_name: str,
+    lanes: list[str],
+) -> PatternMember:
     if not isinstance(raw, dict):
         raise ValueError(
             f"Pattern step {step_name!r}: member entries must be "
             "mappings"
         )
-    unknown = set(raw) - {"name", "block", "inputs", "args"}
+    unknown = set(raw) - {"name", "block", "lane", "inputs", "args"}
     if unknown:
         raise ValueError(
             f"Pattern step {step_name!r}: member has unknown "
@@ -197,6 +348,16 @@ def _parse_member(raw: object, *, step_name: str) -> PatternMember:
         )
     validate_name(name, "Pattern member")
     validate_name(block, "Block")
+    lane = raw.get("lane", DEFAULT_LANE)
+    if not isinstance(lane, str):
+        raise ValueError(
+            f"Pattern member {name!r}: lane must be a string"
+        )
+    validate_name(lane, "Pattern lane")
+    if lane not in lanes:
+        raise ValueError(
+            f"Pattern member {name!r}: lane {lane!r} is not declared"
+        )
     args = raw.get("args", [])
     if not isinstance(args, list) or not all(
         isinstance(item, str) for item in args
@@ -209,6 +370,7 @@ def _parse_member(raw: object, *, step_name: str) -> PatternMember:
     return PatternMember(
         name=name,
         block=block,
+        lane=lane,
         inputs=inputs,
         args=list(args),
     )

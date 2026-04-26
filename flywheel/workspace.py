@@ -31,7 +31,13 @@ from flywheel.artifact import (
     SupersedesRef,
 )
 from flywheel.artifact_validator import ArtifactValidatorRegistry
-from flywheel.run_record import RunMemberRecord, RunRecord, RunStepRecord
+from flywheel.pattern_lanes import DEFAULT_LANE
+from flywheel.run_record import (
+    RunFixtureRecord,
+    RunMemberRecord,
+    RunRecord,
+    RunStepRecord,
+)
 from flywheel.runtime import FAILURE_PHASES
 from flywheel.state import StateSnapshot
 from flywheel.template import ArtifactDeclaration, Template
@@ -140,11 +146,14 @@ def _run_member_to_yaml(member: RunMemberRecord) -> dict:
         "name": member.name,
         "block_name": member.block_name,
         "status": member.status,
+        "lane": member.lane,
     }
     if member.execution_id is not None:
         entry["execution_id"] = member.execution_id
     if member.output_bindings:
         entry["output_bindings"] = dict(member.output_bindings)
+    if member.invocation_ids:
+        entry["invocation_ids"] = list(member.invocation_ids)
     if member.error is not None:
         entry["error"] = member.error
     return entry
@@ -188,9 +197,12 @@ def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
                 name=raw_member["name"],
                 block_name=raw_member["block_name"],
                 status=raw_member["status"],
+                lane=raw_member.get("lane", DEFAULT_LANE),
                 execution_id=raw_member.get("execution_id"),
                 output_bindings=dict(
                     raw_member.get("output_bindings", {})),
+                invocation_ids=list(
+                    raw_member.get("invocation_ids", [])),
                 error=raw_member.get("error"),
             ))
         steps.append(RunStepRecord(
@@ -200,6 +212,45 @@ def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
             members=members,
         ))
     return steps
+
+
+def _run_fixtures_to_yaml(fixtures: list[RunFixtureRecord]) -> list[dict]:
+    """Serialize run fixture materializations."""
+    return [
+        {
+            "id": fixture.id,
+            "lane": fixture.lane,
+            "name": fixture.name,
+            "artifact_id": fixture.artifact_id,
+            "source": fixture.source,
+        }
+        for fixture in fixtures
+    ]
+
+
+def _run_fixtures_from_yaml(entry: object) -> list[RunFixtureRecord]:
+    """Deserialize run fixture materializations."""
+    if entry is None:
+        return []
+    if not isinstance(entry, list):
+        raise ValueError(
+            f"Run fixtures must be a list, got {type(entry).__name__}"
+        )
+    fixtures: list[RunFixtureRecord] = []
+    for raw_fixture in entry:
+        if not isinstance(raw_fixture, dict):
+            raise ValueError(
+                "Run fixture entries must be mappings, got "
+                f"{type(raw_fixture).__name__}"
+            )
+        fixtures.append(RunFixtureRecord(
+            id=raw_fixture["id"],
+            lane=raw_fixture["lane"],
+            name=raw_fixture["name"],
+            artifact_id=raw_fixture["artifact_id"],
+            source=raw_fixture["source"],
+        ))
+    return fixtures
 
 
 def _state_snapshot_to_yaml(snapshot: StateSnapshot) -> dict:
@@ -312,6 +363,15 @@ class Workspace:
             if candidate not in self.state_snapshots:
                 return candidate
 
+    def generate_run_fixture_id(self, run_id: str) -> str:
+        """Generate a unique fixture ID for one run."""
+        run = self.runs.get(run_id)
+        existing = {fixture.id for fixture in run.fixtures} if run else set()
+        while True:
+            candidate = f"fix_{self._short_uuid()}"
+            if candidate not in existing:
+                return candidate
+
     def _add_artifact(self, instance: ArtifactInstance) -> None:
         """Add an artifact instance to the workspace ledger.
 
@@ -367,6 +427,11 @@ class Workspace:
                         f"Git artifact {instance.id!r} is missing "
                         f"required fields: {', '.join(missing)}"
                     )
+            if instance.produced_by is not None and instance.fixture_id is not None:
+                raise ValueError(
+                    f"Artifact {instance.id!r} cannot have both "
+                    "produced_by and fixture_id"
+                )
             self.artifacts[instance.id] = instance
 
     def _add_execution(self, execution: BlockExecution) -> None:
@@ -572,6 +637,7 @@ class Workspace:
         self,
         kind: str,
         config_snapshot: dict[str, Any] | None = None,
+        lanes: list[str] | None = None,
     ) -> RunRecord:
         """Open a new run and append it to the workspace.
 
@@ -586,6 +652,8 @@ class Workspace:
             config_snapshot: Optional config mapping recorded
                 for later inspection (model names, budgets,
                 etc.).
+            lanes: Optional list of run-scoped artifact lanes.
+                Defaults to the implicit default lane.
 
         Returns:
             The newly-created :class:`RunRecord`.
@@ -603,10 +671,73 @@ class Workspace:
                 config_snapshot=(
                     dict(config_snapshot)
                     if config_snapshot else None),
+                lanes=(
+                    list(lanes) if lanes is not None else [DEFAULT_LANE]
+                ),
             )
             self.runs[candidate] = record
         self.save()
         return record
+
+    def record_run_fixture(
+        self,
+        run_id: str,
+        fixture: RunFixtureRecord,
+    ) -> RunRecord:
+        """Append one fixture materialization to a running run."""
+        with self._lock:
+            current = self.runs.get(run_id)
+            if current is None:
+                raise KeyError(
+                    f"run {run_id!r} is not known to this workspace"
+                )
+            if current.status != "running":
+                raise ValueError(
+                    f"record_run_fixture: run {run_id!r} is already "
+                    f"terminal (status={current.status!r})"
+                )
+            if fixture.lane not in current.lanes:
+                raise ValueError(
+                    f"record_run_fixture: lane {fixture.lane!r} is "
+                    f"not declared for run {run_id!r}"
+                )
+            if fixture.artifact_id not in self.artifacts:
+                raise ValueError(
+                    f"record_run_fixture: artifact "
+                    f"{fixture.artifact_id!r} is not known"
+                )
+            artifact = self.artifacts[fixture.artifact_id]
+            if artifact.fixture_id != fixture.id:
+                raise ValueError(
+                    f"record_run_fixture: artifact "
+                    f"{fixture.artifact_id!r} points at fixture "
+                    f"{artifact.fixture_id!r}, not {fixture.id!r}"
+                )
+            if any(
+                existing.id == fixture.id
+                for existing in current.fixtures
+            ):
+                raise ValueError(
+                    f"record_run_fixture: run {run_id!r} already has "
+                    f"a fixture with id {fixture.id!r}"
+                )
+            if any(
+                existing.lane == fixture.lane
+                and existing.name == fixture.name
+                for existing in current.fixtures
+            ):
+                raise ValueError(
+                    f"record_run_fixture: run {run_id!r} already has "
+                    f"a fixture for lane {fixture.lane!r}, "
+                    f"name {fixture.name!r}"
+                )
+            updated = replace(
+                current,
+                fixtures=[*current.fixtures, fixture],
+            )
+            self.runs[run_id] = updated
+        self.save()
+        return updated
 
     def record_run_step(
         self,
@@ -906,6 +1037,7 @@ class Workspace:
         supersedes: SupersedesRef | None = None,
         supersedes_reason: str | None = None,
         produced_by: str | None = None,
+        fixture_id: str | None = None,
         persist: bool = True,
     ) -> ArtifactInstance:
         """Import an external directory as an artifact instance.
@@ -986,6 +1118,8 @@ class Workspace:
                 from a block execution; ``None`` (the default) for
                 operator-driven imports.  Recorded verbatim on
                 the instance.
+            fixture_id: Optional run fixture ID that materialized
+                this artifact.  Set for pattern fixture artifacts.
             persist: Whether to write ``workspace.yaml`` before
                 returning.  Canonical block commit passes
                 ``False`` so produced artifacts and the producing
@@ -1063,7 +1197,7 @@ class Workspace:
         # already carry provenance via ``produced_by`` and should
         # not have a synthetic source pointing at the transient
         # proposal directory.
-        if source is None and produced_by is None:
+        if source is None and produced_by is None and fixture_id is None:
             source = f"imported from {source_path.resolve()}"
 
         instance = ArtifactInstance(
@@ -1072,6 +1206,7 @@ class Workspace:
             kind="copy",
             created_at=datetime.now(UTC),
             produced_by=produced_by,
+            fixture_id=fixture_id,
             source=source,
             copy_path=artifact_id,
             supersedes=supersedes,
@@ -1396,6 +1531,7 @@ class Workspace:
                 kind=entry["kind"],
                 created_at=datetime.fromisoformat(entry["created_at"]),
                 produced_by=entry.get("produced_by"),
+                fixture_id=entry.get("fixture_id"),
                 source=entry.get("source"),
                 copy_path=entry.get("copy_path"),
                 repo=entry.get("repo"),
@@ -1470,6 +1606,9 @@ class Workspace:
                     if finished else None),
                 status=entry.get("status", "running"),
                 config_snapshot=entry.get("config_snapshot"),
+                lanes=list(entry.get("lanes", [DEFAULT_LANE])),
+                fixtures=_run_fixtures_from_yaml(
+                    entry.get("fixtures")),
                 steps=_run_steps_from_yaml(entry.get("steps")),
                 error=entry.get("error"),
             )
@@ -1506,6 +1645,8 @@ class Workspace:
                 }
                 if inst.produced_by is not None:
                     entry["produced_by"] = inst.produced_by
+                if inst.fixture_id is not None:
+                    entry["fixture_id"] = inst.fixture_id
                 if inst.source is not None:
                     entry["source"] = inst.source
                 if inst.kind == "copy" and inst.copy_path is not None:
@@ -1597,6 +1738,11 @@ class Workspace:
                         run.finished_at.isoformat())
                 if run.config_snapshot is not None:
                     entry["config_snapshot"] = run.config_snapshot
+                if run.lanes != [DEFAULT_LANE]:
+                    entry["lanes"] = list(run.lanes)
+                if run.fixtures:
+                    entry["fixtures"] = _run_fixtures_to_yaml(
+                        run.fixtures)
                 if run.steps:
                     entry["steps"] = [
                         _run_step_to_yaml(step) for step in run.steps

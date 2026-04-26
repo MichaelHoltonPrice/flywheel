@@ -4,6 +4,7 @@ from flywheel.pattern_declaration import (
     PriorOutputBinding,
     parse_pattern_declaration,
 )
+from flywheel.pattern_lanes import DEFAULT_LANE
 
 
 def _pattern(overrides: dict | None = None) -> dict:
@@ -53,6 +54,8 @@ def test_pattern_yaml_parses_into_declaration_model():
     pattern = parse_pattern_declaration(_pattern())
 
     assert pattern.name == "train_eval"
+    assert pattern.lanes == [DEFAULT_LANE]
+    assert pattern.fixtures == {}
     assert [step.name for step in pattern.steps] == ["train", "eval"]
     eval_member = pattern.steps[1].cohort.members[0]
     binding = eval_member.inputs["checkpoint"]
@@ -70,6 +73,46 @@ def test_unknown_success_rule_fails_at_parse_time():
         parse_pattern_declaration(data)
     except ValueError as exc:
         assert "min_successes" in str(exc)
+    else:
+        raise AssertionError("expected parse failure")
+
+
+def test_lanes_fixtures_and_foreach_parse():
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "lanes": ["A", "B"],
+        "fixtures": {
+            "bot": "foundry/templates/assets/bot",
+        },
+        "steps": [
+            {
+                "name": "round_1",
+                "cohort": {
+                    "foreach": "lanes",
+                    "block": "ImproveBot",
+                },
+            }
+        ],
+    })
+
+    assert pattern.lanes == ["A", "B"]
+    assert pattern.fixtures["bot"].source == (
+        "foundry/templates/assets/bot")
+    members = pattern.steps[0].cohort.members
+    assert [(member.name, member.lane, member.block) for member in members] == [
+        ("A", "A", "ImproveBot"),
+        ("B", "B", "ImproveBot"),
+    ]
+
+
+def test_member_lane_must_be_declared():
+    data = _pattern({"lanes": ["A"]})
+    data["steps"][0]["cohort"]["members"][0]["lane"] = "B"
+
+    try:
+        parse_pattern_declaration(data)
+    except ValueError as exc:
+        assert "not declared" in str(exc)
     else:
         raise AssertionError("expected parse failure")
 

@@ -6,6 +6,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from flywheel.pattern_lanes import DEFAULT_LANE
+
+
+@dataclass(frozen=True)
+class RunFixtureRecord:
+    """Fixture artifact materialized for one run lane."""
+
+    id: str
+    lane: str
+    name: str
+    artifact_id: str
+    source: str
+
 
 @dataclass(frozen=True)
 class RunMemberRecord:
@@ -14,8 +27,10 @@ class RunMemberRecord:
     name: str
     block_name: str
     status: Literal["succeeded", "failed", "skipped"]
+    lane: str = DEFAULT_LANE
     execution_id: str | None = None
     output_bindings: dict[str, str] = field(default_factory=dict)
+    invocation_ids: list[str] = field(default_factory=list)
     error: str | None = None
 
 
@@ -50,6 +65,8 @@ class RunRecord:
             ``"stopped"``, or ``"interrupted"``.
         config_snapshot: Optional free-form mapping the caller
             records alongside the run for later inspection.
+        lanes: Declared run-scoped artifact lanes.
+        fixtures: Fixture artifacts materialized for the run.
         steps: Ordered step results recorded for the run.
         error: Optional run-level error summary.
     """
@@ -62,5 +79,7 @@ class RunRecord:
         "running", "succeeded", "failed", "stopped", "interrupted"
     ] = "running"
     config_snapshot: dict[str, Any] | None = None
+    lanes: list[str] = field(default_factory=lambda: [DEFAULT_LANE])
+    fixtures: list[RunFixtureRecord] = field(default_factory=list)
     steps: list[RunStepRecord] = field(default_factory=list)
     error: str | None = None

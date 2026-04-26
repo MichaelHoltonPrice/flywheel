@@ -62,15 +62,19 @@ def normalize_state_mode(value: object, *, block_name: str) -> StateMode:
 
 def pattern_state_lineage_key(
     run_id: str,
+    lane_name: str,
     step_name: str,
     member_name: str,
 ) -> str:
     """Return the default managed-state lineage key for a pattern member."""
-    return f"pattern/{run_id}/step/{step_name}/member/{member_name}"
+    return (
+        f"pattern/{run_id}/lane/{lane_name}/step/{step_name}"
+        f"/member/{member_name}"
+    )
 
 
 def state_compatibility_identity(
-    block_def: "BlockDefinition",
+    block_def: BlockDefinition,
 ) -> dict[str, str]:
     """Return the compatibility identity for a stateful block."""
     payload = {

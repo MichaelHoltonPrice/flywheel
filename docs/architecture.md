@@ -215,11 +215,17 @@ The current pattern implementation is intentionally lean:
 * Each cohort has members.
 * Each member is one canonical block execution.
 * Cohorts support `min_successes: all` and `min_successes: 1`.
+* A pattern may declare lanes, which are run-scoped artifact
+  resolution contexts.
+* Pattern fixtures materialize ordinary copy artifacts per lane at run
+  start.
 * Execution is sequential today, even when a cohort is semantically
   parallel.
 
 Pattern inputs can bind directly to an artifact id or to a prior
-member's output in the same run. The pattern runner records member and
+member's output in the same run. Unbound copy inputs resolve to the
+latest artifact in the member's lane, not the latest workspace-global
+artifact by name. The pattern runner records fixture, member, lane, and
 step results on the `RunRecord`.
 
 The resolver is separate from execution. It reads the current pattern
@@ -239,10 +245,11 @@ The bundled Claude battery currently includes:
 * `examples/hello-agent/`.
 
 Projects invoke the battery as an ordinary block by declaring a block
-that uses the Claude battery image. Prompt bytes are ordinary input
-artifacts, auth and other launch details live in the block declaration,
-and the durable outputs remain ordinary block execution records,
-artifact instances, and state snapshots.
+that uses a project image derived from the Claude battery. Prompt bytes
+belong to that derived image's agent workflow definition, not to the
+workspace artifact graph. Auth and other launch details live in the
+block declaration, and durable outputs remain ordinary block execution
+records, artifact instances, and state snapshots.
 
 If an agent block needs another block to run next, it announces a
 project termination reason whose block declaration routes to the child.
@@ -283,10 +290,10 @@ distinction between semantic cohorts and scheduling concurrency.
 
 ### Artifact Selection and Scope
 
-The current default for unbound copy inputs is latest-by-name. Future
-selection may need explicit policies such as best-scoring artifact,
-per-subclass defaults, run-scoped artifacts, or promotion between
-contexts.
+Ad hoc block execution still uses latest-by-name for unbound copy
+inputs. Pattern execution uses run-scoped lane resolution instead.
+Future selection may need explicit policies such as best-scoring
+artifact, per-subclass defaults, or promotion between contexts.
 
 ### Incremental Replacement
 

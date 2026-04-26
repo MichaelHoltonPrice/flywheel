@@ -158,6 +158,9 @@ class ArtifactInstance:
         produced_by: The execution ID that produced this instance,
             or None for artifacts not produced by a block execution
             (e.g., baseline git snapshots or imported artifacts).
+        fixture_id: The run fixture ID that materialized this
+            instance, or None for artifacts not produced by a
+            fixture.
         source: For imported artifacts, a description of where the
             artifact came from (e.g., a file path). None for
             block-produced and baseline artifacts.
@@ -184,6 +187,7 @@ class ArtifactInstance:
     kind: Literal["copy", "git"]
     created_at: datetime
     produced_by: str | None = None
+    fixture_id: str | None = None
     source: str | None = None
     copy_path: str | None = None
     repo: str | None = None

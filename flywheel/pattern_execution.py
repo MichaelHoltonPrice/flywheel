@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from flywheel.artifact import ArtifactInstance
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.bindings import ArtifactIdBinding
 from flywheel.execution import run_block
@@ -21,7 +22,11 @@ from flywheel.pattern_resolution import (
     WorkspaceView,
     resolve_next_step,
 )
-from flywheel.run_record import RunMemberRecord, RunStepRecord
+from flywheel.run_record import (
+    RunFixtureRecord,
+    RunMemberRecord,
+    RunStepRecord,
+)
 from flywheel.state import pattern_state_lineage_key
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import Template
@@ -56,8 +61,20 @@ def run_pattern(
             f"template {workspace.template_name!r}"
         )
 
-    run = workspace.begin_run(kind=f"pattern:{pattern.name}")
+    _validate_pattern_fixtures(pattern, template)
+    run = workspace.begin_run(
+        kind=f"pattern:{pattern.name}",
+        lanes=list(pattern.lanes),
+    )
     try:
+        _materialize_pattern_fixtures(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            run_id=run.id,
+            validator_registry=validator_registry,
+        )
         while True:
             current_run = workspace.runs[run.id]
             decision = resolve_next_step(
@@ -120,6 +137,7 @@ def _execute_step(
             project_root,
             run_id=run_id,
             step_name=step.name,
+            lane_name=member.lane,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
         )
@@ -130,6 +148,7 @@ def _execute_step(
                     name=remaining.name,
                     block_name=remaining.block,
                     status="skipped",
+                    lane=remaining.lane,
                     error="not launched after prior member failed",
                 )
                 for remaining in step.cohort.members[len(members):]
@@ -153,11 +172,18 @@ def _execute_member(
     *,
     run_id: str,
     step_name: str,
+    lane_name: str,
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
 ) -> RunMemberRecord:
     try:
-        input_bindings = _resolve_member_inputs(workspace, member, run_id)
+        input_bindings = _resolve_member_inputs(
+            workspace,
+            member,
+            run_id,
+            lane_name,
+            template,
+        )
         result = run_block(
             workspace,
             member.block,
@@ -168,7 +194,8 @@ def _execute_member(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             state_lineage_key=pattern_state_lineage_key(
-                run_id, step_name, member.name),
+                run_id, lane_name, step_name, member.name),
+            allow_workspace_latest=False,
         )
     except Exception as exc:
         execution_id = getattr(exc, "flywheel_execution_id", None)
@@ -180,6 +207,7 @@ def _execute_member(
             name=member.name,
             block_name=member.block,
             status="failed",
+            lane=lane_name,
             execution_id=execution_id,
             output_bindings=(
                 dict(execution.output_bindings)
@@ -189,6 +217,8 @@ def _execute_member(
         )
 
     execution = result.execution
+    invocation_ids = _invocation_ids_for_parent(
+        workspace, result.execution_id)
     return RunMemberRecord(
         name=member.name,
         block_name=member.block,
@@ -196,8 +226,10 @@ def _execute_member(
             "succeeded"
             if execution.status == "succeeded" else "failed"
         ),
+        lane=lane_name,
         execution_id=result.execution_id,
         output_bindings=dict(execution.output_bindings),
+        invocation_ids=invocation_ids,
         error=execution.error,
     )
 
@@ -206,6 +238,8 @@ def _resolve_member_inputs(
     workspace: Workspace,
     member: PatternMember,
     run_id: str,
+    lane_name: str,
+    template: Template,
 ) -> dict[str, str]:
     bindings: dict[str, str] = {}
     for slot, source in member.inputs.items():
@@ -216,7 +250,139 @@ def _resolve_member_inputs(
             bindings[slot] = _resolve_prior_output(workspace, run_id, source)
             continue
         raise TypeError(f"unknown input binding {source!r}")
+    block = _block_definition(template, member.block)
+    for slot in block.inputs:
+        if slot.name in bindings:
+            continue
+        decl = template.artifact_declaration(slot.name)
+        if decl is not None and decl.kind == "git":
+            continue
+        artifact_id = _resolve_latest_in_lane(
+            workspace, run_id, lane_name, slot.name)
+        if artifact_id is not None:
+            bindings[slot.name] = artifact_id
+        elif not slot.optional:
+            raise PatternRunError(
+                f"required input {slot.name!r} for member "
+                f"{member.name!r} has no artifact in lane "
+                f"{lane_name!r}"
+            )
     return bindings
+
+
+def _block_definition(template: Template, block_name: str):
+    for block in template.blocks:
+        if block.name == block_name:
+            return block
+    raise PatternRunError(f"block {block_name!r} is not in template")
+
+
+def _resolve_latest_in_lane(
+    workspace: Workspace,
+    run_id: str,
+    lane_name: str,
+    artifact_name: str,
+) -> str | None:
+    run = workspace.runs.get(run_id)
+    if run is None:
+        raise PatternRunError(f"run {run_id!r} is not known")
+    candidates: list[str] = []
+    for fixture in run.fixtures:
+        if fixture.lane == lane_name and fixture.name == artifact_name:
+            candidates.append(fixture.artifact_id)
+    for step in run.steps:
+        for member in step.members:
+            if member.lane != lane_name or member.status != "succeeded":
+                continue
+            artifact_id = member.output_bindings.get(artifact_name)
+            if artifact_id is not None:
+                candidates.append(artifact_id)
+            for invocation_id in member.invocation_ids:
+                invocation = workspace.invocations.get(invocation_id)
+                if invocation is None or invocation.status != "succeeded":
+                    continue
+                child_id = invocation.invoked_execution_id
+                if child_id is None:
+                    continue
+                child = workspace.executions.get(child_id)
+                if child is None:
+                    continue
+                child_artifact_id = child.output_bindings.get(
+                    artifact_name)
+                if child_artifact_id is not None:
+                    candidates.append(child_artifact_id)
+    return candidates[-1] if candidates else None
+
+
+def _invocation_ids_for_parent(
+    workspace: Workspace,
+    execution_id: str,
+) -> list[str]:
+    return [
+        invocation.id
+        for invocation in workspace.invocations.values()
+        if invocation.invoking_execution_id == execution_id
+    ]
+
+
+def _validate_pattern_fixtures(
+    pattern: PatternDeclaration,
+    template: Template,
+) -> None:
+    for fixture in pattern.fixtures.values():
+        declaration = template.artifact_declaration(fixture.name)
+        if declaration is None:
+            raise ValueError(
+                f"Pattern {pattern.name!r} fixture {fixture.name!r} "
+                "does not name a template artifact"
+            )
+        if declaration.kind != "copy":
+            raise ValueError(
+                f"Pattern {pattern.name!r} fixture {fixture.name!r} "
+                f"targets {declaration.kind!r}; fixtures require "
+                "copy artifacts"
+            )
+
+
+def _materialize_pattern_fixtures(
+    workspace: Workspace,
+    pattern: PatternDeclaration,
+    template: Template,
+    project_root: Path,
+    *,
+    run_id: str,
+    validator_registry: ArtifactValidatorRegistry | None,
+) -> None:
+    for lane_name in pattern.lanes:
+        for fixture in pattern.fixtures.values():
+            declaration = template.artifact_declaration(fixture.name)
+            assert declaration is not None
+            source_path = (project_root / fixture.source).resolve()
+            fixture_id = workspace.generate_run_fixture_id(run_id)
+            source = (
+                f"fixture:pattern:{pattern.name}:run:{run_id}:"
+                f"lane:{lane_name}:artifact:{fixture.name}:"
+                f"source:{fixture.source}"
+            )
+            instance: ArtifactInstance = workspace.register_artifact(
+                fixture.name,
+                source_path,
+                source=source,
+                validator_registry=validator_registry,
+                declaration=declaration,
+                fixture_id=fixture_id,
+                persist=False,
+            )
+            workspace.record_run_fixture(
+                run_id,
+                RunFixtureRecord(
+                    id=fixture_id,
+                    lane=lane_name,
+                    name=fixture.name,
+                    artifact_id=instance.id,
+                    source=fixture.source,
+                ),
+            )
 
 
 def _resolve_prior_output(
