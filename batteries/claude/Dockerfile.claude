@@ -29,12 +29,13 @@ RUN pip install claude-agent-sdk httpx mcp Pillow numpy
 # Copy the agent runner.  Project-specific MCP servers are
 # mounted at runtime.
 COPY agent_runner.py /app/agent_runner.py
+COPY handoff_session.py /app/handoff_session.py
 COPY entrypoint.sh /app/entrypoint.sh
 
 # Claude Code refuses --dangerously-skip-permissions as root.
 RUN useradd -m claude \
     && mkdir -p /home/claude/.claude /scratch /app/agent \
-                /flywheel/state /flywheel/control /flywheel/mcp_servers \
+                /flywheel/state /flywheel/mcp_servers \
     && chown -R claude:claude /home/claude /scratch /app /flywheel \
     && chmod +x /app/entrypoint.sh
 
@@ -42,8 +43,8 @@ RUN useradd -m claude \
 # iptables, then drops to claude via su.
 # ``/flywheel/`` is the single namespace for framework-owned
 # runtime data — state (``/flywheel/state/session.jsonl``),
-# control files (``/flywheel/control/*.json``), project-mounted
-# MCP server code (``/flywheel/mcp_servers/``).  Kept distinct
+# project-mounted MCP server code (``/flywheel/mcp_servers/``).
+# Kept distinct
 # from the block body's ``/input`` / ``/output`` / ``/scratch``
 # mounts so it's easy to tell framework-owned files apart from
 # the agent's own working directory.  ``/scratch`` is the agent

@@ -1132,7 +1132,7 @@ def test_run_pattern_derives_managed_state_lineage(
 
     snapshot = reloaded.state_snapshots[train_execution.state_snapshot_id]
     assert snapshot.lineage_key == pattern_state_lineage_key(
-        result.run_id, DEFAULT_LANE, "train", "train_dueling")
+        result.run_id, DEFAULT_LANE, "train")
     assert (
         reloaded.state_snapshot_path(snapshot.id) / "marker.txt"
     ).read_text() == "state"
@@ -1142,11 +1142,11 @@ def test_pattern_state_lineage_key_is_injective_for_underscores():
     run_id = "run_collision"
 
     assert pattern_state_lineage_key(
-        run_id, "x", "train_dueling", "a") != pattern_state_lineage_key(
-            run_id, "x", "train", "dueling_a")
+        run_id, "x_train", "dueling") != pattern_state_lineage_key(
+            run_id, "x", "train_dueling")
     assert pattern_state_lineage_key(
-        run_id, "x_y", "train", "a") != pattern_state_lineage_key(
-            run_id, "x", "y_train", "a")
+        run_id, "x", "train") != pattern_state_lineage_key(
+            run_id, "x", "train_dueling")
 
 
 def test_min_successes_one_runs_all_members_and_succeeds(tmp_path: Path):

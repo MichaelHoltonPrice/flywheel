@@ -213,7 +213,7 @@ def _execute_member(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             state_lineage_key=pattern_state_lineage_key(
-                run_id, lane_name, step_name, member.name),
+                run_id, lane_name, member.block),
             allow_workspace_latest=False,
             env_overlay=env_overlay,
             invocation_params=params,

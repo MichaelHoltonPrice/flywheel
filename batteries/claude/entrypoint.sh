@@ -132,6 +132,14 @@ PROJECTS_DIR=/home/claude/.claude/projects
 SDK_SESSION_DIR="$PROJECTS_DIR/$SCRATCH_ENC"
 PERSISTED_SESSION=/flywheel/state/session.jsonl
 
+if [ -f "$PERSISTED_SESSION" ]; then
+    python3 /app/handoff_session.py \
+        --session "$PERSISTED_SESSION" \
+        --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
+        --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
+        --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
+fi
+
 mkdir -p "$SDK_SESSION_DIR"
 if [ -f "$PERSISTED_SESSION" ]; then
     SID=$(python3 -c '
@@ -156,13 +164,6 @@ chown -R root:root /flywheel/state
 mkdir -p /flywheel/mcp_servers /flywheel/telemetry
 chown root:root /flywheel/telemetry
 chmod 700 /flywheel/telemetry
-
-# The agent may choose a project termination reason, but it does
-# not get a general-purpose framework control directory.  This
-# single narrow file is the only agent-writable Flywheel handoff.
-: > /flywheel/termination_request
-chown claude:claude /flywheel/termination_request
-chmod 600 /flywheel/termination_request
 
 # /flywheel/mcp_servers is read-only project code already
 # chowned to claude in the Dockerfile.  Nothing to do.
@@ -247,15 +248,6 @@ if [ "$RC" -eq 0 ]; then
     REASON=$(python3 - <<'PY'
 import json
 from pathlib import Path
-
-override = Path("/flywheel/termination_request")
-try:
-    reason = override.read_text(encoding="utf-8").strip()
-except Exception:
-    reason = ""
-if reason:
-    print(reason)
-    raise SystemExit(0)
 
 path = Path("/tmp/flywheel-claude-runner.jsonl")
 status = None

@@ -142,7 +142,6 @@ DEFAULT_PROMPT_FILE = Path("/app/agent/prompt.md")
 # Orchestration events are emitted on stdout.  The root entrypoint
 # captures that stream without exposing its capture file to the agent.
 # Neither file is an artifact — they are framework-owned runtime
-PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
 
 # Module-level handoff state.  The PreToolUse hook appends each
@@ -179,6 +178,7 @@ def _sdk_session_path(
 def _build_handoff_hook(
     handoff_tools: set[str],
     deny_marker: str,
+    required_paths: list[Path],
 ):
     """Return a PreToolUse hook that intercepts handoff-mapped tools.
 
@@ -190,9 +190,10 @@ def _build_handoff_hook(
     (which polls ``_HANDOFF_STATE`` after each message).
 
     Multi-tool-use turns: the SDK fires PreToolUse for each
-    tool_use in a single assistant message in order; we capture
-    every match and the host-side driver runs / splices all of
-    them in one stop/restart cycle.
+    tool_use in a single assistant message in order.  A one-shot
+    block execution can hand off only one candidate, so the first
+    matching tool wins; later matching calls are denied without
+    the marker and do not create additional pending work.
 
     Args:
         handoff_tools: Set of fully qualified MCP tool names whose
@@ -202,6 +203,8 @@ def _build_handoff_hook(
         deny_marker: Substring embedded in the deny reason; the
             host-side splice helper uses this to locate the deny
             tool_results on disk.
+        required_paths: Files or directories that must exist before
+            accepting the handoff.
 
     Returns:
         An async hook callable matching the SDK's hook signature.
@@ -216,6 +219,29 @@ def _build_handoff_hook(
             return {}
         if tool_use_id is None:
             return {}
+        missing = [str(p) for p in required_paths if not p.exists()]
+        if missing:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "handoff request rejected: missing required "
+                        f"path(s): {', '.join(missing)}"
+                    ),
+                },
+            }
+        if _HANDOFF_STATE["pending"]:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "handoff request rejected: another handoff "
+                        "is already pending for this turn"
+                    ),
+                },
+            }
         _HANDOFF_STATE["pending"].append({
             "tool_use_id": tool_use_id,
             "tool_name": tool_name,
@@ -234,24 +260,14 @@ def _build_handoff_hook(
     return _hook
 
 
-def _persist_handoff(session_id: str) -> None:
-    """Write the pending tool calls + state file for host pickup.
-
-    Called by the main loop after it observes the handoff signal
-    and the SDK has flushed the deny tool_results to the session
-    JSONL.  The pending file is the canonical handoff payload; the
-    state file mirrors the count + first tool name for quick visibility.
-    """
+def _emit_handoff_pending(session_id: str) -> None:
+    """Emit the pending handoff tool calls on stdout."""
     pending = list(_HANDOFF_STATE["pending"])
     if not pending:
         return
-    payload = {
-        "schema_version": PENDING_TOOL_CALLS_SCHEMA_VERSION,
-        "session_id": session_id,
-        "pending": pending,
-    }
     _emit({
         "type": "handoff_pending",
+        "session_id": session_id,
         "count": len(pending),
         "tool_use_ids": [p["tool_use_id"] for p in pending],
         "tool_names": [p["tool_name"] for p in pending],
@@ -365,7 +381,7 @@ def _emit(data: dict) -> None:
 
 
 def _save_state(session_id: str, status: str, reason: str = "") -> None:
-    """Persist agent exit state into the framework control channel."""
+    """Emit agent exit state on stdout for the root entrypoint."""
     state = {
         "session_id": session_id,
         "status": status,
@@ -508,12 +524,22 @@ async def main() -> None:
     handoff_tools = {
         t.strip() for t in handoff_tools_str.split(",") if t.strip()
     }
+    handoff_required_paths = [
+        Path(p.strip())
+        for p in os.environ.get("HANDOFF_REQUIRED_PATHS", "").split(",")
+        if p.strip()
+    ]
     handoff_deny_marker = os.environ.get(
         "HANDOFF_DENY_MARKER", DEFAULT_HANDOFF_DENY_MARKER)
+    handoff_termination_reason = os.environ.get(
+        "HANDOFF_TERMINATION_REASON", "tool_handoff").strip()
+    if not handoff_termination_reason:
+        handoff_termination_reason = "tool_handoff"
     handoff_hooks_config = None
     if handoff_tools:
         hook_callable = _build_handoff_hook(
-            handoff_tools, handoff_deny_marker)
+            handoff_tools, handoff_deny_marker,
+            handoff_required_paths)
         handoff_hooks_config = {
             "PreToolUse": [
                 HookMatcher(matcher=t, hooks=[hook_callable])
@@ -524,6 +550,8 @@ async def main() -> None:
             "type": "handoff_hook_registered",
             "tools": sorted(handoff_tools),
             "deny_marker": handoff_deny_marker,
+            "termination_reason": handoff_termination_reason,
+            "required_paths": [str(p) for p in handoff_required_paths],
         })
 
     # --- Build options ---
@@ -685,7 +713,7 @@ async def main() -> None:
                 # Tool-call handoff.
                 if pause_reason == "tool_handoff":
                     pending = list(_HANDOFF_STATE["pending"])
-                    _persist_handoff(session_id)
+                    _emit_handoff_pending(session_id)
                     if pending:
                         first = pending[0]["tool_name"]
                         reason = (
@@ -695,7 +723,7 @@ async def main() -> None:
                     else:
                         reason = ""
                     _save_state(
-                        session_id, "tool_handoff", reason)
+                        session_id, handoff_termination_reason, reason)
                     return
 
                 # Natural completion.

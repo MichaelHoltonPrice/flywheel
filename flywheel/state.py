@@ -63,14 +63,10 @@ def normalize_state_mode(value: object, *, block_name: str) -> StateMode:
 def pattern_state_lineage_key(
     run_id: str,
     lane_name: str,
-    step_name: str,
-    member_name: str,
+    block_name: str,
 ) -> str:
-    """Return the default managed-state lineage key for a pattern member."""
-    return (
-        f"pattern/{run_id}/lane/{lane_name}/step/{step_name}"
-        f"/member/{member_name}"
-    )
+    """Return the default managed-state lineage key for a pattern lane."""
+    return f"pattern/{run_id}/lane/{lane_name}/block/{block_name}"
 
 
 def state_compatibility_identity(

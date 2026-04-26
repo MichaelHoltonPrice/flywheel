@@ -64,8 +64,10 @@ template globally.
 A managed-state execution must have a `state_lineage_key`.  The key is
 chosen by the caller:
 
-* Pattern execution derives the key from pattern/run/step/member
-  identity unless the pattern later grows an explicit override.
+* Pattern execution derives the key from pattern run, lane, and block
+  identity unless the pattern later grows an explicit override. Repeated
+  steps in the same lane that run the same managed-state block share one
+  lineage; distinct lanes remain isolated.
 * Ad hoc `flywheel run block` requires an explicit `--state-lineage`
   when running a managed-state block.
 
