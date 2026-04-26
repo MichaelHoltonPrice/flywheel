@@ -30,7 +30,7 @@ docker build -t flywheel-claude:latest -f batteries\claude\Dockerfile.claude bat
 docker build -t flywheel-hello-agent:latest -f examples\hello-agent\Dockerfile.hello-agent examples\hello-agent
 
 docker volume create claude-auth
-docker run --rm -v claude-auth:/auth -v "%USERPROFILE%\.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
+docker run --rm -v claude-auth:/auth -v "%USERPROFILE%\.claude:/host-claude:ro" python:3.12-slim sh -c "cp -a /host-claude/. /auth/ && chown -R 1000:1000 /auth"
 
 cd examples\hello-agent
 
@@ -66,7 +66,7 @@ docker build -t flywheel-claude:latest -f batteries\claude\Dockerfile.claude bat
 docker build -t flywheel-hello-agent:latest -f examples\hello-agent\Dockerfile.hello-agent examples\hello-agent
 
 docker volume create claude-auth
-docker run --rm -v claude-auth:/auth -v "$env:USERPROFILE\.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
+docker run --rm -v claude-auth:/auth -v "$env:USERPROFILE\.claude:/host-claude:ro" python:3.12-slim sh -c "cp -a /host-claude/. /auth/ && chown -R 1000:1000 /auth"
 
 Set-Location examples\hello-agent
 
@@ -102,7 +102,7 @@ docker build -t flywheel-claude:latest -f batteries/claude/Dockerfile.claude bat
 docker build -t flywheel-hello-agent:latest -f examples/hello-agent/Dockerfile.hello-agent examples/hello-agent
 
 docker volume create claude-auth
-docker run --rm -v claude-auth:/auth -v "$HOME/.claude:/host-claude:ro" python:3.12-slim sh -c "cp /host-claude/.credentials.json /auth/.credentials.json && chmod 600 /auth/.credentials.json"
+docker run --rm -v claude-auth:/auth -v "$HOME/.claude:/host-claude:ro" python:3.12-slim sh -c "cp -a /host-claude/. /auth/ && chown -R 1000:1000 /auth"
 
 cd examples/hello-agent
 
