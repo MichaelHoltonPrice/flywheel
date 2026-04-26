@@ -124,6 +124,61 @@ def test_lanes_fixtures_and_foreach_parse():
     ]
 
 
+def test_structured_do_foreach_use_and_run_until_parse():
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {"type": "string", "default": "sonnet"},
+            "max_evals": {"type": "int", "default": 5},
+        },
+        "fixtures": {
+            "bot": "foundry/templates/assets/bot",
+        },
+        "do": [
+            {
+                "foreach": {"count": 2},
+                "do": [
+                    {
+                        "use": "improve_lane",
+                        "with": {
+                            "model": "${params.model}",
+                            "max_evals": "${params.max_evals}",
+                        },
+                    }
+                ],
+            }
+        ],
+        "patterns": {
+            "improve_lane": {
+                "params": {
+                    "model": {"type": "string"},
+                    "max_evals": {"type": "int"},
+                },
+                "do": [
+                    {
+                        "run_until": {
+                            "block": "ImproveBot",
+                            "env": {"MODEL": "${params.model}"},
+                            "continue_on": {
+                                "eval_requested": {
+                                    "max": "${params.max_evals}",
+                                },
+                            },
+                            "stop_on": ["normal"],
+                        },
+                    }
+                ],
+            }
+        },
+    })
+
+    assert pattern.lanes == ["lane_0", "lane_1"]
+    assert pattern.fixtures["bot"].source == "foundry/templates/assets/bot"
+    subpattern = pattern.patterns["improve_lane"]
+    assert subpattern.params["max_evals"].type == "int"
+    assert subpattern.body
+
+
 def test_member_lane_must_be_declared():
     data = _pattern({"lanes": ["A"]})
     data["steps"][0]["cohort"]["members"][0]["lane"] = "B"
@@ -166,5 +221,60 @@ def test_empty_patterns_fail_at_parse_time():
         parse_pattern_declaration({"name": "empty", "steps": []})
     except ValueError as exc:
         assert "non-empty" in str(exc)
+    else:
+        raise AssertionError("expected parse failure")
+
+
+def test_pattern_cannot_declare_steps_and_do():
+    data = _pattern({"do": [{"use": "x"}]})
+
+    try:
+        parse_pattern_declaration(data)
+    except ValueError as exc:
+        assert "either 'steps' or 'do'" in str(exc)
+    else:
+        raise AssertionError("expected parse failure")
+
+
+def test_run_until_requires_continue_on_and_stop_on():
+    for key in ("continue_on", "stop_on"):
+        node = {
+            "block": "ImproveBot",
+            "continue_on": {"eval_requested": {"max": 1}},
+            "stop_on": ["normal"],
+        }
+        node[key] = {} if key == "continue_on" else []
+        try:
+            parse_pattern_declaration({
+                "name": f"missing_{key}",
+                "do": [{"run_until": node}],
+            })
+        except ValueError as exc:
+            assert key in str(exc)
+        else:
+            raise AssertionError("expected parse failure")
+
+
+def test_do_with_foreach_cannot_mix_root_non_foreach_nodes():
+    try:
+        parse_pattern_declaration({
+            "name": "mixed",
+            "do": [
+                {
+                    "foreach": {"count": 2},
+                    "do": [{"use": "inner"}],
+                },
+                {"use": "inner"},
+            ],
+            "patterns": {"inner": {"do": [{
+                "run_until": {
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 1}},
+                    "stop_on": ["normal"],
+                },
+            }]}},
+        })
+    except ValueError as exc:
+        assert "root non-foreach" in str(exc)
     else:
         raise AssertionError("expected parse failure")

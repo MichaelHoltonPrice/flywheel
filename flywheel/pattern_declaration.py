@@ -14,8 +14,8 @@ from typing import Literal
 import yaml
 
 from flywheel.bindings import ArtifactIdBinding
-from flywheel.pattern_params import ParamType, coerce_param_value
 from flywheel.pattern_lanes import DEFAULT_LANE
+from flywheel.pattern_params import ParamType, coerce_param_value
 from flywheel.validation import validate_name
 
 
@@ -78,6 +78,45 @@ class PatternStep:
 
 
 @dataclass(frozen=True)
+class PatternForEach:
+    """Run a body once for each generated lane."""
+
+    lanes: list[str]
+    body: list[PatternNode]
+
+
+@dataclass(frozen=True)
+class PatternUse:
+    """Run a locally-declared sub-pattern in the current lane."""
+
+    pattern: str
+    params: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RunUntilContinuation:
+    """Budget for a termination reason that continues a loop."""
+
+    max: int | str
+
+
+@dataclass(frozen=True)
+class PatternRunUntil:
+    """Repeatedly run one block until a termination reason stops it."""
+
+    name: str
+    block: str
+    inputs: dict[str, InputBinding] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    continue_on: dict[str, RunUntilContinuation] = field(default_factory=dict)
+    stop_on: list[str] = field(default_factory=list)
+
+
+PatternNode = PatternStep | PatternForEach | PatternUse | PatternRunUntil
+
+
+@dataclass(frozen=True)
 class PatternDeclaration:
     """A parsed pattern declaration."""
 
@@ -86,6 +125,8 @@ class PatternDeclaration:
     lanes: list[str]
     fixtures: dict[str, PatternFixture]
     steps: list[PatternStep]
+    body: list[PatternNode] = field(default_factory=list)
+    patterns: dict[str, PatternDeclaration] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: Path) -> PatternDeclaration:
@@ -105,7 +146,9 @@ def parse_pattern_declaration(
     source: str = "<pattern>",
 ) -> PatternDeclaration:
     """Parse and validate a pattern declaration mapping."""
-    unknown = set(data) - {"name", "params", "lanes", "fixtures", "steps"}
+    unknown = set(data) - {
+        "name", "params", "lanes", "fixtures", "steps", "do", "patterns",
+    }
     if unknown:
         raise ValueError(
             f"Pattern {source}: unknown top-level key(s) "
@@ -116,31 +159,57 @@ def parse_pattern_declaration(
         raise ValueError(f"Pattern {source}: missing string 'name'")
     validate_name(name, "Pattern")
     params = _parse_params(data.get("params", {}), pattern_name=name)
-    lanes = _parse_lanes(data.get("lanes"), pattern_name=name)
     fixtures = _parse_fixtures(data.get("fixtures", {}), pattern_name=name)
-    raw_steps = data.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise ValueError(
-            f"Pattern {name!r}: 'steps' must be a non-empty list"
-        )
-
     steps: list[PatternStep] = []
-    step_names: set[str] = set()
-    for raw_step in raw_steps:
-        step = _parse_step(raw_step, pattern_name=name, lanes=lanes)
-        if step.name in step_names:
+    body: list[PatternNode] = []
+    if "steps" in data and "do" in data:
+        raise ValueError(
+            f"Pattern {name!r}: declare either 'steps' or 'do', not both"
+        )
+    patterns = _parse_local_patterns(
+        data.get("patterns", {}), parent_name=name, source=source)
+    if "steps" in data:
+        lanes = _parse_lanes(data.get("lanes"), pattern_name=name)
+        raw_steps = data.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
             raise ValueError(
-                f"Pattern {name!r}: duplicate step name "
-                f"{step.name!r}"
+                f"Pattern {name!r}: 'steps' must be a non-empty list"
             )
-        step_names.add(step.name)
-        steps.append(step)
+        step_names: set[str] = set()
+        for raw_step in raw_steps:
+            step = _parse_step(raw_step, pattern_name=name, lanes=lanes)
+            if step.name in step_names:
+                raise ValueError(
+                    f"Pattern {name!r}: duplicate step name "
+                    f"{step.name!r}"
+                )
+            step_names.add(step.name)
+            steps.append(step)
+    elif "do" in data:
+        body = _parse_body(data.get("do"), pattern_name=name)
+        declared_lanes = _collect_body_lanes(body)
+        lanes = (
+            _parse_lanes(data.get("lanes"), pattern_name=name)
+            if "lanes" in data else declared_lanes or [DEFAULT_LANE]
+        )
+        if declared_lanes and _body_has_root_non_foreach(body):
+            raise ValueError(
+                f"Pattern {name!r}: a root 'do' body that declares "
+                "foreach lanes must not mix root non-foreach nodes; "
+                "put non-foreach work inside the foreach body"
+            )
+    else:
+        raise ValueError(
+            f"Pattern {name!r}: declare non-empty 'steps' or 'do'"
+        )
     return PatternDeclaration(
         name=name,
         params=params,
         lanes=lanes,
         fixtures=fixtures,
         steps=steps,
+        body=body,
+        patterns=patterns,
     )
 
 
@@ -246,6 +315,299 @@ def _parse_fixtures(
             )
         fixtures[name] = PatternFixture(name=name, source=source)
     return fixtures
+
+
+def _parse_local_patterns(
+    raw: object,
+    *,
+    parent_name: str,
+    source: str,
+) -> dict[str, PatternDeclaration]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {parent_name!r}: 'patterns' must be a mapping"
+        )
+    patterns: dict[str, PatternDeclaration] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str):
+            raise ValueError(
+                f"Pattern {parent_name!r}: local pattern names must "
+                "be strings"
+            )
+        validate_name(name, "Local pattern")
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"Pattern {parent_name!r}: local pattern {name!r} "
+                "must be a mapping"
+            )
+        merged = {"name": name, **spec}
+        if "fixtures" in merged:
+            raise ValueError(
+                f"Pattern {parent_name!r}: local pattern {name!r} "
+                "must not declare fixtures; fixtures belong to the "
+                "owning run"
+            )
+        patterns[name] = parse_pattern_declaration(
+            merged,
+            source=f"{source} patterns[{name!r}]",
+        )
+    return patterns
+
+
+def _parse_body(raw: object, *, pattern_name: str) -> list[PatternNode]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: 'do' must be a non-empty list"
+        )
+    return [
+        _parse_body_node(item, pattern_name=pattern_name, index=index)
+        for index, item in enumerate(raw)
+    ]
+
+
+def _parse_body_node(
+    raw: object,
+    *,
+    pattern_name: str,
+    index: int,
+) -> PatternNode:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: do[{index}] must be a mapping"
+        )
+    present = [key for key in ("foreach", "use", "run_until", "cohort")
+               if key in raw]
+    if len(present) != 1:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: do[{index}] must declare exactly "
+            "one of foreach, use, run_until, or cohort"
+        )
+    if "cohort" in raw:
+        return _parse_step(raw, pattern_name=pattern_name, lanes=[DEFAULT_LANE])
+    if "foreach" in raw:
+        unknown = set(raw) - {"foreach", "do"}
+        if unknown:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: foreach node has unknown "
+                f"key(s) {sorted(unknown)!r}"
+            )
+        return _parse_foreach_node(raw, pattern_name=pattern_name)
+    if "use" in raw:
+        unknown = set(raw) - {"use", "with"}
+        if unknown:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: use node has unknown "
+                f"key(s) {sorted(unknown)!r}"
+            )
+        target = raw["use"]
+        if not isinstance(target, str):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: use target must be a string"
+            )
+        validate_name(target, "Local pattern")
+        raw_params = raw.get("with", {})
+        if raw_params is None:
+            raw_params = {}
+        if not isinstance(raw_params, dict):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: use {target!r} 'with' "
+                "must be a mapping"
+            )
+        params: dict[str, object] = {}
+        for key, value in raw_params.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"Pattern {pattern_name!r}: use {target!r} "
+                    "param names must be strings"
+                )
+            validate_name(key, "Pattern param")
+            if not isinstance(value, (str, int, float, bool)):
+                raise ValueError(
+                    f"Pattern {pattern_name!r}: use {target!r} "
+                    f"param {key!r} must be a scalar"
+                )
+            params[key] = value
+        return PatternUse(pattern=target, params=params)
+    return _parse_run_until_node(raw["run_until"], pattern_name=pattern_name)
+
+
+def _parse_foreach_node(
+    raw: dict,
+    *,
+    pattern_name: str,
+) -> PatternForEach:
+    spec = raw["foreach"]
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: foreach must be a mapping"
+        )
+    unknown = set(spec) - {"count"}
+    if unknown:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: foreach has unknown key(s) "
+            f"{sorted(unknown)!r}"
+        )
+    count = spec.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: foreach.count must be a "
+            "positive integer"
+        )
+    lanes = [f"lane_{index}" for index in range(count)]
+    return PatternForEach(
+        lanes=lanes,
+        body=_parse_body(raw.get("do"), pattern_name=pattern_name),
+    )
+
+
+def _parse_run_until_node(
+    raw: object,
+    *,
+    pattern_name: str,
+) -> PatternRunUntil:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until must be a mapping"
+        )
+    unknown = set(raw) - {
+        "name", "block", "inputs", "args", "env", "continue_on", "stop_on",
+    }
+    if unknown:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until has unknown key(s) "
+            f"{sorted(unknown)!r}"
+        )
+    block = raw.get("block")
+    if not isinstance(block, str):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until missing string 'block'"
+        )
+    validate_name(block, "Block")
+    name = raw.get("name", block)
+    if not isinstance(name, str):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until name must be a string"
+        )
+    validate_name(name, "run_until")
+    args = raw.get("args", [])
+    if not isinstance(args, list) or not all(
+        isinstance(item, str) for item in args
+    ):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until 'args' must be a "
+            "list of strings"
+        )
+    continue_on = _parse_continue_on(
+        raw.get("continue_on"), pattern_name=pattern_name, node_name=name)
+    stop_on = _parse_stop_on(
+        raw.get("stop_on"), pattern_name=pattern_name, node_name=name)
+    if not continue_on:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {name!r} must "
+            "declare at least one continue_on reason"
+        )
+    if not stop_on:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {name!r} must "
+            "declare at least one stop_on reason"
+        )
+    return PatternRunUntil(
+        name=name,
+        block=block,
+        inputs=_parse_inputs(raw.get("inputs", {}), member_name=name),
+        args=list(args),
+        env=_parse_env(raw.get("env", {}), owner=(
+            f"Pattern {pattern_name!r} run_until {name!r}")),
+        continue_on=continue_on,
+        stop_on=stop_on,
+    )
+
+
+def _parse_continue_on(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> dict[str, RunUntilContinuation]:
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'continue_on' must be a non-empty mapping"
+        )
+    parsed: dict[str, RunUntilContinuation] = {}
+    for reason, spec in raw.items():
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                "continue_on reasons must be non-empty strings"
+            )
+        if isinstance(spec, int) and not isinstance(spec, bool):
+            max_value: int | str = spec
+        elif isinstance(spec, str):
+            max_value = spec
+        elif isinstance(spec, dict) and set(spec) == {"max"}:
+            value = spec["max"]
+            if not isinstance(value, (int, str)) or isinstance(value, bool):
+                raise ValueError(
+                    f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                    f"continue_on[{reason!r}].max must be an int or string"
+                )
+            max_value = value
+        else:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"continue_on[{reason!r}] must be an int, string, "
+                "or {max: ...}"
+            )
+        parsed[reason] = RunUntilContinuation(max=max_value)
+    return parsed
+
+
+def _parse_stop_on(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> list[str]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'stop_on' must be a non-empty list"
+        )
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for reason in raw:
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                "stop_on reasons must be non-empty strings"
+            )
+        if reason in seen:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"duplicate stop_on reason {reason!r}"
+            )
+        seen.add(reason)
+        reasons.append(reason)
+    return reasons
+
+
+def _collect_body_lanes(nodes: list[PatternNode]) -> list[str]:
+    lanes: list[str] = []
+    seen: set[str] = set()
+    for node in nodes:
+        if isinstance(node, PatternForEach):
+            for lane in node.lanes:
+                if lane not in seen:
+                    seen.add(lane)
+                    lanes.append(lane)
+    return lanes
+
+
+def _body_has_root_non_foreach(nodes: list[PatternNode]) -> bool:
+    return any(not isinstance(node, PatternForEach) for node in nodes)
 
 
 def _parse_step(

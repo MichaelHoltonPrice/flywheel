@@ -12,10 +12,15 @@ from flywheel.bindings import ArtifactIdBinding
 from flywheel.execution import run_block
 from flywheel.pattern_declaration import (
     PatternDeclaration,
+    PatternForEach,
     PatternMember,
+    PatternNode,
+    PatternRunUntil,
     PatternStep,
+    PatternUse,
     PriorOutputBinding,
 )
+from flywheel.pattern_lanes import DEFAULT_LANE
 from flywheel.pattern_params import (
     PatternParamError,
     coerce_param_value,
@@ -85,6 +90,26 @@ def run_pattern(
             run_id=run.id,
             validator_registry=validator_registry,
         )
+        if pattern.body:
+            _execute_body(
+                workspace,
+                pattern.body,
+                pattern,
+                template,
+                project_root,
+                run_id=run.id,
+                lane_name=(
+                    pattern.lanes[0]
+                    if pattern.lanes == [DEFAULT_LANE]
+                    else DEFAULT_LANE
+                ),
+                step_prefix=[],
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+            )
+            workspace.end_run(run.id, "succeeded")
+            return PatternRunResult(run_id=run.id, status="succeeded")
         while True:
             current_run = workspace.runs[run.id]
             decision = resolve_next_step(
@@ -126,6 +151,336 @@ def run_pattern(
         _close_running_run(
             workspace, run.id, "failed", error=str(exc))
         raise
+
+
+def _execute_body(
+    workspace: Workspace,
+    nodes: list[PatternNode],
+    pattern: PatternDeclaration,
+    template: Template,
+    project_root: Path,
+    *,
+    run_id: str,
+    lane_name: str,
+    step_prefix: list[str],
+    validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
+) -> None:
+    for index, node in enumerate(nodes):
+        if isinstance(node, PatternForEach):
+            _execute_foreach(
+                workspace,
+                node,
+                pattern,
+                template,
+                project_root,
+                run_id=run_id,
+                step_prefix=[*step_prefix, f"foreach_{index + 1}"],
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+            )
+            continue
+        if isinstance(node, PatternUse):
+            _execute_use(
+                workspace,
+                node,
+                pattern,
+                template,
+                project_root,
+                run_id=run_id,
+                lane_name=lane_name,
+                step_prefix=[*step_prefix, node.pattern],
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+            )
+            continue
+        if isinstance(node, PatternRunUntil):
+            _execute_run_until(
+                workspace,
+                node,
+                template,
+                project_root,
+                run_id=run_id,
+                lane_name=lane_name,
+                step_prefix=step_prefix,
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+            )
+            continue
+        if isinstance(node, PatternStep):
+            step_result = _execute_step(
+                workspace,
+                node,
+                template,
+                project_root,
+                run_id=run_id,
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+            )
+            workspace.record_run_step(run_id, step_result)
+            if step_result.status == "failed":
+                raise PatternRunError(f"step {node.name!r} failed")
+            continue
+        raise TypeError(f"unknown pattern node {node!r}")
+
+
+def _execute_foreach(
+    workspace: Workspace,
+    node: PatternForEach,
+    pattern: PatternDeclaration,
+    template: Template,
+    project_root: Path,
+    *,
+    run_id: str,
+    step_prefix: list[str],
+    validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
+) -> None:
+    for lane_name in node.lanes:
+        _execute_body(
+            workspace,
+            node.body,
+            pattern,
+            template,
+            project_root,
+            run_id=run_id,
+            lane_name=lane_name,
+            step_prefix=[*step_prefix, lane_name],
+            validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
+            params=params,
+        )
+
+
+def _execute_use(
+    workspace: Workspace,
+    node: PatternUse,
+    pattern: PatternDeclaration,
+    template: Template,
+    project_root: Path,
+    *,
+    run_id: str,
+    lane_name: str,
+    step_prefix: list[str],
+    validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
+) -> None:
+    subpattern = pattern.patterns.get(node.pattern)
+    if subpattern is None:
+        raise PatternRunError(
+            f"pattern {pattern.name!r} uses unknown local pattern "
+            f"{node.pattern!r}"
+        )
+    provided = {
+        key: (
+            substitute_params(value, params)
+            if isinstance(value, str) else value
+        )
+        for key, value in node.params.items()
+    }
+    child_params = resolve_pattern_params(
+        subpattern,
+        {key: str(value) for key, value in provided.items()},
+    )
+    _execute_body(
+        workspace,
+        subpattern.body,
+        subpattern,
+        template,
+        project_root,
+        run_id=run_id,
+        lane_name=lane_name,
+        step_prefix=step_prefix,
+        validator_registry=validator_registry,
+        state_validator_registry=state_validator_registry,
+        params=child_params,
+    )
+
+
+def _execute_run_until(
+    workspace: Workspace,
+    node: PatternRunUntil,
+    template: Template,
+    project_root: Path,
+    *,
+    run_id: str,
+    lane_name: str,
+    step_prefix: list[str],
+    validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
+) -> None:
+    budgets = {
+        reason: _resolve_positive_int(
+            budget.max,
+            params,
+            context=(
+                f"run_until {node.name!r} continue_on[{reason!r}].max"
+            ),
+        )
+        for reason, budget in node.continue_on.items()
+    }
+    reason_counts = {reason: 0 for reason in budgets}
+    iteration = 0
+    step_name = _generated_step_name([*step_prefix, node.name])
+    step: RunStepRecord | None = None
+    while True:
+        iteration += 1
+        member = PatternMember(
+            name=f"iter_{iteration}",
+            block=node.block,
+            lane=lane_name,
+            inputs=dict(node.inputs),
+            args=list(node.args),
+            env=dict(node.env),
+        )
+        result = _execute_member(
+            workspace,
+            member,
+            template,
+            project_root,
+            run_id=run_id,
+            step_name=step_name,
+            lane_name=lane_name,
+            validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
+            params=params,
+        )
+        members = [*step.members, result] if step is not None else [result]
+        step = RunStepRecord(
+            name=step_name,
+            min_successes=1,
+            status=(
+                "succeeded"
+                if result.status == "succeeded" else "failed"
+            ),
+            members=members,
+            kind="run_until",
+            reason_counts=dict(reason_counts),
+        )
+        if iteration == 1:
+            workspace.record_run_step(run_id, step)
+        else:
+            workspace.replace_run_step(run_id, step)
+        if result.status != "succeeded":
+            step = _finish_run_until_step(
+                workspace,
+                run_id,
+                step,
+                status="failed",
+                stop_kind="failed",
+                terminal_reason=None,
+                reason_counts=reason_counts,
+            )
+            raise PatternRunError(
+                result.error or f"run_until {node.name!r} failed"
+            )
+        assert result.execution_id is not None
+        execution = workspace.executions[result.execution_id]
+        reason = execution.termination_reason
+        if reason in node.stop_on:
+            _finish_run_until_step(
+                workspace,
+                run_id,
+                step,
+                status="succeeded",
+                stop_kind="stop_on",
+                terminal_reason=reason,
+                reason_counts=reason_counts,
+            )
+            return
+        if reason in budgets:
+            reason_counts[reason] += 1
+            if reason_counts[reason] >= budgets[reason]:
+                _finish_run_until_step(
+                    workspace,
+                    run_id,
+                    step,
+                    status="succeeded",
+                    stop_kind="budget_exhausted",
+                    terminal_reason=reason,
+                    reason_counts=reason_counts,
+                )
+                return
+            step = _finish_run_until_step(
+                workspace,
+                run_id,
+                step,
+                status="succeeded",
+                stop_kind=None,
+                terminal_reason=None,
+                reason_counts=reason_counts,
+            )
+            continue
+        _finish_run_until_step(
+            workspace,
+            run_id,
+            step,
+            status="failed",
+            stop_kind="unexpected_reason",
+            terminal_reason=reason,
+            reason_counts=reason_counts,
+        )
+        raise PatternRunError(
+            f"run_until {node.name!r} received unexpected "
+            f"termination reason {reason!r}"
+        )
+
+
+def _finish_run_until_step(
+    workspace: Workspace,
+    run_id: str,
+    step: RunStepRecord,
+    *,
+    status: Literal["succeeded", "failed"],
+    stop_kind: str | None,
+    terminal_reason: str | None,
+    reason_counts: dict[str, int],
+) -> RunStepRecord:
+    updated = RunStepRecord(
+        name=step.name,
+        min_successes=step.min_successes,
+        status=status,
+        members=list(step.members),
+        kind=step.kind,
+        terminal_reason=terminal_reason,
+        stop_kind=stop_kind,
+        reason_counts=dict(reason_counts),
+    )
+    workspace.replace_run_step(run_id, updated)
+    return updated
+
+
+def _resolve_positive_int(
+    value: int | str,
+    params: dict[str, object],
+    *,
+    context: str,
+) -> int:
+    rendered = substitute_params(value, params) if isinstance(value, str) else value
+    try:
+        parsed = int(rendered)
+    except (TypeError, ValueError) as exc:
+        raise PatternParamError(f"{context} must resolve to an integer") from exc
+    if parsed < 1:
+        raise PatternParamError(f"{context} must be positive")
+    return parsed
+
+
+def _generated_step_name(parts: list[str]) -> str:
+    cleaned = [
+        "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in part)
+        for part in parts
+        if part
+    ]
+    return "__".join(cleaned)
 
 
 def _execute_step(
@@ -299,37 +654,170 @@ def _validate_pattern_param_references(
     pattern: PatternDeclaration,
     template: Template,
 ) -> None:
-    declared = set(pattern.params)
+    def validate_one(current: PatternDeclaration) -> None:
+        declared = set(current.params)
 
-    def check(value: str, context: str) -> None:
-        unknown = referenced_params(value) - declared
-        if unknown:
-            raise PatternParamError(
-                f"Pattern {pattern.name!r}: {context} references "
-                f"unknown param(s) {sorted(unknown)!r}"
+        def check(value: str, context: str) -> None:
+            unknown = referenced_params(value) - declared
+            if unknown:
+                raise PatternParamError(
+                    f"Pattern {current.name!r}: {context} references "
+                    f"unknown param(s) {sorted(unknown)!r}"
+                )
+
+        used_blocks: set[str] = set()
+        if current.body:
+            _validate_body_uses(current.body, current.patterns)
+            _collect_body_param_references(
+                current.body,
+                check=check,
+                used_blocks=used_blocks,
             )
+            _validate_body_run_until_reasons(current.body, template)
+        for step in current.steps:
+            for member in step.cohort.members:
+                used_blocks.add(member.block)
+                _check_member_param_references(member, check=check)
 
-    used_blocks: set[str] = set()
-    for step in pattern.steps:
-        for member in step.cohort.members:
-            used_blocks.add(member.block)
-            for arg in member.args:
-                check(arg, f"member {member.name!r} arg")
-            for key, value in member.env.items():
-                check(value, f"member {member.name!r} env {key!r}")
+        for block_name in sorted(used_blocks):
+            block = _block_definition(template, block_name)
+            for reason, routes in block.on_termination.items():
+                for route in routes:
+                    for arg in route.args:
+                        check(
+                            arg,
+                            (
+                                f"block {block.name!r} "
+                                f"on_termination[{reason!r}] arg"
+                            ),
+                        )
 
-    for block_name in sorted(used_blocks):
-        block = _block_definition(template, block_name)
-        for reason, routes in block.on_termination.items():
-            for route in routes:
-                for arg in route.args:
+    def visit(current: PatternDeclaration) -> None:
+        validate_one(current)
+        for subpattern in current.patterns.values():
+            visit(subpattern)
+
+    visit(pattern)
+
+
+def _check_member_param_references(
+    member: PatternMember,
+    *,
+    check,
+) -> None:
+    for arg in member.args:
+        check(arg, f"member {member.name!r} arg")
+    for key, value in member.env.items():
+        check(value, f"member {member.name!r} env {key!r}")
+
+
+def _collect_body_param_references(
+    nodes: list[PatternNode],
+    *,
+    check,
+    used_blocks: set[str],
+) -> None:
+    for node in nodes:
+        if isinstance(node, PatternForEach):
+            _collect_body_param_references(
+                node.body,
+                check=check,
+                used_blocks=used_blocks,
+            )
+            continue
+        if isinstance(node, PatternUse):
+            for key, value in node.params.items():
+                if isinstance(value, str):
+                    check(value, f"use {node.pattern!r} param {key!r}")
+            continue
+        if isinstance(node, PatternRunUntil):
+            used_blocks.add(node.block)
+            member = PatternMember(
+                name=node.name,
+                block=node.block,
+                inputs=dict(node.inputs),
+                args=list(node.args),
+                env=dict(node.env),
+            )
+            _check_member_param_references(member, check=check)
+            for reason, budget in node.continue_on.items():
+                if isinstance(budget.max, str):
                     check(
-                        arg,
+                        budget.max,
                         (
-                            f"block {block.name!r} "
-                            f"on_termination[{reason!r}] arg"
+                            f"run_until {node.name!r} "
+                            f"continue_on[{reason!r}].max"
                         ),
                     )
+            continue
+        if isinstance(node, PatternStep):
+            for member in node.cohort.members:
+                used_blocks.add(member.block)
+                _check_member_param_references(member, check=check)
+            continue
+        raise TypeError(f"unknown pattern node {node!r}")
+
+
+def _validate_body_uses(
+    nodes: list[PatternNode],
+    patterns: dict[str, PatternDeclaration],
+) -> None:
+    for node in nodes:
+        if isinstance(node, PatternForEach):
+            _validate_body_uses(node.body, patterns)
+        elif isinstance(node, PatternUse):
+            subpattern = patterns.get(node.pattern)
+            if subpattern is None:
+                raise PatternRunError(
+                    f"use references unknown local pattern {node.pattern!r}"
+                )
+            unknown = set(node.params) - set(subpattern.params)
+            if unknown:
+                raise PatternParamError(
+                    f"use {node.pattern!r} supplies unknown param(s) "
+                    f"{sorted(unknown)!r}"
+                )
+            missing = {
+                name
+                for name, param in subpattern.params.items()
+                if param.default is None and name not in node.params
+            }
+            if missing:
+                raise PatternParamError(
+                    f"use {node.pattern!r} is missing required param(s) "
+                    f"{sorted(missing)!r}"
+                )
+
+
+def _validate_body_run_until_reasons(
+    nodes: list[PatternNode],
+    template: Template,
+) -> None:
+    for node in nodes:
+        if isinstance(node, PatternForEach):
+            _validate_body_run_until_reasons(node.body, template)
+            continue
+        if isinstance(node, PatternRunUntil):
+            block = _block_definition(template, node.block)
+            declared = set(block.outputs)
+            required = set(node.continue_on) | set(node.stop_on)
+            missing = required - declared
+            if missing:
+                raise PatternRunError(
+                    f"run_until {node.name!r} references termination "
+                    f"reason(s) {sorted(missing)!r} not declared by "
+                    f"block {node.block!r}"
+                )
+            overlap = set(node.continue_on) & set(node.stop_on)
+            if overlap:
+                raise PatternRunError(
+                    f"run_until {node.name!r} lists reason(s) "
+                    f"{sorted(overlap)!r} in both continue_on and stop_on"
+                )
+            continue
+        if isinstance(node, (PatternStep, PatternUse)):
+            continue
+        raise TypeError(f"unknown pattern node {node!r}")
 
 
 def _resolve_member_inputs(

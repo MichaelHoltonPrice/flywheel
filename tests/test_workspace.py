@@ -1318,6 +1318,40 @@ class TestRuns:
             "checkpoint": "checkpoint@1"
         }
 
+    def test_run_until_step_metadata_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:improve")
+
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="lane_0__improve",
+                min_successes=1,
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="iter_1",
+                        block_name="ImproveBot",
+                        status="succeeded",
+                        lane="lane_0",
+                        execution_id="exec_1",
+                    )
+                ],
+                kind="run_until",
+                terminal_reason="eval_requested",
+                stop_kind="budget_exhausted",
+                reason_counts={"eval_requested": 5},
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        step = Workspace.load(ws.path).runs[record.id].steps[0]
+        assert step.kind == "run_until"
+        assert step.terminal_reason == "eval_requested"
+        assert step.stop_kind == "budget_exhausted"
+        assert step.reason_counts == {"eval_requested": 5}
+
     def test_load_without_runs_key(self, tmp_path: Path):
         """Old workspace.yaml without runs key loads to empty dict."""
         _, foundry_dir, template = _setup_project(tmp_path)

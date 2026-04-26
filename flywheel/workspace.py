@@ -163,7 +163,7 @@ def _run_member_to_yaml(member: RunMemberRecord) -> dict:
 
 def _run_step_to_yaml(step: RunStepRecord) -> dict:
     """Serialize a run step result for ``workspace.yaml``."""
-    return {
+    entry: dict[str, Any] = {
         "name": step.name,
         "min_successes": step.min_successes,
         "status": step.status,
@@ -171,6 +171,15 @@ def _run_step_to_yaml(step: RunStepRecord) -> dict:
             _run_member_to_yaml(member) for member in step.members
         ],
     }
+    if step.kind != "cohort":
+        entry["kind"] = step.kind
+    if step.terminal_reason is not None:
+        entry["terminal_reason"] = step.terminal_reason
+    if step.stop_kind is not None:
+        entry["stop_kind"] = step.stop_kind
+    if step.reason_counts:
+        entry["reason_counts"] = dict(step.reason_counts)
+    return entry
 
 
 def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
@@ -212,6 +221,10 @@ def _run_steps_from_yaml(entry: object) -> list[RunStepRecord]:
             min_successes=raw_step["min_successes"],
             status=raw_step["status"],
             members=members,
+            kind=raw_step.get("kind", "cohort"),
+            terminal_reason=raw_step.get("terminal_reason"),
+            stop_kind=raw_step.get("stop_kind"),
+            reason_counts=dict(raw_step.get("reason_counts", {})),
         ))
     return steps
 
@@ -837,6 +850,41 @@ class Workspace:
                 current,
                 steps=[*current.steps, step],
             )
+            self.runs[run_id] = updated
+        self.save()
+        return updated
+
+    def replace_run_step(
+        self,
+        run_id: str,
+        step: RunStepRecord,
+    ) -> RunRecord:
+        """Replace one existing step result on a running run."""
+        with self._lock:
+            current = self.runs.get(run_id)
+            if current is None:
+                raise KeyError(
+                    f"run {run_id!r} is not known to this workspace"
+                )
+            if current.status != "running":
+                raise ValueError(
+                    f"replace_run_step: run {run_id!r} is already "
+                    f"terminal (status={current.status!r})"
+                )
+            replaced = False
+            steps: list[RunStepRecord] = []
+            for existing in current.steps:
+                if existing.name == step.name:
+                    steps.append(step)
+                    replaced = True
+                else:
+                    steps.append(existing)
+            if not replaced:
+                raise KeyError(
+                    f"replace_run_step: run {run_id!r} has no step "
+                    f"named {step.name!r}"
+                )
+            updated = replace(current, steps=steps)
             self.runs[run_id] = updated
         self.save()
         return updated

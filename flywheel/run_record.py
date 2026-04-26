@@ -42,6 +42,12 @@ class RunStepRecord:
     min_successes: int | Literal["all"]
     status: Literal["succeeded", "failed"]
     members: list[RunMemberRecord] = field(default_factory=list)
+    kind: Literal["cohort", "run_until"] = "cohort"
+    terminal_reason: str | None = None
+    stop_kind: Literal[
+        "stop_on", "budget_exhausted", "failed", "unexpected_reason",
+    ] | None = None
+    reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

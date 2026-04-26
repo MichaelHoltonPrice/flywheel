@@ -6,9 +6,10 @@ input handoff, and success rule for a multi-step workflow without
 letting the workflow runner forge artifacts or write block execution
 records directly.
 
-Each pattern run opens a `RunRecord`, resolves one cohort at a time,
-executes each member through `flywheel.execution.run_block`, records
-cohort membership on the run, and closes the run.
+Each pattern run opens a `RunRecord`, materializes run fixtures,
+executes the declared pattern body through
+`flywheel.execution.run_block`, records executed members on the run,
+and closes the run.
 
 Block executions produced by a pattern use the same prepare, invoke,
 commit, validation, quarantine, and ledger path as ad hoc
@@ -50,25 +51,56 @@ steps:
               output: checkpoint
 ```
 
-Patterns may also declare lanes and fixtures:
+The legacy `steps:` form remains supported for linear cohort patterns.
+New patterns should use `do:`, a structured executable body. For
+example, this pattern runs two independent lanes. Each lane runs a
+local sub-pattern that repeatedly runs `ImproveBot` until the agent
+exits normally or has requested five evaluations:
 
 ```yaml
 name: improve_bot
-lanes: [A, B, C]
+params:
+  model:
+    type: string
+    default: claude-sonnet-4-6[1m]
+  max_evals:
+    type: int
+    default: 5
 fixtures:
   bot: foundry/templates/assets/bots/baseline
-steps:
-  - name: improve_1
-    cohort:
-      min_successes: all
-      foreach: lanes
-      block: ImproveBot
+do:
+  - foreach:
+      count: 2
+    do:
+      - use: improve_bot_lane
+        with:
+          model: ${params.model}
+          max_evals: ${params.max_evals}
+patterns:
+  improve_bot_lane:
+    params:
+      model:
+        type: string
+      max_evals:
+        type: int
+    do:
+      - run_until:
+          block: ImproveBot
+          env:
+            MODEL: ${params.model}
+          continue_on:
+            eval_requested:
+              max: ${params.max_evals}
+          stop_on:
+            - normal
 ```
 
-`steps` is an ordered, non-empty list. Step names are unique within a
-pattern. Member names are unique within a step. Pattern members are
-block executions. If omitted, `lanes` defaults to a single implicit
-`default` lane.
+`steps` is an ordered, non-empty list of cohorts. `do` is an ordered,
+non-empty list of pattern body nodes. A pattern must declare one or the
+other, not both. Pattern members are block executions. If omitted,
+`lanes` defaults to a single implicit `default` lane unless the root
+body declares a `foreach.count`, in which case Flywheel generates
+stable lanes named `lane_0`, `lane_1`, and so on.
 
 ## Parameters
 
@@ -107,6 +139,11 @@ steps:
 Invocation route args may also use the same placeholder syntax. Unknown
 parameter names are errors; Flywheel does not silently pass unresolved
 placeholders into containers.
+
+Local sub-patterns under `patterns:` declare their own `params:`.
+`use.with` supplies values for those params. There is no implicit
+capture across a `use` boundary; `${params.name}` inside the local
+sub-pattern refers to that sub-pattern's resolved params.
 
 ### Placeholder Grammar
 
@@ -152,6 +189,27 @@ cohort:
 expands to one member per declared lane. The generated member name is
 the lane name and the member belongs to that lane.
 
+The structured body form can generate anonymous lanes:
+
+```yaml
+do:
+  - foreach:
+      count: 3
+    do:
+      - use: lane_pattern
+```
+
+This creates `lane_0`, `lane_1`, and `lane_2`. The scheduler executes
+the body lane-major: a lane's body runs to completion before the next
+lane starts. Lane-major order is a scheduling strategy, not permission
+for cross-lane visibility. Each lane still sees only its own fixture,
+member, and direct invocation-child history.
+
+A root `do:` body that declares `foreach.count` lanes must contain only
+root `foreach` nodes. Work that should happen per lane belongs inside
+the `foreach` body. This keeps the root body from accidentally mixing
+default-lane work with generated lane fixtures.
+
 ## Fixtures
 
 Pattern fixtures seed each lane at run start. Each fixture maps an
@@ -195,6 +253,57 @@ Supported success rules:
 
 Unsupported success-rule keys or values are parse errors.
 
+## Local Composition And Loops
+
+`patterns:` declares local sub-patterns in the same file. A `use` node
+runs one of those sub-patterns in the current lane:
+
+```yaml
+do:
+  - use: improve_bot_lane
+    with:
+      model: ${params.model}
+```
+
+The sub-pattern inherits the current run and lane. It does not create a
+new workspace, run record, or artifact-resolution scope.
+
+`run_until` repeatedly runs one block in the current lane:
+
+```yaml
+run_until:
+  block: ImproveBot
+  continue_on:
+    eval_requested:
+      max: 5
+  stop_on:
+    - normal
+```
+
+One `run_until` loop is recorded as one `RunStepRecord` with
+`kind: run_until`. Each iteration is an ordinary `RunMemberRecord`
+inside that step, named `iter_1`, `iter_2`, and so on. The step records
+`terminal_reason`, `stop_kind`, and `reason_counts` when the loop
+stops, so operators can inspect how many iterations ran and why the
+loop ended. If the block exits with a `continue_on` termination reason,
+Flywheel first lets the block's `on_termination` routes dispatch. The
+next iteration therefore sees both the parent block's committed outputs
+and any direct invocation-child outputs from the prior iteration.
+
+The `max` value is the budget for that continuation reason. If the
+budget is reached, the loop stops after the iteration and any routed
+child invocations have committed; the step records
+`stop_kind: budget_exhausted`. If the block exits with a `stop_on`
+reason, the loop stops successfully and records `stop_kind: stop_on`.
+A declared block termination reason that appears in neither
+`continue_on` nor `stop_on` is a pattern error for this loop and
+records `stop_kind: unexpected_reason`. A member execution failure
+records `stop_kind: failed`.
+
+`continue_on` and `stop_on` reasons must be declared by the block's
+`outputs` map. This prevents a loop from silently discarding proposed
+outputs for a termination reason the block did not declare.
+
 ## Input Resolution
 
 Pattern members may bind an input slot from:
@@ -236,6 +345,11 @@ successful members. Invocation children do not dispatch further routes
 in v1, so there are no transitive invocation grandchildren for the
 lane resolver to consider.
 
+Managed-state blocks in patterns use a lineage key derived from the
+run id, lane, and block name. The iteration member name is deliberately
+excluded so repeated `run_until` iterations of the same managed block
+restore and extend one lane-local state chain.
+
 ## Run Records
 
 `RunRecord` stores run-level metadata:
@@ -247,6 +361,7 @@ lane resolver to consider.
 * declared lanes;
 * fixture materializations by lane;
 * ordered step results;
+* step kind and loop terminal metadata for structured steps;
 * member execution ids, lanes, invocation ids, and output bindings;
 * optional run-level error.
 

@@ -156,6 +156,49 @@ blocks:
         container_path: /output/bot
 """
 
+RUN_UNTIL_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: ImproveBot
+    image: improve:latest
+    state: managed
+    inputs:
+      - name: bot
+        container_path: /input/bot
+      - name: score
+        container_path: /input/score
+        optional: true
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+      normal:
+        - name: bot
+          container_path: /output/bot
+      aborted:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: EvalBot
+            bind:
+              bot: bot
+  - name: EvalBot
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      - name: score
+        container_path: /output/score
+"""
+
 PARAM_INVOCATION_TEMPLATE_YAML = """\
 artifacts:
   - name: bot
@@ -591,6 +634,57 @@ def test_bool_pattern_param_round_trips_through_workspace_yaml(
     }
 
 
+def test_use_with_bool_param_coerces_literal_bool(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "bool_use",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [{"use": "inner", "with": {"dry_run": True}}],
+        "patterns": {
+            "inner": {
+                "params": {"dry_run": {"type": "bool"}},
+                "do": [
+                    {
+                        "run_until": {
+                            "block": "ImproveBot",
+                            "env": {"DRY_RUN": "${params.dry_run}"},
+                            "continue_on": {"eval_requested": {"max": 1}},
+                            "stop_on": ["normal"],
+                        },
+                    }
+                ],
+            }
+        },
+    })
+    seen_env: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        seen_env.append(config.env["DRY_RUN"])
+        output = mounts["/output/bot"] / "bot.py"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("DONE")
+        state_file = mounts["/flywheel"] / "state" / "session.txt"
+        state_file.write_text("DONE")
+        (mounts["/flywheel"] / "termination").write_text("normal")
+        return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    assert seen_env == ["true"]
+    assert Workspace.load(workspace.path).runs[result.run_id].status == (
+        "succeeded")
+
+
 def test_unknown_member_param_reference_fails_before_run(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(
         tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
@@ -691,6 +785,92 @@ def test_unknown_pattern_param_override_is_rejected(tmp_path: Path):
         assert "unknown param" in str(exc)
     else:
         raise AssertionError("expected unknown param failure")
+
+
+def test_run_until_rejects_reason_not_declared_by_block(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "bad_reason",
+        "do": [
+            {
+                "run_until": {
+                    "block": "ImproveBot",
+                    "continue_on": {"missing": {"max": 1}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except RuntimeError as exc:
+        assert "not declared" in str(exc)
+        assert "missing" in str(exc)
+    else:
+        raise AssertionError("expected run_until validation failure")
+
+
+def test_run_until_rejects_reason_in_continue_and_stop(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "overlap",
+        "do": [
+            {
+                "run_until": {
+                    "block": "ImproveBot",
+                    "continue_on": {"normal": {"max": 1}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except RuntimeError as exc:
+        assert "both continue_on and stop_on" in str(exc)
+    else:
+        raise AssertionError("expected run_until validation failure")
+
+
+def test_use_param_validation_catches_unknown_and_missing_params(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    for bad_with, expected in (
+        ({"unknown": "x"}, "unknown param"),
+        ({}, "missing required param"),
+    ):
+        pattern = parse_pattern_declaration({
+            "name": "bad_use",
+            "do": [{"use": "inner", "with": bad_with}],
+            "patterns": {
+                "inner": {
+                    "params": {"needed": {"type": "string"}},
+                    "do": [
+                        {
+                            "run_until": {
+                                "block": "ImproveBot",
+                                "continue_on": {
+                                    "eval_requested": {"max": 1},
+                                },
+                                "stop_on": ["normal"],
+                            },
+                        }
+                    ],
+                }
+            },
+        })
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError("expected use param validation failure")
 
 
 def test_pattern_lanes_keep_artifact_pedigrees_separate(tmp_path: Path):
@@ -938,6 +1118,339 @@ def test_invocation_child_output_feeds_next_step_in_lane(tmp_path: Path):
     assert consumed_scores == ["SCORE"]
     assert consume_execution.input_bindings["score"] == (
         child_execution.output_bindings["score"])
+
+
+def test_run_until_executes_lane_major_and_stops_on_normal(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "model": {"type": "string", "default": "sonnet"},
+            "max_evals": {"type": "int", "default": 3},
+        },
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "foreach": {"count": 2},
+                "do": [
+                    {
+                        "use": "lane_loop",
+                        "with": {
+                            "model": "${params.model}",
+                            "max_evals": "${params.max_evals}",
+                        },
+                    }
+                ],
+            }
+        ],
+        "patterns": {
+            "lane_loop": {
+                "params": {
+                    "model": {"type": "string"},
+                    "max_evals": {"type": "int"},
+                },
+                "do": [
+                    {
+                        "run_until": {
+                            "name": "improve",
+                            "block": "ImproveBot",
+                            "env": {"MODEL": "${params.model}"},
+                            "continue_on": {
+                                "eval_requested": {
+                                    "max": "${params.max_evals}",
+                                },
+                            },
+                            "stop_on": ["normal"],
+                        }
+                    }
+                ],
+            }
+        },
+    })
+    seen_improve_inputs: list[str] = []
+    seen_score_inputs: list[bool] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            source = (mounts["/input/bot"] / "bot.py").read_text()
+            seen_improve_inputs.append(source)
+            seen_score_inputs.append("/input/score" in mounts)
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            if "->eval2" in source:
+                reason = "normal"
+                next_bot = f"{source}->done"
+            elif "->eval1" in source:
+                reason = "eval_requested"
+                next_bot = f"{source}->eval2"
+                assert state_file.read_text() in {"BASE", "BASE->eval1"}
+            else:
+                reason = "eval_requested"
+                next_bot = f"{source}->eval1"
+            state_file.write_text(next_bot)
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(next_bot)
+            (mounts["/flywheel"] / "termination").write_text(reason)
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            bot_text = (mounts["/input/bot"] / "bot.py").read_text()
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text(f"score:{bot_text}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    assert run.lanes == ["lane_0", "lane_1"]
+    assert run.status == "succeeded"
+    assert seen_improve_inputs == [
+        "BASE",
+        "BASE->eval1",
+        "BASE->eval1->eval2",
+        "BASE",
+        "BASE->eval1",
+        "BASE->eval1->eval2",
+    ]
+    assert seen_score_inputs == [False, True, True, False, True, True]
+    assert [step.kind for step in run.steps] == ["run_until", "run_until"]
+    assert [len(step.members) for step in run.steps] == [3, 3]
+    assert [member.lane for step in run.steps for member in step.members] == [
+        "lane_0", "lane_0", "lane_0", "lane_1", "lane_1", "lane_1",
+    ]
+    assert [member.name for member in run.steps[0].members] == [
+        "iter_1", "iter_2", "iter_3"]
+    assert run.steps[0].terminal_reason == "normal"
+    assert run.steps[0].stop_kind == "stop_on"
+    assert run.steps[0].reason_counts == {"eval_requested": 2}
+    lane_0_snapshots = [
+        reloaded.state_snapshots[
+            reloaded.executions[member.execution_id]
+            .state_snapshot_id
+        ]
+        for member in run.steps[0].members
+    ]
+    assert {
+        snapshot.lineage_key for snapshot in lane_0_snapshots
+    } == {
+        pattern_state_lineage_key(result.run_id, "lane_0", "ImproveBot")
+    }
+    assert lane_0_snapshots[1].predecessor_snapshot_id == (
+        lane_0_snapshots[0].id)
+    assert lane_0_snapshots[2].predecessor_snapshot_id == (
+        lane_0_snapshots[1].id)
+
+
+def test_run_until_budget_stops_after_max_continue_reason(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "budget",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 2}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+    seen: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            source = (mounts["/input/bot"] / "bot.py").read_text()
+            seen.append(source)
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(f"{source}->{len(seen)}")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text(f"{source}->{len(seen)}")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    run = Workspace.load(workspace.path).runs[result.run_id]
+    assert seen == ["BASE", "BASE->1"]
+    assert len(run.steps) == 1
+    assert run.steps[0].kind == "run_until"
+    assert [member.name for member in run.steps[0].members] == [
+        "iter_1", "iter_2"]
+    assert run.steps[0].status == "succeeded"
+    assert run.steps[0].terminal_reason == "eval_requested"
+    assert run.steps[0].stop_kind == "budget_exhausted"
+    assert run.steps[0].reason_counts == {"eval_requested": 2}
+
+
+def test_run_until_unexpected_declared_reason_fails_run(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "unexpected",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 2}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("ABORT")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text("ABORT")
+            (mounts["/flywheel"] / "termination").write_text("aborted")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError as exc:
+            assert "unexpected termination reason 'aborted'" in str(exc)
+        else:
+            raise AssertionError("expected run failure")
+
+    run = next(iter(Workspace.load(workspace.path).runs.values()))
+    assert run.status == "failed"
+    assert run.error == (
+        "run_until 'improve' received unexpected termination reason 'aborted'"
+    )
+    assert len(run.steps) == 1
+    step = run.steps[0]
+    assert step.kind == "run_until"
+    assert step.status == "failed"
+    assert step.terminal_reason == "aborted"
+    assert step.stop_kind == "unexpected_reason"
+    assert step.members[0].status == "succeeded"
+
+
+def test_run_until_member_failure_fails_loop_without_more_iterations(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "failure",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 3}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+    calls = 0
+
+    def fake_container(config, args=None):
+        nonlocal calls
+        del args
+        calls += 1
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest" and calls == 1:
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("NEXT")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text("NEXT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "improve:latest":
+            return ContainerResult(exit_code=1, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected run failure")
+
+    reloaded = Workspace.load(workspace.path)
+    run = next(iter(reloaded.runs.values()))
+    assert run.status == "failed"
+    assert len(run.steps) == 1
+    step = run.steps[0]
+    assert step.kind == "run_until"
+    assert step.status == "failed"
+    assert step.stop_kind == "failed"
+    assert [member.status for member in step.members] == [
+        "succeeded", "failed"]
+    assert len(reloaded.invocations) == 1
 
 
 def test_pattern_member_stays_parent_when_invoked_child_fails(
