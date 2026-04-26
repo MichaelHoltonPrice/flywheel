@@ -268,6 +268,7 @@ try:
         if candidate.get("type") == "agent_state":
             status = candidate.get("status")
 except Exception:
+    pass
 print("normal" if status in (None, "", "complete") else status)
 PY
 )
