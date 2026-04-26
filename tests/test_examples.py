@@ -35,6 +35,7 @@ def test_claude_battery_uses_agent_status_for_termination():
     )
 
     text = entrypoint.read_text()
-    assert "agent_exit_state.json" in text
+    assert "/tmp/flywheel-claude-runner.jsonl" in text
+    assert 'candidate.get("type") == "agent_state"' in text
     assert "complete" in text
     assert "/flywheel/termination" in text

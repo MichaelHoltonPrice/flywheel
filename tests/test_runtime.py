@@ -32,6 +32,9 @@ class TestPathConstants:
             == "/flywheel/mcp_servers"
         )
 
+    def test_flywheel_telemetry_mount(self):
+        assert runtime.FLYWHEEL_TELEMETRY_MOUNT == "/flywheel/telemetry"
+
     def test_stop_sentinel_relative(self):
         # Workspace-relative path; absolute location depends on
         # where the workspace is mounted in the container.

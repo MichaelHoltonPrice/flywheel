@@ -19,11 +19,11 @@ Pause/resume
 
 - **Rate limit**: Detected from RateLimitEvent; auto-retries with
   exponential backoff (60s, 120s, 300s, 300s, 300s).  Falls back
-  to ``/flywheel/control/.agent_resume`` after exhausting retries.
+  to ``/scratch/.agent_resume`` after exhausting retries.
 - **Auth error**: Detected from error messages; pauses and waits
-  for ``/flywheel/control/.agent_resume``.
+  for ``/scratch/.agent_resume``.
 - **External resume**: Write a prompt (or empty) to
-  ``/flywheel/control/.agent_resume`` to continue after a pause.
+  ``/scratch/.agent_resume`` to continue after a pause.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
@@ -43,10 +43,7 @@ Environment variables:
                       one or more in a single assistant turn, the
                       hook denies each (recording deny tool_results
                       in the session), captures every intercepted
-                      call into ``/flywheel/control/
-                      pending_tool_calls.json``, sets the exit
-                      state in ``/flywheel/control/
-                      agent_exit_state.json`` to status
+                      call on stdout, emits status
                       ``tool_handoff``, and signals the runner to
                       exit cleanly so a host-side driver can run
                       the blocks out-of-band, splice every real
@@ -113,15 +110,10 @@ from claude_agent_sdk.types import (
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/scratch"))
 STOP_FILE = WORKSPACE / ".stop"
-# Framework-owned control files live under ``/flywheel/control/``
-# so they don't clutter the agent's scratchpad namespace or the
-# ``/output/<slot>/`` mounts that carry real artifact outputs.
-# Flywheel mounts a host tempdir here; the runner reads/writes
-# the files listed below and flywheel collects them after exit
-# by battery-level recovery code.  Nothing under
-# ``/flywheel/control/`` is an artifact.
-CONTROL_DIR = Path("/flywheel/control")
-RESUME_FILE = CONTROL_DIR / ".agent_resume"
+# Pause/resume is intentionally separate from Flywheel's root-owned
+# control directory.  The agent can see this scratchpad file, but it
+# cannot see framework telemetry or control captures.
+RESUME_FILE = WORKSPACE / ".agent_resume"
 POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Rate limit auto-retry: sleep with exponential backoff before
@@ -147,14 +139,9 @@ SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 DEFAULT_PROMPT_FILE = Path("/app/agent/prompt.md")
 
-# Orchestration control outputs.  The runner writes them to
-# ``/flywheel/control/`` and flywheel's agent launcher reads them
-# back from the host-side mount after the container exits.
+# Orchestration events are emitted on stdout.  The root entrypoint
+# captures that stream without exposing its capture file to the agent.
 # Neither file is an artifact — they are framework-owned runtime
-# data consumed by the host handoff loop.
-PENDING_TOOL_CALLS_FILE = (
-    CONTROL_DIR / "pending_tool_calls.json")
-EXIT_STATE_FILE = CONTROL_DIR / "agent_exit_state.json"
 PENDING_TOOL_CALLS_SCHEMA_VERSION = 2
 DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
 
@@ -263,16 +250,12 @@ def _persist_handoff(session_id: str) -> None:
         "session_id": session_id,
         "pending": pending,
     }
-    PENDING_TOOL_CALLS_FILE.parent.mkdir(
-        parents=True, exist_ok=True)
-    PENDING_TOOL_CALLS_FILE.write_text(
-        json.dumps(payload, indent=2), encoding="utf-8")
     _emit({
         "type": "handoff_pending",
         "count": len(pending),
         "tool_use_ids": [p["tool_use_id"] for p in pending],
         "tool_names": [p["tool_name"] for p in pending],
-        "path": str(PENDING_TOOL_CALLS_FILE),
+        "pending": pending,
     })
 
 
@@ -389,8 +372,6 @@ def _save_state(session_id: str, status: str, reason: str = "") -> None:
         "reason": reason,
         "timestamp": time.time(),
     }
-    EXIT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    EXIT_STATE_FILE.write_text(json.dumps(state, indent=2))
     _emit({"type": "agent_state", **state})
 
 

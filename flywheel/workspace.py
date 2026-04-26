@@ -25,8 +25,10 @@ from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
     BlockInvocation,
+    ExecutionTelemetry,
     LifecycleEvent,
     RejectedOutput,
+    RejectedTelemetry,
     RejectionRef,
     SupersedesRef,
 )
@@ -310,6 +312,8 @@ class Workspace:
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
     invocations: dict[str, BlockInvocation] = field(default_factory=dict)
+    telemetry: dict[str, ExecutionTelemetry] = field(default_factory=dict)
+    telemetry_rejections: dict[str, RejectedTelemetry] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
     runs: dict[str, RunRecord] = field(default_factory=dict)
     state_snapshots: dict[str, StateSnapshot] = field(default_factory=dict)
@@ -354,6 +358,20 @@ class Workspace:
         while True:
             candidate = f"inv_{self._short_uuid()}"
             if candidate not in self.invocations:
+                return candidate
+
+    def generate_telemetry_id(self) -> str:
+        """Generate a unique execution telemetry ID."""
+        while True:
+            candidate = f"tel_{self._short_uuid()}"
+            if candidate not in self.telemetry:
+                return candidate
+
+    def generate_telemetry_rejection_id(self) -> str:
+        """Generate a unique rejected telemetry ID."""
+        while True:
+            candidate = f"telrej_{self._short_uuid()}"
+            if candidate not in self.telemetry_rejections:
                 return candidate
 
     def generate_state_snapshot_id(self) -> str:
@@ -536,6 +554,56 @@ class Workspace:
             self.invocations[invocation.id] = invocation
         self.save()
         return invocation
+
+    def record_execution_telemetry(
+        self,
+        telemetry: ExecutionTelemetry,
+        *,
+        persist: bool = True,
+    ) -> ExecutionTelemetry:
+        """Record one accepted telemetry item for an execution."""
+        with self._lock:
+            if telemetry.id in self.telemetry:
+                raise ValueError(
+                    f"Telemetry {telemetry.id!r} already exists "
+                    "in workspace"
+                )
+            if telemetry.execution_id not in self.executions:
+                raise ValueError(
+                    f"Telemetry {telemetry.id!r} references unknown "
+                    f"execution {telemetry.execution_id!r}"
+                )
+            if not telemetry.kind or not telemetry.kind.strip():
+                raise ValueError("Telemetry kind must not be empty")
+            if not isinstance(telemetry.data, dict):
+                raise ValueError("Telemetry data must be a mapping")
+            self.telemetry[telemetry.id] = telemetry
+        if persist:
+            self.save()
+        return telemetry
+
+    def record_rejected_telemetry(
+        self,
+        rejection: RejectedTelemetry,
+        *,
+        persist: bool = True,
+    ) -> RejectedTelemetry:
+        """Record a telemetry candidate rejected during ingest."""
+        with self._lock:
+            if rejection.id in self.telemetry_rejections:
+                raise ValueError(
+                    f"Telemetry rejection {rejection.id!r} already "
+                    "exists in workspace"
+                )
+            if rejection.execution_id not in self.executions:
+                raise ValueError(
+                    f"Telemetry rejection {rejection.id!r} references "
+                    f"unknown execution {rejection.execution_id!r}"
+                )
+            self.telemetry_rejections[rejection.id] = rejection
+        if persist:
+            self.save()
+        return rejection
 
     @staticmethod
     def _validate_and_normalize_execution(
@@ -1586,6 +1654,28 @@ class Workspace:
                 error=entry.get("error"),
             )
 
+        telemetry: dict[str, ExecutionTelemetry] = {}
+        for tid, entry in data.get("telemetry", {}).items():
+            telemetry[tid] = ExecutionTelemetry(
+                id=tid,
+                execution_id=entry["execution_id"],
+                kind=entry["kind"],
+                recorded_at=datetime.fromisoformat(entry["recorded_at"]),
+                data=dict(entry.get("data", {})),
+                source=entry.get("source"),
+            )
+
+        telemetry_rejections: dict[str, RejectedTelemetry] = {}
+        for rid, entry in data.get("telemetry_rejections", {}).items():
+            telemetry_rejections[rid] = RejectedTelemetry(
+                id=rid,
+                execution_id=entry["execution_id"],
+                recorded_at=datetime.fromisoformat(entry["recorded_at"]),
+                path=entry["path"],
+                reason=entry["reason"],
+                preserved_path=entry.get("preserved_path"),
+            )
+
         events: dict[str, LifecycleEvent] = {}
         for evid, entry in data.get("events", {}).items():
             events[evid] = LifecycleEvent(
@@ -1626,6 +1716,8 @@ class Workspace:
             artifacts=artifacts,
             executions=executions,
             invocations=invocations,
+            telemetry=telemetry,
+            telemetry_rejections=telemetry_rejections,
             events=events,
             runs=runs,
             state_snapshots=_state_snapshots_from_yaml(
@@ -1718,6 +1810,31 @@ class Workspace:
                     entry["error"] = inv.error
                 serialized_invocations[iid] = entry
 
+            serialized_telemetry = {}
+            for tid, tel in self.telemetry.items():
+                entry = {
+                    "execution_id": tel.execution_id,
+                    "kind": tel.kind,
+                    "recorded_at": tel.recorded_at.isoformat(),
+                    "data": dict(tel.data),
+                }
+                if tel.source is not None:
+                    entry["source"] = tel.source
+                serialized_telemetry[tid] = entry
+
+            serialized_telemetry_rejections = {}
+            for rid, rejection in self.telemetry_rejections.items():
+                serialized_telemetry_rejections[rid] = {
+                    "execution_id": rejection.execution_id,
+                    "recorded_at": rejection.recorded_at.isoformat(),
+                    "path": rejection.path,
+                    "reason": rejection.reason,
+                }
+                if rejection.preserved_path is not None:
+                    serialized_telemetry_rejections[rid][
+                        "preserved_path"
+                    ] = rejection.preserved_path
+
             serialized_events = {}
             for evid, ev in self.events.items():
                 entry = {
@@ -1767,6 +1884,12 @@ class Workspace:
             }
             if serialized_invocations:
                 data["invocations"] = serialized_invocations
+            if serialized_telemetry:
+                data["telemetry"] = serialized_telemetry
+            if serialized_telemetry_rejections:
+                data["telemetry_rejections"] = (
+                    serialized_telemetry_rejections
+                )
             if serialized_events:
                 data["events"] = serialized_events
             if serialized_runs:

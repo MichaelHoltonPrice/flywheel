@@ -44,5 +44,21 @@ def test_claude_battery_entrypoint_creates_framework_subdirs():
     entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
     text = entrypoint.read_text(encoding="utf-8")
 
-    assert "mkdir -p /flywheel/control /flywheel/mcp_servers" in text
-    assert "chown -R claude:claude /flywheel/control" in text
+    assert "mkdir -p /flywheel/mcp_servers /flywheel/telemetry" in text
+    assert "/flywheel/control" not in text
+    assert "chown claude:claude /flywheel/termination_request" in text
+    assert "chown root:root /flywheel/telemetry" in text
+    assert "chmod 700 /flywheel/telemetry" in text
+
+
+def test_claude_battery_writes_usage_telemetry():
+    runner = ROOT / "batteries" / "claude" / "agent_runner.py"
+    entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
+    runner_text = runner.read_text(encoding="utf-8")
+    entrypoint_text = entrypoint.read_text(encoding="utf-8")
+
+    assert "claude_result.json" not in runner_text
+    assert "/tmp/flywheel-claude-runner.jsonl" in entrypoint_text
+    assert "/flywheel/telemetry/claude_usage.json" in entrypoint_text
+    assert '"kind": "claude_usage"' in entrypoint_text
+    assert '"source": "flywheel-claude"' in entrypoint_text

@@ -34,6 +34,13 @@ FLYWHEEL_MCP_SERVERS_MOUNT: Final[str] = "/flywheel/mcp_servers"
 Agent-specific; read-only.  The agent runner discovers
 ``*_mcp_server.py`` files here at startup."""
 
+FLYWHEEL_TELEMETRY_MOUNT: Final[str] = "/flywheel/telemetry"
+"""Container-side path where runtime wrappers may write telemetry
+candidate JSON files.  Flywheel ingests these after the container
+exits and records accepted or rejected telemetry on the execution
+ledger.  Telemetry is not an artifact and does not affect execution
+success."""
+
 STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 """Workspace-relative path of the cooperative cancellation
 sentinel.  Flywheel writes this file to request a clean shutdown;

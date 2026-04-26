@@ -152,7 +152,13 @@ contract is "the workspace is updated, or the call raises".
    slot reached (`artifact_commit` > `output_validate` >
    `output_collect`); `status` follows the
    [status mapping](#status-mapping).
-4. **Persist the workspace** (`workspace.save()`).
+4. **Ingest execution telemetry** from `/flywheel/telemetry`. Accepted
+   telemetry and telemetry rejections are durable records tied to the
+   execution. Telemetry ingest is non-fatal and never changes execution
+   status.
+   Recording the execution persists the workspace. Telemetry records
+   are persisted separately and best-effort so telemetry write failures
+   cannot turn a completed execution into a substrate failure.
 
 ### Commit-passing-slots
 
@@ -172,6 +178,49 @@ typical block outputs this is negligible. For very large directory
 trees the copy may matter; if and when that becomes a real bottleneck
 the spec can introduce a same-filesystem hardlink or rename
 optimization without changing the API.
+
+### Execution telemetry
+
+Execution telemetry is durable metadata about an execution: model
+usage, cost, timing, or other measurements supplied by the runtime
+wrapper or project code. It is not an artifact, not managed state, and
+not a validator-controlled output.
+
+The one-shot runtime exposes `/flywheel/telemetry` as the telemetry
+candidate directory. Candidate files are flat direct children of that
+directory, must have a `.json` suffix, must not exceed 256 KiB, and
+must be UTF-8 JSON with this strict envelope:
+
+```json
+{
+  "kind": "claude_usage",
+  "source": "flywheel-claude",
+  "data": {
+    "total_cost_usd": 0.01
+  }
+}
+```
+
+`kind` is a non-empty string without surrounding whitespace. `data`
+must be a JSON object. `source` is optional and must be a string when
+present; an empty string is normalized to no source. Unknown envelope
+keys, malformed JSON, non-object data, oversized files, nested
+directories, or non-`.json` files are rejected.
+
+Accepted candidates become `ExecutionTelemetry` records with
+Flywheel-assigned `id`, `execution_id`, and `recorded_at`. Rejected
+candidates become `RejectedTelemetry` records with `execution_id`,
+candidate path, reason, timestamp, and a best-effort
+`preserved_path` when Flywheel could copy the rejected bytes under
+`telemetry_rejections/<execution_id>/<rejection_id>/`. Rejections are
+warnings in the ledger; they do not fail the execution.
+
+The substrate provides the mount and validates the envelope. A battery
+that wants stronger provenance for its own telemetry must also control
+who can write the candidate file. The Claude battery, for example,
+keeps `/flywheel/telemetry` root-owned and derives usage telemetry
+from a root-owned capture of the runner's stdout; the prompt-driven
+agent cannot read or write that capture file.
 
 ### Failure recording for prepare-time and invoke-time errors
 
@@ -195,16 +244,19 @@ def commit_failure(
 * Looks up `status` from the [status mapping](#status-mapping).
 * Sets `failure_phase=phase`, `error=error`,
   `termination_reason=termination_reason`.
-* Cleans up any pre-allocated proposal directories under
-  `<workspace>/proposals/<execution_id>/`.
 * Calls `Workspace.record_execution(...)`.
+* For invoke-time failures that have an `ExecutionPlan`, ingests
+  execution telemetry and then cleans up the proposal directory.
+* For prepare-time failures that do not have an `ExecutionPlan`, cleans
+  up any pre-allocated proposal directory directly.
 
 `commit_failure` is called from `prepare()` (for proposal-allocation
 and input-resolution failures, both of which happen after the
 `execution_id` is minted in step 1) and from the per-runtime
 `invoke()` adapters (for invoke failures). The caller passes in the
-`execution_id` and `started_at` it already has; no `ExecutionPlan` is
-required.
+`execution_id` and `started_at` it already has. Invoke failures pass an
+`ExecutionPlan` so any telemetry already written by the runtime wrapper
+can still be recorded before cleanup.
 
 ## Data shapes
 

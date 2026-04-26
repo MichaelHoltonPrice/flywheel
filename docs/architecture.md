@@ -161,6 +161,16 @@ rejected outputs, and records the `BlockExecution`.
 Reserved failure reasons record the execution without accepting
 artifacts or advancing state.
 
+Commit also ingests execution telemetry candidates from
+`/flywheel/telemetry`. Telemetry is a separate ledger lane from
+artifacts and state: valid candidates become `ExecutionTelemetry`
+records tied to the execution, and malformed candidates become durable
+telemetry rejection records. Telemetry ingest is non-fatal and never
+changes execution status. Flywheel validates and records telemetry
+candidates, and preserves rejected candidate bytes under
+`telemetry_rejections/` when possible, but battery wrappers own any
+stronger provenance boundary for the bytes they emit.
+
 ## Workspaces
 
 A workspace is a directory under a project's foundry. It contains
@@ -169,12 +179,14 @@ proposals, quarantine, and recovery directories.
 
 `workspace.yaml` is the durable ledger. It records workspace metadata,
 artifact declarations, artifact instances, state snapshots, block
-executions, run records, and lifecycle events.
+executions, execution telemetry and telemetry rejections, run records,
+and lifecycle events.
 
 Workspace mutations go through sanctioned methods such as
 `register_artifact`, `register_git_artifact`, `register_state_snapshot`,
-`record_execution`, `begin_run`, `record_run_step`, and `end_run`.
-Private mutators are not public write paths.
+`record_execution`, `record_execution_telemetry`,
+`record_rejected_telemetry`, `begin_run`, `record_run_step`, and
+`end_run`. Private mutators are not public write paths.
 
 `Workspace.save()` writes atomically via a temporary file and replace.
 

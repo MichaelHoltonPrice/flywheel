@@ -153,12 +153,16 @@ chown -R claude:claude "$PROJECTS_DIR"
 chmod 700 /flywheel/state
 chown -R root:root /flywheel/state
 
-# /flywheel/control is a write-only handoff drop for the agent
-# runner; claude needs to write JSON files here, the launcher
-# reads them after container exit.
-mkdir -p /flywheel/control /flywheel/mcp_servers
-chown -R claude:claude /flywheel/control
-chmod 700 /flywheel/control
+mkdir -p /flywheel/mcp_servers /flywheel/telemetry
+chown root:root /flywheel/telemetry
+chmod 700 /flywheel/telemetry
+
+# The agent may choose a project termination reason, but it does
+# not get a general-purpose framework control directory.  This
+# single narrow file is the only agent-writable Flywheel handoff.
+: > /flywheel/termination_request
+chown claude:claude /flywheel/termination_request
+chmod 600 /flywheel/termination_request
 
 # /flywheel/mcp_servers is read-only project code already
 # chowned to claude in the Dockerfile.  Nothing to do.
@@ -170,8 +174,14 @@ echo "[entrypoint] /flywheel/state locked to root; running agent as claude"
 # root-owned state.  ``set +e`` so we capture the rc instead of
 # crashing on a non-zero agent exit.
 set +e
-su -s /bin/bash claude -c "python3 /app/agent_runner.py"
-RC=$?
+RUNNER_LOG=/tmp/flywheel-claude-runner.jsonl
+: > "$RUNNER_LOG"
+chown root:root "$RUNNER_LOG"
+chmod 600 "$RUNNER_LOG"
+set -o pipefail
+su -s /bin/bash claude -c "python3 /app/agent_runner.py" | tee "$RUNNER_LOG"
+RC=${PIPESTATUS[0]}
+set +o pipefail
 
 # Sync the latest SDK session back to /flywheel/state so the
 # next launch can populate from it.  The SDK may have written a
@@ -188,12 +198,57 @@ if [ -n "$LATEST" ]; then
     fi
 fi
 
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+result_path = Path("/tmp/flywheel-claude-runner.jsonl")
+telemetry_path = Path("/flywheel/telemetry/claude_usage.json")
+result = None
+try:
+    for line in result_path.read_text(encoding="utf-8").splitlines():
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if candidate.get("type") == "result":
+            result = candidate
+except Exception:
+    raise SystemExit(0)
+if result is None:
+    raise SystemExit(0)
+
+data = {}
+for key in (
+    "model",
+    "total_cost_usd",
+    "duration_ms",
+    "duration_api_ms",
+    "is_error",
+    "num_turns",
+    "stop_reason",
+    "session_id",
+    "uuid",
+    "usage",
+    "model_usage",
+):
+    if key in result:
+        data[key] = result[key]
+
+if data:
+    telemetry_path.write_text(json.dumps({
+        "kind": "claude_usage",
+        "source": "flywheel-claude",
+        "data": data,
+    }, indent=2), encoding="utf-8")
+PY
+
 if [ "$RC" -eq 0 ]; then
     REASON=$(python3 - <<'PY'
 import json
 from pathlib import Path
 
-override = Path("/flywheel/control/termination_reason")
+override = Path("/flywheel/termination_request")
 try:
     reason = override.read_text(encoding="utf-8").strip()
 except Exception:
@@ -202,11 +257,17 @@ if reason:
     print(reason)
     raise SystemExit(0)
 
-path = Path("/flywheel/control/agent_exit_state.json")
+path = Path("/tmp/flywheel-claude-runner.jsonl")
+status = None
 try:
-    status = json.loads(path.read_text(encoding="utf-8")).get("status")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if candidate.get("type") == "agent_state":
+            status = candidate.get("status")
 except Exception:
-    status = None
 print("normal" if status in (None, "", "complete") else status)
 PY
 )

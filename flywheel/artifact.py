@@ -316,6 +316,35 @@ class BlockInvocation:
 
 
 @dataclass(frozen=True)
+class ExecutionTelemetry:
+    """Project- or battery-supplied telemetry for one execution.
+
+    Telemetry records are durable execution metadata: cost,
+    usage, timing, or other measurements that are not artifacts,
+    state, or validator-controlled outputs.
+    """
+
+    id: str
+    execution_id: str
+    kind: str
+    recorded_at: datetime
+    data: dict[str, Any]
+    source: str | None = None
+
+
+@dataclass(frozen=True)
+class RejectedTelemetry:
+    """Malformed telemetry candidate rejected during ingest."""
+
+    id: str
+    execution_id: str
+    recorded_at: datetime
+    path: str
+    reason: str
+    preserved_path: str | None = None
+
+
+@dataclass(frozen=True)
 class LifecycleEvent:
     """An operational event recorded in the workspace.
 

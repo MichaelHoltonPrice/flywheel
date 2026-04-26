@@ -294,6 +294,347 @@ class TestBlockLookup:
         assert result.execution == ws.executions[result.execution_id]
 
 
+class TestExecutionTelemetry:
+    def test_valid_telemetry_files_are_recorded(self, tmp_path: Path):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            telemetry_dir = mounts["/flywheel"] / "telemetry"
+            (telemetry_dir / "usage.json").write_text(json.dumps({
+                "kind": "usage",
+                "source": "test",
+                "data": {"tokens": 12},
+            }))
+            (telemetry_dir / "timing.json").write_text(json.dumps({
+                "kind": "timing",
+                "data": {"elapsed_ms": 50},
+            }))
+            checkpoint = mounts["/output"] / "checkpoint.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("weights")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "train", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        telemetry = sorted(
+            reloaded.telemetry.values(), key=lambda item: item.kind)
+        assert [item.kind for item in telemetry] == ["timing", "usage"]
+        assert {item.execution_id for item in telemetry} == {
+            result.execution_id}
+        assert telemetry[0].data == {"elapsed_ms": 50}
+        assert telemetry[1].source == "test"
+        assert telemetry[1].data == {"tokens": 12}
+        assert reloaded.telemetry_rejections == {}
+
+    def test_malformed_telemetry_is_rejected_without_failing_execution(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            telemetry_dir = mounts["/flywheel"] / "telemetry"
+            (telemetry_dir / "bad-json.json").write_text("{")
+            (telemetry_dir / "bad-envelope.json").write_text(json.dumps({
+                "kind": "usage",
+                "data": {},
+                "extra": True,
+            }))
+            (telemetry_dir / "note.txt").write_text("not telemetry")
+            (telemetry_dir / "nested").mkdir()
+            (telemetry_dir / "huge.json").write_text(
+                json.dumps({"kind": "usage", "data": {"payload": "x" * 300000}})
+            )
+            checkpoint = mounts["/output"] / "checkpoint.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("weights")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "train", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        assert reloaded.executions[result.execution_id].status == "succeeded"
+        assert reloaded.telemetry == {}
+        rejections = sorted(
+            reloaded.telemetry_rejections.values(),
+            key=lambda item: item.path,
+        )
+        assert [item.path for item in rejections] == [
+            "/flywheel/telemetry/bad-envelope.json",
+            "/flywheel/telemetry/bad-json.json",
+            "/flywheel/telemetry/huge.json",
+            "/flywheel/telemetry/nested",
+            "/flywheel/telemetry/note.txt",
+        ]
+        assert all(
+            item.execution_id == result.execution_id for item in rejections)
+        assert any("unknown key" in item.reason for item in rejections)
+        assert all(item.preserved_path is not None for item in rejections)
+        for item in rejections:
+            assert (ws.path / item.preserved_path).exists()
+
+    def test_crashed_execution_can_still_record_telemetry(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            (mounts["/flywheel"] / "telemetry" / "usage.json").write_text(
+                json.dumps({"kind": "usage", "data": {"tokens": 1}})
+            )
+            return ContainerResult(exit_code=9, elapsed_s=0.1)
+
+        with (
+            patch("flywheel.execution.run_container", side_effect=fake_run),
+            pytest.raises(RuntimeError),
+        ):
+            run_block(ws, "train", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        execution = next(iter(reloaded.executions.values()))
+        assert execution.status == "failed"
+        assert next(iter(reloaded.telemetry.values())).execution_id == (
+            execution.id)
+
+    def test_invoke_exception_can_still_record_telemetry(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            (mounts["/flywheel"] / "telemetry" / "usage.json").write_text(
+                json.dumps({"kind": "usage", "data": {"tokens": 3}})
+            )
+            raise RuntimeError("docker died")
+
+        with (
+            patch("flywheel.execution.run_container", side_effect=fake_run),
+            pytest.raises(RuntimeError),
+        ):
+            run_block(ws, "train", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        execution = next(iter(reloaded.executions.values()))
+        assert execution.failure_phase == runtime.FAILURE_INVOKE
+        assert next(iter(reloaded.telemetry.values())).execution_id == (
+            execution.id)
+
+    def test_telemetry_ingest_failure_is_non_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            (mounts["/flywheel"] / "telemetry" / "usage.json").write_text(
+                json.dumps({"kind": "usage", "data": {"tokens": 3}})
+            )
+            checkpoint = mounts["/output"] / "checkpoint.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("weights")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        def broken_record(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("telemetry store unavailable")
+
+        monkeypatch.setattr(
+            Workspace, "record_execution_telemetry", broken_record)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "train", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        assert reloaded.executions[result.execution_id].status == "succeeded"
+
+    def test_state_validate_failure_can_still_record_telemetry(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            (mounts["/flywheel"] / "telemetry" / "usage.json").write_text(
+                json.dumps({"kind": "usage", "data": {"tokens": 4}})
+            )
+            checkpoint = mounts["/output"] / "checkpoint.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("weights")
+            (mounts["/flywheel"] / "state" / "state.txt").write_text("state")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        registry = StateValidatorRegistry()
+
+        def reject_state(block_name, block_def, staged_path, lineage_key):
+            del block_name, block_def, staged_path, lineage_key
+            raise StateValidationError("bad state")
+
+        registry.register("stateful", reject_state)
+        with (
+            patch("flywheel.execution.run_container", side_effect=fake_run),
+            pytest.raises(StateValidationError),
+        ):
+            run_block(
+                ws,
+                "stateful",
+                template,
+                project_root,
+                state_lineage_key="stateful",
+                state_validator_registry=registry,
+            )
+
+        reloaded = Workspace.load(ws.path)
+        execution = next(iter(reloaded.executions.values()))
+        assert execution.failure_phase == runtime.FAILURE_STATE_VALIDATE
+        assert next(iter(reloaded.telemetry.values())).execution_id == (
+            execution.id)
+
+    def test_output_validate_failure_can_still_record_telemetry(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, template = _setup_git_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        _commit_all(project_root, "clean")
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            (mounts["/flywheel"] / "telemetry" / "usage.json").write_text(
+                json.dumps({"kind": "usage", "data": {"tokens": 5}})
+            )
+            checkpoint = mounts["/output"] / "checkpoint.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("weights")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        registry = ArtifactValidatorRegistry()
+
+        def reject_checkpoint(name, declaration, staged_path):
+            del name, declaration, staged_path
+            raise ArtifactValidationError("bad checkpoint")
+
+        registry.register("checkpoint", reject_checkpoint)
+        with (
+            patch("flywheel.execution.run_container", side_effect=fake_run),
+            pytest.raises(ArtifactValidationError),
+        ):
+            run_block(
+                ws,
+                "train",
+                template,
+                project_root,
+                validator_registry=registry,
+            )
+
+        reloaded = Workspace.load(ws.path)
+        execution = next(iter(reloaded.executions.values()))
+        assert execution.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert next(iter(reloaded.telemetry.values())).execution_id == (
+            execution.id)
+
+    def test_invoked_child_records_its_own_telemetry(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        def fake_run(config, args=None):
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            flywheel_dir = mounts["/flywheel"]
+            telemetry_dir = flywheel_dir / "telemetry"
+            if config.image == "agent:latest":
+                (mounts["/output/bot"] / "bot.py").write_text("bot")
+                (telemetry_dir / "parent.json").write_text(json.dumps({
+                    "kind": "usage",
+                    "source": "parent",
+                    "data": {"tokens": 1},
+                }))
+                (flywheel_dir / "termination").write_text("eval_requested")
+            else:
+                assert config.image == "eval:latest"
+                assert args == ["--episodes", "2"]
+                (mounts["/output/score"] / "score.json").write_text("{}")
+                (telemetry_dir / "child.json").write_text(json.dumps({
+                    "kind": "usage",
+                    "source": "child",
+                    "data": {"tokens": 2},
+                }))
+                (flywheel_dir / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            parent_result = run_block(ws, "agent", template, project_root)
+
+        reloaded = Workspace.load(ws.path)
+        parent_execution = reloaded.executions[parent_result.execution_id]
+        child_execution = next(
+            execution for execution in reloaded.executions.values()
+            if execution.invoking_execution_id == parent_execution.id
+        )
+        telemetry_by_source = {
+            item.source: item for item in reloaded.telemetry.values()
+        }
+        assert telemetry_by_source["parent"].execution_id == (
+            parent_execution.id)
+        assert telemetry_by_source["child"].execution_id == child_execution.id
+
+
 class TestBlockInvocation:
     def test_termination_route_invokes_child_block(self, tmp_path: Path):
         project_root, foundry_dir, _template_path, template = (

@@ -27,17 +27,21 @@ resolution, artifact forging, quarantine, or ledger semantics.
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from typing import Protocol
 
 from flywheel import runtime
 from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
+    ExecutionTelemetry,
     RejectedOutput,
+    RejectedTelemetry,
 )
 from flywheel.artifact_validator import (
     ArtifactValidationError,
@@ -102,6 +106,8 @@ class ExecutionPlan:
             mount, when one existed.
         state_compatibility: Compatibility identity used to reject
             restoring an incompatible snapshot.
+        telemetry_dir: Host directory visible as
+            ``/flywheel/telemetry`` during execution.
         env_overlay: Per-execution environment values layered over the
             block template's static env.
     """
@@ -120,6 +126,7 @@ class ExecutionPlan:
     state_mount_dir: Path | None = None
     restored_state_snapshot_id: str | None = None
     state_compatibility: dict[str, str] | None = None
+    telemetry_dir: Path | None = None
     env_overlay: dict[str, str] | None = None
 
 
@@ -335,6 +342,7 @@ def commit_failure(
     termination_reason: str = runtime.TERMINATION_REASON_CRASH,
     resolved_bindings: dict[str, str] | None = None,
     proposals_root: Path | None = None,
+    plan: ExecutionPlan | None = None,
     state_mode: StateMode = "none",
     invoking_execution_id: str | None = None,
 ) -> None:
@@ -351,8 +359,10 @@ def commit_failure(
     is empty (the substrate's own pre-commit failures are not
     per-slot rejections).
 
-    If ``proposals_root`` is supplied and exists on disk, it is
-    removed.
+    If ``plan`` is supplied, execution telemetry is ingested after
+    the failed execution record is written and before the proposals
+    tree is removed.  Otherwise, if ``proposals_root`` is supplied
+    and exists on disk, it is removed.
 
     Args:
         workspace: Workspace to record into.
@@ -370,12 +380,12 @@ def commit_failure(
             empty mapping.
         proposals_root: Per-execution proposals tree to clean up,
             if one was allocated before the failure.
+        plan: Prepared execution plan, when failure happened after
+            prepare and runtime-owned files may exist.
         state_mode: State mode to record on the failed execution.
         invoking_execution_id: Execution that routed to this one,
             if the failed attempt was invoked by another block.
     """
-    if proposals_root is not None:
-        shutil.rmtree(proposals_root, ignore_errors=True)
     _record_execution(
         workspace, execution_id, block_name, started_at,
         termination_reason,
@@ -387,6 +397,11 @@ def commit_failure(
         state_mode=state_mode,
         invoking_execution_id=invoking_execution_id,
     )
+    if plan is not None:
+        _ingest_execution_telemetry(workspace, plan)
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+    elif proposals_root is not None:
+        shutil.rmtree(proposals_root, ignore_errors=True)
 
 
 # ── Phase 1: prepare ─────────────────────────────────────────────
@@ -457,6 +472,8 @@ def prepare_block_execution(
     termination_dir = proposals_root / "_flywheel"
     termination_dir.mkdir(parents=True, exist_ok=True)
     termination_file = termination_dir / "termination"
+    telemetry_dir = termination_dir / "telemetry"
+    telemetry_dir.mkdir()
     mounts.append(
         (str(termination_dir.resolve()), "/flywheel", "rw")
     )
@@ -563,6 +580,7 @@ def prepare_block_execution(
         state_mount_dir=state_mount_dir,
         restored_state_snapshot_id=restored_state_snapshot_id,
         state_compatibility=state_compatibility,
+        telemetry_dir=telemetry_dir,
         env_overlay=dict(env_overlay or {}),
     )
 
@@ -703,6 +721,199 @@ def _runtime_failure_error(
     )
 
 
+def _telemetry_candidate_path(
+    telemetry_dir: Path,
+    candidate: Path,
+) -> str:
+    """Return the container-side path for a telemetry candidate."""
+    try:
+        rel = candidate.relative_to(telemetry_dir).as_posix()
+    except ValueError:
+        rel = candidate.name
+    return f"{runtime.FLYWHEEL_TELEMETRY_MOUNT}/{rel}"
+
+
+MAX_TELEMETRY_CANDIDATE_BYTES = 256 * 1024
+
+
+def _preserve_rejected_telemetry_candidate(
+    workspace: Workspace,
+    *,
+    execution_id: str,
+    rejection_id: str,
+    candidate: Path,
+) -> str | None:
+    """Best-effort preservation for rejected telemetry bytes."""
+    if not candidate.exists():
+        return None
+    rel = (
+        Path("telemetry_rejections")
+        / execution_id
+        / rejection_id
+        / candidate.name
+    )
+    dst = workspace.path / rel
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if candidate.is_dir():
+            shutil.copytree(candidate, dst)
+        elif candidate.is_file():
+            shutil.copy2(candidate, dst)
+        else:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return rel.as_posix()
+
+
+def _reject_telemetry_candidate(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+    candidate: Path,
+    reason: str,
+) -> bool:
+    """Record a non-fatal telemetry ingest rejection."""
+    assert plan.telemetry_dir is not None
+    rejection_id = workspace.generate_telemetry_rejection_id()
+    preserved_path = _preserve_rejected_telemetry_candidate(
+        workspace,
+        execution_id=plan.execution_id,
+        rejection_id=rejection_id,
+        candidate=candidate,
+    )
+    try:
+        workspace.record_rejected_telemetry(
+            RejectedTelemetry(
+                id=rejection_id,
+                execution_id=plan.execution_id,
+                recorded_at=datetime.now(UTC),
+                path=_telemetry_candidate_path(plan.telemetry_dir, candidate),
+                reason=reason,
+                preserved_path=preserved_path,
+            ),
+            persist=False,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _validate_telemetry_payload(
+    payload: Any,
+) -> tuple[str, dict[str, Any], str | None]:
+    """Validate the strict container telemetry envelope."""
+    if not isinstance(payload, dict):
+        raise ValueError("telemetry JSON must be an object")
+    allowed = {"kind", "data", "source"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(
+            f"telemetry envelope has unknown key(s) {sorted(unknown)!r}"
+        )
+    missing = {"kind", "data"} - set(payload)
+    if missing:
+        raise ValueError(
+            f"telemetry envelope missing key(s) {sorted(missing)!r}"
+        )
+    kind = payload["kind"]
+    if not isinstance(kind, str) or not kind.strip():
+        raise ValueError("telemetry 'kind' must be a non-empty string")
+    if kind != kind.strip():
+        raise ValueError("telemetry 'kind' must not have surrounding whitespace")
+    data = payload["data"]
+    if not isinstance(data, dict):
+        raise ValueError("telemetry 'data' must be an object")
+    source = payload.get("source")
+    if source is not None and not isinstance(source, str):
+        raise ValueError("telemetry 'source' must be a string when set")
+    if source == "":
+        source = None
+    return kind, data, source
+
+
+def _ingest_execution_telemetry(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+) -> None:
+    """Ingest non-fatal execution telemetry candidates."""
+    telemetry_dir = plan.telemetry_dir
+    if telemetry_dir is None or not telemetry_dir.exists():
+        return
+    changed = False
+    for candidate in sorted(telemetry_dir.iterdir()):
+        try:
+            if candidate.is_dir():
+                changed |= _reject_telemetry_candidate(
+                    workspace,
+                    plan,
+                    candidate,
+                    "telemetry candidates must be flat .json files",
+                )
+                continue
+            if not candidate.is_file():
+                changed |= _reject_telemetry_candidate(
+                    workspace,
+                    plan,
+                    candidate,
+                    "telemetry candidate must be a regular .json file",
+                )
+                continue
+            if candidate.suffix.lower() != ".json":
+                changed |= _reject_telemetry_candidate(
+                    workspace,
+                    plan,
+                    candidate,
+                    "telemetry candidate must be a .json file",
+                )
+                continue
+            if candidate.stat().st_size > MAX_TELEMETRY_CANDIDATE_BYTES:
+                changed |= _reject_telemetry_candidate(
+                    workspace,
+                    plan,
+                    candidate,
+                    (
+                        "telemetry candidate exceeds "
+                        f"{MAX_TELEMETRY_CANDIDATE_BYTES} bytes"
+                    ),
+                )
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                kind, data, source = _validate_telemetry_payload(payload)
+            except Exception as exc:  # noqa: BLE001
+                changed |= _reject_telemetry_candidate(
+                    workspace,
+                    plan,
+                    candidate,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                continue
+            workspace.record_execution_telemetry(
+                ExecutionTelemetry(
+                    id=workspace.generate_telemetry_id(),
+                    execution_id=plan.execution_id,
+                    kind=kind,
+                    recorded_at=datetime.now(UTC),
+                    data=data,
+                    source=source,
+                ),
+                persist=False,
+            )
+            changed = True
+        except Exception as exc:  # noqa: BLE001
+            changed |= _reject_telemetry_candidate(
+                workspace,
+                plan,
+                candidate,
+                f"{type(exc).__name__}: {exc}",
+            )
+    if changed:
+        try:
+            workspace.save()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def commit_block_execution(
     workspace: Workspace,
     plan: ExecutionPlan,
@@ -759,7 +970,6 @@ def commit_block_execution(
     if termination_reason in _RESERVED_FAILURE_PHASES:
         failure_phase = _RESERVED_FAILURE_PHASES[termination_reason]
         error = _runtime_failure_error(runtime_result, block_def, exit_code)
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
             termination_reason,
@@ -771,6 +981,8 @@ def commit_block_execution(
             state_mode=plan.state_mode,
             invoking_execution_id=invoking_execution_id,
         )
+        _ingest_execution_telemetry(workspace, plan)
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
         message = f"Block {block_name!r} runtime failed: {error}"
         if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
             raise _with_execution_id(
@@ -815,7 +1027,6 @@ def commit_block_execution(
                 execution_id=plan.execution_id,
                 source_path=plan.state_mount_dir,
             )
-            shutil.rmtree(plan.proposals_root, ignore_errors=True)
             error = f"state_validate: {exc}"
             if recovery_path is not None:
                 error = f"{error} (recovery: {recovery_path})"
@@ -834,6 +1045,8 @@ def commit_block_execution(
                 state_mode=plan.state_mode,
                 invoking_execution_id=invoking_execution_id,
             )
+            _ingest_execution_telemetry(workspace, plan)
+            shutil.rmtree(plan.proposals_root, ignore_errors=True)
             raise _with_execution_id(
                 StateValidationError(
                     error,
@@ -848,7 +1061,6 @@ def commit_block_execution(
                 execution_id=plan.execution_id,
                 source_path=plan.state_mount_dir,
             )
-            shutil.rmtree(plan.proposals_root, ignore_errors=True)
             error = f"state_capture: {type(exc).__name__}: {exc}"
             if recovery_path is not None:
                 error = f"{error} (recovery: {recovery_path})"
@@ -863,6 +1075,8 @@ def commit_block_execution(
                 state_mode=plan.state_mode,
                 invoking_execution_id=invoking_execution_id,
             )
+            _ingest_execution_telemetry(workspace, plan)
+            shutil.rmtree(plan.proposals_root, ignore_errors=True)
             raise _with_execution_id(
                 RuntimeError(error), plan.execution_id) from exc
 
@@ -921,8 +1135,6 @@ def commit_block_execution(
             continue
         output_bindings[slot.name] = instance.id
 
-    shutil.rmtree(plan.proposals_root, ignore_errors=True)
-
     all_expected_committed = not rejected_outputs
 
     if rejection_messages:
@@ -954,6 +1166,8 @@ def commit_block_execution(
             state_snapshot_id=state_snapshot_id,
             invoking_execution_id=invoking_execution_id,
         )
+        _ingest_execution_telemetry(workspace, plan)
+        shutil.rmtree(plan.proposals_root, ignore_errors=True)
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
             raise _with_execution_id(
                 ArtifactValidationError(error_msg), plan.execution_id)
@@ -970,6 +1184,8 @@ def commit_block_execution(
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
     )
+    _ingest_execution_telemetry(workspace, plan)
+    shutil.rmtree(plan.proposals_root, ignore_errors=True)
 
     return container_result
 
@@ -1131,7 +1347,7 @@ def run_block(
             error=error,
             termination_reason=runtime.TERMINATION_REASON_INTERRUPTED,
             resolved_bindings=plan.resolved_bindings,
-            proposals_root=plan.proposals_root,
+            plan=plan,
             state_mode=plan.state_mode,
             invoking_execution_id=invoking_execution_id,
         )
@@ -1147,7 +1363,7 @@ def run_block(
             phase=runtime.FAILURE_INVOKE,
             error=f"{type(exc).__name__}: {exc}",
             resolved_bindings=plan.resolved_bindings,
-            proposals_root=plan.proposals_root,
+            plan=plan,
             state_mode=plan.state_mode,
             invoking_execution_id=invoking_execution_id,
         )
