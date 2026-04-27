@@ -39,9 +39,12 @@ FLYWHEEL_TELEMETRY_MOUNT: Final[str] = "/flywheel/telemetry"
 candidate JSON files and sidecar diagnostics.  Flywheel ingests
 top-level JSON telemetry envelopes after the container exits and
 records accepted or rejected telemetry on the execution ledger.
-Subdirectories are preserved in the execution proposal tree as
-sidecars and are not inlined into workspace metadata.  Telemetry
-is not an artifact and does not affect execution success."""
+Raw telemetry bytes are copied to
+``<workspace>/telemetry/<execution_id>/`` before the execution
+proposal tree is cleaned up; subdirectories are preserved there
+as sidecars and are not inlined into workspace metadata.
+Telemetry is not an artifact and does not affect execution
+success."""
 
 STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 """Workspace-relative path of the cooperative cancellation

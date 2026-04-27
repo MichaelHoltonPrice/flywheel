@@ -298,8 +298,7 @@ def _telemetry_sidecar_path(
     assert container_path.startswith(prefix)
     rel = container_path[len(prefix):]
     return (
-        workspace.path / "proposals" / execution_id
-        / "_flywheel" / "telemetry" / rel
+        workspace.path / "telemetry" / execution_id / rel
     )
 
 

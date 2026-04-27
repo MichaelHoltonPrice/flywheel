@@ -733,6 +733,24 @@ def _telemetry_candidate_path(
     return f"{runtime.FLYWHEEL_TELEMETRY_MOUNT}/{rel}"
 
 
+def _preserve_execution_telemetry_sidecars(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+) -> Path | None:
+    """Copy raw telemetry bytes out of proposals before cleanup."""
+    telemetry_dir = plan.telemetry_dir
+    if telemetry_dir is None or not telemetry_dir.exists():
+        return None
+    target = workspace.path / "telemetry" / plan.execution_id
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(telemetry_dir, target)
+    except Exception:  # noqa: BLE001
+        return None
+    return target
+
+
 def _preserve_rejected_telemetry_candidate(
     workspace: Workspace,
     *,
@@ -836,6 +854,7 @@ def _ingest_execution_telemetry(
     telemetry_dir = plan.telemetry_dir
     if telemetry_dir is None or not telemetry_dir.exists():
         return
+    _preserve_execution_telemetry_sidecars(workspace, plan)
     changed = False
     for candidate in sorted(telemetry_dir.iterdir()):
         try:

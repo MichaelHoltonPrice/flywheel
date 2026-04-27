@@ -307,6 +307,7 @@ class TestExecutionTelemetry:
                 for host, container, _mode in config.mounts
             }
             telemetry_dir = mounts["/flywheel"] / "telemetry"
+            (telemetry_dir / "session" / "jsonl").mkdir(parents=True)
             (telemetry_dir / "usage.json").write_text(json.dumps({
                 "kind": "usage",
                 "source": "test",
@@ -316,6 +317,10 @@ class TestExecutionTelemetry:
                 "kind": "timing",
                 "data": {"elapsed_ms": 50},
             }))
+            (telemetry_dir / "session" / "jsonl" / "s.jsonl").write_text(
+                '{"type":"message"}\n',
+                encoding="utf-8",
+            )
             checkpoint = mounts["/output"] / "checkpoint.pt"
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             checkpoint.write_text("weights")
@@ -335,6 +340,11 @@ class TestExecutionTelemetry:
         assert telemetry[1].source == "test"
         assert telemetry[1].data == {"tokens": 12}
         assert reloaded.telemetry_rejections == {}
+        preserved = (
+            reloaded.path / "telemetry" / result.execution_id
+            / "session" / "jsonl" / "s.jsonl"
+        )
+        assert preserved.read_text(encoding="utf-8") == '{"type":"message"}\n'
 
     def test_malformed_telemetry_is_rejected_without_failing_execution(
         self, tmp_path: Path,
@@ -358,6 +368,7 @@ class TestExecutionTelemetry:
             }))
             (telemetry_dir / "note.txt").write_text("not telemetry")
             (telemetry_dir / "nested").mkdir()
+            (telemetry_dir / "nested" / "trace.txt").write_text("trace")
             (telemetry_dir / "huge.json").write_text(
                 json.dumps({"kind": "usage", "data": {"payload": "x" * 300000}})
             )
@@ -391,6 +402,10 @@ class TestExecutionTelemetry:
         assert all(item.preserved_path is not None for item in rejections)
         for item in rejections:
             assert (ws.path / item.preserved_path).exists()
+        assert (
+            reloaded.path / "telemetry" / result.execution_id
+            / "nested" / "trace.txt"
+        ).read_text(encoding="utf-8") == "trace"
 
     def test_crashed_execution_can_still_record_telemetry(
         self, tmp_path: Path,
