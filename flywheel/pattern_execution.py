@@ -558,6 +558,14 @@ def _execute_member(
             key: substitute_params(value, params)
             for key, value in member.env.items()
         }
+        resume_prompt = _build_resume_prompt(
+            workspace,
+            template,
+            member.block,
+            input_bindings,
+        )
+        if resume_prompt is not None:
+            env_overlay.setdefault("FLYWHEEL_RESUME_PROMPT", resume_prompt)
         result = run_block(
             workspace,
             member.block,
@@ -861,6 +869,74 @@ def _block_definition(template: Template, block_name: str):
         if block.name == block_name:
             return block
     raise PatternRunError(f"block {block_name!r} is not in template")
+
+
+def _build_resume_prompt(
+    workspace: Workspace,
+    template: Template,
+    block_name: str,
+    input_bindings: dict[str, str],
+) -> str | None:
+    """Describe the concrete input artifacts mounted for a resumed agent.
+
+    The Claude battery only consumes this when it is resuming an existing
+    SDK session.  First executions ignore it, so it is safe to compute
+    for every block launch.
+    """
+    if not input_bindings:
+        return None
+    block = _block_definition(template, block_name)
+    slots = {slot.name: slot for slot in block.inputs}
+    lines = [
+        "Continue the original task.",
+        "The previous external work requested by the session has completed.",
+        "The following input artifacts are now mounted in this execution:",
+    ]
+    for slot_name in sorted(input_bindings):
+        slot = slots.get(slot_name)
+        if slot is None:
+            continue
+        artifact_id = input_bindings[slot_name]
+        instance = workspace.artifacts.get(artifact_id)
+        if instance is None:
+            lines.append(
+                f"- {slot_name}: {slot.container_path} "
+                f"(artifact {artifact_id})"
+            )
+            continue
+        files = _artifact_mounted_files(workspace, instance, slot.container_path)
+        if files:
+            lines.append(
+                f"- {slot_name}: {slot.container_path} "
+                f"(artifact {artifact_id}); files: {', '.join(files)}"
+            )
+        else:
+            lines.append(
+                f"- {slot_name}: {slot.container_path} "
+                f"(artifact {artifact_id})"
+            )
+    lines.append("Read the relevant artifact result and continue.")
+    return "\n".join(lines)
+
+
+def _artifact_mounted_files(
+    workspace: Workspace,
+    instance: ArtifactInstance,
+    container_path: str,
+) -> list[str]:
+    if instance.copy_path is None:
+        return []
+    root = workspace.path / "artifacts" / instance.copy_path
+    if not root.is_dir():
+        return []
+    files: list[str] = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        files.append(f"{container_path.rstrip('/')}/{rel}")
+        if len(files) >= 10:
+            files.append("...")
+            break
+    return files
 
 
 def _resolve_latest_in_lane(

@@ -88,7 +88,9 @@ def _load_battery_module(name: str, path: Path):
     return module
 
 
-def test_claude_battery_splices_handoff_result_into_session(tmp_path: Path):
+def test_claude_battery_splices_placeholder_handoff_result_into_session(
+    tmp_path: Path,
+):
     module = _load_battery_module(
         "handoff_session",
         ROOT / "batteries" / "claude" / "handoff_session.py",
@@ -102,10 +104,14 @@ def test_claude_battery_splices_handoff_result_into_session(tmp_path: Path):
                 "tool_use_id": "toolu_1",
                 "content": [{
                     "type": "text",
-                    "text": "permission denied: handoff_to_flywheel",
+                    "text": "Evaluation requested.",
                 }],
-                "is_error": True,
+                "is_error": False,
             }],
+        },
+        "toolUseResult": "{\"result\":\"Evaluation requested.\"}",
+        "mcpMeta": {
+            "structuredContent": {"result": "Evaluation requested."},
         },
     }) + "\n", encoding="utf-8")
     score = tmp_path / "scores.json"
@@ -132,6 +138,46 @@ def test_claude_battery_splices_handoff_result_into_session(tmp_path: Path):
     assert "mean: 14.2" in text
     assert "episodes: 4000" in text
     assert "handoff_to_flywheel" not in text
+    assert "Evaluation requested." not in text
+    assert "Evaluation requested." not in payload["toolUseResult"]
+    assert "Evaluation requested." not in payload["mcpMeta"][
+        "structuredContent"]["result"]
+
+
+def test_claude_battery_still_splices_legacy_deny_handoff_result(
+    tmp_path: Path,
+):
+    module = _load_battery_module(
+        "handoff_session",
+        ROOT / "batteries" / "claude" / "handoff_session.py",
+    )
+
+    session = tmp_path / "session.jsonl"
+    session.write_text(json.dumps({
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "permission denied: handoff_to_flywheel",
+                "is_error": True,
+            }],
+        },
+    }) + "\n", encoding="utf-8")
+    score = tmp_path / "scores.json"
+    score.write_text(json.dumps({"mean": 3.5}), encoding="utf-8")
+
+    count = module.splice_handoff_results(
+        session,
+        result_path=score,
+        deny_marker="handoff_to_flywheel",
+        result_label="Evaluation",
+    )
+
+    assert count == 1
+    block = json.loads(session.read_text(encoding="utf-8"))[
+        "message"]["content"][0]
+    assert block["is_error"] is False
+    assert "mean: 3.5" in block["content"][0]["text"]
 
 
 def test_claude_battery_splices_missing_result_as_error(tmp_path: Path):
@@ -161,6 +207,94 @@ def test_claude_battery_splices_missing_result_as_error(tmp_path: Path):
     block = json.loads(session.read_text(encoding="utf-8"))["content"][0]
     assert block["is_error"] is True
     assert "did not produce a result artifact" in block["content"][0]["text"]
+
+
+def test_claude_battery_splices_newest_handoff_by_default(
+    tmp_path: Path,
+):
+    module = _load_battery_module(
+        "handoff_session",
+        ROOT / "batteries" / "claude" / "handoff_session.py",
+    )
+    session = tmp_path / "session.jsonl"
+    session.write_text(
+        "\n".join([
+            json.dumps({"content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_old",
+                "content": "permission denied: handoff_to_flywheel",
+                "is_error": True,
+            }]}),
+            json.dumps({"content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_new",
+                "content": "permission denied: handoff_to_flywheel",
+                "is_error": True,
+            }]}),
+        ]),
+        encoding="utf-8",
+    )
+    score = tmp_path / "scores.json"
+    score.write_text(json.dumps({"mean": 88}), encoding="utf-8")
+
+    count = module.splice_handoff_results(
+        session,
+        result_path=score,
+        deny_marker="handoff_to_flywheel",
+        result_label="Evaluation",
+    )
+
+    assert count == 1
+    lines = [
+        json.loads(line)
+        for line in session.read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[0]["content"][0]["is_error"] is True
+    assert lines[1]["content"][0]["is_error"] is False
+    assert "mean: 88" in lines[1]["content"][0]["content"][0]["text"]
+
+
+def test_claude_battery_splices_exact_tool_use_id(tmp_path: Path):
+    module = _load_battery_module(
+        "handoff_session",
+        ROOT / "batteries" / "claude" / "handoff_session.py",
+    )
+    session = tmp_path / "session.jsonl"
+    session.write_text(
+        "\n".join([
+            json.dumps({"content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_old",
+                "content": "permission denied: handoff_to_flywheel",
+                "is_error": True,
+            }]}),
+            json.dumps({"content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_new",
+                "content": "permission denied: handoff_to_flywheel",
+                "is_error": True,
+            }]}),
+        ]),
+        encoding="utf-8",
+    )
+    score = tmp_path / "scores.json"
+    score.write_text(json.dumps({"mean": 77}), encoding="utf-8")
+
+    count = module.splice_handoff_results(
+        session,
+        result_path=score,
+        deny_marker="handoff_to_flywheel",
+        result_label="Evaluation",
+        tool_use_id="toolu_old",
+    )
+
+    assert count == 1
+    lines = [
+        json.loads(line)
+        for line in session.read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[0]["content"][0]["is_error"] is False
+    assert lines[1]["content"][0]["is_error"] is True
 
 
 def test_claude_battery_splicer_ignores_non_deny_marker_hits(
@@ -227,15 +361,14 @@ def test_claude_battery_splicer_preserves_session_mode(tmp_path: Path):
     assert session.stat().st_mode & 0o777 == 0o640
 
 
-def test_claude_battery_handoff_hook_requires_paths(tmp_path: Path):
+def test_claude_battery_handoff_post_hook_requires_paths(tmp_path: Path):
     module = _load_battery_module(
         "agent_runner",
         ROOT / "batteries" / "claude" / "agent_runner.py",
     )
     module._HANDOFF_STATE["pending"] = []
-    hook = module._build_handoff_hook(
+    hook = module._build_handoff_post_hook(
         {"mcp__cyberloop__request_eval"},
-        "handoff_to_flywheel",
         [tmp_path / "missing.py"],
     )
 
@@ -244,13 +377,16 @@ def test_claude_battery_handoff_hook_requires_paths(tmp_path: Path):
         "tool_input": {},
     }, "toolu_1", None))
 
-    assert module._HANDOFF_STATE["pending"] == []
-    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert len(module._HANDOFF_STATE["pending"]) == 1
+    assert module._HANDOFF_STATE["pending"][0]["tool_use_id"] == "toolu_1"
+    assert module._HANDOFF_STATE["pending"][0]["missing_required_paths"]
+    assert result["continue"] is False
+    reason = result["stopReason"]
     assert "missing required path" in reason
     assert "handoff_to_flywheel" not in reason
 
 
-def test_claude_battery_handoff_hook_captures_first_only(
+def test_claude_battery_handoff_post_hook_captures_first_only(
     tmp_path: Path,
 ):
     module = _load_battery_module(
@@ -260,9 +396,8 @@ def test_claude_battery_handoff_hook_captures_first_only(
     module._HANDOFF_STATE["pending"] = []
     bot = tmp_path / "bot.py"
     bot.write_text("def player_fn(env, obs_json, action_labels): return 0")
-    hook = module._build_handoff_hook(
+    hook = module._build_handoff_post_hook(
         {"mcp__cyberloop__request_eval"},
-        "handoff_to_flywheel",
         [bot],
     )
 
@@ -277,18 +412,13 @@ def test_claude_battery_handoff_hook_captures_first_only(
 
     assert len(module._HANDOFF_STATE["pending"]) == 1
     assert module._HANDOFF_STATE["pending"][0]["tool_use_id"] == "toolu_1"
-    first_reason = first["hookSpecificOutput"]["permissionDecisionReason"]
-    second_reason = second["hookSpecificOutput"]["permissionDecisionReason"]
-    assert first_reason == "permission denied: handoff_to_flywheel"
+    assert first["continue"] is False
+    assert first["stopReason"] == "handoff_to_flywheel"
+    second_reason = second["stopReason"]
     assert "already pending" in second_reason
-    assert "handoff_to_flywheel" not in second_reason
 
 
-def test_eval_handoff_resumes_with_spliced_tool_result(tmp_path: Path):
-    module = _load_battery_module(
-        "handoff_session",
-        ROOT / "batteries" / "claude" / "handoff_session.py",
-    )
+def test_eval_handoff_resumes_with_result_artifact_prompt(tmp_path: Path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     foundry = project_root / "foundry"
@@ -377,16 +507,13 @@ blocks:
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": "toolu_eval",
-                        "content": [{
-                            "type": "text",
-                            "text": (
-                                "permission denied: "
-                                "handoff_to_flywheel"
-                            ),
-                        }],
-                        "is_error": True,
+                    "content": [{
+                        "type": "text",
+                        "text": "Evaluation requested.",
                     }],
-                }) + "\n", encoding="utf-8")
+                    "is_error": False,
+                }],
+            }) + "\n", encoding="utf-8")
                 (flywheel_dir / "termination").write_text(
                     "eval_requested", encoding="utf-8")
                 return ContainerResult(exit_code=0, elapsed_s=0.1)
@@ -395,16 +522,13 @@ blocks:
             assert score_path.is_file()
             session = flywheel_dir / "state" / "session.jsonl"
             assert session.is_file()
-            count = module.splice_handoff_results(
-                session,
-                result_path=score_path,
-                deny_marker="handoff_to_flywheel",
-                result_label="Evaluation",
-            )
-            assert count == 1
+            resume_prompt = config.env.get("FLYWHEEL_RESUME_PROMPT", "")
+            assert "/input/score/scores.json" in resume_prompt
+            assert "Continue the original task." in resume_prompt
             text = session.read_text(encoding="utf-8")
             assert "permission denied: handoff_to_flywheel" not in text
-            assert "mean: 42.0" in text
+            assert "Evaluation requested." in text
+            assert "mean: 42.0" not in text
             bot_out.write_text("BOT2", encoding="utf-8")
             (flywheel_dir / "termination").write_text(
                 "normal", encoding="utf-8")

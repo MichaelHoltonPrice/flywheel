@@ -132,11 +132,12 @@ PROJECTS_DIR=/home/claude/.claude/projects
 SDK_SESSION_DIR="$PROJECTS_DIR/$SCRATCH_ENC"
 PERSISTED_SESSION=/flywheel/state/session.jsonl
 
-if [ -f "$PERSISTED_SESSION" ]; then
+if [ -f "$PERSISTED_SESSION" ] && [ "${FLYWHEEL_ENABLE_SESSION_SPLICE:-0}" = "1" ]; then
     python3 /app/handoff_session.py \
         --session "$PERSISTED_SESSION" \
         --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
         --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
+        --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
         --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
 fi
 
@@ -155,6 +156,7 @@ except Exception:
         echo "[entrypoint] staged session $SID for SDK resume"
     fi
 fi
+
 chown -R claude:claude "$PROJECTS_DIR"
 
 # Lock the persisted-state directory so claude cannot read it.
@@ -199,13 +201,104 @@ if [ -n "$LATEST" ]; then
     fi
 fi
 
+HOME=/home/claude python3 - <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+os.environ["HOME"] = "/home/claude"
+
+sdk_session_dir = Path("/home/claude/.claude/projects/-scratch")
+persisted_session = Path("/flywheel/state/session.jsonl")
+snapshot_dir = Path("/flywheel/state/session_readback")
+jsonl_dir = snapshot_dir / "jsonl"
+
+try:
+    jsonl_dir.mkdir(parents=True, exist_ok=True)
+    for src in sdk_session_dir.glob("*.jsonl"):
+        dst = jsonl_dir / src.name
+        shutil.copy2(src, dst)
+        os.chown(dst, 0, 0)
+        os.chmod(dst, 0o600)
+except Exception as exc:  # noqa: BLE001
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "copy_error.json").write_text(
+        json.dumps({
+            "error": type(exc).__name__,
+            "message": str(exc),
+        }, indent=2),
+        encoding="utf-8",
+    )
+
+session_id = ""
+try:
+    first = persisted_session.read_text(encoding="utf-8").splitlines()[0]
+    session_id = json.loads(first).get("sessionId", "")
+except Exception:
+    pass
+
+(snapshot_dir / "active_session.json").write_text(
+    json.dumps({"session_id": session_id}, indent=2),
+    encoding="utf-8",
+)
+
+if session_id:
+    try:
+        from claude_agent_sdk import get_session_info, get_session_messages
+
+        def encode(value):
+            if hasattr(value, "model_dump"):
+                return value.model_dump()
+            if hasattr(value, "to_dict"):
+                return value.to_dict()
+            if hasattr(value, "__dict__"):
+                return {
+                    key: encode(val)
+                    for key, val in value.__dict__.items()
+                    if not key.startswith("_")
+                }
+            if isinstance(value, (list, tuple)):
+                return [encode(item) for item in value]
+            if isinstance(value, dict):
+                return {key: encode(val) for key, val in value.items()}
+            return value
+
+        messages = get_session_messages(session_id, directory="/scratch")
+        info = get_session_info(session_id, directory="/scratch")
+        (snapshot_dir / "session_messages.json").write_text(
+            json.dumps([encode(msg) for msg in messages], indent=2, default=str),
+            encoding="utf-8",
+        )
+        (snapshot_dir / "session_info.json").write_text(
+            json.dumps(encode(info), indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        (snapshot_dir / "sdk_readback_error.json").write_text(
+            json.dumps({
+                "error": type(exc).__name__,
+                "message": str(exc),
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+for path in snapshot_dir.rglob("*"):
+    try:
+        os.chown(path, 0, 0)
+        if path.is_file():
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+PY
+
 python3 - <<'PY'
 import json
 from pathlib import Path
 
 result_path = Path("/tmp/flywheel-claude-runner.jsonl")
 telemetry_path = Path("/flywheel/telemetry/claude_usage.json")
-result = None
+results = []
 try:
     for line in result_path.read_text(encoding="utf-8").splitlines():
         try:
@@ -213,35 +306,85 @@ try:
         except Exception:
             continue
         if candidate.get("type") == "result":
-            result = candidate
+            results.append(candidate)
 except Exception:
     raise SystemExit(0)
-if result is None:
+if not results:
     raise SystemExit(0)
 
-data = {}
-for key in (
-    "model",
-    "total_cost_usd",
-    "duration_ms",
-    "duration_api_ms",
-    "is_error",
-    "num_turns",
-    "stop_reason",
-    "session_id",
-    "uuid",
-    "usage",
-    "model_usage",
-):
-    if key in result:
-        data[key] = result[key]
+def slim(result):
+    data = {}
+    for key in (
+        "model",
+        "total_cost_usd",
+        "duration_ms",
+        "duration_api_ms",
+        "is_error",
+        "num_turns",
+        "stop_reason",
+        "session_id",
+        "uuid",
+        "usage",
+        "model_usage",
+        "result",
+        "structured_output",
+        "permission_denials",
+        "errors",
+    ):
+        if key in result:
+            data[key] = result[key]
+    return data
 
-if data:
-    telemetry_path.write_text(json.dumps({
-        "kind": "claude_usage",
-        "source": "flywheel-claude",
-        "data": data,
-    }, indent=2), encoding="utf-8")
+items = [slim(result) for result in results]
+total_cost = 0.0
+has_cost = False
+for item in items:
+    cost = item.get("total_cost_usd")
+    if isinstance(cost, (int, float)):
+        total_cost += float(cost)
+        has_cost = True
+
+latest = dict(items[-1])
+latest["results"] = items
+latest["summary"] = {
+    "result_count": len(items),
+    "total_cost_usd": total_cost if has_cost else None,
+}
+
+telemetry_path.write_text(json.dumps({
+    "kind": "claude_usage",
+    "source": "flywheel-claude",
+    "data": latest,
+}, indent=2), encoding="utf-8")
+PY
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+result_path = Path("/tmp/flywheel-claude-runner.jsonl")
+compact_events_path = Path("/flywheel/telemetry/compact_events.json")
+compact_events = []
+try:
+    for line in result_path.read_text(encoding="utf-8").splitlines():
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if candidate.get("type") == "compact_hook":
+            compact_events.append(candidate)
+except Exception:
+    raise SystemExit(0)
+
+if compact_events:
+    compact_events_path.write_text(
+        json.dumps({
+            "kind": "claude_compact_events",
+            "source": "flywheel-claude",
+            "data": {"events": compact_events},
+        }, indent=2),
+        encoding="utf-8",
+    )
 PY
 
 if [ "$RC" -eq 0 ]; then

@@ -54,6 +54,9 @@ error rather than a long timeout.
   handoff cycle with Haiku.
 - `test_full_stop_b1_two_container_roundtrip.py` — agent and
   block runner each in their own Docker container.
+- `test_tool_invoked_pipeline_container.py` - real Docker
+  run-until pipeline covering a tool-requested block invocation,
+  managed-state restore, and resume with the invoked block's output.
 
 ## Crash-resume coverage
 

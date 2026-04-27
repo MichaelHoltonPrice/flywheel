@@ -38,25 +38,21 @@ Environment variables:
     MCP_SERVERS     — Comma-separated list of MCP servers to enable.
                       Projects mount servers at
                       /flywheel/mcp_servers/.
-    HANDOFF_TOOLS   — Comma-separated MCP tool names to intercept
-                      via a PreToolUse hook.  When the agent calls
-                      one or more in a single assistant turn, the
-                      hook denies each (recording deny tool_results
-                      in the session), captures every intercepted
-                      call on stdout, emits status
-                      ``tool_handoff``, and signals the runner to
-                      exit cleanly so a host-side driver can run
-                      the blocks out-of-band, splice every real
-                      result into the captured state_dir's
-                      session.jsonl, and let the next launch pick
-                      it up via the ``/flywheel/state/`` populate.
+    HANDOFF_TOOLS   — Comma-separated MCP tool names to stop on via
+                      a PostToolUse hook.  The tool itself runs
+                      normally and records a placeholder tool_result;
+                      the hook captures the tool_use_id and returns
+                      ``continue: false`` so the SDK stops before
+                      Claude reasons about the placeholder.  The next
+                      launch resumes with a prompt describing the
+                      mounted result artifacts.
                       Neither file is an artifact — they are
                       framework-owned runtime data the agent
                       launcher reads from the control tempdir
                       after the container exits.
-    HANDOFF_DENY_MARKER — Substring that the splice helper uses to
-                      locate the deny tool_result on disk.  Defaults
-                      to ``handoff_to_flywheel``.
+    HANDOFF_PLACEHOLDER_MARKER — Substring that the splice helper uses
+                      to locate the placeholder tool_result on disk.
+                      Defaults to ``Evaluation requested.``.
 
     Session resume:
         ``entrypoint.sh`` runs as root and stages the persisted
@@ -142,14 +138,14 @@ DEFAULT_PROMPT_FILE = Path("/app/agent/prompt.md")
 # Orchestration events are emitted on stdout.  The root entrypoint
 # captures that stream without exposing its capture file to the agent.
 # Neither file is an artifact — they are framework-owned runtime
-DEFAULT_HANDOFF_DENY_MARKER = "handoff_to_flywheel"
+DEFAULT_HANDOFF_PLACEHOLDER_MARKER = "Evaluation requested."
 
-# Module-level handoff state.  The PreToolUse hook appends each
-# intercepted tool_use to ``pending`` (preserving emission order);
-# the main message loop reads the list after each message to know
-# whether to exit cleanly with status ``tool_handoff``.  A dict so
-# the hook (a free function passed to the SDK) can mutate the same
-# object the loop reads.
+# Module-level handoff state.  The PostToolUse hook appends each
+# completed handoff tool_use to ``pending`` and returns
+# ``continue: false`` so the SDK stops processing before any
+# post-placeholder assistant reasoning is generated.  The main
+# message loop reads the list as a second line of defense and exits
+# cleanly with status ``tool_handoff``.
 _HANDOFF_STATE: dict[str, Any] = {"pending": []}
 
 
@@ -175,34 +171,34 @@ def _sdk_session_path(
 # Tool-call handoff hook
 # ------------------------------------------------------------------
 
-def _build_handoff_hook(
+def _build_handoff_post_hook(
     handoff_tools: set[str],
-    deny_marker: str,
     required_paths: list[Path],
 ):
-    """Return a PreToolUse hook that intercepts handoff-mapped tools.
+    """Return a PostToolUse hook for tool-result handoff boundaries.
 
-    The returned hook appends every intercepted tool_use into
-    ``_HANDOFF_STATE["pending"]`` (preserving the SDK's emission
-    order within an assistant turn) and returns a deny decision so
-    the SDK records a deny tool_result for each ``tool_use_id``.
-    The actual exit signaling is left to the main message loop
-    (which polls ``_HANDOFF_STATE`` after each message).
+    The tool call is allowed to run normally, so the SDK records a
+    successful placeholder tool_result.  The hook then records the
+    tool_use_id and returns ``continue: false``.  Anthropic documents
+    this common hook field as stopping processing after the hook, which
+    is the boundary Flywheel needs: the session has a completed tool
+    exchange, but Claude has not yet reasoned about the placeholder.
 
-    Multi-tool-use turns: the SDK fires PreToolUse for each
-    tool_use in a single assistant message in order.  A one-shot
-    block execution can hand off only one candidate, so the first
-    matching tool wins; later matching calls are denied without
-    the marker and do not create additional pending work.
+    We intentionally do not use ``PreToolUse`` ``permissionDecision:
+    "deny"`` for normal handoff.  Deny means the tool call was refused
+    and its reason is fed back to Claude, which can create a stale
+    assistant branch before the container stops.
+
+    We also do not use the SDK's ``permissionDecision: "defer"`` here.
+    A live characterization test showed that the SDK can return
+    ``stop_reason == "tool_deferred"`` after already streaming assistant
+    text from after the deferred tool call.
 
     Args:
         handoff_tools: Set of fully qualified MCP tool names whose
             invocations should be intercepted.  Other tool names
             pass through (the hook returns an empty dict, which the
             SDK treats as "no opinion, proceed normally").
-        deny_marker: Substring embedded in the deny reason; the
-            host-side splice helper uses this to locate the deny
-            tool_results on disk.
         required_paths: Files or directories that must exist before
             accepting the handoff.
 
@@ -221,26 +217,27 @@ def _build_handoff_hook(
             return {}
         missing = [str(p) for p in required_paths if not p.exists()]
         if missing:
+            _HANDOFF_STATE["pending"].append({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": input_data.get("tool_input", {}),
+                "captured_at": datetime.now(UTC).isoformat(),
+                "missing_required_paths": missing,
+            })
             return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        "handoff request rejected: missing required "
-                        f"path(s): {', '.join(missing)}"
-                    ),
-                },
+                "continue": False,
+                "stopReason": (
+                    "handoff request rejected: missing required "
+                    f"path(s): {', '.join(missing)}"
+                ),
             }
         if _HANDOFF_STATE["pending"]:
             return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        "handoff request rejected: another handoff "
-                        "is already pending for this turn"
-                    ),
-                },
+                "continue": False,
+                "stopReason": (
+                    "handoff request rejected: another handoff "
+                    "is already pending for this turn"
+                ),
             }
         _HANDOFF_STATE["pending"].append({
             "tool_use_id": tool_use_id,
@@ -249,14 +246,34 @@ def _build_handoff_hook(
             "captured_at": datetime.now(UTC).isoformat(),
         })
         return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    f"permission denied: {deny_marker}"
-                ),
-            },
+            "continue": False,
+            "stopReason": "handoff_to_flywheel",
         }
+    return _hook
+
+
+def _build_compact_hook(phase: str):
+    """Return a passive compact hook that emits compaction telemetry."""
+    async def _hook(
+        input_data: dict,
+        tool_use_id: str | None = None,
+        context=None,
+    ) -> dict:
+        del tool_use_id, context
+        event = {
+            "type": "compact_hook",
+            "phase": phase,
+            "session_id": input_data.get("session_id"),
+            "transcript_path": input_data.get("transcript_path"),
+            "trigger": input_data.get("trigger"),
+        }
+        if phase == "pre":
+            event["custom_instructions"] = input_data.get(
+                "custom_instructions", "")
+        if phase == "post":
+            event["compact_summary"] = input_data.get("compact_summary", "")
+        _emit(event)
+        return {}
     return _hook
 
 
@@ -529,27 +546,33 @@ async def main() -> None:
         for p in os.environ.get("HANDOFF_REQUIRED_PATHS", "").split(",")
         if p.strip()
     ]
-    handoff_deny_marker = os.environ.get(
-        "HANDOFF_DENY_MARKER", DEFAULT_HANDOFF_DENY_MARKER)
+    handoff_placeholder_marker = os.environ.get(
+        "HANDOFF_PLACEHOLDER_MARKER", DEFAULT_HANDOFF_PLACEHOLDER_MARKER)
     handoff_termination_reason = os.environ.get(
         "HANDOFF_TERMINATION_REASON", "tool_handoff").strip()
     if not handoff_termination_reason:
         handoff_termination_reason = "tool_handoff"
-    handoff_hooks_config = None
+    hooks_config = {
+        "PreCompact": [
+            HookMatcher(matcher=t, hooks=[_build_compact_hook("pre")])
+            for t in ("manual", "auto")
+        ],
+        "PostCompact": [
+            HookMatcher(matcher=t, hooks=[_build_compact_hook("post")])
+            for t in ("manual", "auto")
+        ],
+    }
     if handoff_tools:
-        hook_callable = _build_handoff_hook(
-            handoff_tools, handoff_deny_marker,
-            handoff_required_paths)
-        handoff_hooks_config = {
-            "PreToolUse": [
-                HookMatcher(matcher=t, hooks=[hook_callable])
-                for t in sorted(handoff_tools)
-            ],
-        }
+        hook_callable = _build_handoff_post_hook(
+            handoff_tools, handoff_required_paths)
+        hooks_config["PostToolUse"] = [
+            HookMatcher(matcher=t, hooks=[hook_callable])
+            for t in sorted(handoff_tools)
+        ]
         _emit({
             "type": "handoff_hook_registered",
             "tools": sorted(handoff_tools),
-            "deny_marker": handoff_deny_marker,
+            "placeholder_marker": handoff_placeholder_marker,
             "termination_reason": handoff_termination_reason,
             "required_paths": [str(p) for p in handoff_required_paths],
         })
@@ -564,8 +587,8 @@ async def main() -> None:
         options.tools = tools_whitelist
     if model:
         options.model = model
-    if handoff_hooks_config is not None:
-        options.hooks = handoff_hooks_config
+    if hooks_config:
+        options.hooks = hooks_config
     if mcp_servers:
         options.mcp_servers = mcp_servers
     if max_turns:
@@ -581,6 +604,7 @@ async def main() -> None:
     # readable from inside the agent process; that's the
     # privilege boundary the entrypoint enforces.
     session_id = ""
+    resuming_session = False
     encoded_dir = SDK_PROJECTS_DIR / _encode_cwd("/scratch")
     if encoded_dir.is_dir():
         candidates = sorted(
@@ -593,6 +617,7 @@ async def main() -> None:
             resume_sid = staged.stem
             options.resume = resume_sid
             session_id = resume_sid
+            resuming_session = True
             _emit({
                 "type": "session_resume",
                 "session_id": resume_sid,
@@ -605,8 +630,17 @@ async def main() -> None:
 
     try:
         async with ClaudeSDKClient(options=options) as client:
-            # Send initial prompt.
-            await client.query(prompt)
+            if resuming_session:
+                # The SDK exposes resume as another query() call, and
+                # query("") is serialized as an empty user message. The full
+                # task must already be in the session history; Flywheel may
+                # provide execution-specific context that points to newly
+                # mounted artifacts from completed external work.
+                resume_prompt = os.environ.get(
+                    "FLYWHEEL_RESUME_PROMPT", "").strip()
+                await client.query(resume_prompt or "Continue.")
+            else:
+                await client.query(prompt)
 
             # Process responses.  receive_response() yields messages
             # until a ResultMessage, then stops.  After compaction or
@@ -681,12 +715,12 @@ async def main() -> None:
                             pause_reason = "stop_requested"
                             break
 
-                        # Tool-call handoff: PreToolUse hook captured
-                        # one or more mapped tools in this turn.
-                        # All deny tool_results are now in the live
-                        # session; exit cleanly so the finally block
-                        # exports the JSONL and the host driver can
-                        # splice + restart.
+                        # Tool-call handoff: PostToolUse captured a
+                        # completed mapped tool and returned
+                        # continue:false.  The placeholder tool_result
+                        # is now in the live session; exit cleanly so
+                        # the entrypoint can persist it and the next
+                        # launch can resume with result-artifact context.
                         if _HANDOFF_STATE["pending"]:
                             pause_reason = "tool_handoff"
                             break
@@ -710,8 +744,12 @@ async def main() -> None:
                     _save_state(session_id, "stopped", "stop_requested")
                     return
 
+                if pause_reason is None and _HANDOFF_STATE["pending"]:
+                    pause_reason = "tool_handoff"
+
                 # Tool-call handoff.
                 if pause_reason == "tool_handoff":
+                    await client.interrupt()
                     pending = list(_HANDOFF_STATE["pending"])
                     _emit_handoff_pending(session_id)
                     if pending:

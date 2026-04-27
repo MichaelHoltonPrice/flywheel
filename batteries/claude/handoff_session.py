@@ -21,9 +21,18 @@ def splice_handoff_results(
     *,
     result_path: Path,
     deny_marker: str,
+    placeholder_marker: str = "Evaluation requested.",
     result_label: str,
+    tool_use_id: str | None = None,
+    replace_all: bool = False,
 ) -> int:
-    """Replace pending handoff deny results in ``session_jsonl_path``."""
+    """Replace pending handoff placeholder results in a session JSONL.
+
+    The current handoff path lets the MCP tool complete and then stops
+    Claude Code from a PostToolUse hook with ``continue: false``.  That
+    leaves a successful placeholder tool_result in the SDK session.  For
+    migration, this also recognizes the old PreToolUse deny marker.
+    """
     if not session_jsonl_path.is_file():
         return 0
 
@@ -36,39 +45,139 @@ def splice_handoff_results(
         result_label=result_label,
     )
 
-    new_lines: list[str] = []
-    replacements = 0
+    parsed_lines: list[tuple[str, dict[str, Any] | None]] = []
+    candidates: list[tuple[int, dict[str, Any]]] = []
     for lineno, line in enumerate(raw.splitlines(keepends=False), 1):
         if not line.strip():
-            new_lines.append(line)
+            parsed_lines.append((line, None))
             continue
         try:
             obj = json.loads(line)
         except json.JSONDecodeError as exc:
             raise SpliceError(
                 f"line {lineno}: invalid JSON: {exc}") from exc
+        parsed_lines.append((line, obj))
         blocks = _locate_content_array(obj)
         if blocks is None:
-            new_lines.append(line)
             continue
-        line_replacements = _splice_blocks(
-            blocks,
-            deny_marker=deny_marker,
-            payload=content,
-            is_error=is_error,
-        )
-        replacements += line_replacements
-        new_lines.append(
-            json.dumps(obj, separators=(",", ":"))
-            if line_replacements else line
-        )
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if not _is_pending_handoff_result(
+                block,
+                deny_marker=deny_marker,
+                placeholder_marker=placeholder_marker,
+            ):
+                continue
+            if tool_use_id and block.get("tool_use_id") != tool_use_id:
+                continue
+            candidates.append((len(parsed_lines) - 1, block))
 
+    if tool_use_id and not candidates:
+        raise SpliceError(f"no pending handoff tool_result for {tool_use_id}")
+
+    selected = candidates if replace_all else candidates[-1:]
+    for line_index, block in selected:
+        block["content"] = content
+        block["is_error"] = is_error
+        obj = parsed_lines[line_index][1]
+        if obj is not None:
+            _update_tool_result_metadata(
+                obj,
+                payload=content,
+                is_error=is_error,
+            )
+
+    replacements = len(selected)
     if replacements:
+        touched = {idx for idx, _block in selected}
+        new_lines: list[str] = []
+        for idx, (line, obj) in enumerate(parsed_lines):
+            if obj is not None and (replace_all or idx in touched):
+                new_lines.append(json.dumps(obj, separators=(",", ":")))
+            else:
+                new_lines.append(line)
         new_text = "\n".join(new_lines)
         if raw.endswith("\n"):
             new_text += "\n"
         _atomic_write(session_jsonl_path, new_text)
     return replacements
+
+
+def splice_handoff_results_in_blocks(
+    blocks: list[Any],
+    *,
+    result_path: Path,
+    deny_marker: str,
+    placeholder_marker: str = "Evaluation requested.",
+    result_label: str,
+    tool_use_id: str | None = None,
+    replace_all: bool = False,
+) -> int:
+    """Replace pending handoff results inside one content block list."""
+    content, is_error = _build_result_payload(
+        result_path=result_path,
+        result_label=result_label,
+    )
+    candidates = [
+        block for block in blocks
+        if (
+            isinstance(block, dict)
+            and _is_pending_handoff_result(
+                block,
+                deny_marker=deny_marker,
+                placeholder_marker=placeholder_marker,
+            )
+            and (tool_use_id is None or block.get("tool_use_id") == tool_use_id)
+        )
+    ]
+    selected = candidates if replace_all else candidates[-1:]
+    for block in selected:
+        block["content"] = content
+        block["is_error"] = is_error
+    return len(selected)
+
+
+def handoff_result_text(*, result_path: Path, result_label: str) -> tuple[str, bool]:
+    """Build the text payload used for a completed handoff result."""
+    content, is_error = _build_result_payload(
+        result_path=result_path,
+        result_label=result_label,
+    )
+    texts: list[str] = []
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str):
+            texts.append(text)
+    return "\n".join(texts), is_error
+
+
+def _splice_blocks(
+    blocks: list[Any],
+    *,
+    deny_marker: str,
+    payload: list[dict[str, Any]],
+    is_error: bool,
+    tool_use_id: str | None = None,
+    replace_all: bool = False,
+) -> int:
+    candidates = [
+        block for block in blocks
+        if (
+            isinstance(block, dict)
+            and _is_pending_handoff_result(
+                block,
+                deny_marker=deny_marker,
+                placeholder_marker="Evaluation requested.",
+            )
+            and (tool_use_id is None or block.get("tool_use_id") == tool_use_id)
+        )
+    ]
+    selected = candidates if replace_all else candidates[-1:]
+    for block in selected:
+        block["content"] = payload
+        block["is_error"] = is_error
+    return len(selected)
 
 
 def _build_result_payload(
@@ -102,6 +211,7 @@ def _build_result_payload(
         if message:
             lines.append(f"abort_message: {message}")
     for key in (
+        "score",
         "mean",
         "median",
         "std",
@@ -121,6 +231,29 @@ def _build_result_payload(
     return [{"type": "text", "text": "\n".join(lines)}], False
 
 
+def _update_tool_result_metadata(
+    obj: dict[str, Any],
+    *,
+    payload: list[dict[str, Any]],
+    is_error: bool,
+) -> None:
+    """Update Claude Code's duplicated tool-result metadata fields."""
+    text = "\n".join(
+        block.get("text", "")
+        for block in payload
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    )
+    if "toolUseResult" in obj:
+        obj["toolUseResult"] = text
+    if isinstance(obj.get("mcpMeta"), dict):
+        obj["mcpMeta"] = {"structuredContent": {"result": text}}
+    if isinstance(obj.get("tool_use_result"), dict):
+        obj["tool_use_result"] = {
+            "content": text,
+            "is_error": is_error,
+        }
+
+
 def _locate_content_array(obj: dict[str, Any]) -> list[Any] | None:
     msg = obj.get("message")
     if isinstance(msg, dict):
@@ -133,23 +266,19 @@ def _locate_content_array(obj: dict[str, Any]) -> list[Any] | None:
     return None
 
 
-def _splice_blocks(
-    blocks: list[Any],
+def _is_pending_handoff_result(
+    block: dict[str, Any],
     *,
     deny_marker: str,
-    payload: list[dict[str, Any]],
-    is_error: bool,
-) -> int:
-    replacements = 0
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        if not _is_handoff_deny(block, deny_marker):
-            continue
-        block["content"] = payload
-        block["is_error"] = is_error
-        replacements += 1
-    return replacements
+    placeholder_marker: str,
+) -> bool:
+    if block.get("type") != "tool_result":
+        return False
+    if block.get("is_error") is not True:
+        return _content_has_marker(block.get("content"), placeholder_marker)
+    # Backward compatibility for sessions captured by the old PreToolUse
+    # deny handoff path.
+    return _is_handoff_deny(block, deny_marker)
 
 
 def _is_handoff_deny(block: dict[str, Any], deny_marker: str) -> bool:
@@ -202,7 +331,18 @@ def main() -> int:
     parser.add_argument("--session", required=True)
     parser.add_argument("--result", required=True)
     parser.add_argument("--deny-marker", default="handoff_to_flywheel")
+    parser.add_argument(
+        "--placeholder-marker",
+        default="Evaluation requested.",
+        help="Text identifying the successful placeholder tool_result.",
+    )
     parser.add_argument("--label", default="Tool result")
+    parser.add_argument("--tool-use-id", default=None)
+    parser.add_argument(
+        "--replace-all",
+        action="store_true",
+        help="Replace every matching pending handoff result.",
+    )
     args = parser.parse_args()
 
     try:
@@ -210,7 +350,10 @@ def main() -> int:
             Path(args.session),
             result_path=Path(args.result),
             deny_marker=args.deny_marker,
+            placeholder_marker=args.placeholder_marker,
             result_label=args.label,
+            tool_use_id=args.tool_use_id,
+            replace_all=args.replace_all,
         )
     except Exception as exc:  # noqa: BLE001
         print(
