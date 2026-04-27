@@ -850,6 +850,11 @@ def _resolve_member_inputs(
     for slot in block.inputs:
         if slot.name in bindings:
             continue
+        # Sequence-bound slots are resolved by execution.py at exec-prep
+        # time via workspace.resolve_sequence_snapshot. Don't try to
+        # resolve them as plain lane-scoped artifacts here.
+        if slot.sequence is not None:
+            continue
         decl = template.artifact_declaration(slot.name)
         if decl is not None and decl.kind == "git":
             continue
