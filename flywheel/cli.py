@@ -29,8 +29,13 @@ from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.config import ProjectConfig, load_project_config
 from flywheel.execution import run_block
 from flywheel.pattern_declaration import PatternDeclaration
-from flywheel.pattern_params import PatternParamError
 from flywheel.pattern_execution import PatternRunError, run_pattern
+from flywheel.pattern_params import PatternParamError
+from flywheel.persistent_runtime import (
+    PersistentRuntimeError,
+    list_persistent_containers,
+    stop_persistent_container,
+)
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.workspace import Workspace
 
@@ -211,9 +216,9 @@ def main(argv: list[str] | None = None) -> None:
     cstop_parser = container_sub.add_parser(
         "stop",
         help=(
-            "Tear down a request-response runtime via the "
-            "/scratch/.stop sentinel, falling back to "
-            "SIGTERM/SIGKILL."),
+            "Tear down a workspace-persistent runtime via the "
+            "/flywheel/exchange/.stop sentinel, falling back to "
+            "Docker stop."),
     )
     cstop_parser.add_argument("--workspace", required=True)
     cstop_parser.add_argument("--template", required=True)
@@ -223,8 +228,12 @@ def main(argv: list[str] | None = None) -> None:
     cstop_parser.add_argument(
         "--reason", default="cli_stop",
         help=(
-            "Free-form reason string recorded with the teardown "
-            "(default: cli_stop)."),
+            "Free-form reason for operator logs (default: cli_stop)."),
+    )
+    cstop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove the container without waiting for graceful stop.",
     )
 
     clist_parser = container_sub.add_parser(
@@ -288,6 +297,7 @@ def main(argv: list[str] | None = None) -> None:
             template_name=args.template,
             block_name=args.block,
             reason=args.reason,
+            force=args.force,
         )
     elif (
         args.command == "container"
@@ -597,6 +607,7 @@ def run_block_command(
         bindings: Explicit input bindings mapping slot names to artifact IDs.
         extra_args: Extra arguments passed to the container entrypoint.
         state_lineage_key: State lineage key for managed-state blocks.
+        invocation_params: Run-scoped values for invocation route args.
 
     Raises:
         FileNotFoundError: If flywheel.yaml or the template file is missing.
@@ -728,24 +739,44 @@ def container_stop_command(
     template_name: str,
     block_name: str,
     reason: str,
+    force: bool = False,
 ) -> None:
-    """Report that persistent runtime management is deferred."""
-    del workspace, template_name, block_name, reason
-    raise NotImplementedError(
-        "persistent container runtime management is deferred until "
-        "the persistent execution path is rebuilt on the canonical "
-        "block execution pipeline"
-    )
+    """Stop and remove a workspace-persistent runtime container."""
+    workspace_path = Path(workspace)
+    template = _load_template_for(workspace_path, template_name)
+    block = next((b for b in template.blocks if b.name == block_name), None)
+    if block is None:
+        raise KeyError(
+            f"Block {block_name!r} not found in template {template.name!r}"
+        )
+    try:
+        stop_persistent_container(
+            workspace_path,
+            block_name,
+            timeout_s=block.stop_timeout_s,
+            reason=reason,
+            force=force,
+        )
+    except PersistentRuntimeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    print(f"Stopped persistent container for block {block_name!r}")
 
 
 def container_list_command(*, workspace: str) -> None:
-    """Report that persistent runtime management is deferred."""
-    del workspace
-    raise NotImplementedError(
-        "persistent container runtime management is deferred until "
-        "the persistent execution path is rebuilt on the canonical "
-        "block execution pipeline"
-    )
+    """List workspace-persistent runtime containers."""
+    try:
+        containers = list_persistent_containers(Path(workspace))
+    except PersistentRuntimeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    if not containers:
+        print("No persistent containers found.")
+        return
+    for info in containers:
+        block = info.block_name or "?"
+        image = info.image or "?"
+        print(f"{info.name}\t{block}\t{info.status}\t{image}")
 
 def _load_template_for(
     workspace_path: Path, template_name: str,
@@ -764,9 +795,6 @@ def _load_template_for(
             break
     config = load_project_config(project_root)
     registry = config.load_block_registry()
-    template_path = (
-        config.foundry_dir / "templates"
-        / f"{template_name}.yaml"
-    )
+    template_path = config.workspace_templates_dir / f"{template_name}.yaml"
     return Template.from_yaml(
         template_path, block_registry=registry)

@@ -46,20 +46,33 @@ as sidecars and are not inlined into workspace metadata.
 Telemetry is not an artifact and does not affect execution
 success."""
 
+FLYWHEEL_EXCHANGE_MOUNT: Final[str] = "/flywheel/exchange"
+"""Container-side root for workspace-persistent runtime exchange.
+
+Persistent containers receive one stable Flywheel-owned mount at this
+path.  Each execution gets a request directory under
+``/flywheel/exchange/requests/<execution_id>/`` containing staged
+inputs, output proposal directories, telemetry candidates, and the
+termination sidecar.  It is not a scratchpad or project workspace.
+"""
+
 STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 """Workspace-relative path of the cooperative cancellation
 sentinel.  Flywheel writes this file to request a clean shutdown;
 the container polls for it and exits when it appears.  The full
 container-side path depends on where the workspace is mounted
-(typically ``/scratch/.stop``)."""
+(for persistent runtimes, ``/flywheel/exchange/.stop``)."""
 
 REQUEST_TREE_WORKSPACE_RELATIVE: Final[str] = "requests"
 """Workspace-relative parent directory for request-response
 per-request I/O trees.  For request ``id``, flywheel creates
-``/scratch/requests/<id>/input/<slot>/`` (read-only staged
-inputs) and ``/scratch/requests/<id>/output/<slot>/`` (empty
-write targets) before each ``POST /execute`` call.  Unused by
-process-exit blocks."""
+``/flywheel/exchange/requests/<id>/input/<slot>/`` (staged
+inputs) and ``/flywheel/exchange/requests/<id>/output/<slot>/``
+(empty write targets) before each persistent-runtime execute
+call.  Unused by one-shot blocks."""
+
+PERSISTENT_RUNTIME_PROTOCOL_VERSION: Final[str] = "1"
+"""Built-in HTTP persistent-runtime protocol version."""
 
 CONTROL_PORT_ENV_VAR: Final[str] = "FLYWHEEL_CONTROL_PORT"
 """Environment variable used to pass the host-allocated control-

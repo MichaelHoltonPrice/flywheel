@@ -130,16 +130,17 @@ Inputs are copied into per-mount staging directories first.
 
 ### Run
 
-The current supported runtime is a one-shot container. A runtime runner
-receives an `ExecutionPlan`, runs the already-prepared container body,
-and returns observation. It does not register artifacts, write state
-snapshots, quarantine bytes, or record executions.
+The supported runtimes are one-shot containers and workspace-persistent
+containers. A runtime runner receives an `ExecutionPlan`, runs the
+already-prepared container body or request, and returns observation. It
+does not register artifacts, write state snapshots, quarantine bytes, or
+record executions.
 
-The default runner calls Docker. Tests can inject fake runners to prove
-that prepare and commit remain canonical.
-
-Persistent containers are deferred as a runtime variant. They must share
-the same prepare and commit paths when implemented.
+The default one-shot runner calls Docker and waits for the container to
+exit. The default persistent runner keeps a Docker container alive and
+dispatches execution requests through the exchange mount described in
+`docs/specs/persistent-runtime.md`. Tests can inject fake runners to
+prove that prepare and commit remain canonical.
 
 ### Termination
 
@@ -298,9 +299,12 @@ limits, and conditional iteration.
 
 ### Persistent Containers
 
-Implement persistent containers as a runtime variant that shares
-canonical prepare and commit. Persistent runtimes must not register
-artifacts, write state snapshots, or record executions directly.
+Persistent containers are a runtime variant that shares canonical
+prepare and commit. Flywheel owns the `/flywheel/exchange` request tree;
+the worker writes only proposals, telemetry candidates, and the
+termination sidecar for the current request. Persistent runtimes must
+not register artifacts, write state snapshots, or record executions
+directly.
 
 ### Pattern Expressiveness
 

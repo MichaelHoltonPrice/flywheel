@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import subprocess
@@ -16,6 +17,10 @@ from flywheel.artifact_validator import (
 )
 from flywheel.container import ContainerResult
 from flywheel.execution import RuntimeResult, run_block
+from flywheel.persistent_runtime import (
+    DockerHttpPersistentRuntimeRunner,
+    PersistentRuntimeResult,
+)
 from flywheel.state_validator import (
     StateValidationError,
     StateValidatorRegistry,
@@ -183,6 +188,26 @@ blocks:
         container_path: /output/score
 """
 
+PERSISTENT_TEMPLATE_YAML = """\
+artifacts:
+  - name: seed
+    kind: copy
+  - name: result
+    kind: copy
+
+blocks:
+  - name: worker
+    image: persistent:latest
+    lifecycle: workspace_persistent
+    state: unmanaged
+    inputs:
+      - name: seed
+        container_path: /input/seed
+    outputs:
+      - name: result
+        container_path: /output/result
+"""
+
 
 def _setup_git_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     project_root = tmp_path / "project"
@@ -292,6 +317,442 @@ class TestBlockLookup:
         assert result.container_result.exit_code == 0
         assert result.execution_id in ws.executions
         assert result.execution == ws.executions[result.execution_id]
+
+
+class TestPersistentRuntimeExecution:
+    def test_persistent_block_uses_exchange_root_and_commit_path(
+        self, tmp_path: Path,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+        seen = {}
+
+        class FakePersistentRunner:
+            def run(self, plan, args=None):
+                del args
+                seen["runner"] = plan.runner
+                seen["mounts"] = list(plan.mounts)
+                assert plan.runner == "container_persistent"
+                assert (
+                    plan.proposals_root
+                    == ws.path / "runtimes" / "worker"
+                    / "exchange" / "requests" / plan.execution_id
+                )
+                assert (
+                    plan.proposal_dirs["result"]
+                    == plan.proposals_root / "output" / "result"
+                )
+                assert (
+                    plan.proposals_root / "input" / "seed" / "seed.txt"
+                ).read_text() == "seed bytes"
+                (plan.proposal_dirs["result"] / "result.txt").write_text(
+                    "result bytes")
+                (plan.telemetry_dir / "usage.json").write_text(json.dumps({
+                    "kind": "usage",
+                    "data": {"requests": 1},
+                }))
+                (plan.proposals_root / "request.json").write_text(
+                    '{"request_id":"test"}')
+                (plan.proposals_root / "response.json").write_text(
+                    '{"status":"succeeded"}')
+                plan.termination_file.write_text("normal")
+                return PersistentRuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.2),
+                    announcement="normal",
+                )
+
+        result = run_block(
+            ws,
+            "worker",
+            template,
+            project_root,
+            persistent_runner=FakePersistentRunner(),
+        )
+
+        execution = ws.executions[result.execution_id]
+        assert execution.runner == "container_persistent"
+        assert execution.status == "succeeded"
+        assert seen["runner"] == "container_persistent"
+        assert seen["mounts"] == []
+        artifact_id = execution.output_bindings["result"]
+        instance = ws.artifacts[artifact_id]
+        assert instance.produced_by == result.execution_id
+        assert (
+            ws.path / "artifacts" / instance.copy_path / "result.txt"
+        ).read_text() == "result bytes"
+        assert {
+            item.kind: item.data for item in ws.telemetry.values()
+        } == {"usage": {"requests": 1}}
+        assert result.execution_id not in [
+            p.name for p in (
+                ws.path / "runtimes" / "worker" / "exchange" / "requests"
+            ).glob("*")
+        ]
+        archive = (
+            ws.path / "runtimes" / "worker" / "exchange"
+            / "archive" / result.execution_id
+        )
+        assert (archive / "request.json").read_text() == (
+            '{"request_id":"test"}')
+        assert (archive / "response.json").read_text() == (
+            '{"status":"succeeded"}')
+
+    def test_persistent_artifacts_are_registered_only_during_commit(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+
+        original_register = Workspace.register_artifact
+        call_stacks: list[list[str]] = []
+
+        def spy_register(self, *args, **kwargs):
+            call_stacks.append([
+                frame.function for frame in inspect.stack()
+            ])
+            return original_register(self, *args, **kwargs)
+
+        monkeypatch.setattr(Workspace, "register_artifact", spy_register)
+
+        class FakePersistentRunner:
+            def run(self, plan, args=None):
+                del args
+                (plan.proposal_dirs["result"] / "result.txt").write_text(
+                    "result bytes")
+                plan.termination_file.write_text("normal")
+                return PersistentRuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                    announcement="normal",
+                )
+
+        run_block(
+            ws,
+            "worker",
+            template,
+            project_root,
+            persistent_runner=FakePersistentRunner(),
+        )
+
+        assert len(call_stacks) == 1
+        assert "commit_block_execution" in call_stacks[0]
+
+    def test_http_persistent_request_includes_per_execution_env(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML.replace(
+            "image: persistent:latest",
+            'image: persistent:latest\n    env:\n      STATIC: base',
+        ))
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+
+        starts: list[dict] = []
+        payloads: list[dict] = []
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._container_inspect",
+            lambda name: None,
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._find_free_port",
+            lambda: 45678,
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._image_id",
+            lambda image: "image-id",
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._wait_for_health",
+            lambda port, *, timeout_s=30.0: None,
+        )
+
+        def fake_start_container(*, name, config, labels, port):
+            starts.append({
+                "name": name,
+                "env": dict(config.env),
+                "labels": dict(labels),
+                "port": port,
+            })
+
+        def fake_http_json(method, url, payload=None, *, timeout_s=10.0):
+            del method, url, timeout_s
+            payloads.append(dict(payload or {}))
+            exec_id = payload["request_id"]
+            request_root = (
+                ws.path / "runtimes" / "worker" / "exchange"
+                / "requests" / exec_id
+            )
+            (request_root / "output" / "result" / "result.txt").write_text(
+                "result bytes")
+            (request_root / "termination").write_text("normal")
+            return {"status": "succeeded", "termination_reason": "normal"}
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._start_container",
+            fake_start_container,
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._http_json",
+            fake_http_json,
+        )
+
+        run_block(
+            ws,
+            "worker",
+            template,
+            project_root,
+            env_overlay={"MODEL": "sonnet"},
+        )
+
+        assert starts[0]["env"] == {
+            "STATIC": "base",
+            runtime.CONTROL_PORT_ENV_VAR: "45678",
+        }
+        assert payloads[0]["env"] == {
+            "STATIC": "base",
+            "MODEL": "sonnet",
+        }
+
+    def test_stale_persistent_container_fails_loudly_and_records_invoke(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._image_id",
+            lambda image: "current-image-id",
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._container_inspect",
+            lambda name: {
+                "State": {"Running": True, "Status": "running"},
+                "Config": {
+                    "Labels": {
+                        "flywheel.workspace_id": "stale",
+                        "flywheel.block_name": "worker",
+                        "flywheel.lifecycle": "workspace_persistent",
+                        "flywheel.port": "45678",
+                    }
+                },
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="different settings"):
+            run_block(ws, "worker", template, project_root)
+
+        execution = next(iter(ws.executions.values()))
+        assert execution.runner == "container_persistent"
+        assert execution.status == "failed"
+        assert execution.failure_phase == runtime.FAILURE_INVOKE
+        assert "different settings" in execution.error
+
+    def test_persistent_output_validation_uses_shared_commit_path(
+        self, tmp_path: Path,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+
+        class FakePersistentRunner:
+            def run(self, plan, args=None):
+                del args
+                (plan.proposal_dirs["result"] / "result.txt").write_text(
+                    "invalid")
+                plan.termination_file.write_text("normal")
+                return PersistentRuntimeResult(
+                    termination_reason="normal",
+                    container_result=ContainerResult(
+                        exit_code=0, elapsed_s=0.1),
+                    announcement="normal",
+                )
+
+        registry = ArtifactValidatorRegistry()
+
+        def reject_result(name, declaration, staged_path):
+            del name, declaration, staged_path
+            raise ArtifactValidationError("bad result")
+
+        registry.register("result", reject_result)
+        with pytest.raises(ArtifactValidationError, match="bad result"):
+            run_block(
+                ws,
+                "worker",
+                template,
+                project_root,
+                validator_registry=registry,
+                persistent_runner=FakePersistentRunner(),
+            )
+
+        execution = next(iter(ws.executions.values()))
+        assert execution.runner == "container_persistent"
+        assert execution.failure_phase == runtime.FAILURE_OUTPUT_VALIDATE
+        rejection = execution.rejected_outputs["result"]
+        assert rejection.phase == runtime.FAILURE_OUTPUT_VALIDATE
+        assert rejection.quarantine_path is not None
+        assert (ws.path / rejection.quarantine_path / "result.txt").exists()
+
+    def test_http_runner_reuses_matching_container(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        block_def = template.blocks[0]
+        plan = type("Plan", (), {
+            "block_def": block_def,
+            "env_overlay": {},
+        })()
+        containers: dict[str, dict] = {}
+        starts: list[str] = []
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._find_free_port",
+            lambda: 45678,
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._image_id",
+            lambda image: "image-id",
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._wait_for_health",
+            lambda port, *, timeout_s=30.0: None,
+        )
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._container_inspect",
+            lambda name: containers.get(name),
+        )
+
+        def fake_start_container(*, name, config, labels, port):
+            del config, port
+            starts.append(name)
+            containers[name] = {
+                "State": {"Running": True, "Status": "running"},
+                "Config": {"Labels": dict(labels)},
+            }
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime._start_container",
+            fake_start_container,
+        )
+
+        runner = DockerHttpPersistentRuntimeRunner(
+            workspace_path=tmp_path / "workspace")
+        first = runner._ensure_running(plan)
+        second = runner._ensure_running(plan)
+
+        assert first == second
+        assert starts == [first[0]]
+
+    def test_persistent_invoke_exception_records_failed_execution(
+        self, tmp_path: Path,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        _init_git_repo(project_root)
+        foundry_dir = project_root / "foundry"
+        foundry_dir.mkdir()
+        template_path = foundry_dir / "persistent.yaml"
+        template_path.write_text(PERSISTENT_TEMPLATE_YAML)
+        template = from_yaml_with_inline_blocks(template_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        seed_source = tmp_path / "seed"
+        seed_source.mkdir()
+        (seed_source / "seed.txt").write_text("seed bytes")
+        ws.register_artifact("seed", seed_source, source="test seed")
+
+        class FailingPersistentRunner:
+            def run(self, plan, args=None):
+                del args
+                (plan.telemetry_dir / "usage.json").write_text(json.dumps({
+                    "kind": "usage",
+                    "data": {"requests": 1},
+                }))
+                raise RuntimeError("dispatch failed")
+
+        with pytest.raises(RuntimeError, match="dispatch failed"):
+            run_block(
+                ws,
+                "worker",
+                template,
+                project_root,
+                persistent_runner=FailingPersistentRunner(),
+            )
+
+        execution = next(iter(ws.executions.values()))
+        assert execution.runner == "container_persistent"
+        assert execution.status == "failed"
+        assert execution.failure_phase == runtime.FAILURE_INVOKE
+        assert {
+            item.kind: item.execution_id for item in ws.telemetry.values()
+        } == {"usage": execution.id}
 
 
 class TestExecutionTelemetry:

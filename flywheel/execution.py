@@ -49,6 +49,12 @@ from flywheel.artifact_validator import (
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
 from flywheel.invocation import dispatch_invocations
+from flywheel.persistent_runtime import (
+    DockerHttpPersistentRuntimeRunner,
+    PersistentRuntimeResult,
+    PersistentRuntimeRunner,
+    persistent_request_root,
+)
 from flywheel.quarantine import quarantine_slot
 from flywheel.state import (
     StateMode,
@@ -110,6 +116,7 @@ class ExecutionPlan:
             ``/flywheel/telemetry`` during execution.
         env_overlay: Per-execution environment values layered over the
             block template's static env.
+        runner: Runtime strategy used for this execution.
     """
 
     execution_id: str
@@ -128,6 +135,7 @@ class ExecutionPlan:
     state_compatibility: dict[str, str] | None = None
     telemetry_dir: Path | None = None
     env_overlay: dict[str, str] | None = None
+    runner: str = "container_one_shot"
 
 
 @dataclass
@@ -209,6 +217,18 @@ class OneShotContainerRunner(Protocol):
         ...
 
 
+def _persistent_result_to_runtime(
+    result: PersistentRuntimeResult,
+) -> RuntimeResult:
+    """Adapt the persistent-runtime result to commit's runtime facts."""
+    return RuntimeResult(
+        termination_reason=result.termination_reason,
+        container_result=result.container_result,
+        announcement=result.announcement,
+        error=result.error,
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 
@@ -264,6 +284,53 @@ def _mount_artifact_instance(
     return (host_path, container_path, "ro")
 
 
+def _copy_tree_contents(source: Path, target: Path) -> None:
+    """Copy a directory's contents into an existing target."""
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, destination)
+
+
+def _stage_artifact_instance(
+    instance: ArtifactInstance,
+    target_dir: Path,
+    workspace: Workspace,
+) -> None:
+    """Stage an input artifact into a persistent request directory."""
+    if instance.kind == "git":
+        if instance.repo is None or instance.git_path is None:
+            raise ValueError(
+                f"Git artifact {instance.id!r} missing repo or git_path"
+            )
+        source = (Path(instance.repo) / instance.git_path).resolve()
+    elif instance.kind == "copy":
+        if instance.copy_path is None:
+            raise ValueError(
+                f"Copy artifact {instance.id!r} missing copy_path"
+            )
+        source = (workspace.path / "artifacts" / instance.copy_path).resolve()
+    else:
+        raise ValueError(
+            f"Artifact {instance.id!r} has unsupported kind "
+            f"{instance.kind!r}"
+        )
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        _copy_tree_contents(source, target_dir)
+    elif source.is_file():
+        shutil.copy2(source, target_dir / source.name)
+    else:
+        raise ValueError(
+            f"Artifact {instance.id!r} source path does not exist: {source}"
+        )
+
+
 def _restore_state_snapshot(source: Path, target: Path) -> None:
     """Copy state bytes into an existing mount, preserving symlinks."""
     shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
@@ -292,6 +359,7 @@ def _record_execution(
     state_mode: StateMode = "none",
     state_snapshot_id: str | None = None,
     invoking_execution_id: str | None = None,
+    runner: str = "container_one_shot",
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -315,7 +383,7 @@ def _record_execution(
         exit_code=exit_code,
         elapsed_s=elapsed_s,
         image=image,
-        runner="container_one_shot",
+        runner=runner,
         failure_phase=failure_phase,
         error=error,
         rejected_outputs=rejected_outputs or {},
@@ -345,6 +413,7 @@ def commit_failure(
     plan: ExecutionPlan | None = None,
     state_mode: StateMode = "none",
     invoking_execution_id: str | None = None,
+    runner: str = "container_one_shot",
 ) -> None:
     """Record a failure that happened upstream of the commit phase.
 
@@ -385,6 +454,7 @@ def commit_failure(
         state_mode: State mode to record on the failed execution.
         invoking_execution_id: Execution that routed to this one,
             if the failed attempt was invoked by another block.
+        runner: Runtime strategy being prepared when no plan exists.
     """
     _record_execution(
         workspace, execution_id, block_name, started_at,
@@ -396,10 +466,11 @@ def commit_failure(
         error=error,
         state_mode=state_mode,
         invoking_execution_id=invoking_execution_id,
+        runner=plan.runner if plan is not None else runner,
     )
     if plan is not None:
         _ingest_execution_telemetry(workspace, plan)
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        _cleanup_execution_proposals(workspace, plan)
     elif proposals_root is not None:
         shutil.rmtree(proposals_root, ignore_errors=True)
 
@@ -419,6 +490,7 @@ def prepare_block_execution(
     state_lineage_key: str | None = None,
     allow_workspace_latest: bool = True,
     env_overlay: dict[str, str] | None = None,
+    runner: str = "container_one_shot",
 ) -> ExecutionPlan:
     """Allocate proposal dirs, resolve inputs, build mounts.
 
@@ -450,33 +522,51 @@ def prepare_block_execution(
         OSError: If proposal-directory allocation fails.  Same
             failure-recording responsibility applies.
     """
+    if runner not in ("container_one_shot", "container_persistent"):
+        raise ValueError(f"Unknown container runner {runner!r}")
+
     mounts: list[tuple[str, str, str]] = []
     resolved_bindings: dict[str, str] = {}
 
     # Per-slot proposal dirs (proposal-then-forge).  Allocated
     # first so any subsequent input-resolution failure has a known
     # proposals tree to clean up via commit_failure.
-    proposals_root = workspace.path / "proposals" / execution_id
+    if runner == "container_persistent":
+        proposals_root = persistent_request_root(
+            workspace.path, block_def.name, execution_id)
+        output_root = proposals_root / "output"
+        proposals_root.parent.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        proposals_root = workspace.path / "proposals" / execution_id
+        output_root = proposals_root
     proposal_dirs: dict[str, Path] = {}
     for slot in block_def.all_output_slots():
-        proposal_dir = proposals_root / slot.name
+        proposal_dir = output_root / slot.name
         proposal_dir.mkdir(parents=True, exist_ok=True)
         proposal_dirs[slot.name] = proposal_dir
-        mounts.append(
-            (str(proposal_dir.resolve()),
-             slot.container_path, "rw")
-        )
+        if runner == "container_one_shot":
+            mounts.append(
+                (str(proposal_dir.resolve()),
+                 slot.container_path, "rw")
+            )
 
     # Termination-channel sidecar.  The block writes one line to
     # /flywheel/termination announcing why it ended.
-    termination_dir = proposals_root / "_flywheel"
-    termination_dir.mkdir(parents=True, exist_ok=True)
-    termination_file = termination_dir / "termination"
-    telemetry_dir = termination_dir / "telemetry"
+    if runner == "container_persistent":
+        termination_dir = proposals_root
+        termination_dir.mkdir(parents=True, exist_ok=True)
+        termination_file = termination_dir / "termination"
+        telemetry_dir = termination_dir / "telemetry"
+    else:
+        termination_dir = proposals_root / "_flywheel"
+        termination_dir.mkdir(parents=True, exist_ok=True)
+        termination_file = termination_dir / "termination"
+        telemetry_dir = termination_dir / "telemetry"
     telemetry_dir.mkdir()
-    mounts.append(
-        (str(termination_dir.resolve()), "/flywheel", "rw")
-    )
+    if runner == "container_one_shot":
+        mounts.append(
+            (str(termination_dir.resolve()), "/flywheel", "rw")
+        )
 
     state_mode = block_def.state
     state_mount_dir: Path | None = None
@@ -524,20 +614,34 @@ def prepare_block_execution(
                     f"{instance.name!r}, not {slot.name!r}"
                 )
             resolved_bindings[slot.name] = artifact_id
-            mounts.append(
-                _mount_artifact_instance(
-                    instance, slot.container_path, workspace)
-            )
+            if runner == "container_persistent":
+                _stage_artifact_instance(
+                    instance,
+                    proposals_root / "input" / slot.name,
+                    workspace,
+                )
+            else:
+                mounts.append(
+                    _mount_artifact_instance(
+                        instance, slot.container_path, workspace)
+                )
 
         elif decl is not None and decl.kind == "git":
             git_instance = workspace.register_git_artifact(
                 slot.name, decl, project_root,
             )
             resolved_bindings[slot.name] = git_instance.id
-            mounts.append(
-                _mount_artifact_instance(
-                    git_instance, slot.container_path, workspace)
-            )
+            if runner == "container_persistent":
+                _stage_artifact_instance(
+                    git_instance,
+                    proposals_root / "input" / slot.name,
+                    workspace,
+                )
+            else:
+                mounts.append(
+                    _mount_artifact_instance(
+                        git_instance, slot.container_path, workspace)
+                )
 
         elif allow_workspace_latest:
             instances = workspace.instances_for(slot.name)
@@ -546,10 +650,17 @@ def prepare_block_execution(
             if copy_instances:
                 instance = copy_instances[-1]
                 resolved_bindings[slot.name] = instance.id
-                mounts.append(
-                    _mount_artifact_instance(
-                        instance, slot.container_path, workspace)
-                )
+                if runner == "container_persistent":
+                    _stage_artifact_instance(
+                        instance,
+                        proposals_root / "input" / slot.name,
+                        workspace,
+                    )
+                else:
+                    mounts.append(
+                        _mount_artifact_instance(
+                            instance, slot.container_path, workspace)
+                    )
             elif slot.optional:
                 continue
             else:
@@ -582,6 +693,7 @@ def prepare_block_execution(
         state_compatibility=state_compatibility,
         telemetry_dir=telemetry_dir,
         env_overlay=dict(env_overlay or {}),
+        runner=runner,
     )
 
 
@@ -664,6 +776,19 @@ def run_one_shot_container(
     return runner.run(plan, args)
 
 
+def run_persistent_container(
+    plan: ExecutionPlan,
+    args: list[str] | None = None,
+    *,
+    workspace_path: Path,
+    persistent_runner: PersistentRuntimeRunner | None = None,
+) -> RuntimeResult:
+    """Run a prepared execution through a workspace-persistent runtime."""
+    runner = persistent_runner or DockerHttpPersistentRuntimeRunner(
+        workspace_path=workspace_path)
+    return _persistent_result_to_runtime(runner.run(plan, args))
+
+
 # ── Phase 3: commit ──────────────────────────────────────────────
 
 
@@ -722,14 +847,21 @@ def _runtime_failure_error(
 
 
 def _telemetry_candidate_path(
-    telemetry_dir: Path,
+    plan: ExecutionPlan,
     candidate: Path,
 ) -> str:
     """Return the container-side path for a telemetry candidate."""
+    assert plan.telemetry_dir is not None
     try:
-        rel = candidate.relative_to(telemetry_dir).as_posix()
+        rel = candidate.relative_to(plan.telemetry_dir).as_posix()
     except ValueError:
         rel = candidate.name
+    if plan.runner == "container_persistent":
+        return (
+            f"{runtime.FLYWHEEL_EXCHANGE_MOUNT}/"
+            f"{runtime.REQUEST_TREE_WORKSPACE_RELATIVE}/"
+            f"{plan.execution_id}/telemetry/{rel}"
+        )
     return f"{runtime.FLYWHEEL_TELEMETRY_MOUNT}/{rel}"
 
 
@@ -802,7 +934,7 @@ def _reject_telemetry_candidate(
                 id=rejection_id,
                 execution_id=plan.execution_id,
                 recorded_at=datetime.now(UTC),
-                path=_telemetry_candidate_path(plan.telemetry_dir, candidate),
+                path=_telemetry_candidate_path(plan, candidate),
                 reason=reason,
                 preserved_path=preserved_path,
             ),
@@ -915,6 +1047,45 @@ def _ingest_execution_telemetry(
             workspace.save()
 
 
+def _archive_persistent_exchange_envelopes(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+) -> None:
+    """Preserve persistent request/response envelopes before cleanup."""
+    if plan.runner != "container_persistent":
+        return
+    candidates = [
+        path for path in (
+            plan.proposals_root / "request.json",
+            plan.proposals_root / "response.json",
+        )
+        if path.exists() and path.is_file()
+    ]
+    if not candidates:
+        return
+    archive_dir = (
+        workspace.path
+        / "runtimes"
+        / plan.block_name
+        / "exchange"
+        / "archive"
+        / plan.execution_id
+    )
+    with suppress(Exception):
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for candidate in candidates:
+            shutil.copy2(candidate, archive_dir / candidate.name)
+
+
+def _cleanup_execution_proposals(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+) -> None:
+    """Archive runtime envelopes and remove the execution proposal tree."""
+    _archive_persistent_exchange_envelopes(workspace, plan)
+    shutil.rmtree(plan.proposals_root, ignore_errors=True)
+
+
 def commit_block_execution(
     workspace: Workspace,
     plan: ExecutionPlan,
@@ -981,9 +1152,10 @@ def commit_block_execution(
             error=error,
             state_mode=plan.state_mode,
             invoking_execution_id=invoking_execution_id,
+            runner=plan.runner,
         )
         _ingest_execution_telemetry(workspace, plan)
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        _cleanup_execution_proposals(workspace, plan)
         message = f"Block {block_name!r} runtime failed: {error}"
         if termination_reason == runtime.TERMINATION_REASON_INTERRUPTED:
             raise _with_execution_id(
@@ -1045,9 +1217,10 @@ def commit_block_execution(
                 error=error,
                 state_mode=plan.state_mode,
                 invoking_execution_id=invoking_execution_id,
+                runner=plan.runner,
             )
             _ingest_execution_telemetry(workspace, plan)
-            shutil.rmtree(plan.proposals_root, ignore_errors=True)
+            _cleanup_execution_proposals(workspace, plan)
             raise _with_execution_id(
                 StateValidationError(
                     error,
@@ -1075,9 +1248,10 @@ def commit_block_execution(
                 error=error,
                 state_mode=plan.state_mode,
                 invoking_execution_id=invoking_execution_id,
+                runner=plan.runner,
             )
             _ingest_execution_telemetry(workspace, plan)
-            shutil.rmtree(plan.proposals_root, ignore_errors=True)
+            _cleanup_execution_proposals(workspace, plan)
             raise _with_execution_id(
                 RuntimeError(error), plan.execution_id) from exc
 
@@ -1166,9 +1340,10 @@ def commit_block_execution(
             state_mode=plan.state_mode,
             state_snapshot_id=state_snapshot_id,
             invoking_execution_id=invoking_execution_id,
+            runner=plan.runner,
         )
         _ingest_execution_telemetry(workspace, plan)
-        shutil.rmtree(plan.proposals_root, ignore_errors=True)
+        _cleanup_execution_proposals(workspace, plan)
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
             raise _with_execution_id(
                 ArtifactValidationError(error_msg), plan.execution_id)
@@ -1184,9 +1359,10 @@ def commit_block_execution(
         state_mode=plan.state_mode,
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
+        runner=plan.runner,
     )
     _ingest_execution_telemetry(workspace, plan)
-    shutil.rmtree(plan.proposals_root, ignore_errors=True)
+    _cleanup_execution_proposals(workspace, plan)
 
     return container_result
 
@@ -1205,6 +1381,7 @@ def run_block(
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
     container_runner: OneShotContainerRunner | None = None,
+    persistent_runner: PersistentRuntimeRunner | None = None,
     state_lineage_key: str | None = None,
     invoking_execution_id: str | None = None,
     dispatch_child_invocations: bool = True,
@@ -1234,6 +1411,8 @@ def run_block(
             registry consulted before managed state is captured.
         container_runner: Optional runner for the prepared one-shot
             container body.  Defaults to the Docker-backed runner.
+        persistent_runner: Optional runner for prepared persistent
+            container requests. Defaults to the Docker HTTP runner.
         state_lineage_key: Required for blocks that declare
             ``state: managed``; identifies the execution-lineage
             state chain to restore from and capture into.
@@ -1286,14 +1465,14 @@ def run_block(
         )
     if block_def.runner != "container":
         raise ValueError(
-            f"flywheel run block uses the one-shot container "
+            f"flywheel run block uses the container "
             f"pipeline and requires runner 'container'; block "
             f"{block_name!r} has runner {block_def.runner!r}"
         )
-    if block_def.lifecycle != "one_shot":
+    if block_def.lifecycle not in ("one_shot", "workspace_persistent"):
         raise ValueError(
-            f"flywheel run block uses the one-shot container "
-            f"pipeline and requires lifecycle 'one_shot'; block "
+            f"flywheel run block requires lifecycle 'one_shot' "
+            f"or 'workspace_persistent'; block "
             f"{block_name!r} has lifecycle {block_def.lifecycle!r}"
         )
 
@@ -1302,7 +1481,16 @@ def run_block(
     # execution_id to record itself against.
     execution_id = workspace.generate_execution_id()
     started_at = datetime.now(UTC)
-    proposals_root = workspace.path / "proposals" / execution_id
+    runner = (
+        "container_persistent"
+        if block_def.lifecycle == "workspace_persistent"
+        else "container_one_shot"
+    )
+    proposals_root = (
+        persistent_request_root(workspace.path, block_def.name, execution_id)
+        if runner == "container_persistent"
+        else workspace.path / "proposals" / execution_id
+    )
 
     # ── prepare ──────────────────────────────────────────────────
     try:
@@ -1314,6 +1502,7 @@ def run_block(
             state_lineage_key=state_lineage_key,
             allow_workspace_latest=allow_workspace_latest,
             env_overlay=env_overlay,
+            runner=runner,
         )
     except Exception as exc:
         commit_failure(
@@ -1327,15 +1516,24 @@ def run_block(
             proposals_root=proposals_root,
             state_mode=block_def.state,
             invoking_execution_id=invoking_execution_id,
+            runner=runner,
         )
         _with_execution_id(exc, execution_id)
         raise
 
     # -- run -----------------------------------------------------
     try:
-        runtime_result = run_one_shot_container(
-            plan, args, container_runner=container_runner,
-        )
+        if runner == "container_persistent":
+            runtime_result = run_persistent_container(
+                plan,
+                args,
+                workspace_path=workspace.path,
+                persistent_runner=persistent_runner,
+            )
+        else:
+            runtime_result = run_one_shot_container(
+                plan, args, container_runner=container_runner,
+            )
     except KeyboardInterrupt as exc:
         error = str(exc) or "operator interrupt"
         commit_failure(

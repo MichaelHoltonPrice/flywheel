@@ -453,22 +453,29 @@ both depend on it.
 
 ### Persistent Container Runner
 
-* **Channel**: a top-level field in the JSON response body of the
-  in-container server's `/execute` endpoint. Field name:
-  `termination_reason`. Field type: string.
-* **Format**: the string is the termination reason verbatim. Any
-  surrounding whitespace is stripped.
-* **Lifecycle**: the server returns the response when the execution
-  ends. The substrate reads the field from the response body.
+Persistent runtime details are specified in
+[persistent-runtime.md](persistent-runtime.md). Its canonical
+termination channel is
+`/flywheel/exchange/requests/<execution_id>/termination` inside the
+persistent container. The built-in HTTP response may include a
+`termination_reason` fallback, but the sidecar is the primary channel.
+
+* **Channel**: a sidecar file at
+  `/flywheel/exchange/requests/<execution_id>/termination`.
+* **Format**: same single-line UTF-8 format as one-shot
+  `/flywheel/termination`.
+* **Lifecycle**: the worker writes the file before returning from the
+  request. The substrate reads it during runtime observation.
 * **Substrate normalization**:
-  * HTTP 5xx, dropped connection, server exception, malformed JSON,
-    field missing or non-string → `crash`.
-  * Successful response, field present and matches a
-    substrate-reserved name → `protocol_violation`.
-  * Successful response, field present and matches a declared
-    project reason → that value verbatim.
-  * Successful response, field present and matches no declared
-    reason and no reserved name → `protocol_violation`.
+  * Failed dispatch, server exception, malformed response, or worker
+    `status: failed` → `crash`.
+  * Successful response, no valid announcement → `protocol_violation`.
+  * Successful response, announcement matches a substrate-reserved name
+    → `protocol_violation`.
+  * Successful response, announcement matches a declared project reason
+    → that value verbatim.
+  * Successful response, announcement matches no declared reason and no
+    reserved name → `protocol_violation`.
 
 ## Canonical write paths
 
@@ -605,8 +612,8 @@ They share `Prepare` and `Commit` entirely. They differ only in:
 
 * How they invoke the block (start container vs. POST to control
   channel).
-* How they read the termination reason (sidecar file vs. response
-  payload).
+* Where they read the termination sidecar
+  (`/flywheel/termination` vs. the persistent exchange request dir).
 * Container lifecycle (per-execution vs. across many executions).
 
 ## Failure phases
