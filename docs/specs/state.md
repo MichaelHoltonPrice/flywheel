@@ -49,6 +49,18 @@ state: unmanaged
 For compatibility, `state: false` is equivalent to `none`, and
 `state: true` is equivalent to `managed`.
 
+`none` is the right choice for one-shot computations whose behavior
+depends only on declared inputs: pure transforms, summarizers, and
+fan-out workers where each replica reads the same shared inputs and
+writes one independent output. Brainstorm-style blocks that read a
+lane's history sequence and emit one fresh result are a typical fit.
+Choose `managed` instead when an execution must continue from where a
+prior execution left off — for example, an agent session that resumes
+its scratchpad and conversation across loop iterations. Substrate
+batteries (such as `batteries/claude/`) are responsible for tolerating
+the absence of a state mount when `state: none`; see "Prepare" below
+for the substrate-side behavior.
+
 `unmanaged` is a transparency declaration, not a storage mechanism.
 It is intended for blocks such as persistent game servers whose
 behavior depends on in-container state that Flywheel cannot serialize.

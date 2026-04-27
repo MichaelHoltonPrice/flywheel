@@ -198,6 +198,13 @@ chmod 700 "$SCRATCHPAD_RUNTIME_DIR" 2>/dev/null || true
 chown -R claude:claude "$PROJECTS_DIR"
 
 # Lock the persisted-state directory so claude cannot read it.
+# Per docs/specs/state.md, ``state: none`` blocks do not receive a
+# /flywheel/state mount.  This battery still wants a single code path
+# for the lock and the post-agent scratchpad/session writes, so
+# create the directory if it is missing.  Without a host mount the
+# directory lives only in the container's overlay filesystem and is
+# discarded on exit, which is exactly what ``state: none`` means.
+mkdir -p /flywheel/state
 chmod 700 /flywheel/state
 chown -R root:root /flywheel/state
 
