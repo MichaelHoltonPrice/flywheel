@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from flywheel.sequence import SequenceBinding
 from flywheel.state import StateMode
 
 
@@ -216,6 +217,8 @@ class BlockExecution:
             :func:`flywheel.termination.derive_status`.
         input_bindings: Maps each input artifact name to the artifact
             instance ID that was consumed.
+        input_sequence_bindings: Maps sequence-shaped input slot names
+            to the exact sequence snapshot consumed at prepare time.
         output_bindings: Maps each output artifact name to the artifact
             instance ID that was produced.
         exit_code: The container's exit code, if available.
@@ -282,6 +285,8 @@ class BlockExecution:
         "succeeded", "failed", "interrupted", "running"
     ] = "failed"
     input_bindings: dict[str, str] = field(default_factory=dict)
+    input_sequence_bindings: dict[str, SequenceBinding] = field(
+        default_factory=dict)
     output_bindings: dict[str, str] = field(default_factory=dict)
     exit_code: int | None = None
     elapsed_s: float | None = None

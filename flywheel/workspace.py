@@ -41,6 +41,13 @@ from flywheel.run_record import (
     RunStepRecord,
 )
 from flywheel.runtime import FAILURE_PHASES
+from flywheel.sequence import (
+    ArtifactSequenceEntry,
+    RunContext,
+    SequenceBinding,
+    SequenceEntryRef,
+    SequenceScope,
+)
 from flywheel.state import StateSnapshot
 from flywheel.template import ArtifactDeclaration, Template
 from flywheel.termination import derive_status
@@ -140,6 +147,214 @@ def _rejected_outputs_from_yaml(
             phase=rec.get("phase", "output_validate"),
         )
     return out
+
+
+def _sequence_scope_to_yaml(scope: SequenceScope) -> dict[str, str]:
+    """Serialize a concrete sequence scope."""
+    entry: dict[str, str] = {"kind": scope.kind}
+    if scope.run_id is not None:
+        entry["run_id"] = scope.run_id
+    if scope.lane is not None:
+        entry["lane"] = scope.lane
+    return entry
+
+
+def _sequence_scope_from_yaml(entry: object) -> SequenceScope:
+    """Deserialize a concrete sequence scope."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"sequence scope must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    kind = entry.get("kind")
+    if kind == "workspace":
+        return SequenceScope.workspace()
+    if kind == "run":
+        return SequenceScope.run(entry["run_id"])
+    if kind == "lane":
+        return SequenceScope.for_lane(entry["run_id"], entry["lane"])
+    raise ValueError(f"unknown sequence scope kind {kind!r}")
+
+
+def _sequence_binding_to_yaml(binding: SequenceBinding) -> dict:
+    """Serialize a consumed sequence snapshot."""
+    return {
+        "sequence_name": binding.sequence_name,
+        "scope": _sequence_scope_to_yaml(binding.scope),
+        "entries": [
+            {
+                "index": entry.index,
+                "artifact_id": entry.artifact_id,
+                "role": entry.role,
+            }
+            for entry in binding.entries
+        ],
+    }
+
+
+def _sequence_binding_from_yaml(entry: object) -> SequenceBinding:
+    """Deserialize a consumed sequence snapshot."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"sequence binding must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    return SequenceBinding(
+        sequence_name=entry["sequence_name"],
+        scope=_sequence_scope_from_yaml(entry["scope"]),
+        entries=[
+            SequenceEntryRef(
+                index=raw["index"],
+                artifact_id=raw["artifact_id"],
+                role=raw.get("role"),
+            )
+            for raw in entry.get("entries", [])
+        ],
+    )
+
+
+def _sequence_entry_to_yaml(entry: ArtifactSequenceEntry) -> dict:
+    """Serialize a sequence ledger entry."""
+    raw = {
+        "sequence_name": entry.sequence_name,
+        "scope": _sequence_scope_to_yaml(entry.scope),
+        "index": entry.index,
+        "artifact_id": entry.artifact_id,
+        "recorded_at": entry.recorded_at.isoformat(),
+    }
+    if entry.role is not None:
+        raw["role"] = entry.role
+    return raw
+
+
+def _sequence_entry_from_yaml(entry: object) -> ArtifactSequenceEntry:
+    """Deserialize a sequence ledger entry."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"sequence entry must be a mapping, got "
+            f"{type(entry).__name__}"
+        )
+    return ArtifactSequenceEntry(
+        sequence_name=entry["sequence_name"],
+        scope=_sequence_scope_from_yaml(entry["scope"]),
+        index=entry["index"],
+        artifact_id=entry["artifact_id"],
+        role=entry.get("role"),
+        recorded_at=datetime.fromisoformat(entry["recorded_at"]),
+    )
+
+
+def _validate_loaded_sequence_entries(
+    entries: list[ArtifactSequenceEntry],
+    *,
+    artifacts: dict[str, ArtifactInstance],
+    runs: dict[str, RunRecord],
+) -> None:
+    """Validate sequence ledger rows loaded from YAML."""
+    by_key: dict[
+        tuple[str, tuple[str, str | None, str | None]],
+        list[ArtifactSequenceEntry],
+    ] = {}
+    for entry in entries:
+        _validate_name(entry.sequence_name, "Artifact sequence")
+        if entry.role is not None:
+            _validate_name(entry.role, "Artifact sequence role")
+        if entry.artifact_id not in artifacts:
+            raise ValueError(
+                f"Sequence {entry.sequence_name!r} references unknown "
+                f"artifact {entry.artifact_id!r}"
+            )
+        scope = entry.scope
+        if scope.kind == "workspace":
+            if scope.run_id is not None or scope.lane is not None:
+                raise ValueError("Workspace sequence scope must not carry run/lane")
+        elif scope.kind == "run":
+            if scope.run_id is None or scope.run_id not in runs:
+                raise ValueError(
+                    f"Run sequence scope references unknown run "
+                    f"{scope.run_id!r}"
+                )
+            if scope.lane is not None:
+                raise ValueError("Run sequence scope must not carry lane")
+        elif scope.kind == "lane":
+            if scope.run_id is None or scope.lane is None:
+                raise ValueError("Lane sequence scope requires run_id and lane")
+            run = runs.get(scope.run_id)
+            if run is None:
+                raise ValueError(
+                    f"Lane sequence scope references unknown run "
+                    f"{scope.run_id!r}"
+                )
+            if scope.lane not in run.lanes:
+                raise ValueError(
+                    f"Lane sequence scope references unknown lane "
+                    f"{scope.lane!r} in run {scope.run_id!r}"
+                )
+        else:
+            raise ValueError(f"Unknown sequence scope kind {scope.kind!r}")
+        by_key.setdefault((entry.sequence_name, scope.key()), []).append(entry)
+
+    for (name, scope_key), scoped_entries in by_key.items():
+        indices = sorted(entry.index for entry in scoped_entries)
+        expected = list(range(len(indices)))
+        if indices != expected:
+            raise ValueError(
+                f"Sequence {name!r} scope {scope_key!r} has invalid "
+                f"indices {indices!r}; expected {expected!r}"
+            )
+
+
+def _validate_loaded_sequence_bindings(
+    executions: dict[str, BlockExecution],
+    *,
+    artifacts: dict[str, ArtifactInstance],
+    runs: dict[str, RunRecord],
+) -> None:
+    """Validate sequence input snapshots loaded from YAML."""
+    for execution in executions.values():
+        for slot, binding in execution.input_sequence_bindings.items():
+            _validate_name(binding.sequence_name, "Artifact sequence")
+            scope = binding.scope
+            if scope.kind == "run":
+                if scope.run_id is None or scope.run_id not in runs:
+                    raise ValueError(
+                        f"Execution {execution.id!r} sequence input "
+                        f"{slot!r} references unknown run {scope.run_id!r}"
+                    )
+            elif scope.kind == "lane":
+                if scope.run_id is None or scope.lane is None:
+                    raise ValueError(
+                        f"Execution {execution.id!r} sequence input "
+                        f"{slot!r} has incomplete lane scope"
+                    )
+                run = runs.get(scope.run_id)
+                if run is None:
+                    raise ValueError(
+                        f"Execution {execution.id!r} sequence input "
+                        f"{slot!r} references unknown run {scope.run_id!r}"
+                    )
+                if scope.lane not in run.lanes:
+                    raise ValueError(
+                        f"Execution {execution.id!r} sequence input "
+                        f"{slot!r} references unknown lane {scope.lane!r}"
+                    )
+            elif scope.kind != "workspace":
+                raise ValueError(f"Unknown sequence scope kind {scope.kind!r}")
+            indices = [entry.index for entry in binding.entries]
+            if indices != sorted(indices):
+                raise ValueError(
+                    f"Execution {execution.id!r} sequence input "
+                    f"{slot!r} has non-monotonic indices {indices!r}"
+                )
+            for entry in binding.entries:
+                if entry.artifact_id not in artifacts:
+                    raise ValueError(
+                        f"Execution {execution.id!r} sequence input "
+                        f"{slot!r} references unknown artifact "
+                        f"{entry.artifact_id!r}"
+                    )
+                if entry.role is not None:
+                    _validate_name(entry.role, "Artifact sequence role")
 
 
 def _run_member_to_yaml(member: RunMemberRecord) -> dict:
@@ -325,6 +540,7 @@ class Workspace:
     artifacts: dict[str, ArtifactInstance]  # id -> instance
     executions: dict[str, BlockExecution] = field(default_factory=dict)
     invocations: dict[str, BlockInvocation] = field(default_factory=dict)
+    sequence_entries: list[ArtifactSequenceEntry] = field(default_factory=list)
     telemetry: dict[str, ExecutionTelemetry] = field(default_factory=dict)
     telemetry_rejections: dict[str, RejectedTelemetry] = field(default_factory=dict)
     events: dict[str, LifecycleEvent] = field(default_factory=dict)
@@ -502,8 +718,77 @@ class Workspace:
                 )
             self.state_snapshots[snapshot.id] = snapshot
 
+    def _validate_sequence_scope(self, scope: SequenceScope) -> None:
+        """Validate that a concrete sequence scope exists."""
+        if scope.kind == "workspace":
+            if scope.run_id is not None or scope.lane is not None:
+                raise ValueError("Workspace sequence scope must not carry run/lane")
+            return
+        if scope.kind == "run":
+            if scope.run_id is None:
+                raise ValueError("Run sequence scope requires run_id")
+            if scope.run_id not in self.runs:
+                raise ValueError(
+                    f"Run sequence scope references unknown run "
+                    f"{scope.run_id!r}"
+                )
+            if scope.lane is not None:
+                raise ValueError("Run sequence scope must not carry lane")
+            return
+        if scope.kind == "lane":
+            if scope.run_id is None or scope.lane is None:
+                raise ValueError("Lane sequence scope requires run_id and lane")
+            run = self.runs.get(scope.run_id)
+            if run is None:
+                raise ValueError(
+                    f"Lane sequence scope references unknown run "
+                    f"{scope.run_id!r}"
+                )
+            if scope.lane not in run.lanes:
+                raise ValueError(
+                    f"Lane sequence scope references unknown lane "
+                    f"{scope.lane!r} in run {scope.run_id!r}"
+                )
+            return
+        raise ValueError(f"Unknown sequence scope kind {scope.kind!r}")
+
+    def _execution_belongs_to_lane(
+        self,
+        execution_id: str,
+        run_id: str | None,
+        lane: str | None,
+    ) -> bool:
+        """Return whether an execution is recorded as a member of a lane."""
+        if run_id is None or lane is None:
+            return False
+        run = self.runs.get(run_id)
+        if run is None:
+            return False
+        for step in run.steps:
+            for member in step.members:
+                if member.execution_id == execution_id:
+                    return member.lane == lane
+                for invocation_id in member.invocation_ids:
+                    invocation = self.invocations.get(invocation_id)
+                    if (
+                        invocation is not None
+                        and invocation.invoked_execution_id == execution_id
+                    ):
+                        return member.lane == lane
+        execution = self.executions.get(execution_id)
+        if (
+            execution is not None
+            and execution.invoking_execution_id is not None
+        ):
+            return self._execution_belongs_to_lane(
+                execution.invoking_execution_id,
+                run_id,
+                lane,
+            )
+        return False
+
     def record_execution(
-        self, execution: BlockExecution,
+        self, execution: BlockExecution, *, persist: bool = True,
     ) -> BlockExecution:
         """Record a block execution and persist the workspace.
 
@@ -547,7 +832,8 @@ class Workspace:
         if execution.termination_reason is not None:
             execution = self._validate_and_normalize_execution(execution)
         self._add_execution(execution)
-        self.save()
+        if persist:
+            self.save()
         return execution
 
     def record_invocation(
@@ -567,6 +853,120 @@ class Workspace:
             self.invocations[invocation.id] = invocation
         self.save()
         return invocation
+
+    def validate_sequence_entry(
+        self,
+        *,
+        sequence_name: str,
+        scope: SequenceScope,
+        artifact_id: str,
+        role: str | None = None,
+        producer_context: RunContext | None = None,
+        pending_execution_id: str | None = None,
+    ) -> None:
+        """Validate that a sequence append would be accepted."""
+        _validate_name(sequence_name, "Artifact sequence")
+        if role is not None:
+            _validate_name(role, "Artifact sequence role")
+        with self._lock:
+            self._validate_sequence_scope(scope)
+            if artifact_id not in self.artifacts:
+                raise ValueError(
+                    f"Sequence {sequence_name!r}: artifact "
+                    f"{artifact_id!r} does not exist"
+                )
+            artifact = self.artifacts[artifact_id]
+            if artifact.produced_by is not None:
+                execution = self.executions.get(artifact.produced_by)
+                if execution is None and artifact.produced_by != pending_execution_id:
+                    raise ValueError(
+                        f"Sequence {sequence_name!r}: artifact "
+                        f"{artifact_id!r} references unknown execution "
+                        f"{artifact.produced_by!r}"
+                    )
+                if execution is not None and execution.status != "succeeded":
+                    raise ValueError(
+                        f"Sequence {sequence_name!r}: artifact "
+                        f"{artifact_id!r} was produced by non-succeeded "
+                        f"execution {execution.id!r}"
+                    )
+                if (
+                    scope.kind == "lane"
+                    and not (
+                        producer_context is not None
+                        and producer_context.run_id == scope.run_id
+                        and producer_context.lane == scope.lane
+                        and (
+                            artifact.produced_by == pending_execution_id
+                            or artifact.produced_by in self.executions
+                        )
+                    )
+                    and not self._execution_belongs_to_lane(
+                        artifact.produced_by, scope.run_id, scope.lane)
+                ):
+                    raise ValueError(
+                        f"Sequence {sequence_name!r}: artifact "
+                        f"{artifact_id!r} was not produced in lane "
+                        f"{scope.lane!r} of run {scope.run_id!r}"
+                    )
+
+    def record_sequence_entry(
+        self,
+        *,
+        sequence_name: str,
+        scope: SequenceScope,
+        artifact_id: str,
+        role: str | None = None,
+        producer_context: RunContext | None = None,
+        persist: bool = True,
+    ) -> ArtifactSequenceEntry:
+        """Append an artifact instance to an ordered sequence."""
+        self.validate_sequence_entry(
+            sequence_name=sequence_name,
+            scope=scope,
+            artifact_id=artifact_id,
+            role=role,
+            producer_context=producer_context,
+        )
+        with self._lock:
+            existing = [
+                entry for entry in self.sequence_entries
+                if (
+                    entry.sequence_name == sequence_name
+                    and entry.scope.key() == scope.key()
+                )
+            ]
+            index = max((entry.index for entry in existing), default=-1) + 1
+            entry = ArtifactSequenceEntry(
+                sequence_name=sequence_name,
+                scope=scope,
+                index=index,
+                artifact_id=artifact_id,
+                role=role,
+                recorded_at=datetime.now(UTC),
+            )
+            self.sequence_entries.append(entry)
+        if persist:
+            self.save()
+        return entry
+
+    def resolve_sequence_snapshot(
+        self,
+        sequence_name: str,
+        scope: SequenceScope,
+    ) -> list[ArtifactSequenceEntry]:
+        """Return the ordered entries for one concrete sequence scope."""
+        self._validate_sequence_scope(scope)
+        return sorted(
+            (
+                entry for entry in self.sequence_entries
+                if (
+                    entry.sequence_name == sequence_name
+                    and entry.scope.key() == scope.key()
+                )
+            ),
+            key=lambda entry: entry.index,
+        )
 
     def record_execution_telemetry(
         self,
@@ -1672,6 +2072,12 @@ class Workspace:
                 ),
                 status=entry.get("status", "failed"),
                 input_bindings=entry.get("input_bindings", {}),
+                input_sequence_bindings={
+                    name: _sequence_binding_from_yaml(raw)
+                    for name, raw in entry.get(
+                        "input_sequence_bindings", {}
+                    ).items()
+                },
                 output_bindings=entry.get("output_bindings", {}),
                 exit_code=entry.get("exit_code"),
                 elapsed_s=entry.get("elapsed_s"),
@@ -1755,6 +2161,21 @@ class Workspace:
                 error=entry.get("error"),
             )
 
+        sequence_entries = [
+            _sequence_entry_from_yaml(entry)
+            for entry in data.get("sequence_entries", [])
+        ]
+        _validate_loaded_sequence_entries(
+            sequence_entries,
+            artifacts=artifacts,
+            runs=runs,
+        )
+        _validate_loaded_sequence_bindings(
+            executions,
+            artifacts=artifacts,
+            runs=runs,
+        )
+
         return cls(
             name=data["name"],
             path=path,
@@ -1764,6 +2185,7 @@ class Workspace:
             artifacts=artifacts,
             executions=executions,
             invocations=invocations,
+            sequence_entries=sequence_entries,
             telemetry=telemetry,
             telemetry_rejections=telemetry_rejections,
             events=events,
@@ -1814,6 +2236,13 @@ class Workspace:
                     "input_bindings": ex.input_bindings,
                     "output_bindings": ex.output_bindings,
                 }
+                if ex.input_sequence_bindings:
+                    entry["input_sequence_bindings"] = {
+                        name: _sequence_binding_to_yaml(binding)
+                        for name, binding in (
+                            ex.input_sequence_bindings.items()
+                        )
+                    }
                 if ex.finished_at is not None:
                     entry["finished_at"] = ex.finished_at.isoformat()
                 if ex.exit_code is not None:
@@ -1932,6 +2361,11 @@ class Workspace:
             }
             if serialized_invocations:
                 data["invocations"] = serialized_invocations
+            if self.sequence_entries:
+                data["sequence_entries"] = [
+                    _sequence_entry_to_yaml(entry)
+                    for entry in self.sequence_entries
+                ]
             if serialized_telemetry:
                 data["telemetry"] = serialized_telemetry
             if serialized_telemetry_rejections:

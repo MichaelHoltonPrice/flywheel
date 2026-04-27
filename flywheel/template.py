@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Literal
 
 import yaml
 
+from flywheel.sequence import (
+    SequenceDeclaration,
+    validate_sequence_name,
+)
 from flywheel.state import StateMode, normalize_state_mode
 from flywheel.validation import validate_name as _validate_name
 
@@ -62,6 +66,7 @@ class InputSlot:
     name: str
     container_path: str
     optional: bool = False
+    sequence: SequenceDeclaration | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,7 @@ class OutputSlot:
 
     name: str
     container_path: str
+    sequence: SequenceDeclaration | None = None
 
 
 @dataclass(frozen=True)
@@ -377,13 +383,27 @@ _INPUT_SLOT_KEYS: frozenset[str] = frozenset({
     "name",
     "container_path",
     "optional",
+    "sequence",
 })
 
 # Keys accepted inside a nested output-slot mapping.
 _OUTPUT_SLOT_KEYS: frozenset[str] = frozenset({
     "name",
     "container_path",
+    "sequence",
 })
+
+_SEQUENCE_KEYS: frozenset[str] = frozenset({
+    "name",
+    "scope",
+    "role",
+})
+
+_SEQUENCE_SCOPES: tuple[str, ...] = (
+    "workspace",
+    "enclosing_run",
+    "enclosing_lane",
+)
 
 _INVOCATION_ROUTE_KEYS: frozenset[str] = frozenset({
     "block",
@@ -395,6 +415,49 @@ _INVOCATION_BINDING_KEYS: frozenset[str] = frozenset({
     "artifact_id",
     "parent_output",
 })
+
+
+def _parse_sequence_declaration(
+    raw: object,
+    *,
+    context: str,
+    allow_role: bool,
+) -> SequenceDeclaration | None:
+    """Parse an optional sequence declaration."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{context}: 'sequence' must be a mapping, got "
+            f"{type(raw).__name__}"
+        )
+    unknown = set(raw) - _SEQUENCE_KEYS
+    if unknown:
+        raise ValueError(
+            f"{context}: sequence has unknown key(s) "
+            f"{sorted(unknown)!r}; valid keys are "
+            f"{sorted(_SEQUENCE_KEYS)!r}"
+        )
+    name = raw.get("name")
+    if not isinstance(name, str):
+        raise ValueError(f"{context}: sequence.name must be a string")
+    validate_sequence_name(name, f"{context} sequence")
+    scope = raw.get("scope", "workspace")
+    if scope not in _SEQUENCE_SCOPES:
+        raise ValueError(
+            f"{context}: sequence.scope must be one of "
+            f"{list(_SEQUENCE_SCOPES)!r}; got {scope!r}"
+        )
+    role = raw.get("role")
+    if role is not None:
+        if not allow_role:
+            raise ValueError(
+                f"{context}: sequence.role is only valid on outputs"
+            )
+        if not isinstance(role, str):
+            raise ValueError(f"{context}: sequence.role must be a string")
+        validate_sequence_name(role, f"{context} sequence role")
+    return SequenceDeclaration(name=name, scope=scope, role=role)
 
 
 def _parse_input_slots(raw: list) -> list[InputSlot]:
@@ -432,6 +495,11 @@ def _parse_input_slots(raw: list) -> list[InputSlot]:
             container_path=inp.get(
                 "container_path", f"/input/{ref}"),
             optional=inp.get("optional", False),
+            sequence=_parse_sequence_declaration(
+                inp.get("sequence"),
+                context=f"Input slot {ref!r}",
+                allow_role=False,
+            ),
         ))
     return slots
 
@@ -469,6 +537,11 @@ def _parse_output_slot_list(
                 name=ref,
                 container_path=out.get(
                     "container_path", f"/output/{ref}"),
+                sequence=_parse_sequence_declaration(
+                    out.get("sequence"),
+                    context=f"Output slot {ref!r}",
+                    allow_role=True,
+                ),
             ))
         else:
             raise ValueError(
@@ -932,6 +1005,8 @@ def _validate_block_against_artifacts(
 ) -> None:
     """Verify every block I/O slot references a declared artifact."""
     for slot in block.inputs:
+        if slot.sequence is not None:
+            continue
         if slot.name not in artifact_names:
             raise ValueError(
                 f"Block {block.name!r} input {slot.name!r} not "

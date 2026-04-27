@@ -24,7 +24,9 @@ In scope:
     many executions (kept only as a workaround for blocks whose
     in-container state cannot yet be serialized; see
     [Runtime variants](#runtime-variants)).
-* Validation, quarantine, and `SupersedesRef` lineage.
+* Validation, quarantine, `SupersedesRef` lineage, and artifact
+  sequence inputs/outputs (see
+  [artifact-sequences.md](artifact-sequences.md)).
 
 Not covered by this spec (each addressed by its own normative spec):
 
@@ -67,6 +69,11 @@ downstream failure has somewhere to record itself.
      not given).
    * For `git` inputs: resolve to a concrete (repo, commit, path)
      triple at execution time. See [Git artifacts](#git-artifacts).
+   * For sequence inputs: resolve the declared concrete scope,
+     snapshot the ordered sequence entries, stage a manifest plus one
+     directory per entry, and record the snapshot on
+     `BlockExecution.input_sequence_bindings`. Empty sequences are
+     valid inputs.
 4. Return an `ExecutionPlan` carrying everything `Invoke` needs
    (the `execution_id`, resolved input mounts, output slot
    directories, runtime config from the block declaration).
@@ -152,7 +159,12 @@ contract is "the workspace is updated, or the call raises".
    slot reached (`artifact_commit` > `output_validate` >
    `output_collect`); `status` follows the
    [status mapping](#status-mapping).
-4. **Ingest execution telemetry** from `/flywheel/telemetry`. Accepted
+4. **Append artifact sequence entries** for output slots that declare
+   `sequence:`. Appends happen only after the artifact instance and
+   succeeded `BlockExecution` exist. If any expected output slot was
+   rejected and the execution is failed, no sequence entries are
+   appended for that execution.
+5. **Ingest execution telemetry** from `/flywheel/telemetry`. Accepted
    telemetry and telemetry rejections are durable records tied to the
    execution. Telemetry ingest is non-fatal and never changes execution
    status.

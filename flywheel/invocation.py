@@ -17,6 +17,7 @@ from typing import Any
 from flywheel.artifact import BlockExecution, BlockInvocation
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.pattern_params import substitute_params
+from flywheel.sequence import RunContext
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import (
     BlockDefinition,
@@ -72,6 +73,7 @@ def dispatch_invocations(
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
     params: dict[str, Any] | None = None,
+    run_context: RunContext | None = None,
 ) -> list[InvocationDispatchResult]:
     """Run child blocks routed from a committed parent execution.
 
@@ -91,6 +93,7 @@ def dispatch_invocations(
 
     results: list[InvocationDispatchResult] = []
     params = dict(params or {})
+    run_context = run_context or RunContext.empty()
     for route in routes:
         invocation_id = workspace.generate_invocation_id()
         input_bindings: dict[str, str] = {}
@@ -115,6 +118,7 @@ def dispatch_invocations(
                 state_validator_registry=state_validator_registry,
                 invoking_execution_id=parent_execution.id,
                 dispatch_child_invocations=False,
+                run_context=run_context,
             )
             invocation = BlockInvocation(
                 id=invocation_id,

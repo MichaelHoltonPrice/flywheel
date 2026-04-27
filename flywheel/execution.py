@@ -56,6 +56,13 @@ from flywheel.persistent_runtime import (
     persistent_request_root,
 )
 from flywheel.quarantine import quarantine_slot
+from flywheel.sequence import (
+    ArtifactSequenceEntry,
+    RunContext,
+    SequenceBinding,
+    SequenceEntryRef,
+    resolve_sequence_scope,
+)
 from flywheel.state import (
     StateMode,
     state_compatibility_identity,
@@ -96,6 +103,8 @@ class ExecutionPlan:
         started_at: Wall-clock timestamp captured at prepare time.
         resolved_bindings: ``{slot_name: artifact_id}`` for every
             input the block was given.
+        input_sequence_bindings: Sequence snapshots consumed by
+            sequence-shaped input slots.
         mounts: Container mount tuples ``(host, container, mode)``.
         proposal_dirs: ``{slot_name: host_path}`` for the per-slot
             proposal directories the block writes to.
@@ -124,6 +133,7 @@ class ExecutionPlan:
     block_name: str
     started_at: datetime
     resolved_bindings: dict[str, str]
+    input_sequence_bindings: dict[str, SequenceBinding]
     mounts: list[tuple[str, str, str]]
     proposal_dirs: dict[str, Path]
     proposals_root: Path
@@ -331,6 +341,61 @@ def _stage_artifact_instance(
         )
 
 
+def _sequence_scope_to_manifest(scope) -> dict[str, str]:
+    """Serialize a concrete sequence scope for the input manifest."""
+    entry: dict[str, str] = {"kind": scope.kind}
+    if scope.run_id is not None:
+        entry["run_id"] = scope.run_id
+    if scope.lane is not None:
+        entry["lane"] = scope.lane
+    return entry
+
+
+def _sequence_entry_dir_name(entry: ArtifactSequenceEntry) -> str:
+    """Return the stable per-entry directory name for a sequence input."""
+    if entry.role is None:
+        return f"{entry.index:05d}"
+    return f"{entry.index:05d}_{entry.role}"
+
+
+def _stage_sequence_input(
+    *,
+    workspace: Workspace,
+    sequence_name: str,
+    scope,
+    entries: list[ArtifactSequenceEntry],
+    target_dir: Path,
+) -> None:
+    """Stage a whole sequence snapshot into one input directory."""
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    manifest_entries: list[dict[str, object]] = []
+    for entry in entries:
+        instance = workspace.artifacts[entry.artifact_id]
+        directory = _sequence_entry_dir_name(entry)
+        _stage_artifact_instance(instance, target_dir / directory, workspace)
+        manifest_entries.append({
+            "index": entry.index,
+            "role": entry.role,
+            "artifact_name": instance.name,
+            "artifact_id": instance.id,
+            "directory": directory,
+            "produced_by": instance.produced_by,
+        })
+    manifest = {
+        "manifest_version": 1,
+        "sequence_name": sequence_name,
+        "scope": _sequence_scope_to_manifest(scope),
+        "length": len(entries),
+        "entries": manifest_entries,
+    }
+    (target_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def _restore_state_snapshot(source: Path, target: Path) -> None:
     """Copy state bytes into an existing mount, preserving symlinks."""
     shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
@@ -348,6 +413,7 @@ def _record_execution(
     started_at: datetime,
     termination_reason: str,
     input_bindings: dict[str, str],
+    input_sequence_bindings: dict[str, SequenceBinding],
     output_bindings: dict[str, str],
     exit_code: int | None, elapsed_s: float | None,
     image: str,
@@ -360,6 +426,7 @@ def _record_execution(
     state_snapshot_id: str | None = None,
     invoking_execution_id: str | None = None,
     runner: str = "container_one_shot",
+    persist: bool = True,
 ) -> None:
     """Record a block execution and persist the workspace.
 
@@ -379,6 +446,7 @@ def _record_execution(
         finished_at=datetime.now(UTC),
         status=status,
         input_bindings=input_bindings,
+        input_sequence_bindings=input_sequence_bindings,
         output_bindings=output_bindings,
         exit_code=exit_code,
         elapsed_s=elapsed_s,
@@ -392,7 +460,7 @@ def _record_execution(
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
     )
-    workspace.record_execution(execution)
+    workspace.record_execution(execution, persist=persist)
 
 
 # ── Failure recording helper (prepare/runtime phases) ─────────────
@@ -459,7 +527,9 @@ def commit_failure(
     _record_execution(
         workspace, execution_id, block_name, started_at,
         termination_reason,
-        resolved_bindings or {}, {},
+        resolved_bindings or {},
+        plan.input_sequence_bindings if plan is not None else {},
+        {},
         None, None, image,
         all_expected_committed=True,
         failure_phase=phase,
@@ -491,6 +561,7 @@ def prepare_block_execution(
     allow_workspace_latest: bool = True,
     env_overlay: dict[str, str] | None = None,
     runner: str = "container_one_shot",
+    run_context: RunContext | None = None,
 ) -> ExecutionPlan:
     """Allocate proposal dirs, resolve inputs, build mounts.
 
@@ -527,6 +598,8 @@ def prepare_block_execution(
 
     mounts: list[tuple[str, str, str]] = []
     resolved_bindings: dict[str, str] = {}
+    input_sequence_bindings: dict[str, SequenceBinding] = {}
+    run_context = run_context or RunContext.empty()
 
     # Per-slot proposal dirs (proposal-then-forge).  Allocated
     # first so any subsequent input-resolution failure has a known
@@ -626,6 +699,40 @@ def prepare_block_execution(
                         instance, slot.container_path, workspace)
                 )
 
+        elif slot.sequence is not None:
+            scope = resolve_sequence_scope(slot.sequence.scope, run_context)
+            entries = workspace.resolve_sequence_snapshot(
+                slot.sequence.name, scope,
+            )
+            sequence_root = (
+                proposals_root / "input" / slot.name
+                if runner == "container_persistent"
+                else proposals_root / "sequences" / slot.name
+            )
+            _stage_sequence_input(
+                workspace=workspace,
+                sequence_name=slot.sequence.name,
+                scope=scope,
+                entries=entries,
+                target_dir=sequence_root,
+            )
+            input_sequence_bindings[slot.name] = SequenceBinding(
+                sequence_name=slot.sequence.name,
+                scope=scope,
+                entries=[
+                    SequenceEntryRef(
+                        index=entry.index,
+                        artifact_id=entry.artifact_id,
+                        role=entry.role,
+                    )
+                    for entry in entries
+                ],
+            )
+            if runner == "container_one_shot":
+                mounts.append(
+                    (str(sequence_root.resolve()), slot.container_path, "ro")
+                )
+
         elif decl is not None and decl.kind == "git":
             git_instance = workspace.register_git_artifact(
                 slot.name, decl, project_root,
@@ -682,6 +789,7 @@ def prepare_block_execution(
         block_name=block_def.name,
         started_at=started_at,
         resolved_bindings=resolved_bindings,
+        input_sequence_bindings=input_sequence_bindings,
         mounts=mounts,
         proposal_dirs=proposal_dirs,
         proposals_root=proposals_root,
@@ -1095,6 +1203,7 @@ def commit_block_execution(
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
     invoking_execution_id: str | None = None,
+    run_context: RunContext | None = None,
 ) -> ContainerResult | None:
     """Forge proposals, record the execution, and clean up.
 
@@ -1137,6 +1246,7 @@ def commit_block_execution(
     exit_code = container_result.exit_code if container_result else None
     elapsed_s = container_result.elapsed_s if container_result else None
     termination_reason = runtime_result.termination_reason
+    run_context = run_context or RunContext.empty()
 
     # -- Substrate-reserved failure-shaped reasons -----------------
     if termination_reason in _RESERVED_FAILURE_PHASES:
@@ -1145,7 +1255,9 @@ def commit_block_execution(
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
             termination_reason,
-            plan.resolved_bindings, {},
+            plan.resolved_bindings,
+            plan.input_sequence_bindings,
+            {},
             exit_code, elapsed_s, image,
             all_expected_committed=True,
             failure_phase=failure_phase,
@@ -1210,7 +1322,9 @@ def commit_block_execution(
             _record_execution(
                 workspace, plan.execution_id, block_name, plan.started_at,
                 termination_reason,
-                plan.resolved_bindings, {},
+                plan.resolved_bindings,
+                plan.input_sequence_bindings,
+                {},
                 exit_code, elapsed_s, image,
                 all_expected_committed=False,
                 failure_phase=runtime.FAILURE_STATE_VALIDATE,
@@ -1241,7 +1355,9 @@ def commit_block_execution(
             _record_execution(
                 workspace, plan.execution_id, block_name, plan.started_at,
                 termination_reason,
-                plan.resolved_bindings, {},
+                plan.resolved_bindings,
+                plan.input_sequence_bindings,
+                {},
                 exit_code, elapsed_s, image,
                 all_expected_committed=False,
                 failure_phase=runtime.FAILURE_STATE_CAPTURE,
@@ -1331,7 +1447,9 @@ def commit_block_execution(
         _record_execution(
             workspace, plan.execution_id, block_name, plan.started_at,
             termination_reason,
-            plan.resolved_bindings, output_bindings,
+            plan.resolved_bindings,
+            plan.input_sequence_bindings,
+            output_bindings,
             exit_code, elapsed_s, image,
             all_expected_committed=all_expected_committed,
             failure_phase=execution_phase,
@@ -1350,17 +1468,50 @@ def commit_block_execution(
         raise _with_execution_id(
             RuntimeError(error_msg), plan.execution_id)
 
+    sequence_appends: list[tuple[object, str, object]] = []
+    for slot in expected_slots:
+        if slot.sequence is None:
+            continue
+        artifact_id = output_bindings.get(slot.name)
+        if artifact_id is None:
+            continue
+        scope = resolve_sequence_scope(slot.sequence.scope, run_context)
+        workspace.validate_sequence_entry(
+            sequence_name=slot.sequence.name,
+            scope=scope,
+            artifact_id=artifact_id,
+            role=slot.sequence.role,
+            producer_context=run_context,
+            pending_execution_id=plan.execution_id,
+        )
+        sequence_appends.append((slot, artifact_id, scope))
+
     _record_execution(
         workspace, plan.execution_id, block_name, plan.started_at,
         termination_reason,
-        plan.resolved_bindings, output_bindings,
+        plan.resolved_bindings,
+        plan.input_sequence_bindings,
+        output_bindings,
         exit_code, elapsed_s, image,
         all_expected_committed=all_expected_committed,
         state_mode=plan.state_mode,
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
         runner=plan.runner,
+        persist=not sequence_appends,
     )
+    for slot, artifact_id, scope in sequence_appends:
+        assert slot.sequence is not None
+        workspace.record_sequence_entry(
+            sequence_name=slot.sequence.name,
+            scope=scope,
+            artifact_id=artifact_id,
+            role=slot.sequence.role,
+            producer_context=run_context,
+            persist=False,
+        )
+    if sequence_appends:
+        workspace.save()
     _ingest_execution_telemetry(workspace, plan)
     _cleanup_execution_proposals(workspace, plan)
 
@@ -1388,6 +1539,7 @@ def run_block(
     allow_workspace_latest: bool = True,
     env_overlay: dict[str, str] | None = None,
     invocation_params: dict[str, object] | None = None,
+    run_context: RunContext | None = None,
 ) -> BlockRunResult:
     """Execute a block within a workspace.
 
@@ -1430,6 +1582,8 @@ def run_block(
             over the block declaration's static env.
         invocation_params: Optional run-scoped values used only to
             substitute invocation route args for child executions.
+        run_context: Optional pattern run/lane context used to
+            resolve sequence scope policies.
 
     Returns:
         A BlockRunResult with the ledger execution and raw
@@ -1446,6 +1600,7 @@ def run_block(
     """
     if input_bindings is None:
         input_bindings = {}
+    run_context = run_context or RunContext.empty()
 
     if template.name != workspace.template_name:
         raise ValueError(
@@ -1475,6 +1630,12 @@ def run_block(
             f"or 'workspace_persistent'; block "
             f"{block_name!r} has lifecycle {block_def.lifecycle!r}"
         )
+    for slot in block_def.all_output_slots():
+        if slot.sequence is not None:
+            resolve_sequence_scope(slot.sequence.scope, run_context)
+    for slot in block_def.inputs:
+        if slot.sequence is not None:
+            resolve_sequence_scope(slot.sequence.scope, run_context)
 
     # ── identity ─────────────────────────────────────────────────
     # Minted before prepare so any prepare-time failure has an
@@ -1503,6 +1664,7 @@ def run_block(
             allow_workspace_latest=allow_workspace_latest,
             env_overlay=env_overlay,
             runner=runner,
+            run_context=run_context,
         )
     except Exception as exc:
         commit_failure(
@@ -1575,6 +1737,7 @@ def run_block(
         validator_registry=validator_registry,
         state_validator_registry=state_validator_registry,
         invoking_execution_id=invoking_execution_id,
+        run_context=run_context,
     )
     container_result = result or runtime_result.container_result
     if container_result is None:
@@ -1596,6 +1759,7 @@ def run_block(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             params=invocation_params or {},
+            run_context=run_context,
         )
     return BlockRunResult(
         execution_id=plan.execution_id,

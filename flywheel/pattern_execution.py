@@ -38,6 +38,7 @@ from flywheel.run_record import (
     RunMemberRecord,
     RunStepRecord,
 )
+from flywheel.sequence import RunContext
 from flywheel.state import pattern_state_lineage_key
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import Template
@@ -580,6 +581,7 @@ def _execute_member(
             allow_workspace_latest=False,
             env_overlay=env_overlay,
             invocation_params=params,
+            run_context=RunContext(run_id=run_id, lane=lane_name),
         )
     except Exception as exc:
         execution_id = getattr(exc, "flywheel_execution_id", None)

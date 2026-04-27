@@ -67,6 +67,12 @@ not bind mounts. A worker may read or mutate those staged files during a
 request without changing the canonical artifact. The next request gets a
 fresh staged copy from the resolver.
 
+Sequence inputs use the same `input/<slot.name>/` convention. The slot
+directory contains `manifest.json` plus one directory per sequence
+entry, exactly as specified in
+[artifact-sequences.md](artifact-sequences.md). `container_path` is not
+used for sequence inputs under persistent runtimes.
+
 Block-level `docker_args` and static block `env` are container-start
 configuration. Per-execution environment overlays are sent in the
 request envelope as `env`; they are not sticky process environment for

@@ -40,16 +40,14 @@ instances may exist.
 
 ### Storage Kinds
 
-Flywheel currently has three storage kinds:
+Flywheel currently has two canonical storage kinds:
 
 * `copy` - an immutable directory stored under the workspace.
 * `git` - a reference to a repository, commit SHA, and path.
-* `incremental` - an append-oriented legacy kind with one growing
-  instance per declaration.
 
-`copy` and `git` are the current canonical kinds for new
-block-execution work. `incremental` remains implemented for existing
-surfaces, but the preferred future direction is tagged copy instances.
+`copy` and `git` are the storage kinds for new block-execution work.
+Ordered histories are modeled with artifact sequences, not a third
+storage kind.
 
 ### Directory-Shaped Artifacts
 
@@ -89,6 +87,24 @@ Corrected bytes are registered as new artifact instances through
 `SupersedesRef` pointing backward to an accepted artifact id or a
 rejected `(execution_id, slot)` pair. The predecessor is provenance,
 not a resolution rule.
+
+### Artifact Sequences
+
+Artifact sequences are append-only ordered ledger rows that reference
+normal immutable artifact instances. They are for whole-history
+consumption, such as alternating game states and actions, where a
+block needs the ordered sequence rather than the latest artifact by
+name.
+
+Sequences have workspace, run, or lane scope. Blocks append to a
+sequence by declaring `sequence:` on an output slot; blocks consume a
+whole sequence snapshot by declaring `sequence:` on an input slot. The
+consumed snapshot is recorded on
+`BlockExecution.input_sequence_bindings` so later appends do not
+rewrite execution provenance.
+
+The normative contract is in
+[specs/artifact-sequences.md](specs/artifact-sequences.md).
 
 ## State
 
@@ -185,7 +201,7 @@ and lifecycle events.
 
 Workspace mutations go through sanctioned methods such as
 `register_artifact`, `register_git_artifact`, `register_state_snapshot`,
-`record_execution`, `record_execution_telemetry`,
+`record_execution`, `record_sequence_entry`, `record_execution_telemetry`,
 `record_rejected_telemetry`, `begin_run`, `record_run_step`, and
 `end_run`. Private mutators are not public write paths.
 

@@ -73,12 +73,24 @@ def state_compatibility_identity(
     block_def: BlockDefinition,
 ) -> dict[str, str]:
     """Return the compatibility identity for a stateful block."""
+    def sequence_payload(slot) -> dict[str, str | None] | None:
+        if slot.sequence is None:
+            return None
+        payload = {
+            "name": slot.sequence.name,
+            "scope": slot.sequence.scope,
+        }
+        if slot.sequence.role is not None:
+            payload["role"] = slot.sequence.role
+        return payload
+
     payload = {
         "inputs": sorted([
             {
                 "name": slot.name,
                 "container_path": slot.container_path,
                 "optional": slot.optional,
+                "sequence": sequence_payload(slot),
             }
             for slot in block_def.inputs
         ], key=lambda item: item["name"]),
@@ -87,6 +99,7 @@ def state_compatibility_identity(
                 {
                     "name": slot.name,
                     "container_path": slot.container_path,
+                    "sequence": sequence_payload(slot),
                 }
                 for slot in slots
             ], key=lambda item: item["name"])
