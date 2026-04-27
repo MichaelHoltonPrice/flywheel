@@ -53,6 +53,13 @@ Environment variables:
     HANDOFF_PLACEHOLDER_MARKER — Substring that the splice helper uses
                       to locate the placeholder tool_result on disk.
                       Defaults to ``Evaluation requested.``.
+    HANDOFF_TOOL_CONFIG
+                    — Optional JSON object keyed by MCP tool name.  Each
+                      value may set ``termination_reason``,
+                      ``required_paths``, ``result_path``,
+                      ``result_label``, and ``placeholder_marker``.
+                      When set, this replaces the legacy single-handoff
+                      env vars for the listed tools.
     FLYWHEEL_SCRATCHPAD_DIR
                     — Writable directory persisted by the entrypoint
                       across managed-state block executions. Defaults
@@ -154,6 +161,88 @@ DEFAULT_HANDOFF_PLACEHOLDER_MARKER = "Evaluation requested."
 _HANDOFF_STATE: dict[str, Any] = {"pending": []}
 
 
+def _legacy_handoff_config(
+    tools: set[str],
+    required_paths: list[Path],
+    *,
+    termination_reason: str,
+    result_path: str,
+    result_label: str,
+    placeholder_marker: str,
+) -> dict[str, dict[str, Any]]:
+    """Build per-tool handoff config from the legacy env shape."""
+    return {
+        tool: {
+            "termination_reason": termination_reason,
+            "required_paths": list(required_paths),
+            "result_path": result_path,
+            "result_label": result_label,
+            "placeholder_marker": placeholder_marker,
+        }
+        for tool in tools
+    }
+
+
+def _parse_handoff_tool_config(raw: str) -> dict[str, dict[str, Any]]:
+    """Parse HANDOFF_TOOL_CONFIG into normalized per-tool settings."""
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"HANDOFF_TOOL_CONFIG was not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("HANDOFF_TOOL_CONFIG must be a JSON object")
+
+    configs: dict[str, dict[str, Any]] = {}
+    for tool_name, value in parsed.items():
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise RuntimeError("HANDOFF_TOOL_CONFIG has an invalid tool name")
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"HANDOFF_TOOL_CONFIG[{tool_name!r}] must be an object")
+
+        termination_reason = str(
+            value.get("termination_reason") or "tool_handoff").strip()
+        if not termination_reason:
+            raise RuntimeError(
+                f"HANDOFF_TOOL_CONFIG[{tool_name!r}].termination_reason "
+                "must not be empty")
+
+        paths_raw = value.get("required_paths", [])
+        if isinstance(paths_raw, str):
+            required_paths = [
+                Path(p.strip()) for p in paths_raw.split(",") if p.strip()]
+        elif isinstance(paths_raw, list):
+            required_paths = []
+            for item in paths_raw:
+                if not isinstance(item, str) or not item.strip():
+                    raise RuntimeError(
+                        f"HANDOFF_TOOL_CONFIG[{tool_name!r}].required_paths "
+                        "must contain non-empty strings")
+                required_paths.append(Path(item.strip()))
+        else:
+            raise RuntimeError(
+                f"HANDOFF_TOOL_CONFIG[{tool_name!r}].required_paths must "
+                "be a string or list")
+
+        configs[tool_name.strip()] = {
+            "termination_reason": termination_reason,
+            "required_paths": required_paths,
+            "result_path": str(
+                value.get("result_path") or "/input/score/scores.json"),
+            "result_label": str(value.get("result_label") or "Tool result"),
+            "placeholder_marker": str(
+                value.get(
+                    "placeholder_marker",
+                    DEFAULT_HANDOFF_PLACEHOLDER_MARKER,
+                )
+            ),
+        }
+    return configs
+
+
 
 def _encode_cwd(cwd: str) -> str:
     """Encode a cwd path the way the Claude SDK does internally.
@@ -177,8 +266,8 @@ def _sdk_session_path(
 # ------------------------------------------------------------------
 
 def _build_handoff_post_hook(
-    handoff_tools: set[str],
-    required_paths: list[Path],
+    handoff_tools: set[str] | dict[str, dict[str, Any]],
+    required_paths: list[Path] | None = None,
 ):
     """Return a PostToolUse hook for tool-result handoff boundaries.
 
@@ -200,27 +289,39 @@ def _build_handoff_post_hook(
     text from after the deferred tool call.
 
     Args:
-        handoff_tools: Set of fully qualified MCP tool names whose
-            invocations should be intercepted.  Other tool names
-            pass through (the hook returns an empty dict, which the
-            SDK treats as "no opinion, proceed normally").
-        required_paths: Files or directories that must exist before
-            accepting the handoff.
+        handoff_tools: Set of fully qualified MCP tool names or a
+            mapping of tool names to per-tool handoff config.
+        required_paths: Legacy files or directories that must exist
+            before accepting the handoff.
 
     Returns:
         An async hook callable matching the SDK's hook signature.
     """
+    if isinstance(handoff_tools, dict):
+        configs = handoff_tools
+    else:
+        configs = _legacy_handoff_config(
+            handoff_tools,
+            required_paths or [],
+            termination_reason="tool_handoff",
+            result_path="/input/score/scores.json",
+            result_label="Tool result",
+            placeholder_marker=DEFAULT_HANDOFF_PLACEHOLDER_MARKER,
+        )
+
     async def _hook(
         input_data: dict,
         tool_use_id: str | None,
         context,
     ) -> dict:
         tool_name = input_data.get("tool_name", "")
-        if tool_name not in handoff_tools:
+        config = configs.get(tool_name)
+        if config is None:
             return {}
         if tool_use_id is None:
             return {}
-        missing = [str(p) for p in required_paths if not p.exists()]
+        required = config.get("required_paths", [])
+        missing = [str(p) for p in required if not p.exists()]
         if missing:
             _HANDOFF_STATE["pending"].append({
                 "tool_use_id": tool_use_id,
@@ -228,6 +329,10 @@ def _build_handoff_post_hook(
                 "tool_input": input_data.get("tool_input", {}),
                 "captured_at": datetime.now(UTC).isoformat(),
                 "missing_required_paths": missing,
+                "termination_reason": config["termination_reason"],
+                "result_path": config["result_path"],
+                "result_label": config["result_label"],
+                "placeholder_marker": config["placeholder_marker"],
             })
             return {
                 "continue": False,
@@ -249,6 +354,10 @@ def _build_handoff_post_hook(
             "tool_name": tool_name,
             "tool_input": input_data.get("tool_input", {}),
             "captured_at": datetime.now(UTC).isoformat(),
+            "termination_reason": config["termination_reason"],
+            "result_path": config["result_path"],
+            "result_label": config["result_label"],
+            "placeholder_marker": config["placeholder_marker"],
         })
         return {
             "continue": False,
@@ -542,6 +651,12 @@ async def main() -> None:
     ] if tools_str else None
 
     # --- Tool-call handoff hook ---
+    handoff_placeholder_marker = os.environ.get(
+        "HANDOFF_PLACEHOLDER_MARKER", DEFAULT_HANDOFF_PLACEHOLDER_MARKER)
+    handoff_termination_reason = os.environ.get(
+        "HANDOFF_TERMINATION_REASON", "tool_handoff").strip()
+    if not handoff_termination_reason:
+        handoff_termination_reason = "tool_handoff"
     handoff_tools_str = os.environ.get("HANDOFF_TOOLS", "")
     handoff_tools = {
         t.strip() for t in handoff_tools_str.split(",") if t.strip()
@@ -551,12 +666,19 @@ async def main() -> None:
         for p in os.environ.get("HANDOFF_REQUIRED_PATHS", "").split(",")
         if p.strip()
     ]
-    handoff_placeholder_marker = os.environ.get(
-        "HANDOFF_PLACEHOLDER_MARKER", DEFAULT_HANDOFF_PLACEHOLDER_MARKER)
-    handoff_termination_reason = os.environ.get(
-        "HANDOFF_TERMINATION_REASON", "tool_handoff").strip()
-    if not handoff_termination_reason:
-        handoff_termination_reason = "tool_handoff"
+    handoff_configs = _parse_handoff_tool_config(
+        os.environ.get("HANDOFF_TOOL_CONFIG", ""))
+    if not handoff_configs:
+        handoff_configs = _legacy_handoff_config(
+            handoff_tools,
+            handoff_required_paths,
+            termination_reason=handoff_termination_reason,
+            result_path=os.environ.get(
+                "HANDOFF_RESULT_PATH", "/input/score/scores.json"),
+            result_label=os.environ.get(
+                "HANDOFF_RESULT_LABEL", "Tool result"),
+            placeholder_marker=handoff_placeholder_marker,
+        )
     hooks_config = {
         "PreCompact": [
             HookMatcher(matcher=t, hooks=[_build_compact_hook("pre")])
@@ -567,19 +689,27 @@ async def main() -> None:
             for t in ("manual", "auto")
         ],
     }
-    if handoff_tools:
-        hook_callable = _build_handoff_post_hook(
-            handoff_tools, handoff_required_paths)
+    if handoff_configs:
+        hook_callable = _build_handoff_post_hook(handoff_configs)
         hooks_config["PostToolUse"] = [
             HookMatcher(matcher=t, hooks=[hook_callable])
-            for t in sorted(handoff_tools)
+            for t in sorted(handoff_configs)
         ]
         _emit({
             "type": "handoff_hook_registered",
-            "tools": sorted(handoff_tools),
-            "placeholder_marker": handoff_placeholder_marker,
-            "termination_reason": handoff_termination_reason,
-            "required_paths": [str(p) for p in handoff_required_paths],
+            "tools": sorted(handoff_configs),
+            "configs": {
+                tool: {
+                    "termination_reason": cfg["termination_reason"],
+                    "result_path": cfg["result_path"],
+                    "result_label": cfg["result_label"],
+                    "placeholder_marker": cfg["placeholder_marker"],
+                    "required_paths": [
+                        str(p) for p in cfg.get("required_paths", [])
+                    ],
+                }
+                for tool, cfg in sorted(handoff_configs.items())
+            },
         })
 
     # --- Build options ---
@@ -758,15 +888,19 @@ async def main() -> None:
                     pending = list(_HANDOFF_STATE["pending"])
                     _emit_handoff_pending(session_id)
                     if pending:
-                        first = pending[0]["tool_name"]
+                        first_pending = pending[0]
+                        first = first_pending["tool_name"]
                         reason = (
                             first if len(pending) == 1
                             else f"{first} (+{len(pending) - 1} more)"
                         )
+                        termination_reason = first_pending.get(
+                            "termination_reason") or handoff_termination_reason
                     else:
                         reason = ""
+                        termination_reason = handoff_termination_reason
                     _save_state(
-                        session_id, handoff_termination_reason, reason)
+                        session_id, termination_reason, reason)
                     return
 
                 # Natural completion.

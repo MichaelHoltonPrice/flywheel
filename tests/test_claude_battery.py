@@ -454,6 +454,47 @@ def test_claude_battery_handoff_post_hook_captures_first_only(
     assert "already pending" in second_reason
 
 
+def test_claude_battery_handoff_post_hook_records_per_tool_metadata(
+    tmp_path: Path,
+):
+    module = _load_battery_module(
+        "agent_runner",
+        ROOT / "batteries" / "claude" / "agent_runner.py",
+    )
+    module._HANDOFF_STATE["pending"] = []
+    prediction_request = tmp_path / "prediction_request.json"
+    prediction_request.write_text("{}", encoding="utf-8")
+    hook = module._build_handoff_post_hook({
+        "mcp__arc__predict_action": {
+            "termination_reason": "prediction_requested",
+            "required_paths": [prediction_request],
+            "result_path": "/input/prediction/prediction.json",
+            "result_label": "Prediction",
+            "placeholder_marker": "Prediction requested.",
+        },
+        "mcp__arc__take_action": {
+            "termination_reason": "action_requested",
+            "required_paths": [],
+            "result_path": "/input/game_step/game_step.json",
+            "result_label": "Action",
+            "placeholder_marker": "Action requested.",
+        },
+    })
+
+    result = asyncio.run(hook({
+        "tool_name": "mcp__arc__predict_action",
+        "tool_input": {"action": 1},
+    }, "toolu_predict", None))
+
+    assert result["continue"] is False
+    pending = module._HANDOFF_STATE["pending"][0]
+    assert pending["tool_use_id"] == "toolu_predict"
+    assert pending["termination_reason"] == "prediction_requested"
+    assert pending["result_path"] == "/input/prediction/prediction.json"
+    assert pending["result_label"] == "Prediction"
+    assert pending["placeholder_marker"] == "Prediction requested."
+
+
 def test_eval_handoff_resumes_with_result_artifact_prompt(tmp_path: Path):
     project_root = tmp_path / "project"
     project_root.mkdir()

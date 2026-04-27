@@ -131,6 +131,7 @@ SCRATCH_ENC=-scratch
 PROJECTS_DIR=/home/claude/.claude/projects
 SDK_SESSION_DIR="$PROJECTS_DIR/$SCRATCH_ENC"
 PERSISTED_SESSION=/flywheel/state/session.jsonl
+PERSISTED_HANDOFF=/flywheel/state/handoff_pending.json
 SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad
 export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch/.flywheel_scratchpad}"
 SCRATCHPAD_RUNTIME_DIR="$FLYWHEEL_SCRATCHPAD_DIR"
@@ -149,12 +150,22 @@ case "$SCRATCHPAD_RUNTIME_DIR" in
 esac
 
 if [ -f "$PERSISTED_SESSION" ] && [ "${FLYWHEEL_ENABLE_SESSION_SPLICE:-0}" = "1" ]; then
-    python3 /app/handoff_session.py \
-        --session "$PERSISTED_SESSION" \
-        --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
-        --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
-        --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
-        --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
+    if [ -f "$PERSISTED_HANDOFF" ]; then
+        python3 /app/handoff_session.py \
+            --session "$PERSISTED_SESSION" \
+            --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
+            --meta "$PERSISTED_HANDOFF" \
+            --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
+            --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
+            --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
+    else
+        python3 /app/handoff_session.py \
+            --session "$PERSISTED_SESSION" \
+            --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
+            --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
+            --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
+            --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
+    fi
 fi
 
 mkdir -p "$SDK_SESSION_DIR"
@@ -236,6 +247,53 @@ if [ -n "$LATEST" ]; then
         echo "[entrypoint] failed to persist SDK session" >&2
     fi
 fi
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+log_path = Path("/tmp/flywheel-claude-runner.jsonl")
+pending_path = Path("/flywheel/state/handoff_pending.json")
+latest_pending = None
+try:
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if candidate.get("type") == "handoff_pending":
+            pending = candidate.get("pending")
+            if isinstance(pending, list) and pending:
+                first = pending[0]
+                if isinstance(first, dict):
+                    latest_pending = first
+except Exception:
+    latest_pending = None
+
+if latest_pending is None:
+    try:
+        pending_path.unlink()
+    except FileNotFoundError:
+        pass
+    raise SystemExit(0)
+
+meta = {}
+for key in (
+    "tool_use_id",
+    "tool_name",
+    "termination_reason",
+    "result_path",
+    "result_label",
+    "placeholder_marker",
+):
+    value = latest_pending.get(key)
+    if isinstance(value, str) and value:
+        meta[key] = value
+
+pending_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+pending_path.chmod(0o600)
+PY
+chown root:root "$PERSISTED_HANDOFF" 2>/dev/null || true
 
 HOME=/home/claude python3 - <<'PY'
 import json

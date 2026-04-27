@@ -53,6 +53,15 @@ def _resolve_child_bindings(
                 )
             bindings[child_input] = artifact_id
             continue
+        if binding.parent_input is not None:
+            artifact_id = parent.input_bindings.get(binding.parent_input)
+            if artifact_id is None:
+                raise ValueError(
+                    f"Parent execution {parent.id!r} did not bind "
+                    f"input {binding.parent_input!r}"
+                )
+            bindings[child_input] = artifact_id
+            continue
         if binding.artifact_id is not None:
             if binding.artifact_id not in workspace.artifacts:
                 raise ValueError(

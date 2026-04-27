@@ -83,6 +83,7 @@ class InvocationBinding:
     """A child input binding for a termination-route invocation."""
 
     parent_output: str | None = None
+    parent_input: str | None = None
     artifact_id: str | None = None
 
 
@@ -413,6 +414,7 @@ _INVOCATION_ROUTE_KEYS: frozenset[str] = frozenset({
 
 _INVOCATION_BINDING_KEYS: frozenset[str] = frozenset({
     "artifact_id",
+    "parent_input",
     "parent_output",
 })
 
@@ -662,12 +664,21 @@ def _parse_invocation_binding(
                 f"{sorted(_INVOCATION_BINDING_KEYS)!r}"
             )
         parent_output = raw.get("parent_output")
+        parent_input = raw.get("parent_input")
         artifact_id = raw.get("artifact_id")
-        if parent_output is not None and artifact_id is not None:
+        specified = [
+            key for key, value in (
+                ("parent_output", parent_output),
+                ("parent_input", parent_input),
+                ("artifact_id", artifact_id),
+            )
+            if value is not None
+        ]
+        if len(specified) > 1:
             raise ValueError(
                 f"Block {block_name!r} on_termination[{reason!r}] "
                 f"binding for {child_input!r}: specify exactly one "
-                "of 'parent_output' or 'artifact_id'"
+                "of 'parent_output', 'parent_input', or 'artifact_id'"
             )
         if parent_output is not None:
             if not isinstance(parent_output, str) or not parent_output.strip():
@@ -678,18 +689,27 @@ def _parse_invocation_binding(
                 )
             _validate_name(parent_output, "Output slot")
             return InvocationBinding(parent_output=parent_output)
+        if parent_input is not None:
+            if not isinstance(parent_input, str) or not parent_input.strip():
+                raise ValueError(
+                    f"Block {block_name!r} on_termination[{reason!r}] "
+                    f"binding for {child_input!r}: 'parent_input' must "
+                    "be a non-empty string"
+                )
+            _validate_name(parent_input, "Input slot")
+            return InvocationBinding(parent_input=parent_input)
         artifact_id = raw.get("artifact_id")
         if not isinstance(artifact_id, str) or not artifact_id.strip():
             raise ValueError(
                 f"Block {block_name!r} on_termination[{reason!r}] "
                 f"binding for {child_input!r}: binding must specify "
-                "'parent_output' or 'artifact_id'"
+                "'parent_output', 'parent_input', or 'artifact_id'"
             )
         return InvocationBinding(artifact_id=artifact_id)
     raise ValueError(
         f"Block {block_name!r} on_termination[{reason!r}] binding "
-        f"for {child_input!r} must be an output-slot name or an "
-        f"artifact_id mapping"
+        f"for {child_input!r} must be an output-slot name, parent_input "
+        f"mapping, or artifact_id mapping"
     )
 
 
@@ -1041,6 +1061,7 @@ def _validate_invocations(blocks: list[BlockDefinition], template_label: str) ->
             parent_outputs = {
                 slot.name for slot in block.outputs_for(reason)
             }
+            parent_inputs = {slot.name for slot in block.inputs}
             for invocation in invocations:
                 child = by_name.get(invocation.block)
                 if child is None:
@@ -1075,6 +1096,17 @@ def _validate_invocations(blocks: list[BlockDefinition], template_label: str) ->
                             f"input {child_input!r} from parent output "
                             f"{binding.parent_output!r}, but that output "
                             "is not declared for the termination reason"
+                        )
+                    if (
+                        binding.parent_input is not None
+                        and binding.parent_input not in parent_inputs
+                    ):
+                        raise ValueError(
+                            f"Block {block.name!r} "
+                            f"on_termination[{reason!r}] binds child "
+                            f"input {child_input!r} from parent input "
+                            f"{binding.parent_input!r}, but that input "
+                            "is not declared on the parent block"
                         )
     _validate_invocation_route_cycles(blocks, template_label)
 

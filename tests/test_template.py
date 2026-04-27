@@ -193,9 +193,14 @@ artifacts:
     kind: copy
   - name: score
     kind: copy
+  - name: config
+    kind: copy
 blocks:
   - name: agent
     image: agent:latest
+    inputs:
+      - name: config
+        container_path: /input/config
     outputs:
       eval_requested:
         - name: bot
@@ -284,6 +289,19 @@ on_termination:
         template = _from_yaml_with_inline_blocks(path)
         route = template.blocks[0].on_termination["eval_requested"][0]
         assert route.bind["bot"].parent_output == "bot"
+
+    def test_parses_parent_input_binding(self, tmp_path: Path):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot:
+                parent_input: config""")
+        template = _from_yaml_with_inline_blocks(path)
+        route = template.blocks[0].on_termination["eval_requested"][0]
+        assert route.bind["bot"].parent_input == "config"
 
     def test_rejects_unknown_long_form_binding_key(self, tmp_path: Path):
         path = self._write(tmp_path, """\

@@ -330,6 +330,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session", required=True)
     parser.add_argument("--result", required=True)
+    parser.add_argument(
+        "--meta",
+        default=None,
+        help=(
+            "Optional JSON file with result_path, result_label, "
+            "placeholder_marker, and tool_use_id for the pending handoff."
+        ),
+    )
     parser.add_argument("--deny-marker", default="handoff_to_flywheel")
     parser.add_argument(
         "--placeholder-marker",
@@ -345,14 +353,37 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    result_path = Path(args.result)
+    result_label = args.label
+    placeholder_marker = args.placeholder_marker
+    tool_use_id = args.tool_use_id
+    if args.meta:
+        try:
+            meta = json.loads(Path(args.meta).read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                if isinstance(meta.get("result_path"), str):
+                    result_path = Path(meta["result_path"])
+                if isinstance(meta.get("result_label"), str):
+                    result_label = meta["result_label"]
+                if isinstance(meta.get("placeholder_marker"), str):
+                    placeholder_marker = meta["placeholder_marker"]
+                if isinstance(meta.get("tool_use_id"), str):
+                    tool_use_id = meta["tool_use_id"]
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[handoff-session] ignored invalid metadata file "
+                f"{args.meta}: {type(exc).__name__}: {exc}",
+                file=os.sys.stderr,
+            )
+
     try:
         count = splice_handoff_results(
             Path(args.session),
-            result_path=Path(args.result),
+            result_path=result_path,
             deny_marker=args.deny_marker,
-            placeholder_marker=args.placeholder_marker,
-            result_label=args.label,
-            tool_use_id=args.tool_use_id,
+            placeholder_marker=placeholder_marker,
+            result_label=result_label,
+            tool_use_id=tool_use_id,
             replace_all=args.replace_all,
         )
     except Exception as exc:  # noqa: BLE001
