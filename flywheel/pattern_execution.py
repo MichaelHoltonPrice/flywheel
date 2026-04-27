@@ -11,6 +11,7 @@ from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.bindings import ArtifactIdBinding
 from flywheel.execution import run_block
 from flywheel.pattern_declaration import (
+    PatternAfterEvery,
     PatternDeclaration,
     PatternForEach,
     PatternMember,
@@ -202,6 +203,7 @@ def _execute_body(
             _execute_run_until(
                 workspace,
                 node,
+                pattern,
                 template,
                 project_root,
                 run_id=run_id,
@@ -213,12 +215,15 @@ def _execute_body(
             )
             continue
         if isinstance(node, PatternStep):
+            step_name = _generated_step_name([*step_prefix, node.name])
+            step = PatternStep(name=step_name, cohort=node.cohort)
             step_result = _execute_step(
                 workspace,
-                node,
+                step,
                 template,
                 project_root,
                 run_id=run_id,
+                lane_override=lane_name,
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
@@ -308,6 +313,7 @@ def _execute_use(
 def _execute_run_until(
     workspace: Workspace,
     node: PatternRunUntil,
+    pattern: PatternDeclaration,
     template: Template,
     project_root: Path,
     *,
@@ -329,6 +335,20 @@ def _execute_run_until(
         for reason, budget in node.continue_on.items()
     }
     reason_counts = {reason: 0 for reason in budgets}
+    after_every = [
+        (
+            trigger,
+            _resolve_positive_int(
+                trigger.count,
+                params,
+                context=(
+                    f"run_until {node.name!r} "
+                    f"after_every[{trigger.reason!r}].count"
+                ),
+            ),
+        )
+        for trigger in node.after_every
+    ]
     iteration = 0
     step_name = _generated_step_name([*step_prefix, node.name])
     step: RunStepRecord | None = None
@@ -399,6 +419,31 @@ def _execute_run_until(
             return
         if reason in budgets:
             reason_counts[reason] += 1
+            step = _finish_run_until_step(
+                workspace,
+                run_id,
+                step,
+                status="succeeded",
+                stop_kind=None,
+                terminal_reason=None,
+                reason_counts=reason_counts,
+            )
+            _execute_due_after_every(
+                workspace,
+                after_every,
+                pattern_node=node,
+                pattern=pattern,
+                template=template,
+                project_root=project_root,
+                run_id=run_id,
+                lane_name=lane_name,
+                step_prefix=step_prefix,
+                validator_registry=validator_registry,
+                state_validator_registry=state_validator_registry,
+                params=params,
+                reason=reason,
+                reason_count=reason_counts[reason],
+            )
             if reason_counts[reason] >= budgets[reason]:
                 _finish_run_until_step(
                     workspace,
@@ -410,15 +455,6 @@ def _execute_run_until(
                     reason_counts=reason_counts,
                 )
                 return
-            step = _finish_run_until_step(
-                workspace,
-                run_id,
-                step,
-                status="succeeded",
-                stop_kind=None,
-                terminal_reason=None,
-                reason_counts=reason_counts,
-            )
             continue
         _finish_run_until_step(
             workspace,
@@ -459,6 +495,48 @@ def _finish_run_until_step(
     return updated
 
 
+def _execute_due_after_every(
+    workspace: Workspace,
+    after_every: list[tuple[PatternAfterEvery, int]],
+    *,
+    pattern_node: PatternRunUntil,
+    pattern: PatternDeclaration,
+    template: Template,
+    project_root: Path,
+    run_id: str,
+    lane_name: str,
+    step_prefix: list[str],
+    validator_registry: ArtifactValidatorRegistry | None,
+    state_validator_registry: StateValidatorRegistry | None,
+    params: dict[str, object],
+    reason: str,
+    reason_count: int,
+) -> None:
+    for trigger, count in after_every:
+        if trigger.reason != reason:
+            continue
+        if reason_count % count != 0:
+            continue
+        occurrence = reason_count // count
+        _execute_body(
+            workspace,
+            trigger.body,
+            pattern,
+            template,
+            project_root,
+            run_id=run_id,
+            lane_name=lane_name,
+            step_prefix=[
+                *step_prefix,
+                pattern_node.name,
+                f"after_{reason}_{count}_{occurrence}",
+            ],
+            validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
+            params=params,
+        )
+
+
 def _resolve_positive_int(
     value: int | str,
     params: dict[str, object],
@@ -491,6 +569,7 @@ def _execute_step(
     project_root: Path,
     *,
     run_id: str,
+    lane_override: str | None = None,
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
@@ -505,7 +584,7 @@ def _execute_step(
             project_root,
             run_id=run_id,
             step_name=step.name,
-            lane_name=member.lane,
+            lane_name=lane_override or member.lane,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             params=params,
@@ -517,7 +596,7 @@ def _execute_step(
                     name=remaining.name,
                     block_name=remaining.block,
                     status="skipped",
-                    lane=remaining.lane,
+                    lane=lane_override or remaining.lane,
                     error="not launched after prior member failed",
                 )
                 for remaining in step.cohort.members[len(members):]
@@ -759,6 +838,20 @@ def _collect_body_param_references(
                             f"continue_on[{reason!r}].max"
                         ),
                     )
+            for trigger in node.after_every:
+                if isinstance(trigger.count, str):
+                    check(
+                        trigger.count,
+                        (
+                            f"run_until {node.name!r} "
+                            f"after_every[{trigger.reason!r}].count"
+                        ),
+                    )
+                _collect_body_param_references(
+                    trigger.body,
+                    check=check,
+                    used_blocks=used_blocks,
+                )
             continue
         if isinstance(node, PatternStep):
             for member in node.cohort.members:
@@ -775,6 +868,9 @@ def _validate_body_uses(
     for node in nodes:
         if isinstance(node, PatternForEach):
             _validate_body_uses(node.body, patterns)
+        elif isinstance(node, PatternRunUntil):
+            for trigger in node.after_every:
+                _validate_body_uses(trigger.body, patterns)
         elif isinstance(node, PatternUse):
             subpattern = patterns.get(node.pattern)
             if subpattern is None:
@@ -824,6 +920,16 @@ def _validate_body_run_until_reasons(
                     f"run_until {node.name!r} lists reason(s) "
                     f"{sorted(overlap)!r} in both continue_on and stop_on"
                 )
+            after_reasons = {trigger.reason for trigger in node.after_every}
+            missing_after = after_reasons - set(node.continue_on)
+            if missing_after:
+                raise PatternRunError(
+                    f"run_until {node.name!r} after_every references "
+                    f"reason(s) {sorted(missing_after)!r} not listed "
+                    "under continue_on"
+                )
+            for trigger in node.after_every:
+                _validate_body_run_until_reasons(trigger.body, template)
             continue
         if isinstance(node, (PatternStep, PatternUse)):
             continue

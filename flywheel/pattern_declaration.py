@@ -101,6 +101,15 @@ class RunUntilContinuation:
 
 
 @dataclass(frozen=True)
+class PatternAfterEvery:
+    """Run a body after a counted continuation reason."""
+
+    reason: str
+    count: int | str
+    body: list[PatternNode]
+
+
+@dataclass(frozen=True)
 class PatternRunUntil:
     """Repeatedly run one block until a termination reason stops it."""
 
@@ -111,6 +120,7 @@ class PatternRunUntil:
     env: dict[str, str] = field(default_factory=dict)
     continue_on: dict[str, RunUntilContinuation] = field(default_factory=dict)
     stop_on: list[str] = field(default_factory=list)
+    after_every: list[PatternAfterEvery] = field(default_factory=list)
 
 
 PatternNode = PatternStep | PatternForEach | PatternUse | PatternRunUntil
@@ -385,7 +395,12 @@ def _parse_body_node(
             "one of foreach, use, run_until, or cohort"
         )
     if "cohort" in raw:
-        return _parse_step(raw, pattern_name=pattern_name, lanes=[DEFAULT_LANE])
+        return _parse_body_cohort_node(
+            raw,
+            pattern_name=pattern_name,
+            lanes=[DEFAULT_LANE],
+            index=index,
+        )
     if "foreach" in raw:
         unknown = set(raw) - {"foreach", "do"}
         if unknown:
@@ -433,6 +448,30 @@ def _parse_body_node(
     return _parse_run_until_node(raw["run_until"], pattern_name=pattern_name)
 
 
+def _parse_body_cohort_node(
+    raw: dict,
+    *,
+    pattern_name: str,
+    lanes: list[str],
+    index: int,
+) -> PatternStep:
+    if "name" in raw:
+        return _parse_step(raw, pattern_name=pattern_name, lanes=lanes)
+    cohort = raw.get("cohort")
+    name = f"cohort_{index + 1}"
+    if isinstance(cohort, dict):
+        members = cohort.get("members")
+        if isinstance(members, list) and len(members) == 1:
+            member = members[0]
+            if isinstance(member, dict) and isinstance(member.get("name"), str):
+                name = member["name"]
+    return _parse_step(
+        {"name": name, "cohort": cohort},
+        pattern_name=pattern_name,
+        lanes=lanes,
+    )
+
+
 def _parse_foreach_node(
     raw: dict,
     *,
@@ -473,6 +512,7 @@ def _parse_run_until_node(
         )
     unknown = set(raw) - {
         "name", "block", "inputs", "args", "env", "continue_on", "stop_on",
+        "after_every",
     }
     if unknown:
         raise ValueError(
@@ -522,7 +562,68 @@ def _parse_run_until_node(
             f"Pattern {pattern_name!r} run_until {name!r}")),
         continue_on=continue_on,
         stop_on=stop_on,
+        after_every=_parse_after_every(
+            raw.get("after_every", []),
+            pattern_name=pattern_name,
+            node_name=name,
+        ),
     )
+
+
+def _parse_after_every(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> list[PatternAfterEvery]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'after_every' must be a list"
+        )
+    parsed: list[PatternAfterEvery] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"after_every[{index}] must be a mapping"
+            )
+        unknown = set(item) - {"reason", "count", "do"}
+        if unknown:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"after_every[{index}] has unknown key(s) "
+                f"{sorted(unknown)!r}"
+            )
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"after_every[{index}].reason must be a non-empty string"
+            )
+        count = item.get("count")
+        if isinstance(count, int) and not isinstance(count, bool):
+            if count < 1:
+                raise ValueError(
+                    f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                    f"after_every[{index}].count must be positive"
+                )
+            count_value: int | str = count
+        elif isinstance(count, str) and count:
+            count_value = count
+        else:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"after_every[{index}].count must be an int or string"
+            )
+        parsed.append(PatternAfterEvery(
+            reason=reason,
+            count=count_value,
+            body=_parse_body(item.get("do"), pattern_name=pattern_name),
+        ))
+    return parsed
 
 
 def _parse_continue_on(

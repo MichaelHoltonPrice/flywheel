@@ -162,6 +162,8 @@ artifacts:
     kind: copy
   - name: score
     kind: copy
+  - name: ideas
+    kind: copy
 
 blocks:
   - name: ImproveBot
@@ -197,6 +199,15 @@ blocks:
     outputs:
       - name: score
         container_path: /output/score
+  - name: Brainstorm
+    image: brainstorm:latest
+    inputs:
+      - name: score
+        container_path: /input/score
+        optional: true
+    outputs:
+      - name: ideas
+        container_path: /output/ideas
 """
 
 PARAM_INVOCATION_TEMPLATE_YAML = """\
@@ -1318,6 +1329,155 @@ def test_run_until_budget_stops_after_max_continue_reason(
     assert run.steps[0].terminal_reason == "eval_requested"
     assert run.steps[0].stop_kind == "budget_exhausted"
     assert run.steps[0].reason_counts == {"eval_requested": 2}
+
+
+def test_run_until_after_every_runs_after_invocation_before_next_iteration(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "periodic",
+        "params": {
+            "interval": {"type": "int", "default": 2},
+        },
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 3}},
+                    "stop_on": ["normal"],
+                    "after_every": [
+                        {
+                            "reason": "eval_requested",
+                            "count": "${params.interval}",
+                            "do": [
+                                {
+                                    "cohort": {
+                                        "members": [
+                                            {
+                                                "name": "brainstorm",
+                                                "block": "Brainstorm",
+                                            }
+                                        ],
+                                    }
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        ],
+    })
+    order: list[str] = []
+    brainstorm_scores: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            order.append("improve")
+            source = (mounts["/input/bot"] / "bot.py").read_text()
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(f"{source}->{len(order)}")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text(source)
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            order.append("eval")
+            bot_text = (mounts["/input/bot"] / "bot.py").read_text()
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text(f"score:{bot_text}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "brainstorm:latest":
+            order.append("brainstorm")
+            brainstorm_scores.append(
+                (mounts["/input/score"] / "score.json").read_text())
+            ideas = mounts["/output/ideas"] / "ideas.md"
+            ideas.parent.mkdir(parents=True, exist_ok=True)
+            ideas.write_text("try a different button")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    assert order == [
+        "improve", "eval",
+        "improve", "eval",
+        "brainstorm",
+        "improve", "eval",
+    ]
+    assert brainstorm_scores == ["score:BASE->1->3"]
+    assert [step.kind for step in run.steps] == ["run_until", "cohort"]
+    assert run.steps[1].name == (
+        "improve__after_eval_requested_2_1__brainstorm")
+    assert run.steps[1].members[0].lane == DEFAULT_LANE
+    assert run.steps[0].reason_counts == {"eval_requested": 3}
+
+
+def test_run_until_after_every_reason_must_be_continue_reason(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "bad_periodic",
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 3}},
+                    "stop_on": ["normal"],
+                    "after_every": [
+                        {
+                            "reason": "normal",
+                            "count": 1,
+                            "do": [
+                                {
+                                    "cohort": {
+                                        "members": [
+                                            {
+                                                "name": "brainstorm",
+                                                "block": "Brainstorm",
+                                            }
+                                        ],
+                                    }
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        ],
+    })
+
+    with patch("flywheel.execution.run_container") as run_container:
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError as exc:
+            assert "not listed under continue_on" in str(exc)
+        else:
+            raise AssertionError("expected after_every validation failure")
+
+    assert run_container.call_count == 0
 
 
 def test_run_until_unexpected_declared_reason_fails_run(

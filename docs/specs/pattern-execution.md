@@ -93,6 +93,17 @@ patterns:
               max: ${params.max_evals}
           stop_on:
             - normal
+          after_every:
+            - reason: eval_requested
+              count: 20
+              do:
+                - cohort:
+                    min_successes: 1
+                    members:
+                      - name: brainstorm_1
+                        block: Brainstorm
+                      - name: brainstorm_2
+                        block: Brainstorm
 ```
 
 `steps` is an ordered, non-empty list of cohorts. `do` is an ordered,
@@ -303,6 +314,53 @@ records `stop_kind: failed`.
 `continue_on` and `stop_on` reasons must be declared by the block's
 `outputs` map. This prevents a loop from silently discarding proposed
 outputs for a termination reason the block did not declare.
+
+`run_until.after_every` declares periodic lane-local work that runs
+after a counted continuation reason. Each entry has:
+
+* `reason`: a reason listed under `continue_on`;
+* `count`: a positive integer or parameter placeholder resolving to a
+  positive integer;
+* `do`: a non-empty structured body to run when the count is reached.
+
+For example, a play loop can run four brainstorm agents after every
+twentieth `action_requested` termination:
+
+```yaml
+run_until:
+  name: play
+  block: play
+  continue_on:
+    action_requested:
+      max: ${params.max_actions}
+  stop_on:
+    - normal
+  after_every:
+    - reason: action_requested
+      count: 20
+      do:
+        - cohort:
+            min_successes: 1
+            members:
+              - name: brainstorm_1
+                block: brainstorm
+              - name: brainstorm_2
+                block: brainstorm
+              - name: brainstorm_3
+                block: brainstorm
+              - name: brainstorm_4
+                block: brainstorm
+```
+
+The periodic body runs after the parent iteration commits and after
+any `on_termination` child invocations for that iteration have
+committed. The next loop iteration therefore sees artifacts produced
+by both the parent iteration, its invocation children, and the
+periodic body, all through the same lane-scoped resolver. The
+periodic body executes in the current lane. Inline `cohort` nodes in a
+structured body may omit `name`; if a nameless cohort has one member,
+Flywheel uses that member name for the generated step name, otherwise
+it uses a stable `cohort_N` name.
 
 ## Input Resolution
 
