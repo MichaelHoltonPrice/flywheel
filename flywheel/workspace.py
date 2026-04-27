@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -1457,7 +1458,19 @@ class Workspace:
                 source_path, staging_dir, dirs_exist_ok=True,
             )
             target_dir = states_dir / snapshot_id
-            staging_dir.rename(target_dir)
+            # Windows: AV scanners and Docker filesystem can transiently
+            # hold a handle on the just-written staging dir, causing
+            # rename to fail with WinError 5 ("Access is denied"). Retry
+            # with brief backoff; the contention typically clears within
+            # a few hundred ms.
+            for attempt in range(6):
+                try:
+                    staging_dir.rename(target_dir)
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.1 * (2 ** attempt))
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
