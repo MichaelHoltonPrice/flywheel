@@ -15,7 +15,6 @@ from flywheel.pattern_execution import PatternRunError, run_pattern
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 
-
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.live_api
 SENTINEL_SCORE = 91357
@@ -100,8 +99,10 @@ def test_claude_battery_tool_invoked_pipeline_with_real_containers(
             agent_execs[1].state_snapshot_id)
         _assert_clean_handoff_session(first_state_dir / "session.jsonl")
         _assert_clean_resumed_session(second_state_dir / "session.jsonl")
-        _assert_session_readback(first_state_dir)
-        _assert_session_readback(second_state_dir)
+        _assert_session_state(first_state_dir)
+        _assert_session_state(second_state_dir)
+        _assert_session_telemetry(reloaded, agent_execs[0].id)
+        _assert_session_telemetry(reloaded, agent_execs[1].id)
         _assert_scratchpad(first_state_dir)
         _assert_scratchpad(second_state_dir)
 
@@ -257,14 +258,49 @@ def _assert_clean_resumed_session(session_path: Path) -> None:
     assert _find_resume_message_line(lines, "/input/score/scores.json") is not None
 
 
-def _assert_session_readback(state_dir: Path) -> None:
-    readback = state_dir / "session_readback"
-    assert (readback / "active_session.json").is_file()
-    assert (readback / "session_messages.json").is_file()
-    assert not (readback / "sdk_readback_error.json").exists()
+def _assert_session_state(state_dir: Path) -> None:
+    assert not (state_dir / "session_readback").exists()
+    meta_path = state_dir / "session_meta.json"
+    assert meta_path.is_file()
     active = json.loads(
-        (readback / "active_session.json").read_text(encoding="utf-8"))
+        meta_path.read_text(encoding="utf-8"))
     assert active.get("session_id")
+    assert active.get("cwd") == "/scratch"
+
+
+def _assert_session_telemetry(
+    workspace: Workspace, execution_id: str,
+) -> None:
+    records = [
+        record for record in workspace.telemetry.values()
+        if record.execution_id == execution_id
+        and record.kind == "claude_session"
+    ]
+    assert records
+    data = records[-1].data
+    assert data.get("session_id")
+    files = data.get("files", {})
+    active_path = _telemetry_sidecar_path(
+        workspace, execution_id, files["active_session"])
+    assert active_path.is_file()
+    messages_path = _telemetry_sidecar_path(
+        workspace, execution_id, files["session_messages"]["path"])
+    assert messages_path.is_file()
+    assert not _telemetry_sidecar_path(
+        workspace, execution_id, "/flywheel/telemetry/session_readback",
+    ).exists()
+
+
+def _telemetry_sidecar_path(
+    workspace: Workspace, execution_id: str, container_path: str,
+) -> Path:
+    prefix = "/flywheel/telemetry/"
+    assert container_path.startswith(prefix)
+    rel = container_path[len(prefix):]
+    return (
+        workspace.path / "proposals" / execution_id
+        / "_flywheel" / "telemetry" / rel
+    )
 
 
 def _assert_scratchpad(state_dir: Path) -> None:

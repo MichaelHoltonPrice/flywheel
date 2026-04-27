@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
-from flywheel.container import ContainerResult
 from flywheel.config import load_project_config
+from flywheel.container import ContainerResult
 from flywheel.pattern_declaration import parse_pattern_declaration
 from flywheel.pattern_execution import run_pattern
 from flywheel.template import Template
@@ -98,6 +98,21 @@ def test_claude_battery_writes_usage_telemetry():
     assert "python3 /app/handoff_session.py" in entrypoint_text
     assert '"kind": "claude_usage"' in entrypoint_text
     assert '"source": "flywheel-claude"' in entrypoint_text
+
+
+def test_claude_battery_separates_resume_state_from_session_telemetry():
+    entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
+    text = entrypoint.read_text(encoding="utf-8")
+
+    assert 'PERSISTED_SESSION=/flywheel/state/session.jsonl' in text
+    assert 'state_meta_path = Path("/flywheel/state/session_meta.json")' in text
+    assert 'snapshot_dir = Path("/flywheel/telemetry/session")' in text
+    assert (
+        'telemetry_index_path = Path("/flywheel/telemetry/claude_session.json")'
+        in text
+    )
+    assert 'Path("/flywheel/state/session_readback")' not in text
+    assert '"kind": "claude_session"' in text
 
 
 def _load_battery_module(name: str, path: Path):

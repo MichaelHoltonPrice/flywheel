@@ -241,14 +241,20 @@ HOME=/home/claude python3 - <<'PY'
 import json
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ["HOME"] = "/home/claude"
 
 sdk_session_dir = Path("/home/claude/.claude/projects/-scratch")
 persisted_session = Path("/flywheel/state/session.jsonl")
-snapshot_dir = Path("/flywheel/state/session_readback")
+state_meta_path = Path("/flywheel/state/session_meta.json")
+# Resume-critical state stays in /flywheel/state.  Full readbacks,
+# raw JSONL copies, and SDK inspection output are telemetry sidecars.
+snapshot_dir = Path("/flywheel/telemetry/session")
 jsonl_dir = snapshot_dir / "jsonl"
+telemetry_index_path = Path("/flywheel/telemetry/claude_session.json")
+now = datetime.now(timezone.utc).isoformat()
 
 try:
     jsonl_dir.mkdir(parents=True, exist_ok=True)
@@ -278,6 +284,17 @@ except Exception:
     json.dumps({"session_id": session_id}, indent=2),
     encoding="utf-8",
 )
+state_meta_path.write_text(
+    json.dumps({
+        "session_id": session_id,
+        "cwd": "/scratch",
+        "saved_at": now,
+        "source": "flywheel-claude",
+    }, indent=2),
+    encoding="utf-8",
+)
+os.chown(state_meta_path, 0, 0)
+os.chmod(state_meta_path, 0o600)
 
 if session_id:
     try:
@@ -319,6 +336,47 @@ if session_id:
             encoding="utf-8",
         )
 
+def telemetry_path(path):
+    try:
+        rel = path.relative_to(Path("/flywheel/telemetry"))
+    except ValueError:
+        return str(path)
+    return f"/flywheel/telemetry/{rel.as_posix()}"
+
+jsonl_files = []
+for path in sorted(jsonl_dir.glob("*.jsonl")):
+    jsonl_files.append({
+        "path": telemetry_path(path),
+        "bytes": path.stat().st_size,
+    })
+
+session_files = {
+    "active_session": telemetry_path(snapshot_dir / "active_session.json"),
+    "raw_jsonl_dir": telemetry_path(jsonl_dir),
+    "jsonl_files": jsonl_files,
+}
+for name in ("session_messages.json", "session_info.json", "sdk_readback_error.json"):
+    path = snapshot_dir / name
+    if path.exists():
+        session_files[name.removesuffix(".json")] = {
+            "path": telemetry_path(path),
+            "bytes": path.stat().st_size,
+        }
+
+telemetry_index_path.write_text(
+    json.dumps({
+        "kind": "claude_session",
+        "source": "flywheel-claude",
+        "data": {
+            "session_id": session_id,
+            "cwd": "/scratch",
+            "saved_at": now,
+            "files": session_files,
+        },
+    }, indent=2),
+    encoding="utf-8",
+)
+
 for path in snapshot_dir.rglob("*"):
     try:
         os.chown(path, 0, 0)
@@ -326,6 +384,11 @@ for path in snapshot_dir.rglob("*"):
             os.chmod(path, 0o600)
     except Exception:
         pass
+try:
+    os.chown(telemetry_index_path, 0, 0)
+    os.chmod(telemetry_index_path, 0o600)
+except Exception:
+    pass
 PY
 
 python3 - <<'PY'

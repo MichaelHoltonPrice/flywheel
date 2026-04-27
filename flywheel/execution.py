@@ -29,11 +29,11 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-from typing import Protocol
+from typing import Any, Protocol
 
 from flywheel import runtime
 from flywheel.artifact import (
@@ -733,9 +733,6 @@ def _telemetry_candidate_path(
     return f"{runtime.FLYWHEEL_TELEMETRY_MOUNT}/{rel}"
 
 
-MAX_TELEMETRY_CANDIDATE_BYTES = 256 * 1024
-
-
 def _preserve_rejected_telemetry_candidate(
     workspace: Workspace,
     *,
@@ -843,12 +840,10 @@ def _ingest_execution_telemetry(
     for candidate in sorted(telemetry_dir.iterdir()):
         try:
             if candidate.is_dir():
-                changed |= _reject_telemetry_candidate(
-                    workspace,
-                    plan,
-                    candidate,
-                    "telemetry candidates must be flat .json files",
-                )
+                # Directories are telemetry sidecars: large files, traces,
+                # readbacks, and other diagnostic payloads that should remain
+                # in the execution proposal tree but should not be inlined
+                # into workspace.yaml.
                 continue
             if not candidate.is_file():
                 changed |= _reject_telemetry_candidate(
@@ -864,17 +859,6 @@ def _ingest_execution_telemetry(
                     plan,
                     candidate,
                     "telemetry candidate must be a .json file",
-                )
-                continue
-            if candidate.stat().st_size > MAX_TELEMETRY_CANDIDATE_BYTES:
-                changed |= _reject_telemetry_candidate(
-                    workspace,
-                    plan,
-                    candidate,
-                    (
-                        "telemetry candidate exceeds "
-                        f"{MAX_TELEMETRY_CANDIDATE_BYTES} bytes"
-                    ),
                 )
                 continue
             try:
@@ -908,10 +892,8 @@ def _ingest_execution_telemetry(
                 f"{type(exc).__name__}: {exc}",
             )
     if changed:
-        try:
+        with suppress(Exception):
             workspace.save()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def commit_block_execution(

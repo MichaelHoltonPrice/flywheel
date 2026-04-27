@@ -36,10 +36,12 @@ Agent-specific; read-only.  The agent runner discovers
 
 FLYWHEEL_TELEMETRY_MOUNT: Final[str] = "/flywheel/telemetry"
 """Container-side path where runtime wrappers may write telemetry
-candidate JSON files.  Flywheel ingests these after the container
-exits and records accepted or rejected telemetry on the execution
-ledger.  Telemetry is not an artifact and does not affect execution
-success."""
+candidate JSON files and sidecar diagnostics.  Flywheel ingests
+top-level JSON telemetry envelopes after the container exits and
+records accepted or rejected telemetry on the execution ledger.
+Subdirectories are preserved in the execution proposal tree as
+sidecars and are not inlined into workspace metadata.  Telemetry
+is not an artifact and does not affect execution success."""
 
 STOP_SENTINEL_WORKSPACE_RELATIVE: Final[str] = ".stop"
 """Workspace-relative path of the cooperative cancellation

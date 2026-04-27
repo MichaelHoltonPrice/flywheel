@@ -372,7 +372,10 @@ class TestExecutionTelemetry:
 
         reloaded = Workspace.load(ws.path)
         assert reloaded.executions[result.execution_id].status == "succeeded"
-        assert reloaded.telemetry == {}
+        telemetry = list(reloaded.telemetry.values())
+        assert len(telemetry) == 1
+        assert telemetry[0].kind == "usage"
+        assert telemetry[0].data == {"payload": "x" * 300000}
         rejections = sorted(
             reloaded.telemetry_rejections.values(),
             key=lambda item: item.path,
@@ -380,8 +383,6 @@ class TestExecutionTelemetry:
         assert [item.path for item in rejections] == [
             "/flywheel/telemetry/bad-envelope.json",
             "/flywheel/telemetry/bad-json.json",
-            "/flywheel/telemetry/huge.json",
-            "/flywheel/telemetry/nested",
             "/flywheel/telemetry/note.txt",
         ]
         assert all(
