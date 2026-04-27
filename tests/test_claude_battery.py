@@ -65,6 +65,27 @@ def test_claude_battery_entrypoint_creates_framework_subdirs():
     assert "chmod 700 /flywheel/telemetry" in text
 
 
+def test_claude_battery_entrypoint_persists_agent_scratchpad():
+    dockerfile = ROOT / "batteries" / "claude" / "Dockerfile.claude"
+    entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    entrypoint_text = entrypoint.read_text(encoding="utf-8")
+
+    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad" in (
+        dockerfile_text)
+    assert "SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad" in entrypoint_text
+    assert "export FLYWHEEL_SCRATCHPAD_DIR=" in entrypoint_text
+    assert "refusing unsafe FLYWHEEL_SCRATCHPAD_DIR" in entrypoint_text
+    assert "FLYWHEEL_SCRATCHPAD_DIR must be under /scratch" in entrypoint_text
+    assert 'cp -a "$SCRATCHPAD_STATE_DIR"/. "$SCRATCHPAD_RUNTIME_DIR"/' in (
+        entrypoint_text)
+    assert 'cp -a "$SCRATCHPAD_RUNTIME_DIR"/. "$SCRATCHPAD_STATE_DIR"/' in (
+        entrypoint_text)
+    assert 'chown -R claude:claude "$SCRATCHPAD_RUNTIME_DIR"' in (
+        entrypoint_text)
+    assert 'chown -R root:root "$SCRATCHPAD_STATE_DIR"' in entrypoint_text
+
+
 def test_claude_battery_writes_usage_telemetry():
     runner = ROOT / "batteries" / "claude" / "agent_runner.py"
     entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"

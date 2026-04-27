@@ -131,6 +131,22 @@ SCRATCH_ENC=-scratch
 PROJECTS_DIR=/home/claude/.claude/projects
 SDK_SESSION_DIR="$PROJECTS_DIR/$SCRATCH_ENC"
 PERSISTED_SESSION=/flywheel/state/session.jsonl
+SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad
+export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch/.flywheel_scratchpad}"
+SCRATCHPAD_RUNTIME_DIR="$FLYWHEEL_SCRATCHPAD_DIR"
+if [ -z "$SCRATCHPAD_RUNTIME_DIR" ] \
+    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/" ] \
+    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/scratch" ]; then
+    echo "[entrypoint] refusing unsafe FLYWHEEL_SCRATCHPAD_DIR: $SCRATCHPAD_RUNTIME_DIR" >&2
+    exit 1
+fi
+case "$SCRATCHPAD_RUNTIME_DIR" in
+    /scratch/*) ;;
+    *)
+        echo "[entrypoint] FLYWHEEL_SCRATCHPAD_DIR must be under /scratch: $SCRATCHPAD_RUNTIME_DIR" >&2
+        exit 1
+        ;;
+esac
 
 if [ -f "$PERSISTED_SESSION" ] && [ "${FLYWHEEL_ENABLE_SESSION_SPLICE:-0}" = "1" ]; then
     python3 /app/handoff_session.py \
@@ -156,6 +172,17 @@ except Exception:
         echo "[entrypoint] staged session $SID for SDK resume"
     fi
 fi
+
+rm -rf "$SCRATCHPAD_RUNTIME_DIR"
+mkdir -p "$SCRATCHPAD_RUNTIME_DIR"
+if [ -d "$SCRATCHPAD_STATE_DIR" ]; then
+    cp -a "$SCRATCHPAD_STATE_DIR"/. "$SCRATCHPAD_RUNTIME_DIR"/
+    echo "[entrypoint] staged scratchpad from managed state"
+else
+    echo "[entrypoint] initialized empty scratchpad"
+fi
+chown -R claude:claude "$SCRATCHPAD_RUNTIME_DIR"
+chmod 700 "$SCRATCHPAD_RUNTIME_DIR" 2>/dev/null || true
 
 chown -R claude:claude "$PROJECTS_DIR"
 
@@ -185,6 +212,15 @@ set -o pipefail
 su -s /bin/bash claude -c "python3 /app/agent_runner.py" | tee "$RUNNER_LOG"
 RC=${PIPESTATUS[0]}
 set +o pipefail
+
+rm -rf "$SCRATCHPAD_STATE_DIR"
+mkdir -p "$SCRATCHPAD_STATE_DIR"
+if [ -d "$SCRATCHPAD_RUNTIME_DIR" ]; then
+    cp -a "$SCRATCHPAD_RUNTIME_DIR"/. "$SCRATCHPAD_STATE_DIR"/
+fi
+chown -R root:root "$SCRATCHPAD_STATE_DIR"
+chmod -R go-rwx "$SCRATCHPAD_STATE_DIR" 2>/dev/null || true
+echo "[entrypoint] persisted scratchpad to managed state"
 
 # Sync the latest SDK session back to /flywheel/state so the
 # next launch can populate from it.  The SDK may have written a

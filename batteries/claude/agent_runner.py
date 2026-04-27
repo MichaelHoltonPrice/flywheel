@@ -53,6 +53,11 @@ Environment variables:
     HANDOFF_PLACEHOLDER_MARKER — Substring that the splice helper uses
                       to locate the placeholder tool_result on disk.
                       Defaults to ``Evaluation requested.``.
+    FLYWHEEL_SCRATCHPAD_DIR
+                    — Writable directory persisted by the entrypoint
+                      across managed-state block executions. Defaults
+                      to ``/scratch/.flywheel_scratchpad`` in the
+                      Claude battery image.
 
     Session resume:
         ``entrypoint.sh`` runs as root and stages the persisted

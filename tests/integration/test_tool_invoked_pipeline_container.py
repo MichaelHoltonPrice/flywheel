@@ -19,6 +19,7 @@ from tests._inline_blocks import from_yaml_with_inline_blocks
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.live_api
 SENTINEL_SCORE = 91357
+SCRATCH_SENTINEL = "SCRATCHPAD_SENTINEL_71429"
 
 
 def test_claude_battery_tool_invoked_pipeline_with_real_containers(
@@ -101,6 +102,8 @@ def test_claude_battery_tool_invoked_pipeline_with_real_containers(
         _assert_clean_resumed_session(second_state_dir / "session.jsonl")
         _assert_session_readback(first_state_dir)
         _assert_session_readback(second_state_dir)
+        _assert_scratchpad(first_state_dir)
+        _assert_scratchpad(second_state_dir)
 
         invocation = reloaded.invocations[step.members[0].invocation_ids[0]]
         eval_execution = reloaded.executions[invocation.invoked_execution_id]
@@ -116,6 +119,7 @@ def test_claude_battery_tool_invoked_pipeline_with_real_containers(
         ).read_text(encoding="utf-8")
         assert "FINAL" in final_text
         assert f"score={SENTINEL_SCORE}" in final_text
+        assert SCRATCH_SENTINEL in final_text
 
         usage_records = [
             record for record in reloaded.telemetry.values()
@@ -202,6 +206,8 @@ def _docker_available() -> bool:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
         )
     except Exception:
@@ -259,6 +265,12 @@ def _assert_session_readback(state_dir: Path) -> None:
     active = json.loads(
         (readback / "active_session.json").read_text(encoding="utf-8"))
     assert active.get("session_id")
+
+
+def _assert_scratchpad(state_dir: Path) -> None:
+    notes = state_dir / "scratchpad" / "notes.txt"
+    assert notes.is_file()
+    assert notes.read_text(encoding="utf-8").strip() == SCRATCH_SENTINEL
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -349,6 +361,8 @@ def _build_claude_battery_image(tag: str) -> None:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=900,
     )
 
@@ -360,6 +374,8 @@ def _container_claude_auth_available(base_image: str) -> bool:
         ["docker", "volume", "inspect", "claude-auth"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if volume.returncode != 0:
         return False
@@ -382,6 +398,8 @@ def _container_claude_auth_available(base_image: str) -> bool:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
     return check.returncode == 0
@@ -406,6 +424,8 @@ RUN chown -R claude:claude /app/agent
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
 
@@ -423,6 +443,8 @@ ENTRYPOINT ["python", "/run.py"]
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
 
@@ -431,13 +453,17 @@ _PROMPT = textwrap.dedent("""\
 You are running a Flywheel integration test. Follow these rules exactly.
 
 Your full task:
-1. Call the `mcp__test__request_eval` tool exactly once.
-2. When the evaluation result is available at `/input/score/scores.json`,
+1. Before requesting evaluation, write
+   `/scratch/.flywheel_scratchpad/notes.txt` with exactly:
+   `SCRATCHPAD_SENTINEL_71429`.
+2. Call the `mcp__test__request_eval` tool exactly once.
+3. When the evaluation result is available at `/input/score/scores.json`,
    read `/input/score/scores.json`.
-3. Write `/output/bot/bot.txt` with exactly this prefix:
-   `FINAL score=<score from scores.json>`.
+4. Read `/scratch/.flywheel_scratchpad/notes.txt`.
+5. Write `/output/bot/bot.txt` with exactly this prefix:
+   `FINAL score=<score from scores.json> scratchpad=<notes.txt content>`.
 
-Do not write any files before reading the score artifact.
+Do not write any output files before reading the score artifact.
 Do not call `mcp__test__request_eval` more than once.
 Do not call any tools after writing the final file.
 """)

@@ -19,6 +19,7 @@ RUN npm install -g @anthropic-ai/claude-code
 ENV PYTHONUNBUFFERED=1
 ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
 ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
+ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
 
 # Install the Agents SDK, HTTP client, and image rendering deps.
 # NOTE: We intentionally do NOT install arc-agi here to prevent
@@ -48,8 +49,8 @@ RUN useradd -m claude \
 # from the block body's ``/input`` / ``/output`` / ``/scratch``
 # mounts so it's easy to tell framework-owned files apart from
 # the agent's own working directory.  ``/scratch`` is the agent
-# scratchpad (renamed from ``/workspace`` to stop colliding with
-# flywheel's own project-level "workspace" concept).
+# working directory.  ``$FLYWHEEL_SCRATCHPAD_DIR`` is synced to
+# managed state by the entrypoint between block executions.
 WORKDIR /scratch
 
 ENTRYPOINT ["/app/entrypoint.sh"]
