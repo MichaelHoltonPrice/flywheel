@@ -25,6 +25,7 @@ COPY desktop_server.py /app/desktop_server.py
 COPY entrypoint.sh /app/entrypoint.sh
 
 RUN mkdir -p /desktop/shared /flywheel/exchange \
+    && sed -i 's/\r$//' /app/entrypoint.sh \
     && chmod +x /app/entrypoint.sh
 
 WORKDIR /desktop
