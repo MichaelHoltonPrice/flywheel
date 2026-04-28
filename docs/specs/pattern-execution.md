@@ -433,3 +433,37 @@ restore and extend one lane-local state chain.
 
 `BlockExecution` does not carry run-specific fields. Reverse lookup
 from an execution id to its run is done through run metadata.
+
+## Pattern Resume
+
+`flywheel run pattern ... --resume RUN_ID` continues an existing
+logical pattern run in the same workspace. It does not create a child
+run. Flywheel reopens the existing `RunRecord`, keeps the same run id,
+and re-resolves declared pattern params with any supplied `--param`
+overrides.
+
+Keeping the same run id is the continuity contract:
+
+* managed-state lineages derived from run id, lane, and block continue
+  to restore the latest compatible snapshot for the logical run;
+* lane-scoped artifact sequences continue appending to the same
+  sequence scope;
+* pattern fixtures are not rematerialized;
+* completed boot/cohort work is skipped rather than launched again.
+
+For structured `run_until` nodes, resume uses the existing
+`RunStepRecord` as the loop cursor. Existing members and
+`reason_counts` are preserved, the next member name continues from the
+prior count (`iter_26` after `iter_25`), and continuation budgets are
+interpreted as absolute totals under the newly resolved params. A run
+that stopped with `budget_exhausted` therefore continues only if the
+new resolved budget is greater than the already-recorded count.
+
+Periodic `after_every` bodies use the preserved `reason_counts`, so
+they fire at the next due occurrence rather than replaying old
+occurrences.
+
+Resume is deliberately same-pattern and same-lane in v1. Flywheel
+rejects resuming an unknown run, a running run, a run whose kind does
+not match the requested pattern, or a run whose lanes do not match the
+current pattern declaration.

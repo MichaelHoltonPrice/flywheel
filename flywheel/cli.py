@@ -202,6 +202,16 @@ def main(argv: list[str] | None = None) -> None:
             "keys must be declared by the pattern."
         ),
     )
+    pattern_parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help=(
+            "Resume an existing logical pattern run in this workspace. "
+            "The same run id, state lineages, and lane sequences are "
+            "continued; --param overrides are re-resolved for the "
+            "continuation."
+        ),
+    )
 
     # flywheel container — manage persistent request-response runtimes
     container_parser = subparsers.add_parser(
@@ -684,6 +694,7 @@ def run_pattern_command(args, extra_args: list[str]) -> None:
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             param_overrides=param_overrides,
+            resume_run_id=args.resume,
         )
     except (PatternRunError, PatternParamError) as exc:
         print(f"Pattern {pattern.name!r} failed: {exc}")

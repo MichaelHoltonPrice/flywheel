@@ -1352,6 +1352,39 @@ class TestRuns:
         assert step.stop_kind == "budget_exhausted"
         assert step.reason_counts == {"eval_requested": 5}
 
+    def test_reopen_run_preserves_steps_and_updates_params(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:improve", params={"max": 5})
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="improve",
+                min_successes=1,
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="iter_1",
+                        block_name="ImproveBot",
+                        status="succeeded",
+                    )
+                ],
+                kind="run_until",
+                stop_kind="budget_exhausted",
+                terminal_reason="eval_requested",
+                reason_counts={"eval_requested": 5},
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        reopened = ws.reopen_run(record.id, params={"max": 20})
+
+        assert reopened.id == record.id
+        assert reopened.status == "running"
+        assert reopened.finished_at is None
+        assert reopened.params == {"max": 20}
+        assert reopened.steps[0].members[0].name == "iter_1"
+
     def test_load_without_runs_key(self, tmp_path: Path):
         """Old workspace.yaml without runs key loads to empty dict."""
         _, foundry_dir, template = _setup_project(tmp_path)

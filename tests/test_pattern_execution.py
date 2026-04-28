@@ -1331,6 +1331,196 @@ def test_run_until_budget_stops_after_max_continue_reason(
     assert run.steps[0].reason_counts == {"eval_requested": 2}
 
 
+def test_resume_reopens_same_run_and_continues_run_until(
+    tmp_path: Path,
+):
+    template_yaml = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: ideas
+    kind: copy
+
+blocks:
+  - name: Boot
+    image: boot:latest
+    outputs:
+      - name: bot
+        container_path: /output/bot
+  - name: ImproveBot
+    image: improve:latest
+    state: managed
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      tick:
+        - name: bot
+          container_path: /output/bot
+          sequence:
+            name: arc_game
+            scope: enclosing_lane
+            role: state
+      normal:
+        - name: bot
+          container_path: /output/bot
+  - name: Brainstorm
+    image: brainstorm:latest
+    outputs:
+      - name: ideas
+        container_path: /output/ideas
+        sequence:
+          name: arc_brainstorm
+          scope: enclosing_lane
+          role: brainstorm
+"""
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, template_yaml)
+    pattern = parse_pattern_declaration({
+        "name": "resume_loop",
+        "params": {
+            "max": {"type": "int", "default": 2},
+            "interval": {"type": "int", "default": 2},
+        },
+        "do": [
+            {
+                "name": "boot",
+                "cohort": {
+                    "members": [{"name": "boot", "block": "Boot"}],
+                },
+            },
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"tick": {"max": "${params.max}"}},
+                    "stop_on": ["normal"],
+                    "after_every": [
+                        {
+                            "reason": "tick",
+                            "count": "${params.interval}",
+                            "do": [
+                                {
+                                    "cohort": {
+                                        "members": [
+                                            {
+                                                "name": "brainstorm",
+                                                "block": "Brainstorm",
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        ],
+    })
+    calls: list[str] = []
+    improve_inputs: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        flywheel = mounts["/flywheel"]
+        if config.image == "boot:latest":
+            calls.append("boot")
+            bot = mounts["/output/bot"] / "bot.txt"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("BASE")
+            (flywheel / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "improve:latest":
+            calls.append("improve")
+            source = (mounts["/input/bot"] / "bot.txt").read_text()
+            improve_inputs.append(source)
+            next_text = f"{source}->{len(improve_inputs)}"
+            bot = mounts["/output/bot"] / "bot.txt"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text(next_text)
+            state = flywheel / "state" / "session.txt"
+            state.write_text(next_text)
+            (flywheel / "termination").write_text("tick")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "brainstorm:latest":
+            calls.append("brainstorm")
+            ideas = mounts["/output/ideas"] / "ideas.txt"
+            ideas.parent.mkdir(parents=True, exist_ok=True)
+            ideas.write_text(f"ideas:{calls.count('brainstorm')}")
+            (flywheel / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        first = run_pattern(workspace, pattern, template, project_root)
+        second = run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={"max": "4"},
+            resume_run_id=first.run_id,
+        )
+
+    assert second.run_id == first.run_id
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[first.run_id]
+    assert run.status == "succeeded"
+    assert run.params["max"] == 4
+    assert calls == [
+        "boot",
+        "improve",
+        "improve",
+        "brainstorm",
+        "improve",
+        "improve",
+        "brainstorm",
+    ]
+    assert improve_inputs == [
+        "BASE",
+        "BASE->1",
+        "BASE->1->2",
+        "BASE->1->2->3",
+    ]
+    assert [step.name for step in run.steps] == [
+        "boot",
+        "improve",
+        "improve__after_tick_2_1__brainstorm",
+        "improve__after_tick_2_2__brainstorm",
+    ]
+    loop = run.steps[1]
+    assert [member.name for member in loop.members] == [
+        "iter_1", "iter_2", "iter_3", "iter_4"]
+    assert loop.reason_counts == {"tick": 4}
+    assert loop.stop_kind == "budget_exhausted"
+    assert loop.terminal_reason == "tick"
+    snapshots = [
+        reloaded.state_snapshots[
+            reloaded.executions[member.execution_id].state_snapshot_id
+        ]
+        for member in loop.members
+    ]
+    assert {snapshot.lineage_key for snapshot in snapshots} == {
+        pattern_state_lineage_key(first.run_id, DEFAULT_LANE, "ImproveBot")
+    }
+    assert snapshots[2].predecessor_snapshot_id == snapshots[1].id
+    assert snapshots[3].predecessor_snapshot_id == snapshots[2].id
+    assert [
+        (entry.sequence_name, entry.scope.run_id, entry.index, entry.role)
+        for entry in reloaded.sequence_entries
+        if entry.sequence_name == "arc_game"
+    ] == [
+        ("arc_game", first.run_id, 0, "state"),
+        ("arc_game", first.run_id, 1, "state"),
+        ("arc_game", first.run_id, 2, "state"),
+        ("arc_game", first.run_id, 3, "state"),
+    ]
+
+
 def test_run_until_after_every_runs_after_invocation_before_next_iteration(
     tmp_path: Path,
 ):

@@ -58,6 +58,34 @@ class PatternRunResult:
     status: Literal["succeeded", "failed"]
 
 
+def _reopen_pattern_run(
+    workspace: Workspace,
+    run_id: str,
+    *,
+    expected_kind: str,
+    lanes: list[str],
+    params: dict[str, object],
+):
+    existing = workspace.runs.get(run_id)
+    if existing is None:
+        raise PatternRunError(f"cannot resume unknown run {run_id!r}")
+    if existing.kind != expected_kind:
+        raise PatternRunError(
+            f"cannot resume run {run_id!r}: kind {existing.kind!r} "
+            f"does not match {expected_kind!r}"
+        )
+    if existing.status == "running":
+        raise PatternRunError(
+            f"cannot resume run {run_id!r}: run is already running"
+        )
+    if list(existing.lanes) != list(lanes):
+        raise PatternRunError(
+            f"cannot resume run {run_id!r}: lanes {existing.lanes!r} "
+            f"do not match pattern lanes {lanes!r}"
+        )
+    return workspace.reopen_run(run_id, params=params)
+
+
 def run_pattern(
     workspace: Workspace,
     pattern: PatternDeclaration,
@@ -67,6 +95,7 @@ def run_pattern(
     validator_registry: ArtifactValidatorRegistry | None = None,
     state_validator_registry: StateValidatorRegistry | None = None,
     param_overrides: dict[str, str] | None = None,
+    resume_run_id: str | None = None,
 ) -> PatternRunResult:
     """Execute a pattern through canonical block execution."""
     if template.name != workspace.template_name:
@@ -78,20 +107,33 @@ def run_pattern(
     _validate_pattern_fixtures(pattern, template)
     _validate_pattern_param_references(pattern, template)
     params = resolve_pattern_params(pattern, param_overrides or {})
-    run = workspace.begin_run(
-        kind=f"pattern:{pattern.name}",
-        params=params,
-        lanes=list(pattern.lanes),
-    )
-    try:
-        _materialize_pattern_fixtures(
-            workspace,
-            pattern,
-            template,
-            project_root,
-            run_id=run.id,
-            validator_registry=validator_registry,
+    expected_kind = f"pattern:{pattern.name}"
+    if resume_run_id is None:
+        run = workspace.begin_run(
+            kind=expected_kind,
+            params=params,
+            lanes=list(pattern.lanes),
         )
+        materialize_fixtures = True
+    else:
+        run = _reopen_pattern_run(
+            workspace,
+            resume_run_id,
+            expected_kind=expected_kind,
+            lanes=list(pattern.lanes),
+            params=params,
+        )
+        materialize_fixtures = False
+    try:
+        if materialize_fixtures:
+            _materialize_pattern_fixtures(
+                workspace,
+                pattern,
+                template,
+                project_root,
+                run_id=run.id,
+                validator_registry=validator_registry,
+            )
         if pattern.body:
             _execute_body(
                 workspace,
@@ -109,6 +151,7 @@ def run_pattern(
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
+                resume=not materialize_fixtures,
             )
             workspace.end_run(run.id, "succeeded")
             return PatternRunResult(run_id=run.id, status="succeeded")
@@ -168,6 +211,7 @@ def _execute_body(
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
+    resume: bool = False,
 ) -> None:
     for index, node in enumerate(nodes):
         if isinstance(node, PatternForEach):
@@ -182,6 +226,7 @@ def _execute_body(
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
+                resume=resume,
             )
             continue
         if isinstance(node, PatternUse):
@@ -197,6 +242,7 @@ def _execute_body(
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
+                resume=resume,
             )
             continue
         if isinstance(node, PatternRunUntil):
@@ -212,10 +258,19 @@ def _execute_body(
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
+                resume=resume,
             )
             continue
         if isinstance(node, PatternStep):
             step_name = _generated_step_name([*step_prefix, node.name])
+            existing = _existing_run_step(workspace, run_id, step_name)
+            if resume and existing is not None:
+                if existing.status == "succeeded":
+                    continue
+                raise PatternRunError(
+                    f"cannot resume run {run_id!r}: prior step "
+                    f"{step_name!r} is {existing.status!r}"
+                )
             step = PatternStep(name=step_name, cohort=node.cohort)
             step_result = _execute_step(
                 workspace,
@@ -247,6 +302,7 @@ def _execute_foreach(
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
+    resume: bool,
 ) -> None:
     for lane_name in node.lanes:
         _execute_body(
@@ -261,6 +317,7 @@ def _execute_foreach(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             params=params,
+            resume=resume,
         )
 
 
@@ -277,6 +334,7 @@ def _execute_use(
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
+    resume: bool,
 ) -> None:
     subpattern = pattern.patterns.get(node.pattern)
     if subpattern is None:
@@ -307,6 +365,7 @@ def _execute_use(
         validator_registry=validator_registry,
         state_validator_registry=state_validator_registry,
         params=child_params,
+        resume=resume,
     )
 
 
@@ -323,6 +382,7 @@ def _execute_run_until(
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
+    resume: bool,
 ) -> None:
     budgets = {
         reason: _resolve_positive_int(
@@ -352,6 +412,28 @@ def _execute_run_until(
     iteration = 0
     step_name = _generated_step_name([*step_prefix, node.name])
     step: RunStepRecord | None = None
+    if resume:
+        existing = _existing_run_step(workspace, run_id, step_name)
+        if existing is not None:
+            if existing.kind != "run_until":
+                raise PatternRunError(
+                    f"cannot resume run {run_id!r}: step "
+                    f"{step_name!r} is not a run_until step"
+                )
+            if existing.status != "succeeded":
+                raise PatternRunError(
+                    f"cannot resume run {run_id!r}: step "
+                    f"{step_name!r} is {existing.status!r}"
+                )
+            step = existing
+            iteration = len(existing.members)
+            reason_counts.update(existing.reason_counts)
+            if existing.stop_kind == "stop_on":
+                return
+            if existing.stop_kind == "budget_exhausted":
+                for reason, count in reason_counts.items():
+                    if count >= budgets.get(reason, count + 1):
+                        return
     while True:
         iteration += 1
         member = PatternMember(
@@ -386,7 +468,7 @@ def _execute_run_until(
             kind="run_until",
             reason_counts=dict(reason_counts),
         )
-        if iteration == 1:
+        if step is None or len(step.members) == 1:
             workspace.record_run_step(run_id, step)
         else:
             workspace.replace_run_step(run_id, step)
@@ -457,6 +539,7 @@ def _execute_run_until(
                 params=params,
                 reason=reason,
                 reason_count=reason_counts[reason],
+                resume=resume,
             )
             if reason_counts[reason] >= budgets[reason]:
                 _finish_run_until_step(
@@ -525,6 +608,7 @@ def _execute_due_after_every(
     params: dict[str, object],
     reason: str,
     reason_count: int,
+    resume: bool,
 ) -> None:
     for trigger, count in after_every:
         if trigger.reason != reason:
@@ -548,6 +632,7 @@ def _execute_due_after_every(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             params=params,
+            resume=resume,
         )
 
 
@@ -574,6 +659,20 @@ def _generated_step_name(parts: list[str]) -> str:
         if part
     ]
     return "__".join(cleaned)
+
+
+def _existing_run_step(
+    workspace: Workspace,
+    run_id: str,
+    step_name: str,
+) -> RunStepRecord | None:
+    run = workspace.runs.get(run_id)
+    if run is None:
+        return None
+    for step in run.steps:
+        if step.name == step_name:
+            return step
+    return None
 
 
 def _execute_step(

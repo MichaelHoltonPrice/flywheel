@@ -236,12 +236,23 @@ output artifacts from the execution.
 
 Patterns own state-lineage policy for pattern-driven executions.
 
-The default derivation is lineage per pattern run, step, and member.
-This prevents two unrelated members using the same block template from
-silently sharing state.
+The default derivation is lineage per pattern run, lane, and block:
 
-Future pattern syntax may allow explicit lineage sharing across steps
-or across resumed runs.  Such sharing must be recorded on `RunRecord`
+```text
+pattern/<run_id>/lane/<lane>/block/<block>
+```
+
+The iteration member name is deliberately excluded so repeated
+`run_until` iterations of the same managed block restore and extend
+one lane-local state chain. Distinct lanes remain isolated.
+
+Pattern resume reopens the same logical `RunRecord` and keeps the same
+run id. As a result, resumed pattern executions continue the same
+state lineages without introducing a separate parent/child lineage
+mapping.
+
+Future pattern syntax may allow explicit lineage sharing across
+different logical runs. Such sharing must be recorded on `RunRecord`
 or equivalent run metadata; it must not be inferred from block name
 alone.
 

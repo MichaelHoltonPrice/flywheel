@@ -821,6 +821,7 @@ class Workspace:
 
         Args:
             execution: The execution record to record.
+            persist: Whether to write ``workspace.yaml`` immediately.
 
         Returns:
             The (possibly status-corrected) execution record, for
@@ -1163,6 +1164,40 @@ class Workspace:
             self.runs[candidate] = record
         self.save()
         return record
+
+    def reopen_run(
+        self,
+        run_id: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> RunRecord:
+        """Reopen an existing terminal run for same-run resume.
+
+        The run id remains the logical pattern-run identity.  Reopening
+        clears the terminal timestamp/error and updates resolved params,
+        but preserves fixtures, steps, lane membership, sequence scopes,
+        and managed-state lineage keys.
+        """
+        with self._lock:
+            current = self.runs.get(run_id)
+            if current is None:
+                raise KeyError(
+                    f"run {run_id!r} is not known to this workspace"
+                )
+            if current.status == "running":
+                raise ValueError(
+                    f"reopen_run: run {run_id!r} is already running"
+                )
+            updated = replace(
+                current,
+                status="running",
+                finished_at=None,
+                params=dict(params or current.params),
+                error=None,
+            )
+            self.runs[run_id] = updated
+        self.save()
+        return updated
 
     def record_run_fixture(
         self,

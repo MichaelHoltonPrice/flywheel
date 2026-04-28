@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -741,3 +742,39 @@ steps:
     assert {execution.block_name for execution in ws.executions.values()} == {
         "train", "eval",
     }
+
+
+def test_run_pattern_cli_passes_resume_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    project_root = make_project(tmp_path)
+    monkeypatch.chdir(project_root)
+    main(["create", "workspace", "--name", "ws",
+          "--template", "my_template"])
+    _write_pattern(project_root, "train_eval", """\
+name: train_eval
+steps:
+  - name: train
+    cohort:
+      min_successes: all
+      members:
+        - name: train_dueling
+          block: train
+""")
+
+    with patch("flywheel.cli.run_pattern") as run_pattern:
+        run_pattern.return_value = SimpleNamespace(
+            run_id="run_existing",
+            status="succeeded",
+        )
+        main([
+            "run", "pattern", "train_eval",
+            "--workspace",
+            str(project_root / "foundry" / "workspaces" / "ws"),
+            "--template", "my_template",
+            "--resume", "run_existing",
+            "--param", "episode_limit=200",
+        ])
+
+    assert run_pattern.call_args.kwargs["resume_run_id"] == "run_existing"
