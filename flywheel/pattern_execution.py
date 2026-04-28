@@ -28,12 +28,6 @@ from flywheel.pattern_params import (
     referenced_params,
     substitute_params,
 )
-from flywheel.pattern_resolution import (
-    RunPrefix,
-    StopDecision,
-    WorkspaceView,
-    resolve_next_step,
-)
 from flywheel.run_record import (
     RunFixtureRecord,
     RunMemberRecord,
@@ -134,60 +128,26 @@ def run_pattern(
                 run_id=run.id,
                 validator_registry=validator_registry,
             )
-        if pattern.body:
-            _execute_body(
-                workspace,
-                pattern.body,
-                pattern,
-                template,
-                project_root,
-                run_id=run.id,
-                lane_name=(
-                    pattern.lanes[0]
-                    if pattern.lanes == [DEFAULT_LANE]
-                    else DEFAULT_LANE
-                ),
-                step_prefix=[],
-                validator_registry=validator_registry,
-                state_validator_registry=state_validator_registry,
-                params=params,
-                resume=not materialize_fixtures,
-            )
-            workspace.end_run(run.id, "succeeded")
-            return PatternRunResult(run_id=run.id, status="succeeded")
-        while True:
-            current_run = workspace.runs[run.id]
-            decision = resolve_next_step(
-                pattern,
-                RunPrefix.from_run(current_run),
-                WorkspaceView.from_workspace(workspace),
-            )
-            if isinstance(decision, StopDecision):
-                workspace.end_run(
-                    run.id,
-                    decision.status,
-                    error=decision.error,
-                )
-                if decision.status == "failed":
-                    raise PatternRunError(
-                        decision.error or "pattern run failed"
-                    )
-                return PatternRunResult(
-                    run_id=run.id,
-                    status=decision.status,
-                )
-
-            step_result = _execute_step(
-                workspace,
-                decision.step,
-                template,
-                project_root,
-                run_id=run.id,
-                validator_registry=validator_registry,
-                state_validator_registry=state_validator_registry,
-                params=params,
-            )
-            workspace.record_run_step(run.id, step_result)
+        _execute_body(
+            workspace,
+            pattern.body,
+            pattern,
+            template,
+            project_root,
+            run_id=run.id,
+            lane_name=(
+                pattern.lanes[0]
+                if pattern.lanes == [DEFAULT_LANE]
+                else DEFAULT_LANE
+            ),
+            step_prefix=[],
+            validator_registry=validator_registry,
+            state_validator_registry=state_validator_registry,
+            params=params,
+            resume=not materialize_fixtures,
+        )
+        workspace.end_run(run.id, "succeeded")
+        return PatternRunResult(run_id=run.id, status="succeeded")
     except KeyboardInterrupt:
         _close_running_run(
             workspace, run.id, "interrupted", error="operator interrupt")
@@ -272,13 +232,22 @@ def _execute_body(
                     f"{step_name!r} is {existing.status!r}"
                 )
             step = PatternStep(name=step_name, cohort=node.cohort)
+            lane_override = lane_name
+            if (
+                lane_name == DEFAULT_LANE
+                and any(
+                    member.lane != DEFAULT_LANE
+                    for member in node.cohort.members
+                )
+            ):
+                lane_override = None
             step_result = _execute_step(
                 workspace,
                 step,
                 template,
                 project_root,
                 run_id=run_id,
-                lane_override=lane_name,
+                lane_override=lane_override,
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 params=params,
@@ -876,11 +845,6 @@ def _validate_pattern_param_references(
                 used_blocks=used_blocks,
             )
             _validate_body_run_until_reasons(current.body, template)
-        for step in current.steps:
-            for member in step.cohort.members:
-                used_blocks.add(member.block)
-                _check_member_param_references(member, check=check)
-
         for block_name in sorted(used_blocks):
             block = _block_definition(template, block_name)
             for reason, routes in block.on_termination.items():

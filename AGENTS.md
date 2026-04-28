@@ -79,7 +79,6 @@ results. Ad hoc `run block` invocations do not create runs.
 **Patterns** are ordered declarations of semantic cohorts. The
 current pattern path lives in
 [flywheel/pattern_declaration.py](flywheel/pattern_declaration.py),
-[flywheel/pattern_resolution.py](flywheel/pattern_resolution.py),
 and [flywheel/pattern_execution.py](flywheel/pattern_execution.py).
 Each member is an ordinary canonical block execution. Cohorts
 support `min_successes: all` and `min_successes: 1`; scheduling is

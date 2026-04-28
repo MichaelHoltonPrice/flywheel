@@ -27,11 +27,15 @@ blocks:
   - name: train
     image: cyberloop-train:latest
     inputs: [checkpoint]
-    outputs: [checkpoint]
+    outputs:
+      normal:
+        - checkpoint
   - name: eval
     image: cyberloop-eval:latest
     inputs: [checkpoint]
-    outputs: [score]
+    outputs:
+      normal:
+        - score
 """
 
 
@@ -146,7 +150,9 @@ blocks:
   - name: process
     image: img:latest
     inputs: [nonexistent]
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -162,7 +168,9 @@ blocks:
   - name: process
     image: img:latest
     inputs: [data]
-    outputs: [nonexistent]
+    outputs:
+      normal:
+        - nonexistent
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -178,7 +186,9 @@ blocks:
   - name: my_block
     image: img:latest
     inputs: [missing]
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -212,8 +222,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
     def _write(self, tmp_path: Path, route: str) -> Path:
@@ -339,7 +350,8 @@ blocks:
     inputs:
       - name: bot
         container_path: /input/bot
-    outputs: []
+    outputs:
+      normal: []
 """
         path = tmp_path / "managed_child.yaml"
         path.write_text(yaml_content)
@@ -475,7 +487,9 @@ blocks:
   - name: build
     image: build:latest
     inputs: []
-    outputs: [engine]
+    outputs:
+      normal:
+        - engine
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -495,7 +509,9 @@ blocks:
   - name: eval
     image: eval:latest
     inputs: [engine]
-    outputs: [result]
+    outputs:
+      normal:
+        - result
 """
         path = tmp_path / "ok.yaml"
         path.write_text(yaml_content)
@@ -513,11 +529,15 @@ blocks:
   - name: process
     image: img:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
   - name: process
     image: img2:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "dup_block.yaml"
         path.write_text(yaml_content)
@@ -535,7 +555,10 @@ blocks:
   - name: process
     image: img:latest
     inputs: []
-    outputs: [data, data]
+    outputs:
+      normal:
+        - data
+        - data
 """
         path = tmp_path / "dup_output.yaml"
         path.write_text(yaml_content)
@@ -577,7 +600,9 @@ blocks:
   - name: "my block"
     image: img:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -597,7 +622,9 @@ blocks:
       - name: checkpoint
         container_path: /data/input
         optional: true
-    outputs: [checkpoint]
+    outputs:
+      normal:
+        - checkpoint
 """
         path = tmp_path / "expanded.yaml"
         path.write_text(yaml_content)
@@ -617,8 +644,9 @@ blocks:
     image: train:latest
     inputs: []
     outputs:
-      - name: checkpoint
-        container_path: /output
+      normal:
+        - name: checkpoint
+          container_path: /output
 """
         path = tmp_path / "expanded.yaml"
         path.write_text(yaml_content)
@@ -626,6 +654,24 @@ blocks:
         out = template.blocks[0].all_output_slots()[0]
         assert out.name == "checkpoint"
         assert out.container_path == "/output"
+
+    def test_flat_outputs_are_rejected(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: checkpoint
+    kind: copy
+blocks:
+  - name: train
+    image: train:latest
+    inputs: []
+    outputs:
+      - name: checkpoint
+        container_path: /output
+"""
+        path = tmp_path / "flat_outputs.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="mapping keyed by termination"):
+            _from_yaml_with_inline_blocks(path)
 
     def test_resource_config(self, tmp_path: Path):
         yaml_content = """\
@@ -639,7 +685,9 @@ blocks:
     env:
       OMP_NUM_THREADS: "1"
     inputs: []
-    outputs: [checkpoint]
+    outputs:
+      normal:
+        - checkpoint
 """
         path = tmp_path / "resources.yaml"
         path.write_text(yaml_content)
@@ -657,7 +705,9 @@ blocks:
   - name: process
     image: proc:latest
     inputs: [data]
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "defaults.yaml"
         path.write_text(yaml_content)
@@ -682,7 +732,9 @@ blocks:
   - name: my-block_v2
     image: img:latest
     inputs: []
-    outputs: [my-data_01]
+    outputs:
+      normal:
+        - my-data_01
 """
         path = tmp_path / "ok.yaml"
         path.write_text(yaml_content)
@@ -703,7 +755,9 @@ blocks:
     runner: lifecycle
     runner_justification: "Test fixture"
     inputs: [session]
-    outputs: [session]
+    outputs:
+      normal:
+        - session
 """
         path = tmp_path / "lifecycle.yaml"
         path.write_text(yaml_content)
@@ -726,7 +780,9 @@ blocks:
   - name: proc
     image: proc:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "default.yaml"
         path.write_text(yaml_content)
@@ -743,7 +799,9 @@ blocks:
     image: proc:latest
     lifecycle: workspace_persistent
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "persistent.yaml"
         path.write_text(yaml_content)
@@ -760,7 +818,9 @@ blocks:
     image: proc:latest
     lifecycle: forever
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -779,7 +839,9 @@ blocks:
     runner_justification: "test fixture"
     lifecycle: workspace_persistent
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -807,7 +869,9 @@ blocks:
     runner_justification: "test fixture"
     lifecycle: one_shot
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -829,7 +893,9 @@ blocks:
   - name: proc
     image: proc:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "default.yaml"
         path.write_text(yaml_content)
@@ -846,7 +912,9 @@ blocks:
     image: proc:latest
     state: true
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "stateful.yaml"
         path.write_text(yaml_content)
@@ -863,7 +931,9 @@ blocks:
     image: proc:latest
     state: unmanaged
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "stateful.yaml"
         path.write_text(yaml_content)
@@ -880,11 +950,32 @@ blocks:
     image: proc:latest
     state: "yes"
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="unknown state mode"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_state_false_is_rejected(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    state: false
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "bad.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="'state' must be"):
             _from_yaml_with_inline_blocks(path)
 
     def test_state_rejected_on_non_container(self, tmp_path: Path):
@@ -898,7 +989,9 @@ blocks:
     runner_justification: "test fixture"
     state: true
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -920,7 +1013,9 @@ blocks:
     lifecycle: workspace_persistent
     state: managed
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -942,7 +1037,9 @@ blocks:
     lifecycle: workspace_persistent
     state: unmanaged
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "persistent.yaml"
         path.write_text(yaml_content)
@@ -963,7 +1060,9 @@ blocks:
   - name: proc
     image: proc:latest
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "default.yaml"
         path.write_text(yaml_content)
@@ -980,7 +1079,9 @@ blocks:
     image: proc:latest
     stop_timeout_s: 120
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "custom.yaml"
         path.write_text(yaml_content)
@@ -999,7 +1100,9 @@ blocks:
     image: proc:latest
     stop_timeout_s: 0
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "zero.yaml"
         path.write_text(yaml_content)
@@ -1016,7 +1119,9 @@ blocks:
     image: proc:latest
     stop_timeout_s: -1
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -1035,7 +1140,9 @@ blocks:
     image: proc:latest
     stop_timeout_s: "30"
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -1055,7 +1162,9 @@ blocks:
     runner_justification: "test fixture"
     stop_timeout_s: 15
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -1078,7 +1187,9 @@ blocks:
     image: proc:latest
     notes: random extra field
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad.yaml"
         path.write_text(yaml_content)
@@ -1096,7 +1207,9 @@ blocks:
     image: proc:latest
     lifecylce: workspace_persistent
     inputs: []
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "typo.yaml"
         path.write_text(yaml_content)
@@ -1120,7 +1233,9 @@ blocks:
       - name: data
         container_path: /input/data
         optionl: true
-    outputs: [data]
+    outputs:
+      normal:
+        - data
 """
         path = tmp_path / "bad_in.yaml"
         path.write_text(yaml_content)
@@ -1138,8 +1253,9 @@ blocks:
     image: proc:latest
     inputs: []
     outputs:
-      - name: data
-        container_pat: /output/data
+      normal:
+        - name: data
+          container_pat: /output/data
 """
         path = tmp_path / "bad_out.yaml"
         path.write_text(yaml_content)

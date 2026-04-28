@@ -34,9 +34,11 @@ CONTAINER_BLOCK = {
     "inputs": [
         {"name": "engine", "container_path": "/input/engine"},
     ],
-    "outputs": [
-        {"name": "checkpoint", "container_path": "/output/checkpoint"},
-    ],
+    "outputs": {
+        "normal": [
+            {"name": "checkpoint", "container_path": "/output/checkpoint"},
+        ],
+    },
 }
 
 # A second container-block fixture used alongside CONTAINER_BLOCK
@@ -47,9 +49,11 @@ EVAL_BLOCK = {
     "inputs": [
         {"name": "checkpoint", "container_path": "/input/checkpoint"},
     ],
-    "outputs": [
-        {"name": "score", "container_path": "/output/score"},
-    ],
+    "outputs": {
+        "normal": [
+            {"name": "score", "container_path": "/output/score"},
+        ],
+    },
 }
 
 
@@ -109,12 +113,14 @@ class TestParseBlockDefinition:
     def test_duplicate_output_rejected(self):
         body = {
             **CONTAINER_BLOCK,
-            "outputs": [
-                {"name": "checkpoint",
-                 "container_path": "/output/checkpoint"},
-                {"name": "checkpoint",
-                 "container_path": "/output/checkpoint2"},
-            ],
+            "outputs": {
+                "normal": [
+                    {"name": "checkpoint",
+                     "container_path": "/output/checkpoint"},
+                    {"name": "checkpoint",
+                     "container_path": "/output/checkpoint2"},
+                ],
+            },
         }
         with pytest.raises(
                 ValueError, match="duplicate output"):
@@ -247,7 +253,9 @@ class TestTemplateRegistryIntegration:
             "  - name: inline_block\n"
             "    image: inline:latest\n"
             "    inputs: [misc]\n"
-            "    outputs: [misc]\n"
+            "    outputs:\n"
+            "      normal:\n"
+            "        - misc\n"
         )
         registry = BlockRegistry.from_directory(blocks_dir)
         with pytest.raises(
@@ -307,7 +315,9 @@ class TestInlineBlockRemoved:
             "  - name: foo\n"
             "    image: foo:latest\n"
             "    inputs: [misc]\n"
-            "    outputs: [misc]\n"
+            "    outputs:\n"
+            "      normal:\n"
+            "        - misc\n"
         )
         with pytest.raises(
                 ValueError, match="unsupported type 'dict'"):

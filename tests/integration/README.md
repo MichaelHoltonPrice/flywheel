@@ -68,8 +68,8 @@ the loop's recovery contract; integration tests here only
 add evidence that real containers obey the same contract.
 
 Container-internal kill points are intentionally NOT
-automated.  These boundaries live inside the agent runner
-process (kill mid-PreToolUse hook, kill between deny
+automated. These boundaries live inside the agent runner
+process (kill mid-PostToolUse hook, kill between placeholder
 tool_result and clean exit, kill mid-resume), and the timing
 windows are too narrow to hit reliably from a test harness.
 When investigating a real-world incident at one of these

@@ -187,10 +187,9 @@ protocol violation."""
 
 DEFAULT_TERMINATION_REASON: Final[str] = "normal"
 """Convention default termination-reason label used by happy-path
-blocks that declare a single clean-exit pathway.  Not reserved —
-projects may use a different label.  The block-declaration
-parser maps a legacy flat ``outputs:`` list to this label so
-existing single-reason blocks parse without YAML migration."""
+blocks that declare a single clean-exit pathway. Not reserved;
+projects may use a different label. Single-reason blocks declare
+this label explicitly under ``outputs.normal``."""
 
 TERMINATION_PATH: Final[str] = "/flywheel/termination"
 """Container-side path for the one-shot runtime's termination

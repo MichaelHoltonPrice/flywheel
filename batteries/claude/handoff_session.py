@@ -20,7 +20,6 @@ def splice_handoff_results(
     session_jsonl_path: Path,
     *,
     result_path: Path,
-    deny_marker: str,
     placeholder_marker: str = "Evaluation requested.",
     result_label: str,
     tool_use_id: str | None = None,
@@ -28,10 +27,10 @@ def splice_handoff_results(
 ) -> int:
     """Replace pending handoff placeholder results in a session JSONL.
 
-    The current handoff path lets the MCP tool complete and then stops
-    Claude Code from a PostToolUse hook with ``continue: false``.  That
-    leaves a successful placeholder tool_result in the SDK session.  For
-    migration, this also recognizes the old PreToolUse deny marker.
+    The handoff path lets the MCP tool complete and then stops Claude
+    Code from a PostToolUse hook with ``continue: false``. That leaves
+    a successful placeholder tool_result in the SDK session, which this
+    function replaces with the completed external result.
     """
     if not session_jsonl_path.is_file():
         return 0
@@ -65,7 +64,6 @@ def splice_handoff_results(
                 continue
             if not _is_pending_handoff_result(
                 block,
-                deny_marker=deny_marker,
                 placeholder_marker=placeholder_marker,
             ):
                 continue
@@ -108,7 +106,6 @@ def splice_handoff_results_in_blocks(
     blocks: list[Any],
     *,
     result_path: Path,
-    deny_marker: str,
     placeholder_marker: str = "Evaluation requested.",
     result_label: str,
     tool_use_id: str | None = None,
@@ -125,7 +122,6 @@ def splice_handoff_results_in_blocks(
             isinstance(block, dict)
             and _is_pending_handoff_result(
                 block,
-                deny_marker=deny_marker,
                 placeholder_marker=placeholder_marker,
             )
             and (tool_use_id is None or block.get("tool_use_id") == tool_use_id)
@@ -155,7 +151,6 @@ def handoff_result_text(*, result_path: Path, result_label: str) -> tuple[str, b
 def _splice_blocks(
     blocks: list[Any],
     *,
-    deny_marker: str,
     payload: list[dict[str, Any]],
     is_error: bool,
     tool_use_id: str | None = None,
@@ -167,7 +162,6 @@ def _splice_blocks(
             isinstance(block, dict)
             and _is_pending_handoff_result(
                 block,
-                deny_marker=deny_marker,
                 placeholder_marker="Evaluation requested.",
             )
             and (tool_use_id is None or block.get("tool_use_id") == tool_use_id)
@@ -269,25 +263,13 @@ def _locate_content_array(obj: dict[str, Any]) -> list[Any] | None:
 def _is_pending_handoff_result(
     block: dict[str, Any],
     *,
-    deny_marker: str,
     placeholder_marker: str,
 ) -> bool:
     if block.get("type") != "tool_result":
         return False
-    if block.get("is_error") is not True:
-        return _content_has_marker(block.get("content"), placeholder_marker)
-    # Backward compatibility for sessions captured by the old PreToolUse
-    # deny handoff path.
-    return _is_handoff_deny(block, deny_marker)
-
-
-def _is_handoff_deny(block: dict[str, Any], deny_marker: str) -> bool:
-    if block.get("type") != "tool_result":
+    if block.get("is_error") is True:
         return False
-    if block.get("is_error") is not True:
-        return False
-    expected = f"permission denied: {deny_marker}"
-    return _content_has_marker(block.get("content"), expected)
+    return _content_has_marker(block.get("content"), placeholder_marker)
 
 
 def _content_has_marker(content: Any, marker: str) -> bool:
@@ -338,7 +320,6 @@ def main() -> int:
             "placeholder_marker, and tool_use_id for the pending handoff."
         ),
     )
-    parser.add_argument("--deny-marker", default="handoff_to_flywheel")
     parser.add_argument(
         "--placeholder-marker",
         default="Evaluation requested.",
@@ -380,7 +361,6 @@ def main() -> int:
         count = splice_handoff_results(
             Path(args.session),
             result_path=result_path,
-            deny_marker=args.deny_marker,
             placeholder_marker=placeholder_marker,
             result_label=result_label,
             tool_use_id=tool_use_id,

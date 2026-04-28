@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import importlib.util
@@ -161,7 +161,6 @@ def test_claude_battery_splices_placeholder_handoff_result_into_session(
     count = module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
@@ -180,7 +179,7 @@ def test_claude_battery_splices_placeholder_handoff_result_into_session(
         "structuredContent"]["result"]
 
 
-def test_claude_battery_still_splices_legacy_deny_handoff_result(
+def test_claude_battery_ignores_legacy_deny_handoff_result(
     tmp_path: Path,
 ):
     module = _load_battery_module(
@@ -205,15 +204,14 @@ def test_claude_battery_still_splices_legacy_deny_handoff_result(
     count = module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
-    assert count == 1
+    assert count == 0
     block = json.loads(session.read_text(encoding="utf-8"))[
         "message"]["content"][0]
-    assert block["is_error"] is False
-    assert "mean: 3.5" in block["content"][0]["text"]
+    assert block["is_error"] is True
+    assert block["content"] == "permission denied: handoff_to_flywheel"
 
 
 def test_claude_battery_splices_missing_result_as_error(tmp_path: Path):
@@ -227,15 +225,14 @@ def test_claude_battery_splices_missing_result_as_error(tmp_path: Path):
         "content": [{
             "type": "tool_result",
             "tool_use_id": "toolu_1",
-            "content": "permission denied: handoff_to_flywheel",
-            "is_error": True,
+            "content": "Evaluation requested.",
+            "is_error": False,
         }],
     }), encoding="utf-8")
 
     count = module.splice_handoff_results(
         session,
         result_path=tmp_path / "missing.json",
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
@@ -258,14 +255,14 @@ def test_claude_battery_splices_newest_handoff_by_default(
             json.dumps({"content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_old",
-                "content": "permission denied: handoff_to_flywheel",
-                "is_error": True,
+                "content": "Evaluation requested.",
+                "is_error": False,
             }]}),
             json.dumps({"content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_new",
-                "content": "permission denied: handoff_to_flywheel",
-                "is_error": True,
+                "content": "Evaluation requested.",
+                "is_error": False,
             }]}),
         ]),
         encoding="utf-8",
@@ -276,7 +273,6 @@ def test_claude_battery_splices_newest_handoff_by_default(
     count = module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
@@ -285,7 +281,8 @@ def test_claude_battery_splices_newest_handoff_by_default(
         json.loads(line)
         for line in session.read_text(encoding="utf-8").splitlines()
     ]
-    assert lines[0]["content"][0]["is_error"] is True
+    assert lines[0]["content"][0]["is_error"] is False
+    assert lines[0]["content"][0]["content"] == "Evaluation requested."
     assert lines[1]["content"][0]["is_error"] is False
     assert "mean: 88" in lines[1]["content"][0]["content"][0]["text"]
 
@@ -301,14 +298,14 @@ def test_claude_battery_splices_exact_tool_use_id(tmp_path: Path):
             json.dumps({"content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_old",
-                "content": "permission denied: handoff_to_flywheel",
-                "is_error": True,
+                "content": "Evaluation requested.",
+                "is_error": False,
             }]}),
             json.dumps({"content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_new",
-                "content": "permission denied: handoff_to_flywheel",
-                "is_error": True,
+                "content": "Evaluation requested.",
+                "is_error": False,
             }]}),
         ]),
         encoding="utf-8",
@@ -319,7 +316,6 @@ def test_claude_battery_splices_exact_tool_use_id(tmp_path: Path):
     count = module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
         tool_use_id="toolu_old",
     )
@@ -330,10 +326,12 @@ def test_claude_battery_splices_exact_tool_use_id(tmp_path: Path):
         for line in session.read_text(encoding="utf-8").splitlines()
     ]
     assert lines[0]["content"][0]["is_error"] is False
-    assert lines[1]["content"][0]["is_error"] is True
+    assert "mean: 77" in lines[0]["content"][0]["content"][0]["text"]
+    assert lines[1]["content"][0]["is_error"] is False
+    assert lines[1]["content"][0]["content"] == "Evaluation requested."
 
 
-def test_claude_battery_splicer_ignores_non_deny_marker_hits(
+def test_claude_battery_splicer_ignores_non_placeholder_hits(
     tmp_path: Path,
 ):
     module = _load_battery_module(
@@ -359,7 +357,6 @@ def test_claude_battery_splicer_ignores_non_deny_marker_hits(
     count = module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
@@ -379,8 +376,8 @@ def test_claude_battery_splicer_preserves_session_mode(tmp_path: Path):
         "content": [{
             "type": "tool_result",
             "tool_use_id": "toolu_1",
-            "content": "permission denied: handoff_to_flywheel",
-            "is_error": True,
+            "content": "Evaluation requested.",
+            "is_error": False,
         }],
     }), encoding="utf-8")
     os.chmod(session, 0o640)
@@ -390,7 +387,6 @@ def test_claude_battery_splicer_preserves_session_mode(tmp_path: Path):
     module.splice_handoff_results(
         session,
         result_path=score,
-        deny_marker="handoff_to_flywheel",
         result_label="Evaluation",
     )
 
@@ -549,7 +545,7 @@ blocks:
         "name": "improve",
         "lanes": ["A"],
         "fixtures": {"bot": "assets/bot"},
-        "steps": [
+        "do": [
             {"name": "improve_1", "cohort": {
                 "foreach": "lanes",
                 "block": "ImproveBot",

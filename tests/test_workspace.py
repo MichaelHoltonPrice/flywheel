@@ -43,7 +43,9 @@ blocks:
   - name: train
     image: train:latest
     inputs: [engine]
-    outputs: [checkpoint]
+    outputs:
+      normal:
+        - checkpoint
 """
 
 
@@ -1437,7 +1439,9 @@ blocks:
   - name: train
     image: train:latest
     inputs: [engine]
-    outputs: [history]
+    outputs:
+      normal:
+        - history
 """
 
 

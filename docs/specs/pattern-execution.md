@@ -29,7 +29,7 @@ params:
   eval_episodes:
     type: int
     default: 4000
-steps:
+do:
   - name: train
     cohort:
       min_successes: all
@@ -51,9 +51,8 @@ steps:
               output: checkpoint
 ```
 
-The legacy `steps:` form remains supported for linear cohort patterns.
-New patterns should use `do:`, a structured executable body. For
-example, this pattern runs two independent lanes. Each lane runs a
+Patterns must declare a non-empty `do:` structured executable body.
+For example, this pattern runs two independent lanes. Each lane runs a
 local sub-pattern that repeatedly runs `ImproveBot` until the agent
 exits normally or has requested five evaluations:
 
@@ -108,12 +107,11 @@ patterns:
                         block: Brainstorm
 ```
 
-`steps` is an ordered, non-empty list of cohorts. `do` is an ordered,
-non-empty list of pattern body nodes. A pattern must declare one or the
-other, not both. Pattern members are block executions. If omitted,
-`lanes` defaults to a single implicit `default` lane unless the root
-body declares a `foreach.count`, in which case Flywheel generates
-stable lanes named `lane_0`, `lane_1`, and so on.
+`do` is an ordered, non-empty list of pattern body nodes. Pattern
+members are block executions. If omitted, `lanes` defaults to a single
+implicit `default` lane unless the root body declares a `foreach.count`,
+in which case Flywheel generates stable lanes named `lane_0`, `lane_1`,
+and so on. The old top-level `steps:` grammar is rejected.
 
 ## Parameters
 
@@ -140,7 +138,7 @@ params:
     type: int
     default: 4000
 
-steps:
+do:
   - name: improve
     cohort:
       foreach: lanes

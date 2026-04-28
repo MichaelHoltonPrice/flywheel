@@ -155,14 +155,12 @@ if [ -f "$PERSISTED_SESSION" ] && [ "${FLYWHEEL_ENABLE_SESSION_SPLICE:-0}" = "1"
             --session "$PERSISTED_SESSION" \
             --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
             --meta "$PERSISTED_HANDOFF" \
-            --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
             --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
             --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
     else
         python3 /app/handoff_session.py \
             --session "$PERSISTED_SESSION" \
             --result "${HANDOFF_RESULT_PATH:-/input/score/scores.json}" \
-            --deny-marker "${HANDOFF_DENY_MARKER:-handoff_to_flywheel}" \
             --placeholder-marker "${HANDOFF_PLACEHOLDER_MARKER:-Evaluation requested.}" \
             --label "${HANDOFF_RESULT_LABEL:-Tool result}" || true
     fi

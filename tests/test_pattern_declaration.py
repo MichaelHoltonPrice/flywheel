@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from flywheel.pattern_declaration import (
     PriorOutputBinding,
@@ -10,7 +10,7 @@ from flywheel.pattern_lanes import DEFAULT_LANE
 def _pattern(overrides: dict | None = None) -> dict:
     data = {
         "name": "train_eval",
-        "steps": [
+        "do": [
             {
                 "name": "train",
                 "cohort": {
@@ -56,8 +56,8 @@ def test_pattern_yaml_parses_into_declaration_model():
     assert pattern.name == "train_eval"
     assert pattern.lanes == [DEFAULT_LANE]
     assert pattern.fixtures == {}
-    assert [step.name for step in pattern.steps] == ["train", "eval"]
-    eval_member = pattern.steps[1].cohort.members[0]
+    assert [step.name for step in pattern.body] == ["train", "eval"]
+    eval_member = pattern.body[1].cohort.members[0]
     binding = eval_member.inputs["checkpoint"]
     assert isinstance(binding, PriorOutputBinding)
     assert binding.from_step == "train"
@@ -67,7 +67,7 @@ def test_pattern_yaml_parses_into_declaration_model():
 
 def test_unknown_success_rule_fails_at_parse_time():
     data = _pattern()
-    data["steps"][0]["cohort"]["min_successes"] = 2
+    data["do"][0]["cohort"]["min_successes"] = 2
 
     try:
         parse_pattern_declaration(data)
@@ -94,7 +94,7 @@ def test_lanes_fixtures_and_foreach_parse():
         "fixtures": {
             "bot": "foundry/templates/assets/bot",
         },
-        "steps": [
+        "do": [
             {
                 "name": "round_1",
                 "cohort": {
@@ -113,7 +113,7 @@ def test_lanes_fixtures_and_foreach_parse():
     assert pattern.params["eval_episodes"].default == 4000
     assert pattern.fixtures["bot"].source == (
         "foundry/templates/assets/bot")
-    members = pattern.steps[0].cohort.members
+    members = pattern.body[0].cohort.members
     assert [(member.name, member.lane, member.block) for member in members] == [
         ("A", "A", "ImproveBot"),
         ("B", "B", "ImproveBot"),
@@ -183,7 +183,7 @@ def test_structured_do_foreach_use_and_run_until_parse():
 
 def test_member_lane_must_be_declared():
     data = _pattern({"lanes": ["A"]})
-    data["steps"][0]["cohort"]["members"][0]["lane"] = "B"
+    data["do"][0]["cohort"]["members"][0]["lane"] = "B"
 
     try:
         parse_pattern_declaration(data)
@@ -195,7 +195,7 @@ def test_member_lane_must_be_declared():
 
 def test_step_names_are_unique():
     data = _pattern()
-    data["steps"][1]["name"] = "train"
+    data["do"][1]["name"] = "train"
 
     try:
         parse_pattern_declaration(data)
@@ -207,7 +207,7 @@ def test_step_names_are_unique():
 
 def test_member_names_are_unique_within_step():
     data = _pattern()
-    members = data["steps"][0]["cohort"]["members"]
+    members = data["do"][0]["cohort"]["members"]
     members.append({**members[0]})
 
     try:
@@ -220,20 +220,28 @@ def test_member_names_are_unique_within_step():
 
 def test_empty_patterns_fail_at_parse_time():
     try:
-        parse_pattern_declaration({"name": "empty", "steps": []})
+        parse_pattern_declaration({"name": "empty", "do": []})
     except ValueError as exc:
         assert "non-empty" in str(exc)
     else:
         raise AssertionError("expected parse failure")
 
 
-def test_pattern_cannot_declare_steps_and_do():
-    data = _pattern({"do": [{"use": "x"}]})
-
+def test_pattern_steps_key_is_rejected():
     try:
-        parse_pattern_declaration(data)
+        parse_pattern_declaration({
+            "name": "old",
+            "steps": [
+                {
+                    "name": "train",
+                    "cohort": {
+                        "members": [{"name": "train", "block": "Train"}],
+                    },
+                }
+            ],
+        })
     except ValueError as exc:
-        assert "either 'steps' or 'do'" in str(exc)
+        assert "'steps' is no longer supported" in str(exc)
     else:
         raise AssertionError("expected parse failure")
 

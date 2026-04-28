@@ -1,6 +1,5 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,13 +11,6 @@ from flywheel.pattern_execution import (
     run_pattern,
 )
 from flywheel.pattern_lanes import DEFAULT_LANE
-from flywheel.pattern_resolution import (
-    RunPrefix,
-    StopDecision,
-    WorkspaceView,
-    resolve_next_step,
-)
-from flywheel.run_record import RunMemberRecord, RunRecord, RunStepRecord
 from flywheel.state import pattern_state_lineage_key
 from flywheel.template import Template
 from flywheel.workspace import Workspace
@@ -35,16 +27,18 @@ blocks:
   - name: train
     image: train:latest
     outputs:
-      - name: checkpoint
-        container_path: /output/checkpoint
+      normal:
+        - name: checkpoint
+          container_path: /output/checkpoint
   - name: eval
     image: eval:latest
     inputs:
       - name: checkpoint
         container_path: /input/checkpoint
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
 INVOCATION_FAILURE_TEMPLATE_YAML = """\
@@ -73,8 +67,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
 LANE_TEMPLATE_YAML = """\
@@ -89,8 +84,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: bot
-        container_path: /output/bot
+      normal:
+        - name: bot
+          container_path: /output/bot
 """
 
 OPTIONAL_LANE_TEMPLATE_YAML = """\
@@ -111,8 +107,9 @@ blocks:
         container_path: /input/note
         optional: true
     outputs:
-      - name: note
-        container_path: /output/note
+      normal:
+        - name: note
+          container_path: /output/note
 """
 
 INVOCATION_OUTPUT_TEMPLATE_YAML = """\
@@ -144,16 +141,18 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
   - name: consume_score
     image: consume-score:latest
     inputs:
       - name: score
         container_path: /input/score
     outputs:
-      - name: bot
-        container_path: /output/bot
+      normal:
+        - name: bot
+          container_path: /output/bot
 """
 
 RUN_UNTIL_TEMPLATE_YAML = """\
@@ -197,8 +196,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
   - name: Brainstorm
     image: brainstorm:latest
     inputs:
@@ -206,8 +206,9 @@ blocks:
         container_path: /input/score
         optional: true
     outputs:
-      - name: ideas
-        container_path: /output/ideas
+      normal:
+        - name: ideas
+          container_path: /output/ideas
 """
 
 PARAM_INVOCATION_TEMPLATE_YAML = """\
@@ -239,8 +240,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
 
@@ -283,7 +285,7 @@ def _fake_container(config, args=None):
 def _declaration():
     return parse_pattern_declaration({
         "name": "train_eval",
-        "steps": [
+        "do": [
             {
                 "name": "train",
                 "cohort": {
@@ -314,87 +316,6 @@ def _declaration():
             },
         ],
     })
-
-
-def test_resolver_emits_first_cohort_and_is_deterministic():
-    pattern = _declaration()
-    run = RunRecord(
-        id="run_1",
-        kind="pattern:train_eval",
-        started_at=datetime.now(UTC),
-    )
-    prefix = RunPrefix.from_run(run)
-    view = WorkspaceView(execution_statuses={})
-
-    first = resolve_next_step(pattern, prefix, view)
-    second = resolve_next_step(pattern, prefix, view)
-
-    assert first == second
-    assert first.step.name == "train"
-
-
-def test_resolver_emits_second_cohort_after_first_succeeds():
-    pattern = _declaration()
-    run = RunRecord(
-        id="run_1",
-        kind="pattern:train_eval",
-        started_at=datetime.now(UTC),
-        steps=[
-            RunStepRecord(
-                name="train",
-                min_successes="all",
-                status="succeeded",
-                members=[
-                    RunMemberRecord(
-                        name="train_dueling",
-                        block_name="train",
-                        status="succeeded",
-                        execution_id="exec_1",
-                        output_bindings={"checkpoint": "checkpoint@1"},
-                    )
-                ],
-            )
-        ],
-    )
-
-    decision = resolve_next_step(
-        pattern, RunPrefix.from_run(run), WorkspaceView(execution_statuses={}))
-
-    assert decision.step.name == "eval"
-
-
-def test_resolver_stops_succeeded_after_final_cohort():
-    pattern = _declaration()
-    run = RunRecord(
-        id="run_1",
-        kind="pattern:train_eval",
-        started_at=datetime.now(UTC),
-        steps=[
-            RunStepRecord("train", "all", "succeeded", []),
-            RunStepRecord("eval", "all", "succeeded", []),
-        ],
-    )
-
-    decision = resolve_next_step(
-        pattern, RunPrefix.from_run(run), WorkspaceView(execution_statuses={}))
-
-    assert decision == StopDecision(status="succeeded")
-
-
-def test_resolver_stops_failed_after_failed_step():
-    pattern = _declaration()
-    run = RunRecord(
-        id="run_1",
-        kind="pattern:train_eval",
-        started_at=datetime.now(UTC),
-        steps=[RunStepRecord("train", "all", "failed", [])],
-    )
-
-    decision = resolve_next_step(
-        pattern, RunPrefix.from_run(run), WorkspaceView(execution_statuses={}))
-
-    assert decision == StopDecision(
-        status="failed", error="step 'train' failed")
 
 
 def test_run_pattern_records_train_eval_membership(tmp_path: Path):
@@ -436,7 +357,7 @@ def test_pattern_params_persist_and_substitute_into_env_args_and_invocations(
                 "default": 4000,
             },
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -516,7 +437,7 @@ def test_pattern_param_resolution_coerces_defaults_and_overrides():
             "threshold": {"type": "float", "default": 1},
             "dry_run": {"type": "bool", "default": "false"},
         },
-        "steps": [
+        "do": [
             {
                 "name": "noop",
                 "cohort": {
@@ -550,7 +471,7 @@ def test_required_pattern_param_without_default_fails_before_run(
             "model": {"type": "string"},
             "eval_episodes": {"type": "int", "default": 10},
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -582,7 +503,7 @@ def test_pattern_param_override_type_failure_happens_before_run(
         "params": {
             "eval_episodes": {"type": "int"},
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -619,7 +540,7 @@ def test_bool_pattern_param_round_trips_through_workspace_yaml(
         "params": {
             "dry_run": {"type": "bool", "default": False},
         },
-        "steps": [
+        "do": [
             {
                 "name": "train",
                 "cohort": {
@@ -704,7 +625,7 @@ def test_unknown_member_param_reference_fails_before_run(tmp_path: Path):
         "params": {
             "model": {"type": "string", "default": "m"},
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -741,7 +662,7 @@ def test_unknown_invocation_route_param_reference_fails_before_run(
         "params": {
             "episodes": {"type": "int", "default": 10},
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -772,7 +693,7 @@ def test_unknown_pattern_param_override_is_rejected(tmp_path: Path):
         "params": {
             "model": {"type": "string"},
         },
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -894,7 +815,7 @@ def test_pattern_lanes_keep_artifact_pedigrees_separate(tmp_path: Path):
         "name": "improve",
         "lanes": ["A", "B"],
         "fixtures": {"bot": "foundry/templates/assets/bot"},
-        "steps": [
+        "do": [
             {
                 "name": "round_1",
                 "cohort": {
@@ -970,7 +891,7 @@ def test_pattern_optional_inputs_do_not_use_workspace_global_latest(
     pattern = parse_pattern_declaration({
         "name": "optional_inputs",
         "lanes": ["A"],
-        "steps": [
+        "do": [
             {
                 "name": "optional",
                 "cohort": {
@@ -1019,7 +940,7 @@ def test_pattern_fixtures_ignore_workspace_global_latest(
         "name": "fixture_inputs",
         "lanes": ["A"],
         "fixtures": {"bot": "foundry/templates/assets/bot"},
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -1065,7 +986,7 @@ def test_invocation_child_output_feeds_next_step_in_lane(tmp_path: Path):
         "name": "invocation_lane",
         "lanes": ["A"],
         "fixtures": {"bot": "foundry/templates/assets/bot"},
-        "steps": [
+        "do": [
             {
                 "name": "agent",
                 "cohort": {
@@ -1345,8 +1266,9 @@ blocks:
   - name: Boot
     image: boot:latest
     outputs:
-      - name: bot
-        container_path: /output/bot
+      normal:
+        - name: bot
+          container_path: /output/bot
   - name: ImproveBot
     image: improve:latest
     state: managed
@@ -1367,12 +1289,13 @@ blocks:
   - name: Brainstorm
     image: brainstorm:latest
     outputs:
-      - name: ideas
-        container_path: /output/ideas
-        sequence:
-          name: arc_brainstorm
-          scope: enclosing_lane
-          role: brainstorm
+      normal:
+        - name: ideas
+          container_path: /output/ideas
+          sequence:
+            name: arc_brainstorm
+            scope: enclosing_lane
+            role: brainstorm
 """
     project_root, template, workspace = _setup_workspace(
         tmp_path, template_yaml)
@@ -1871,7 +1794,7 @@ def test_pattern_member_stays_parent_when_invoked_child_fails(
         tmp_path, INVOCATION_FAILURE_TEMPLATE_YAML)
     pattern = parse_pattern_declaration({
         "name": "improve",
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -1954,7 +1877,7 @@ def test_pattern_fixture_uses_artifact_validator(tmp_path: Path):
         "name": "fixture_validation",
         "lanes": ["A"],
         "fixtures": {"bot": "foundry/templates/assets/bot"},
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -2007,7 +1930,7 @@ def test_missing_pattern_fixture_fails_run_before_first_step(tmp_path: Path):
         "name": "missing_fixture",
         "lanes": ["A"],
         "fixtures": {"bot": "foundry/templates/assets/missing"},
-        "steps": [
+        "do": [
             {
                 "name": "improve",
                 "cohort": {
@@ -2077,7 +2000,7 @@ def test_min_successes_one_runs_all_members_and_succeeds(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(tmp_path)
     pattern = parse_pattern_declaration({
         "name": "try_two",
-        "steps": [
+        "do": [
             {
                 "name": "train",
                 "cohort": {
@@ -2110,7 +2033,7 @@ def test_min_successes_all_stops_after_first_failure(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(tmp_path)
     pattern = parse_pattern_declaration({
         "name": "all_required",
-        "steps": [
+        "do": [
             {
                 "name": "train",
                 "cohort": {

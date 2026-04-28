@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import subprocess
 from datetime import UTC, datetime
@@ -75,13 +75,17 @@ blocks:
 name: train
 image: cyberloop-train:latest
 inputs: [checkpoint]
-outputs: [checkpoint]
+outputs:
+  normal:
+    - checkpoint
 """)
     (blocks_dir / "eval.yaml").write_text("""\
 name: eval
 image: cyberloop-eval:latest
 inputs: [checkpoint]
-outputs: [score]
+outputs:
+  normal:
+    - score
 """)
 
     # Commit the project config files so the tree is clean
@@ -590,7 +594,9 @@ name: train
 image: cyberloop-train:latest
 state: managed
 inputs: []
-outputs: [checkpoint]
+outputs:
+  normal:
+    - checkpoint
 """)
         subprocess.run(
             ["git", "-C", str(project_root), "add", "."],
@@ -649,7 +655,7 @@ class TestRemovedAgentSurfaces:
         assert "invalid choice" in capsys.readouterr().err
 
 
-# ── flywheel run pattern ────────────────────────────────────────
+# â”€â”€ flywheel run pattern â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _write_pattern(project_root: Path, name: str, body: str) -> Path:
@@ -673,7 +679,9 @@ image: cyberloop-train:latest
 inputs:
   - name: checkpoint
     optional: true
-outputs: [checkpoint]
+outputs:
+  normal:
+    - checkpoint
 """)
     subprocess.run(
         ["git", "-C", str(project_root), "add", "."],
@@ -690,7 +698,7 @@ outputs: [checkpoint]
           "--template", "my_template"])
     _write_pattern(project_root, "train_eval", """\
 name: train_eval
-steps:
+do:
   - name: train
     cohort:
       min_successes: all
@@ -754,7 +762,7 @@ def test_run_pattern_cli_passes_resume_run_id(
           "--template", "my_template"])
     _write_pattern(project_root, "train_eval", """\
 name: train_eval
-steps:
+do:
   - name: train
     cohort:
       min_successes: all

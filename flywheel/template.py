@@ -186,9 +186,8 @@ class BlockDefinition:
     implicitly to the empty output set and are not enumerated
     here.
 
-    The legacy YAML shape ``outputs: [<flat list>]`` parses as
-    ``{DEFAULT_TERMINATION_REASON: <flat list>}`` so single-reason
-    blocks need no migration.  See
+    The YAML shape is always a mapping keyed by termination reason.
+    Single-reason blocks should use ``normal:`` explicitly. See
     :func:`_parse_output_groups`.
     """
     docker_args: list[str] = field(default_factory=list)
@@ -565,37 +564,26 @@ def _parse_output_groups(
 ) -> dict[str, list[OutputSlot]]:
     """Parse a block's ``outputs:`` declaration into the grouped form.
 
-    Two YAML shapes are accepted:
+    The YAML shape is a mapping keyed by termination reason.
 
-    * **Flat list** (legacy / single-termination-reason blocks)::
-
-        outputs:
-          - name: result
-            container_path: /scratch/result
-
-      Parses to ``{DEFAULT_TERMINATION_REASON: [<slots>]}`` —
-      the slots all live under the single conventional
-      ``"normal"`` reason.
-
-    * **Mapping keyed by termination reason** (multi-reason
-      blocks)::
+    ``outputs:`` is written like this::
 
         outputs:
           normal:
-            - name: turn_summary
-              container_path: /scratch/turn_summary
-          defer:
-            - name: action
-              container_path: /scratch/action
+            - name: result
+              container_path: /output/result
+          eval_requested:
+            - name: bot
+              container_path: /output/bot
 
-      Each key is a project-defined termination-reason label.
-      Substrate-reserved labels
-      (:data:`flywheel.runtime.RESERVED_TERMINATION_REASONS`)
-      are rejected — declarations never enumerate them; they
-      implicitly map to the empty output set at commit time.
+    Each key is a project-defined termination-reason label.
+    Substrate-reserved labels
+    (:data:`flywheel.runtime.RESERVED_TERMINATION_REASONS`)
+    are rejected; declarations never enumerate them. Reserved
+    reasons implicitly map to the empty output set at commit time.
 
-    A block with no outputs (``outputs:`` omitted, ``[]``, or
-    ``{}``) parses to ``{DEFAULT_TERMINATION_REASON: []}`` — every
+    A block with no outputs (``outputs:`` omitted or
+    ``{}``) parses to ``{DEFAULT_TERMINATION_REASON: []}``; every
     block declares at least one termination reason, defaulting to
     the conventional ``"normal"`` reason with an empty output set.
     """
@@ -604,14 +592,8 @@ def _parse_output_groups(
         RESERVED_TERMINATION_REASONS,
     )
 
-    if raw is None or raw == [] or raw == {}:
+    if raw is None or raw == {}:
         return {DEFAULT_TERMINATION_REASON: []}
-    if isinstance(raw, list):
-        slots = _parse_output_slot_list(
-            raw, block_name=block_name,
-            group_label=DEFAULT_TERMINATION_REASON,
-        )
-        return {DEFAULT_TERMINATION_REASON: slots}
     if isinstance(raw, dict):
         groups: dict[str, list[OutputSlot]] = {}
         for reason, entries in raw.items():
@@ -641,8 +623,7 @@ def _parse_output_groups(
             )
         return groups
     raise ValueError(
-        f"Block {block_name!r}: 'outputs' must be a list "
-        f"(legacy single-reason form) or a mapping keyed by "
+        f"Block {block_name!r}: 'outputs' must be a mapping keyed by "
         f"termination reason, got {type(raw).__name__}"
     )
 

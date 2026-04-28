@@ -135,7 +135,6 @@ class PatternDeclaration:
     params: dict[str, PatternParam]
     lanes: list[str]
     fixtures: dict[str, PatternFixture]
-    steps: list[PatternStep]
     body: list[PatternNode] = field(default_factory=list)
     patterns: dict[str, PatternDeclaration] = field(default_factory=dict)
 
@@ -158,7 +157,8 @@ def parse_pattern_declaration(
 ) -> PatternDeclaration:
     """Parse and validate a pattern declaration mapping."""
     unknown = set(data) - {
-        "name", "params", "lanes", "fixtures", "steps", "do", "patterns",
+        "name", "params", "lanes", "fixtures", "do", "patterns",
+        "steps",
     }
     if unknown:
         raise ValueError(
@@ -171,38 +171,27 @@ def parse_pattern_declaration(
     validate_name(name, "Pattern")
     params = _parse_params(data.get("params", {}), pattern_name=name)
     fixtures = _parse_fixtures(data.get("fixtures", {}), pattern_name=name)
-    steps: list[PatternStep] = []
     body: list[PatternNode] = []
-    if "steps" in data and "do" in data:
-        raise ValueError(
-            f"Pattern {name!r}: declare either 'steps' or 'do', not both"
-        )
+    explicit_lanes = (
+        _parse_lanes(data.get("lanes"), pattern_name=name)
+        if "lanes" in data else None
+    )
     patterns = _parse_local_patterns(
         data.get("patterns", {}), parent_name=name, source=source)
     if "steps" in data:
-        lanes = _parse_lanes(data.get("lanes"), pattern_name=name)
-        raw_steps = data.get("steps")
-        if not isinstance(raw_steps, list) or not raw_steps:
-            raise ValueError(
-                f"Pattern {name!r}: 'steps' must be a non-empty list"
-            )
-        step_names: set[str] = set()
-        for raw_step in raw_steps:
-            step = _parse_step(raw_step, pattern_name=name, lanes=lanes)
-            if step.name in step_names:
-                raise ValueError(
-                    f"Pattern {name!r}: duplicate step name "
-                    f"{step.name!r}"
-                )
-            step_names.add(step.name)
-            steps.append(step)
-    elif "do" in data:
-        body = _parse_body(data.get("do"), pattern_name=name)
-        declared_lanes = _collect_body_lanes(body)
-        lanes = (
-            _parse_lanes(data.get("lanes"), pattern_name=name)
-            if "lanes" in data else declared_lanes or [DEFAULT_LANE]
+        raise ValueError(
+            f"Pattern {name!r}: 'steps' is no longer supported; "
+            "declare a non-empty 'do' body"
         )
+    if "do" in data:
+        body = _parse_body(
+            data.get("do"),
+            pattern_name=name,
+            lanes=explicit_lanes or [DEFAULT_LANE],
+        )
+        _validate_body_step_names(body, pattern_name=name)
+        declared_lanes = _collect_body_lanes(body)
+        lanes = explicit_lanes or declared_lanes or [DEFAULT_LANE]
         if declared_lanes and _body_has_root_non_foreach(body):
             raise ValueError(
                 f"Pattern {name!r}: a root 'do' body that declares "
@@ -211,17 +200,34 @@ def parse_pattern_declaration(
             )
     else:
         raise ValueError(
-            f"Pattern {name!r}: declare non-empty 'steps' or 'do'"
+            f"Pattern {name!r}: declare a non-empty 'do' body"
         )
     return PatternDeclaration(
         name=name,
         params=params,
         lanes=lanes,
         fixtures=fixtures,
-        steps=steps,
         body=body,
         patterns=patterns,
     )
+
+
+def _validate_body_step_names(
+    nodes: list[PatternNode],
+    *,
+    pattern_name: str,
+) -> None:
+    """Reject duplicate cohort step names within one body list."""
+    names: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, PatternStep):
+            continue
+        if node.name in names:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: duplicate step name "
+                f"{node.name!r}"
+            )
+        names.add(node.name)
 
 
 def _parse_params(
@@ -367,13 +373,23 @@ def _parse_local_patterns(
     return patterns
 
 
-def _parse_body(raw: object, *, pattern_name: str) -> list[PatternNode]:
+def _parse_body(
+    raw: object,
+    *,
+    pattern_name: str,
+    lanes: list[str],
+) -> list[PatternNode]:
     if not isinstance(raw, list) or not raw:
         raise ValueError(
             f"Pattern {pattern_name!r}: 'do' must be a non-empty list"
         )
     return [
-        _parse_body_node(item, pattern_name=pattern_name, index=index)
+        _parse_body_node(
+            item,
+            pattern_name=pattern_name,
+            lanes=lanes,
+            index=index,
+        )
         for index, item in enumerate(raw)
     ]
 
@@ -382,6 +398,7 @@ def _parse_body_node(
     raw: object,
     *,
     pattern_name: str,
+    lanes: list[str],
     index: int,
 ) -> PatternNode:
     if not isinstance(raw, dict):
@@ -399,7 +416,7 @@ def _parse_body_node(
         return _parse_body_cohort_node(
             raw,
             pattern_name=pattern_name,
-            lanes=[DEFAULT_LANE],
+            lanes=lanes,
             index=index,
         )
     if "foreach" in raw:
@@ -498,7 +515,11 @@ def _parse_foreach_node(
     lanes = [f"lane_{index}" for index in range(count)]
     return PatternForEach(
         lanes=lanes,
-        body=_parse_body(raw.get("do"), pattern_name=pattern_name),
+        body=_parse_body(
+            raw.get("do"),
+            pattern_name=pattern_name,
+            lanes=lanes,
+        ),
     )
 
 
@@ -625,7 +646,11 @@ def _parse_after_every(
         parsed.append(PatternAfterEvery(
             reason=reason,
             count=count_value,
-            body=_parse_body(item.get("do"), pattern_name=pattern_name),
+            body=_parse_body(
+                item.get("do"),
+                pattern_name=pattern_name,
+                lanes=[DEFAULT_LANE],
+            ),
         ))
     return parsed
 

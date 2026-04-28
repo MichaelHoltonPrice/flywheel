@@ -46,8 +46,8 @@ state: managed
 state: unmanaged
 ```
 
-For compatibility, `state: false` is equivalent to `none`, and
-`state: true` is equivalent to `managed`.
+For shorthand, `state: true` is equivalent to `managed`. Use
+`state: none` explicitly for stateless blocks.
 
 `none` is the right choice for one-shot computations whose behavior
 depends only on declared inputs: pure transforms, summarizers, and

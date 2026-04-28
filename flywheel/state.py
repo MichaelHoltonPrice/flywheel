@@ -42,7 +42,7 @@ class StateSnapshot:
 
 def normalize_state_mode(value: object, *, block_name: str) -> StateMode:
     """Normalize a block YAML ``state:`` value."""
-    if value is None or value is False:
+    if value is None:
         return "none"
     if value is True:
         return "managed"
@@ -51,11 +51,11 @@ def normalize_state_mode(value: object, *, block_name: str) -> StateMode:
             return value
         raise ValueError(
             f"Block {block_name!r}: unknown state mode {value!r}; "
-            "expected 'none', 'managed', 'unmanaged', true, or false"
+            "expected 'none', 'managed', 'unmanaged', or true"
         )
     raise ValueError(
         f"Block {block_name!r}: 'state' must be one of "
-        "'none', 'managed', 'unmanaged', true, or false "
+        "'none', 'managed', 'unmanaged', or true "
         f"(got {type(value).__name__})"
     )
 

@@ -52,16 +52,18 @@ blocks:
         container_path: /input/checkpoint
         optional: true
     outputs:
-      - name: checkpoint
-        container_path: /output
+      normal:
+        - name: checkpoint
+          container_path: /output
   - name: eval
     image: eval:latest
     inputs:
       - name: checkpoint
         container_path: /input/checkpoint
     outputs:
-      - name: score
-        container_path: /output
+      normal:
+        - name: score
+          container_path: /output
 """
 
 STATE_TEMPLATE_YAML = """\
@@ -107,8 +109,9 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
 MULTI_INVOCATION_TEMPLATE_YAML = """\
@@ -142,16 +145,18 @@ blocks:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
   - name: audit
     image: audit:latest
     inputs:
       - name: bot
         container_path: /input/bot
     outputs:
-      - name: audit
-        container_path: /output/audit
+      normal:
+        - name: audit
+          container_path: /output/audit
 """
 
 IMPLICIT_INVOCATION_TEMPLATE_YAML = """\
@@ -184,8 +189,9 @@ blocks:
       - name: config
         container_path: /input/config
     outputs:
-      - name: score
-        container_path: /output/score
+      normal:
+        - name: score
+          container_path: /output/score
 """
 
 PERSISTENT_TEMPLATE_YAML = """\
@@ -204,8 +210,9 @@ blocks:
       - name: seed
         container_path: /input/seed
     outputs:
-      - name: result
-        container_path: /output/result
+      normal:
+        - name: result
+          container_path: /output/result
 """
 
 
