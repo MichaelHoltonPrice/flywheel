@@ -93,6 +93,8 @@ patterns:
               max: ${params.max_evals}
           stop_on:
             - normal
+          fail_on:
+            - aborted
           after_every:
             - reason: eval_requested
               count: 20
@@ -306,14 +308,20 @@ budget is reached, the loop stops after the iteration and any routed
 child invocations have committed; the step records
 `stop_kind: budget_exhausted`. If the block exits with a `stop_on`
 reason, the loop stops successfully and records `stop_kind: stop_on`.
-A declared block termination reason that appears in neither
-`continue_on` nor `stop_on` is a pattern error for this loop and
-records `stop_kind: unexpected_reason`. A member execution failure
-records `stop_kind: failed`.
+If the block exits with a `fail_on` reason, the block's declared
+outputs are still committed, the loop records `stop_kind: fail_on`,
+and the pattern run fails with that termination reason. This is useful
+for project-level diagnostic exits that should preserve artifacts but
+should not be treated as successful loop completion. A declared block
+termination reason that appears in neither `continue_on`, `stop_on`,
+nor `fail_on` is a pattern error for this loop and records
+`stop_kind: unexpected_reason`. A member execution failure records
+`stop_kind: failed`.
 
-`continue_on` and `stop_on` reasons must be declared by the block's
-`outputs` map. This prevents a loop from silently discarding proposed
-outputs for a termination reason the block did not declare.
+`continue_on`, `stop_on`, and `fail_on` reasons must be declared by the
+block's `outputs` map, and a reason may appear in only one of those
+sets. This prevents a loop from silently discarding proposed outputs
+for a termination reason the block did not declare.
 
 `run_until.after_every` declares periodic lane-local work that runs
 after a counted continuation reason. Each entry has:

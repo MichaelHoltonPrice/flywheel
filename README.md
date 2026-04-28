@@ -45,6 +45,12 @@ Flywheel-provided Claude battery image and managed state
 restore/capture. The example invokes the battery as an ordinary block
 with `flywheel run block`.
 
+Reusable battery images live under [batteries/](batteries/). The
+Claude battery provides a managed-state agent container. The desktop
+battery provides an agent-agnostic virtual desktop service with
+screenshot/input APIs; projects derive from it and wire controller
+blocks to it through project Docker networking.
+
 ## Setup
 
 ```bash

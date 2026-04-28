@@ -120,6 +120,7 @@ class PatternRunUntil:
     env: dict[str, str] = field(default_factory=dict)
     continue_on: dict[str, RunUntilContinuation] = field(default_factory=dict)
     stop_on: list[str] = field(default_factory=list)
+    fail_on: list[str] = field(default_factory=list)
     after_every: list[PatternAfterEvery] = field(default_factory=list)
 
 
@@ -512,7 +513,7 @@ def _parse_run_until_node(
         )
     unknown = set(raw) - {
         "name", "block", "inputs", "args", "env", "continue_on", "stop_on",
-        "after_every",
+        "fail_on", "after_every",
     }
     if unknown:
         raise ValueError(
@@ -543,6 +544,8 @@ def _parse_run_until_node(
         raw.get("continue_on"), pattern_name=pattern_name, node_name=name)
     stop_on = _parse_stop_on(
         raw.get("stop_on"), pattern_name=pattern_name, node_name=name)
+    fail_on = _parse_fail_on(
+        raw.get("fail_on", []), pattern_name=pattern_name, node_name=name)
     if not continue_on:
         raise ValueError(
             f"Pattern {pattern_name!r}: run_until {name!r} must "
@@ -562,6 +565,7 @@ def _parse_run_until_node(
             f"Pattern {pattern_name!r} run_until {name!r}")),
         continue_on=continue_on,
         stop_on=stop_on,
+        fail_on=fail_on,
         after_every=_parse_after_every(
             raw.get("after_every", []),
             pattern_name=pattern_name,
@@ -689,6 +693,37 @@ def _parse_stop_on(
             raise ValueError(
                 f"Pattern {pattern_name!r}: run_until {node_name!r} "
                 f"duplicate stop_on reason {reason!r}"
+            )
+        seen.add(reason)
+        reasons.append(reason)
+    return reasons
+
+
+def _parse_fail_on(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'fail_on' must be a list"
+        )
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for reason in raw:
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                "fail_on reasons must be non-empty strings"
+            )
+        if reason in seen:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                f"duplicate fail_on reason {reason!r}"
             )
         seen.add(reason)
         reasons.append(reason)

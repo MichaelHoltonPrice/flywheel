@@ -1541,6 +1541,67 @@ def test_run_until_unexpected_declared_reason_fails_run(
     assert step.members[0].status == "succeeded"
 
 
+def test_run_until_fail_on_reason_fails_run_legibly(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "fail_on",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 2}},
+                    "stop_on": ["normal"],
+                    "fail_on": ["aborted"],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("ABORT")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text("ABORT")
+            (mounts["/flywheel"] / "termination").write_text("aborted")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError as exc:
+            assert "failed on termination reason 'aborted'" in str(exc)
+        else:
+            raise AssertionError("expected run failure")
+
+    run = next(iter(Workspace.load(workspace.path).runs.values()))
+    assert run.status == "failed"
+    assert run.error == (
+        "run_until 'improve' failed on termination reason 'aborted'"
+    )
+    step = run.steps[0]
+    assert step.kind == "run_until"
+    assert step.status == "failed"
+    assert step.terminal_reason == "aborted"
+    assert step.stop_kind == "fail_on"
+    assert step.members[0].status == "succeeded"
+
+
 def test_run_until_member_failure_fails_loop_without_more_iterations(
     tmp_path: Path,
 ):

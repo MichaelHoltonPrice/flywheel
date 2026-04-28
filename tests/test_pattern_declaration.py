@@ -165,6 +165,7 @@ def test_structured_do_foreach_use_and_run_until_parse():
                                 },
                             },
                             "stop_on": ["normal"],
+                            "fail_on": ["aborted"],
                         },
                     }
                 ],
@@ -176,7 +177,8 @@ def test_structured_do_foreach_use_and_run_until_parse():
     assert pattern.fixtures["bot"].source == "foundry/templates/assets/bot"
     subpattern = pattern.patterns["improve_lane"]
     assert subpattern.params["max_evals"].type == "int"
-    assert subpattern.body
+    run_until = subpattern.body[0]
+    assert run_until.fail_on == ["aborted"]
 
 
 def test_member_lane_must_be_declared():

@@ -417,6 +417,20 @@ def _execute_run_until(
                 reason_counts=reason_counts,
             )
             return
+        if reason in node.fail_on:
+            _finish_run_until_step(
+                workspace,
+                run_id,
+                step,
+                status="failed",
+                stop_kind="fail_on",
+                terminal_reason=reason,
+                reason_counts=reason_counts,
+            )
+            raise PatternRunError(
+                f"run_until {node.name!r} failed on termination "
+                f"reason {reason!r}"
+            )
         if reason in budgets:
             reason_counts[reason] += 1
             step = _finish_run_until_step(
@@ -906,7 +920,11 @@ def _validate_body_run_until_reasons(
         if isinstance(node, PatternRunUntil):
             block = _block_definition(template, node.block)
             declared = set(block.outputs)
-            required = set(node.continue_on) | set(node.stop_on)
+            required = (
+                set(node.continue_on)
+                | set(node.stop_on)
+                | set(node.fail_on)
+            )
             missing = required - declared
             if missing:
                 raise PatternRunError(
@@ -919,6 +937,15 @@ def _validate_body_run_until_reasons(
                 raise PatternRunError(
                     f"run_until {node.name!r} lists reason(s) "
                     f"{sorted(overlap)!r} in both continue_on and stop_on"
+                )
+            fail_overlap = set(node.fail_on) & (
+                set(node.continue_on) | set(node.stop_on)
+            )
+            if fail_overlap:
+                raise PatternRunError(
+                    f"run_until {node.name!r} lists reason(s) "
+                    f"{sorted(fail_overlap)!r} in fail_on and another "
+                    "run_until reason set"
                 )
             after_reasons = {trigger.reason for trigger in node.after_every}
             missing_after = after_reasons - set(node.continue_on)
