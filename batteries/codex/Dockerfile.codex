@@ -20,8 +20,17 @@ ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
 ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
 ENV CODEX_HOME=/home/codex/.codex
 
-# MCP support is project-provided; httpx is useful for small MCP proxy tools.
-RUN pip install mcp httpx
+# MCP support is project-provided. Include a compact Python analysis stack so
+# agents can prefer scripts over ad hoc shell text processing for structured
+# inputs such as grids, JSON histories, images, and tables.
+RUN pip install \
+    mcp \
+    httpx \
+    numpy \
+    pandas \
+    pillow \
+    scipy \
+    scikit-image
 
 COPY agent_runner.py /app/agent_runner.py
 COPY codex_handoff_hook.py /app/codex_handoff_hook.py

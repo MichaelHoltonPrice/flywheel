@@ -32,6 +32,11 @@ def test_codex_dockerfile_installs_cli_and_uses_battery_contract():
     text = (CODEX_DIR / "Dockerfile.codex").read_text(encoding="utf-8")
     assert "npm install -g @openai/codex" in text
     assert "ripgrep" in text
+    assert "numpy" in text
+    assert "pandas" in text
+    assert "pillow" in text
+    assert "scipy" in text
+    assert "scikit-image" in text
     assert "ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md" in text
     assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad" in text
     assert "COPY agent_runner.py /app/agent_runner.py" in text
