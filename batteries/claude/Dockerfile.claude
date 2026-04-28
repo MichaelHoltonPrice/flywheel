@@ -3,7 +3,7 @@ FROM python:3.12-slim
 # Install Node.js 22 (required for Claude Code CLI).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates curl gnupg \
+       ca-certificates curl gnupg iptables \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
@@ -16,20 +16,38 @@ RUN apt-get update \
 # The Agents SDK spawns the Claude Code CLI as a subprocess.
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install the Agents SDK and HTTP client.
-RUN pip install claude-agent-sdk httpx mcp
+ENV PYTHONUNBUFFERED=1
+ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
+ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
+ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
 
-# Copy the agent runner and built-in MCP server scripts.
-# Project-specific MCP servers are mounted at runtime.
+# Install the Agents SDK, HTTP client, MCP support, and common
+# image-rendering dependencies used by agent-side tools.
+RUN pip install claude-agent-sdk httpx mcp Pillow numpy
+
+# Copy the agent runner.  Project-specific MCP servers are
+# mounted at runtime.
 COPY agent_runner.py /app/agent_runner.py
-COPY eval_mcp_server.py /app/eval_mcp_server.py
+COPY handoff_session.py /app/handoff_session.py
+COPY entrypoint.sh /app/entrypoint.sh
 
 # Claude Code refuses --dangerously-skip-permissions as root.
 RUN useradd -m claude \
-    && mkdir -p /home/claude/.claude /workspace \
-    && chown -R claude:claude /home/claude /workspace /app
+    && mkdir -p /home/claude/.claude /scratch /app/agent \
+                /flywheel/state /flywheel/mcp_servers \
+    && chown -R claude:claude /home/claude /scratch /app /flywheel \
+    && chmod +x /app/entrypoint.sh
 
-USER claude
-WORKDIR /workspace
+# Don't set USER here: entrypoint runs as root to configure
+# iptables, then drops to claude via su.
+# ``/flywheel/`` is the single namespace for framework-owned
+# runtime data: state (``/flywheel/state/session.jsonl``) and
+# project-mounted MCP server code (``/flywheel/mcp_servers/``).
+# It is distinct from the block body's ``/input`` / ``/output`` /
+# ``/scratch`` mounts, so framework-owned files are easy to
+# distinguish from the agent's working directory. ``/scratch`` is
+# the agent working directory. ``$FLYWHEEL_SCRATCHPAD_DIR`` is
+# synced to managed state by the entrypoint between block executions.
+WORKDIR /scratch
 
-ENTRYPOINT ["python3", "/app/agent_runner.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]

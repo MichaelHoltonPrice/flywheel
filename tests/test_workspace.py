@@ -6,11 +6,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
-from flywheel.artifact import ArtifactInstance, BlockExecution
+from flywheel.artifact import (
+    ArtifactInstance,
+    BlockExecution,
+    BlockInvocation,
+    LifecycleEvent,
+    RejectedOutput,
+    RejectionRef,
+    SupersedesRef,
+)
+from flywheel.artifact_validator import (
+    ArtifactValidationError,
+    ArtifactValidatorRegistry,
+)
+from flywheel.run_record import RunMemberRecord, RunStepRecord
 from flywheel.template import Template
 from flywheel.validation import validate_name
 from flywheel.workspace import Workspace
+from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
 
 TEMPLATE_YAML = """\
@@ -28,7 +43,9 @@ blocks:
   - name: train
     image: train:latest
     inputs: [engine]
-    outputs: [checkpoint]
+    outputs:
+      normal:
+        - checkpoint
 """
 
 
@@ -48,8 +65,8 @@ def _setup_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     )
     foundry_dir = project_root / "foundry"
     foundry_dir.mkdir()
-    templates_dir = foundry_dir / "templates"
-    templates_dir.mkdir()
+    templates_dir = foundry_dir / "templates" / "workspaces"
+    templates_dir.mkdir(parents=True)
     template_path = templates_dir / "test.yaml"
     template_path.write_text(TEMPLATE_YAML)
     subprocess.run(
@@ -60,7 +77,7 @@ def _setup_project(tmp_path: Path) -> tuple[Path, Path, Template]:
         ["git", "-C", str(project_root), "commit", "-m", "add foundry"],
         check=True, capture_output=True,
     )
-    template = Template.from_yaml(template_path)
+    template = from_yaml_with_inline_blocks(template_path)
     return project_root, foundry_dir, template
 
 
@@ -70,6 +87,7 @@ class TestWorkspaceCreate:
         ws = Workspace.create("test_ws", template, foundry_dir)
         assert ws.path.exists()
         assert (ws.path / "artifacts").exists()
+        assert (ws.path / "states").exists()
         assert (ws.path / "workspace.yaml").exists()
 
     def test_name_and_template(self, tmp_path: Path):
@@ -139,6 +157,162 @@ class TestWorkspaceLoadSave:
         assert loaded.artifact_declarations == ws.artifact_declarations
         assert len(loaded.artifacts) == len(ws.artifacts)
 
+    def test_state_snapshot_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "counter.txt").write_text("1")
+
+        snapshot = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_abc123",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        loaded = Workspace.load(ws.path)
+        loaded_snapshot = loaded.state_snapshots[snapshot.id]
+        assert loaded_snapshot.lineage_key == "lineage_a"
+        assert loaded_snapshot.produced_by == "exec_abc123"
+        assert loaded_snapshot.predecessor_snapshot_id is None
+        assert loaded_snapshot.compatibility == {
+            "block_template_hash": "hash-a",
+        }
+        assert (
+            loaded.state_snapshot_path(snapshot.id) / "counter.txt"
+        ).read_text() == "1"
+        assert loaded.artifacts == ws.artifacts
+
+    def test_failed_block_invocation_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        invocation = BlockInvocation(
+            id="inv_abc123",
+            invoking_execution_id="exec_parent",
+            termination_reason="eval_requested",
+            invoked_block_name="EvalBot",
+            invoked_at=datetime.now(UTC),
+            status="failed",
+            input_bindings={"bot": "bot@seed"},
+            args=["--episodes", "10"],
+            error="RuntimeError: child failed",
+        )
+        ws.record_invocation(invocation)
+
+        loaded = Workspace.load(ws.path)
+        loaded_invocation = loaded.invocations[invocation.id]
+        assert loaded_invocation.status == "failed"
+        assert loaded_invocation.invoked_execution_id is None
+        assert loaded_invocation.input_bindings == {"bot": "bot@seed"}
+        assert loaded_invocation.error == "RuntimeError: child failed"
+
+    def test_state_snapshot_lineage_chains_to_latest(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+
+        first = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+        second = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_2",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        assert second.predecessor_snapshot_id == first.id
+        assert ws.latest_state_snapshot("lineage_a") == second
+
+    def test_state_snapshot_rejects_forked_predecessor(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+        first = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+        ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_2",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        with pytest.raises(ValueError, match="latest snapshot"):
+            ws.register_state_snapshot(
+                lineage_key="lineage_a",
+                source_path=source,
+                produced_by="exec_3",
+                compatibility={"block_template_hash": "hash-a"},
+                predecessor_snapshot_id=first.id,
+            )
+
+    def test_state_snapshot_rejects_explicit_none_after_latest(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("first")
+        ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+        (source / "marker.txt").write_text("second")
+
+        with pytest.raises(ValueError, match="latest snapshot"):
+            ws.register_state_snapshot(
+                lineage_key="lineage_a",
+                source_path=source,
+                produced_by="exec_2",
+                compatibility={"block_template_hash": "hash-a"},
+                predecessor_snapshot_id=None,
+            )
+
+    def test_state_snapshot_can_defer_workspace_persistence(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "marker.txt").write_text("state")
+
+        snapshot = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_1",
+            compatibility={"block_template_hash": "hash-a"},
+            persist=False,
+        )
+
+        assert snapshot.id in ws.state_snapshots
+        loaded = Workspace.load(ws.path)
+        assert snapshot.id not in loaded.state_snapshots
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert snapshot.id in loaded.state_snapshots
+
     def test_round_trip_with_execution(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
@@ -148,7 +322,7 @@ class TestWorkspaceLoadSave:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=now, produced_by="exec1", copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
 
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
@@ -157,7 +331,7 @@ class TestWorkspaceLoadSave:
             output_bindings={"checkpoint": "checkpoint@1"},
             exit_code=0, elapsed_s=10.0, image="train:latest",
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         ws.save()
 
         loaded = Workspace.load(ws.path)
@@ -177,7 +351,7 @@ class TestAddArtifact:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=datetime.now(UTC), copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
         assert "checkpoint@1" in ws.artifacts
 
     def test_duplicate_id_raises(self, tmp_path: Path):
@@ -187,9 +361,9 @@ class TestAddArtifact:
             id="checkpoint@1", name="checkpoint", kind="copy",
             created_at=datetime.now(UTC), copy_path="checkpoint@1",
         )
-        ws.add_artifact(inst)
+        ws._add_artifact(inst)
         with pytest.raises(ValueError, match="already exists"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_undeclared_slot_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -199,7 +373,7 @@ class TestAddArtifact:
             created_at=datetime.now(UTC),
         )
         with pytest.raises(ValueError, match="not declared"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_kind_mismatch_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -209,7 +383,7 @@ class TestAddArtifact:
             created_at=datetime.now(UTC),
         )
         with pytest.raises(ValueError, match="expects"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_copy_without_copy_path_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -220,7 +394,7 @@ class TestAddArtifact:
             copy_path=None,
         )
         with pytest.raises(ValueError, match="missing copy_path"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
     def test_git_without_required_fields_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -231,7 +405,7 @@ class TestAddArtifact:
             repo="/repo", commit=None, git_path=None,
         )
         with pytest.raises(ValueError, match="missing required fields"):
-            ws.add_artifact(inst)
+            ws._add_artifact(inst)
 
 
 class TestGenerateArtifactId:
@@ -268,11 +442,11 @@ class TestInstancesFor:
         ws = Workspace.create("test_ws", template, foundry_dir)
         t1 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
         t2 = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@aaa", name="checkpoint", kind="copy",
             created_at=t1, copy_path="checkpoint@aaa",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@bbb", name="checkpoint", kind="copy",
             created_at=t2, copy_path="checkpoint@bbb",
         ))
@@ -293,15 +467,15 @@ class TestInstancesFor:
         t2 = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
         t3 = datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
         # Add out of order
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@ccc", name="checkpoint", kind="copy",
             created_at=t3, copy_path="checkpoint@ccc",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@aaa", name="checkpoint", kind="copy",
             created_at=t1, copy_path="checkpoint@aaa",
         ))
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="checkpoint@bbb", name="checkpoint", kind="copy",
             created_at=t2, copy_path="checkpoint@bbb",
         ))
@@ -317,7 +491,7 @@ class TestInstancesFor:
         assert len(baseline) == 1
         assert baseline[0].id == "engine@baseline"
         later = datetime(2099, 1, 1, tzinfo=UTC)
-        ws.add_artifact(ArtifactInstance(
+        ws._add_artifact(ArtifactInstance(
             id="engine@abc123", name="engine", kind="git",
             created_at=later, repo="/r", commit="def", git_path="src",
         ))
@@ -348,7 +522,7 @@ class TestAddExecution:
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         assert "exec1" in ws.executions
 
     def test_duplicate_execution_raises(self, tmp_path: Path):
@@ -358,23 +532,20 @@ class TestAddExecution:
         ex = BlockExecution(
             id="exec1", block_name="train", started_at=now,
         )
-        ws.add_execution(ex)
+        ws._add_execution(ex)
         with pytest.raises(ValueError, match="already exists"):
-            ws.add_execution(ex)
+            ws._add_execution(ex)
 
 
 class TestRegisterArtifact:
-    def test_register_file(self, tmp_path: Path):
+    def test_file_source_rejected(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
         bot_file = tmp_path / "bot.py"
         bot_file.write_text("def player_fn(): pass")
 
-        inst = ws.register_artifact("checkpoint", bot_file)
-
-        target = ws.path / "artifacts" / inst.id / "bot.py"
-        assert target.exists()
-        assert target.read_text() == "def player_fn(): pass"
+        with pytest.raises(ValueError, match="must be a directory"):
+            ws.register_artifact("checkpoint", bot_file)
 
     def test_register_directory(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -389,6 +560,43 @@ class TestRegisterArtifact:
         target = ws.path / "artifacts" / inst.id
         assert (target / "bot.py").exists()
         assert (target / "helpers.py").exists()
+
+    def test_register_artifact_can_defer_workspace_persistence(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src_dir = tmp_path / "bot_dir"
+        src_dir.mkdir()
+        (src_dir / "bot.py").write_text("def player_fn(): pass")
+
+        inst = ws.register_artifact(
+            "checkpoint", src_dir, produced_by="exec_1", persist=False)
+
+        assert inst.id in ws.artifacts
+        loaded = Workspace.load(ws.path)
+        assert inst.id not in loaded.artifacts
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert inst.id in loaded.artifacts
+
+    def test_register_single_file_via_wrapper_directory(
+        self, tmp_path: Path,
+    ):
+        # Canonical pattern for callers that have a single file:
+        # wrap it in a directory and register that.  This makes
+        # the artifact's structure explicit at the call site.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        wrapper = tmp_path / "wrap"
+        wrapper.mkdir()
+        (wrapper / "bot.py").write_text("def player_fn(): pass")
+
+        inst = ws.register_artifact("checkpoint", wrapper)
+
+        target = ws.path / "artifacts" / inst.id / "bot.py"
+        assert target.exists()
+        assert target.read_text() == "def player_fn(): pass"
 
     def test_undeclared_name_raises(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -418,10 +626,13 @@ class TestRegisterArtifact:
     def test_artifact_instance_fields(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "data.bin"
-        f.write_bytes(b"\x00")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "data.bin").write_bytes(b"\x00")
 
-        inst = ws.register_artifact("checkpoint", f, source="test import")
+        inst = ws.register_artifact(
+            "checkpoint", src, source="test import",
+        )
 
         assert inst.name == "checkpoint"
         assert inst.kind == "copy"
@@ -433,10 +644,11 @@ class TestRegisterArtifact:
     def test_default_source(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "bot.py"
-        f.write_text("pass")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-        inst = ws.register_artifact("checkpoint", f)
+        inst = ws.register_artifact("checkpoint", src)
 
         assert inst.source is not None
         assert "imported from" in inst.source
@@ -444,139 +656,285 @@ class TestRegisterArtifact:
     def test_round_trip_with_source(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
         ws = Workspace.create("test_ws", template, foundry_dir)
-        f = tmp_path / "bot.py"
-        f.write_text("pass")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-        inst = ws.register_artifact("checkpoint", f, source="from agent")
+        inst = ws.register_artifact(
+            "checkpoint", src, source="from agent",
+        )
         loaded = Workspace.load(ws.path)
 
         assert inst.id in loaded.artifacts
         loaded_inst = loaded.artifacts[inst.id]
         assert loaded_inst.source == "from agent"
-        assert loaded_inst.produced_by is None
 
+    def test_validator_passes_through(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-class TestMaterializeSequence:
-    @staticmethod
-    def _make_step_workspace(tmp_path: Path) -> Workspace:
-        """Create a workspace with game_step and game_history declarations."""
-        ws_path = tmp_path / "workspace"
-        ws_path.mkdir()
-        (ws_path / "artifacts").mkdir()
-        ws = Workspace(
-            name="mat_test",
-            path=ws_path,
-            template_name="test",
-            created_at=datetime.now(UTC),
-            artifact_declarations={
-                "game_step": "copy",
-                "game_history": "copy",
-            },
-            artifacts={},
+        seen: list[Path] = []
+
+        def validator(name, decl, path):
+            seen.append(path)
+            # The validator sees a flywheel-owned staging
+            # directory, not the operator's source path, and
+            # the directory contains the file shaped exactly
+            # as it will appear in the committed artifact.
+            assert path.is_dir()
+            assert path != src
+            assert (path / "bot.py").read_text() == "pass"
+
+        registry = ArtifactValidatorRegistry(
+            {"checkpoint": validator},
         )
-        ws.save()
-        return ws
-
-    @staticmethod
-    def _add_step(ws: Workspace, index: int, data: dict) -> None:
-        """Add a game_step artifact with the given data."""
-        aid = ws.generate_artifact_id("game_step")
-        artifact_dir = ws.path / "artifacts" / aid
-        artifact_dir.mkdir(parents=True)
-        (artifact_dir / "game_step.json").write_text(
-            json.dumps(data), encoding="utf-8",
+        inst = ws.register_artifact(
+            "checkpoint", src, validator_registry=registry,
         )
-        ws.add_artifact(ArtifactInstance(
-            id=aid, name="game_step", kind="copy",
-            created_at=datetime(2026, 1, 1, 0, index, tzinfo=UTC),
-            copy_path=aid,
-        ))
-        ws.save()
-
-    def test_materializes_steps_to_jsonl(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        self._add_step(ws, 1, {"step_index": 1, "action": "A"})
-        self._add_step(ws, 2, {"step_index": 2, "action": "B"})
-        self._add_step(ws, 3, {"step_index": 3, "action": "C"})
-
-        inst = ws.materialize_sequence("game_step", "game_history")
-
-        assert inst.name == "game_history"
-        assert inst.kind == "copy"
-        assert "materialized" in (inst.source or "")
-
-        history_file = ws.path / "artifacts" / inst.copy_path / "history.jsonl"
-        assert history_file.exists()
-        lines = history_file.read_text(encoding="utf-8").strip().split("\n")
-        assert len(lines) == 3
-        assert json.loads(lines[0])["step_index"] == 1
-        assert json.loads(lines[2])["step_index"] == 3
-
-    def test_ordering_by_created_at(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        # Add in reverse order.
-        self._add_step(ws, 3, {"step_index": 3})
-        self._add_step(ws, 1, {"step_index": 1})
-        self._add_step(ws, 2, {"step_index": 2})
-
-        inst = ws.materialize_sequence("game_step", "game_history")
-        history_file = ws.path / "artifacts" / inst.copy_path / "history.jsonl"
-        lines = history_file.read_text(encoding="utf-8").strip().split("\n")
-        indices = [json.loads(line)["step_index"] for line in lines]
-        assert indices == [1, 2, 3]
-
-    def test_empty_source_raises(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        with pytest.raises(ValueError, match="No instances"):
-            ws.materialize_sequence("game_step", "game_history")
-
-    def test_registered_in_workspace(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        self._add_step(ws, 1, {"step_index": 1})
-
-        inst = ws.materialize_sequence("game_step", "game_history")
-
         assert inst.id in ws.artifacts
-        instances = ws.instances_for("game_history")
-        assert len(instances) == 1
-        assert instances[0].id == inst.id
+        assert len(seen) == 1
+        # On success the staging directory is renamed into the
+        # canonical artifact directory; the staging path the
+        # validator saw is gone, and the bytes now live at
+        # artifacts/<inst.id>/.
+        assert not seen[0].exists()
+        canonical = ws.path / "artifacts" / inst.id
+        assert (canonical / "bot.py").read_text() == "pass"
 
-    def test_persists_to_disk(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        self._add_step(ws, 1, {"step_index": 1})
+    def test_validator_rejection_aborts_import(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
 
-        ws.materialize_sequence("game_step", "game_history")
+        def reject(name, decl, path):
+            raise ArtifactValidationError("nope")
 
-        reloaded = Workspace.load(ws.path)
-        assert len(reloaded.instances_for("game_history")) == 1
+        registry = ArtifactValidatorRegistry({"checkpoint": reject})
+        with pytest.raises(ArtifactValidationError, match="nope"):
+            ws.register_artifact(
+                "checkpoint", src, validator_registry=registry,
+            )
 
-    def test_skips_empty_artifact_dirs(self, tmp_path: Path):
-        """Artifact directory with no .json files is silently skipped."""
-        ws = self._make_step_workspace(tmp_path)
-        self._add_step(ws, 1, {"step_index": 1})
+        # Workspace state is untouched: no checkpoint
+        # artifact, no canonical checkpoint dir, and no
+        # leftover staging dir under artifacts/.  (The git
+        # baseline created on workspace creation is still
+        # present — it predates this call.)
+        assert ws.instances_for("checkpoint") == []
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("checkpoint@")
+            or d.name.startswith("_staging-checkpoint-")
+        ]
+        assert leftover == []
 
-        # Add a second artifact with an empty directory.
-        aid = ws.generate_artifact_id("game_step")
-        (ws.path / "artifacts" / aid).mkdir(parents=True)
-        ws.add_artifact(ArtifactInstance(
-            id=aid, name="game_step", kind="copy",
-            created_at=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
-            copy_path=aid,
+        # The operator's source path is also untouched.
+        assert (src / "bot.py").read_text() == "pass"
+
+    def test_validator_skipped_when_no_registration(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+
+        # Registry exists but has no validator for this name —
+        # import should still succeed.
+        registry = ArtifactValidatorRegistry()
+        inst = ws.register_artifact(
+            "checkpoint", src, validator_registry=registry,
+        )
+        assert inst.id in ws.artifacts
+
+
+class TestRegisterArtifactSupersedes:
+    """``supersedes`` / ``supersedes_reason`` substrate on
+    :meth:`Workspace.register_artifact`.
+
+    Covers both predecessor flavours (accepted artifact id and
+    rejected slot) and the predecessor-existence checks that
+    fire before staging so a bad lineage reference fails cheaply.
+    """
+
+    @staticmethod
+    def _src(tmp_path: Path, name: str = "src") -> Path:
+        src = tmp_path / name
+        src.mkdir()
+        (src / "bot.py").write_text("pass")
+        return src
+
+    def test_supersede_accepted_artifact(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        first = ws.register_artifact(
+            "checkpoint", self._src(tmp_path, "v1"),
+        )
+        second = ws.register_artifact(
+            "checkpoint", self._src(tmp_path, "v2"),
+            supersedes=SupersedesRef(artifact_id=first.id),
+            supersedes_reason="hand-edited weights",
+        )
+
+        assert second.supersedes == SupersedesRef(artifact_id=first.id)
+        assert second.supersedes_reason == "hand-edited weights"
+        assert first.id in ws.artifacts
+        assert second.id in ws.artifacts
+
+    def test_supersede_rejected_slot(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws._add_execution(BlockExecution(
+            id="exec_bad", block_name="train",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            rejected_outputs={
+                "checkpoint": RejectedOutput(
+                    reason="schema mismatch",
+                    quarantine_path=(
+                        "quarantine/exec_bad/checkpoint"
+                    ),
+                ),
+            },
         ))
-        ws.save()
 
-        inst = ws.materialize_sequence("game_step", "game_history")
-        history_file = ws.path / "artifacts" / inst.copy_path / "history.jsonl"
-        lines = history_file.read_text(encoding="utf-8").strip().split("\n")
-        # Only the first step has a .json file.
-        assert len(lines) == 1
+        inst = ws.register_artifact(
+            "checkpoint", self._src(tmp_path),
+            supersedes=SupersedesRef(rejection=RejectionRef(
+                execution_id="exec_bad", slot="checkpoint",
+            )),
+            supersedes_reason="re-derived after fixing schema",
+        )
 
-    def test_undeclared_target_raises(self, tmp_path: Path):
-        ws = self._make_step_workspace(tmp_path)
-        self._add_step(ws, 1, {"step_index": 1})
+        assert inst.supersedes == SupersedesRef(
+            rejection=RejectionRef(
+                execution_id="exec_bad", slot="checkpoint",
+            ),
+        )
+        assert (
+            inst.supersedes_reason == "re-derived after fixing schema"
+        )
 
-        with pytest.raises(ValueError, match="not declared"):
-            ws.materialize_sequence("game_step", "nonexistent")
+    def test_reason_without_supersedes_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(
+            ValueError, match="reason text is only meaningful",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes_reason="orphan reason",
+            )
+
+    def test_missing_artifact_id_predecessor_raises(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(ValueError, match="does not exist"):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(
+                    artifact_id="checkpoint@deadbeef",
+                ),
+            )
+
+    def test_name_mismatch_predecessor_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        # The 'engine' git baseline was created at workspace
+        # creation time and lives under a different declaration
+        # name than 'checkpoint'.
+        engine_id = next(
+            inst.id for inst in ws.artifacts.values()
+            if inst.name == "engine"
+        )
+
+        with pytest.raises(
+            ValueError, match="cannot supersede across artifact names",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(artifact_id=engine_id),
+            )
+
+    def test_missing_execution_for_rejection_raises(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(
+            ValueError, match="execution_id 'exec_ghost'",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(rejection=RejectionRef(
+                    execution_id="exec_ghost", slot="checkpoint",
+                )),
+            )
+
+    def test_slot_not_rejected_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws._add_execution(BlockExecution(
+            id="exec_ok", block_name="train",
+            started_at=now, finished_at=now,
+            status="succeeded",
+            rejected_outputs={},
+        ))
+
+        with pytest.raises(
+            ValueError, match="no rejected output for slot",
+        ):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(rejection=RejectionRef(
+                    execution_id="exec_ok", slot="checkpoint",
+                )),
+            )
+
+    def test_predecessor_check_runs_before_staging(
+        self, tmp_path: Path,
+    ):
+        # A bad lineage reference must fail before any bytes
+        # are copied into the workspace's artifacts dir, so
+        # bad calls leave no debris.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        with pytest.raises(ValueError, match="does not exist"):
+            ws.register_artifact(
+                "checkpoint", self._src(tmp_path),
+                supersedes=SupersedesRef(
+                    artifact_id="checkpoint@nope",
+                ),
+            )
+
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("checkpoint@")
+            or d.name.startswith("_staging-checkpoint-")
+        ]
+        assert leftover == []
 
 
 class TestNameValidation:
@@ -590,3 +948,478 @@ class TestNameValidation:
 
     def test_valid_name(self):
         validate_name("my-workspace_01", "Test")
+
+
+class TestBlockExecutionFailurePhase:
+    """Tests for the runtime contract fields on BlockExecution.
+
+    Stripped down after the block-execution schema purge: the
+    legacy ``stop_reason`` / ``predecessor_id`` / ``state_dir`` /
+    ``state_lineage_id`` round-trip cases were dropped along with
+    their fields.  See ``flywheel/docs/specs/block-execution.md``.
+    """
+
+    def test_round_trip_with_failure_phase(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            finished_at=now, status="failed",
+            failure_phase="output_validate",
+            error="validator rejected slot",
+        )
+        ws._add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert (
+            loaded.executions["exec1"].failure_phase
+            == "output_validate"
+        )
+        assert loaded.executions["exec1"].status == "failed"
+
+    def test_none_fields_not_serialized(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec1", block_name="train", started_at=now,
+            status="succeeded",
+        )
+        ws._add_execution(ex)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        exec_data = raw["executions"]["exec1"]
+        assert "failure_phase" not in exec_data
+
+
+class TestRoundTripSupersedesAndQuarantine:
+    """YAML round-trip for the supersedes + quarantine schema
+    additions on :class:`ArtifactInstance` and
+    :class:`BlockExecution`."""
+
+    def _make_instance(
+        self, *, supersedes: SupersedesRef | None = None,
+        supersedes_reason: str | None = None,
+        inst_id: str = "checkpoint@2",
+    ) -> ArtifactInstance:
+        return ArtifactInstance(
+            id=inst_id, name="checkpoint", kind="copy",
+            created_at=datetime.now(UTC),
+            copy_path=inst_id,
+            supersedes=supersedes,
+            supersedes_reason=supersedes_reason,
+        )
+
+    def test_round_trip_supersedes_artifact_id(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws._add_artifact(self._make_instance(
+            inst_id="checkpoint@1"))
+        ws._add_artifact(self._make_instance(
+            inst_id="checkpoint@2",
+            supersedes=SupersedesRef(artifact_id="checkpoint@1"),
+            supersedes_reason="fix gradient explosion",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        successor = loaded.artifacts["checkpoint@2"]
+        assert successor.supersedes == SupersedesRef(
+            artifact_id="checkpoint@1")
+        assert successor.supersedes_reason == "fix gradient explosion"
+
+    def test_round_trip_supersedes_rejection(
+        self, tmp_path: Path,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        rej = RejectionRef(execution_id="exec_a3f", slot="checkpoint")
+        ws._add_artifact(self._make_instance(
+            inst_id="checkpoint@2",
+            supersedes=SupersedesRef(rejection=rej),
+            supersedes_reason="corrected validator-rejected output",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        successor = loaded.artifacts["checkpoint@2"]
+        assert successor.supersedes is not None
+        assert successor.supersedes.artifact_id is None
+        assert successor.supersedes.rejection == rej
+        assert successor.supersedes_reason == (
+            "corrected validator-rejected output")
+
+    def test_round_trip_rejected_outputs(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ex = BlockExecution(
+            id="exec_rej", block_name="train",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            error="checkpoint: model.pt missing",
+            rejected_outputs={
+                "checkpoint": RejectedOutput(
+                    reason="model.pt missing",
+                    quarantine_path=(
+                        "quarantine/exec_rej/checkpoint"),
+                ),
+                "score": RejectedOutput(
+                    reason="score must be a float",
+                    # quarantine_path omitted to verify
+                    # round-trip when quarantine I/O failed.
+                ),
+            },
+        )
+        ws._add_execution(ex)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        loaded_ex = loaded.executions["exec_rej"]
+        assert set(loaded_ex.rejected_outputs) == {
+            "checkpoint", "score"}
+        ckpt = loaded_ex.rejected_outputs["checkpoint"]
+        assert ckpt.reason == "model.pt missing"
+        assert ckpt.quarantine_path == (
+            "quarantine/exec_rej/checkpoint")
+        score = loaded_ex.rejected_outputs["score"]
+        assert score.reason == "score must be a float"
+        assert score.quarantine_path is None
+
+    def test_absent_fields_not_serialized(self, tmp_path: Path):
+        # New fields should be absent from the on-disk YAML when
+        # not set, rather than littering ``null`` placeholders
+        # across every existing workspace.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws._add_artifact(self._make_instance(inst_id="checkpoint@plain"))
+        now = datetime.now(UTC)
+        ws._add_execution(BlockExecution(
+            id="exec_plain", block_name="train",
+            started_at=now, status="succeeded",
+        ))
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        artifact_yaml = raw["artifacts"]["checkpoint@plain"]
+        assert "supersedes" not in artifact_yaml
+        assert "supersedes_reason" not in artifact_yaml
+        exec_yaml = raw["executions"]["exec_plain"]
+        assert "rejected_outputs" not in exec_yaml
+
+    def test_load_old_format_has_safe_defaults(
+        self, tmp_path: Path,
+    ):
+        # An older workspace.yaml predating this schema must
+        # still load: unknown fields default to None / empty.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws._add_artifact(self._make_instance(
+            inst_id="checkpoint@old"))
+        now = datetime.now(UTC)
+        ws._add_execution(BlockExecution(
+            id="exec_old", block_name="train",
+            started_at=now, status="failed",
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        inst = loaded.artifacts["checkpoint@old"]
+        assert inst.supersedes is None
+        assert inst.supersedes_reason is None
+        ex = loaded.executions["exec_old"]
+        assert ex.rejected_outputs == {}
+
+    def test_supersedes_yaml_shape(self, tmp_path: Path):
+        # Lock in the on-disk YAML shape so external tooling can
+        # rely on it.  Both flavours use a discriminated map.
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ws._add_artifact(self._make_instance(
+            inst_id="a@id",
+            supersedes=SupersedesRef(artifact_id="a@parent"),
+        ))
+        ws._add_artifact(self._make_instance(
+            inst_id="a@rej",
+            supersedes=SupersedesRef(rejection=RejectionRef(
+                execution_id="exec_z", slot="checkpoint")),
+        ))
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert raw["artifacts"]["a@id"]["supersedes"] == {
+            "artifact": "a@parent"}
+        assert raw["artifacts"]["a@rej"]["supersedes"] == {
+            "rejected": {"execution": "exec_z",
+                         "slot": "checkpoint"}}
+
+
+class TestLifecycleEvents:
+    """Tests for the LifecycleEvent entity on Workspace."""
+
+    def test_add_and_retrieve_event(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        event = LifecycleEvent(
+            id="evt_abc1", kind="agent_stopped",
+            timestamp=now, execution_id="exec1",
+            detail={"reason": "timeout"},
+        )
+        ws.add_event(event)
+        assert "evt_abc1" in ws.events
+        assert ws.events["evt_abc1"].kind == "agent_stopped"
+
+    def test_duplicate_event_raises(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        event = LifecycleEvent(
+            id="evt_dup", kind="test", timestamp=now)
+        ws.add_event(event)
+        with pytest.raises(ValueError, match="already exists"):
+            ws.add_event(event)
+
+    def test_events_for_filters_by_kind(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_event(LifecycleEvent(
+            id="evt_1", kind="agent_stopped", timestamp=now))
+        ws.add_event(LifecycleEvent(
+            id="evt_2", kind="group_completed", timestamp=now))
+        ws.add_event(LifecycleEvent(
+            id="evt_3", kind="agent_stopped", timestamp=now))
+
+        stopped = ws.events_for("agent_stopped")
+        assert len(stopped) == 2
+        assert all(e.kind == "agent_stopped" for e in stopped)
+
+    def test_generate_event_id_unique(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        ids = {ws.generate_event_id() for _ in range(50)}
+        assert len(ids) == 50
+        assert all(eid.startswith("evt_") for eid in ids)
+
+    def test_round_trip_with_events(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws.add_event(LifecycleEvent(
+            id="evt_rt", kind="agent_stopped", timestamp=now,
+            execution_id="exec_x",
+            detail={"reason": "exploration_request"},
+        ))
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert "evt_rt" in loaded.events
+        evt = loaded.events["evt_rt"]
+        assert evt.kind == "agent_stopped"
+        assert evt.execution_id == "exec_x"
+        assert evt.detail == {"reason": "exploration_request"}
+
+    def test_load_without_events_key(self, tmp_path: Path):
+        """Old workspace.yaml without events key loads correctly."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.events == {}
+
+    def test_empty_events_not_serialized(self, tmp_path: Path):
+        """Events key omitted from YAML when empty."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert "events" not in raw
+
+
+class TestRuns:
+    """Tests for :class:`flywheel.artifact.RunRecord` persistence."""
+
+    def test_begin_and_end_run_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        record = ws.begin_run(
+            kind="pattern:play-bs",
+            config_snapshot={"n": 3},
+        )
+        assert record.id.startswith("run_")
+        assert record.status == "running"
+        assert record.finished_at is None
+
+        ws.end_run(record.id, status="succeeded")
+        assert ws.runs[record.id].status == "succeeded"
+        assert ws.runs[record.id].finished_at is not None
+
+        ws.save()
+        loaded = Workspace.load(ws.path)
+        assert record.id in loaded.runs
+        assert loaded.runs[record.id].kind == "pattern:play-bs"
+        assert loaded.runs[record.id].config_snapshot == {"n": 3}
+        assert loaded.runs[record.id].status == "succeeded"
+
+    def test_record_run_step_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:train-eval")
+
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="train",
+                min_successes="all",
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="train_dueling",
+                        block_name="train",
+                        status="succeeded",
+                        execution_id="exec_1",
+                        output_bindings={"checkpoint": "checkpoint@1"},
+                    )
+                ],
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        loaded = Workspace.load(ws.path)
+        step = loaded.runs[record.id].steps[0]
+        assert step.name == "train"
+        assert step.min_successes == "all"
+        assert step.members[0].execution_id == "exec_1"
+        assert step.members[0].output_bindings == {
+            "checkpoint": "checkpoint@1"
+        }
+
+    def test_run_until_step_metadata_round_trip(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:improve")
+
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="lane_0__improve",
+                min_successes=1,
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="iter_1",
+                        block_name="ImproveBot",
+                        status="succeeded",
+                        lane="lane_0",
+                        execution_id="exec_1",
+                    )
+                ],
+                kind="run_until",
+                terminal_reason="eval_requested",
+                stop_kind="budget_exhausted",
+                reason_counts={"eval_requested": 5},
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        step = Workspace.load(ws.path).runs[record.id].steps[0]
+        assert step.kind == "run_until"
+        assert step.terminal_reason == "eval_requested"
+        assert step.stop_kind == "budget_exhausted"
+        assert step.reason_counts == {"eval_requested": 5}
+
+    def test_reopen_run_preserves_steps_and_updates_params(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:improve", params={"max": 5})
+        ws.record_run_step(
+            record.id,
+            RunStepRecord(
+                name="improve",
+                min_successes=1,
+                status="succeeded",
+                members=[
+                    RunMemberRecord(
+                        name="iter_1",
+                        block_name="ImproveBot",
+                        status="succeeded",
+                    )
+                ],
+                kind="run_until",
+                stop_kind="budget_exhausted",
+                terminal_reason="eval_requested",
+                reason_counts={"eval_requested": 5},
+            ),
+        )
+        ws.end_run(record.id, status="succeeded")
+
+        reopened = ws.reopen_run(record.id, params={"max": 20})
+
+        assert reopened.id == record.id
+        assert reopened.status == "running"
+        assert reopened.finished_at is None
+        assert reopened.params == {"max": 20}
+        assert reopened.steps[0].members[0].name == "iter_1"
+
+    def test_load_without_runs_key(self, tmp_path: Path):
+        """Old workspace.yaml without runs key loads to empty dict."""
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        ws.save()
+
+        with open(ws.path / "workspace.yaml") as f:
+            raw = yaml.safe_load(f)
+        assert "runs" not in raw
+
+        loaded = Workspace.load(ws.path)
+        assert loaded.runs == {}
+
+    def test_end_run_rejects_non_terminal_status(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:x")
+
+        with pytest.raises(ValueError):
+            ws.end_run(record.id, status="running")
+
+    def test_end_run_rejects_double_close(self, tmp_path: Path):
+        """Second ``end_run`` on a terminal run raises.
+
+        Silent overwrite would hide orchestration bugs where two
+        layers race to close the same run.
+        """
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        record = ws.begin_run(kind="pattern:x")
+        ws.end_run(record.id, status="succeeded")
+
+        with pytest.raises(ValueError, match="double-close"):
+            ws.end_run(record.id, status="failed")
+
+

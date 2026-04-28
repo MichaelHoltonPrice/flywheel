@@ -27,6 +27,51 @@ Three things are co-equal in flywheel's design:
 These three reinforce each other. Visibility without artifact
 tracking is anecdotal. Artifact tracking without visibility is a
 data lake. Improvement loops without either are blind iteration.
+While improvement loops are a first-order concern for flywheel,
+it is not a requirement for every workflow.
+
+## Intended use: reproducible workflows and patterns
+
+Flywheel's central job is to make block execution reproducible and
+inspectable across a workspace history. A user or orchestrator decides
+when to create a workspace, import a starting artifact, run a block, or
+launch a pattern. Flywheel handles the durable side: workspace state,
+block execution, artifact registration, managed state snapshots,
+execution records, run records, and the ledger that explains what
+already happened.
+
+AI agent orchestrators such as Cursor, Claude Code, and custom loops
+are a major intended audience because they benefit from small CLI
+commands and machine-readable workspace state. They are not the only
+audience. The same substrate is meant for RL training/evaluation
+loops, simulation campaigns, benchmark workflows, and human-in-the-loop
+processes that need provenance and repeatability.
+
+This shapes several design choices:
+
+* **Small composable subcommands.** The user-facing surface is a
+  short list of orthogonal commands (`create workspace`,
+  `import artifact`, `run block`, `run pattern`) rather than a
+  monolithic driver. A workflow that needs only `run block` is
+  not paying for the rest.
+* **Durable, inspectable workspace state.** Every block execution,
+  artifact instance, and run is persisted to the workspace
+  ledger before the corresponding subcommand returns. A caller
+  that exits between commands sees exactly what the next caller
+  will see, with no in-memory state to reconstruct.
+* **Machine-readable ledger format.** The workspace YAML and the
+  artifact directory layout are stable enough that programs can
+  read them directly (alongside any future structured-output
+  flags on the CLI).
+* **Documentation aimed at automation as well as humans.**
+  Per-command docs live in `docs/cli/` and follow a fixed
+  structure (purpose, prerequisites, invocation, what gets
+  changed, failure modes, verification, next steps,
+  implementation pointers) so a human or agent can locate the
+  section it needs without rereading prose.
+
+Humans and agents use the same surface, read the same workspaces,
+and benefit from the same conventions.
 
 ## The foundry
 
@@ -85,7 +130,8 @@ Success criteria may be an automated metric, a human judgment, an
 LLM evaluation, or something built up over time from initially
 human-mediated feedback. Not every block starts with an automated
 success criterion — the criterion itself can be improved as
-understanding deepens.
+understanding deepens. Not all blocks have a metric; some just do
+work.
 
 ### Implementations vs approaches
 
@@ -297,7 +343,7 @@ influence legible and governable.
 ## Solve-once capabilities
 
 Some capabilities are hard to build, reusable across projects, and
-belong in flywheel rather than in each project:
+worth shipping with Flywheel so each project does not rebuild them:
 
 - **Computer use agents** provide session management, screenshot
   loops, click targeting, and verification for visual interaction
@@ -307,7 +353,10 @@ belong in flywheel rather than in each project:
   SDK, Codex, and similar agent runtimes.
 
 Projects provide their domain-specific containers and artifacts.
-Flywheel provides the orchestration and these shared capabilities.
+Flywheel provides the orchestration substrate and may also ship
+reusable batteries. Those batteries are project-style code bundled for
+reuse; they should not become new substrate concepts unless the same
+abstraction is useful outside the battery.
 
 ## Design principles
 

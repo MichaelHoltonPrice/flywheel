@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+# Generic desktop service battery.
+#
+# This image owns a virtual display plus a small HTTP API for
+# screenshot/input operations. It intentionally has no agent, browser,
+# or project-specific dependency. Projects derive from it and provide
+# DESKTOP_APP_COMMAND to launch their GUI app.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl openbox procps x11-utils xdotool xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir mss Pillow
+
+ENV PYTHONUNBUFFERED=1
+ENV DESKTOP_WIDTH=1280
+ENV DESKTOP_HEIGHT=720
+ENV DESKTOP_DPI=96
+ENV DESKTOP_DISPLAY=:99
+ENV DESKTOP_API_PORT=8080
+ENV DESKTOP_SHARED_DIR=/desktop/shared
+
+COPY desktop_server.py /app/desktop_server.py
+COPY entrypoint.sh /app/entrypoint.sh
+
+RUN mkdir -p /desktop/shared /flywheel/exchange \
+    && sed -i 's/\r$//' /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh
+
+WORKDIR /desktop
+
+ENTRYPOINT ["/app/entrypoint.sh"]

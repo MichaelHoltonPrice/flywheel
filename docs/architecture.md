@@ -1,438 +1,356 @@
 # Architecture Decisions
 
-Design choices that shape flywheel's implementation. These serve
-the vision but are distinct from it — they could change without
-changing what flywheel is for.
+This document describes the implementation architecture Flywheel
+currently intends to preserve. Aspirational product direction belongs
+in [vision.md](vision.md). Normative details for specific subsystems
+live in [docs/specs/](specs/). Work that is intentionally deferred is
+listed in "Future Work" below.
 
-Everything in the main body of this document reflects agreed-upon
-design decisions. Items that have a clear design direction but are
-not yet implemented are collected in the "Future work" section at
-the end.
+## Core Boundary
+
+Flywheel's substrate abstraction is block execution, not agent
+execution.
+
+A block execution owns:
+
+1. input resolution and staging;
+2. one runtime invocation;
+3. output collection;
+4. artifact validation and registration;
+5. managed state restore/capture;
+6. quarantine and state recovery;
+7. the `BlockExecution` ledger record.
+
+Batteries such as the bundled Claude agent are reusable project-style
+code shipped with Flywheel. They may provide Dockerfiles, entrypoints,
+runners, examples, and CLI conveniences, but they must enter durable
+state through the same canonical block-execution path as any other
+block.
 
 ## Artifacts
 
-### Declarations and instances
-
-An **artifact declaration** is a template-level concept: a named
-artifact type with a storage kind. "The train block produces
-checkpoints."
-
-An **artifact instance** is a concrete, immutable record: a
-specific checkpoint produced by a specific block execution, with
-a unique ID, a timestamp, and full provenance. Multiple instances
-can exist for the same declaration within a workspace.
-
-This distinction is fundamental. The template declares what
-*types* of artifacts exist. The workspace accumulates *instances*
-of those types as blocks execute.
-
-### Storage kinds
-
-There are two storage kinds:
-
-- **Copy artifacts** are files or directories stored directly in
-  the workspace. Block executions produce them — checkpoints,
-  scores, and logs are typical examples.
-- **Git artifacts** are references to version-controlled code,
-  recorded as repo, commit SHA, and path. They are used to
-  inject source code, configurations, or prompts into a
-  workspace.
-
-From a block's perspective both kinds behave the same way: each
-is something injectable with a name.
-
-### Artifact IDs
-
-Each artifact instance has a unique ID in the form
-`name@identifier` — for example, `checkpoint@a3f7b2`,
-`engine@baseline`, `score@e9c104`. The prefix is the
-artifact declaration name; the suffix is a short UUID
-(or ``baseline`` for workspace-creation git artifacts).
-IDs are scoped to the workspace.
-
-### Git artifacts require a clean working tree
-
-Git artifacts are recorded as repo + commit SHA + path. Flywheel
-does not support a dirty flag or content hashing to capture
-uncommitted changes. If the working tree is dirty, the reference
-is not reproducible, and flywheel should refuse to proceed rather
-than record something it cannot recreate.
-
-### Git artifact resolution creates new instances
-
-At **workspace creation**, flywheel records a baseline git
-artifact instance (e.g., `engine@baseline`). This captures what
-the code looked like when the workspace was set up.
-
-At **block execution**, flywheel re-resolves the current committed
-state and records a **new** git artifact instance (e.g.,
-`engine@a3f7b2`). The baseline instance is never mutated. Both
-coexist in the workspace and the execution record shows exactly
-which instance was used.
-
-**Current limitation:** when a git artifact is mounted into a
-container, flywheel mounts the live working tree path, not the
-specific recorded commit. The commit SHA is recorded for
-provenance but not enforced at mount time. If the working tree
-has moved to a newer commit since the artifact was recorded,
-the container sees the newer code.
-
-### Imported artifacts
-
-Users and agents can import externally created artifacts into a
-workspace via ``Workspace.register_artifact()`` or the CLI command
-``flywheel import artifact``. Imported artifacts are copied into
-the workspace (preserving immutability) and recorded as normal
-artifact instances. They have ``produced_by=None`` (like baseline
-git snapshots) but carry a ``source`` field describing their
-origin. Once registered, they bind identically to block-produced
-artifacts.
-
-### Immutability
-
-Artifact instances are immutable once created. They are never
-overwritten, updated, or deleted. A new block execution produces
-new instances; it does not modify existing ones. This ensures
-the execution history is trustworthy — an artifact referenced
-by an execution record will never silently change.
-
-## Block executions
-
-A **block execution** is the atomic operation in flywheel: one
-block, one container, one set of input artifact instances
-producing output artifact instances.
-
-Each block execution record includes:
-- A unique execution ID.
-- The block name.
-- Input bindings, showing which artifact instance was used for
-  each input slot.
-- Output bindings, showing which artifact instance was produced
-  for each output slot.
-- A status indicator (succeeded, failed, or interrupted).
-- Runtime metadata such as the image, docker args, exit code,
-  and elapsed time.
-
-Block executions are append-only. The workspace accumulates a
-history of executions that forms the complete provenance graph.
-
-A **run** is a higher-level concept — an orchestration pattern
-composed of multiple block executions, potentially in parallel.
-Runs are not yet implemented; block execution is the primitive.
-
-### Dependency injection: build-time vs runtime
-
-Blocks receive inputs via dependency injection. There are two
-forms:
-
-- **Runtime injection** mounts artifacts into a running container
-  as files or directories. Flywheel handles this directly via
-  Docker volume mounts.
-- **Build-time injection** compiles source code or data into the
-  Docker image itself (e.g., a game engine compiled into PyO3
-  bindings). Flywheel tracks the dependency via git artifacts
-  for provenance, even though the injection happens at image
-  build time, not container run time.
-
-Both are real dependencies. The distinction is practical:
-runtime inputs can change between executions without rebuilding
-the image; build-time inputs require a rebuild. This is an
-implementation detail, not a fundamental design choice — a
-future block could accept source code at runtime and compile
-on startup.
-
-### Input and output slots
-
-Each block declares its inputs and outputs as named slots,
-each mapped to a container path:
-
-```yaml
-blocks:
-  - name: train
-    image: cyberloop-train:latest
-    docker_args: ["--gpus", "all", "--shm-size", "8g"]
-    inputs:
-      - name: checkpoint
-        container_path: /input/checkpoint
-        optional: true
-    outputs:
-      - name: checkpoint
-        container_path: /output
-```
-
-Flywheel mounts artifact instance directories at the declared
-container paths. What files exist inside is the container's
-concern, not flywheel's.
-
-### Convention-based output recording
-
-Flywheel creates a fresh directory per declared output and
-mounts it at the block's declared container path. The container
-writes files there. After the container exits, flywheel records
-whatever appeared as a new artifact instance.
-
-This avoids requiring containers to write a manifest or be
-flywheel-aware. The template already declares the contract
-(what a block produces), so a manifest would be redundant.
-If we later need richer signaling (metadata, partial results,
-error details), manifests can be layered on top.
-
-### Docker configuration
-
-Block definitions include a `docker_args` list for pass-through
-Docker flags (e.g. `["--gpus", "all", "--shm-size", "8g"]`).
-Flywheel does not interpret these — they are project-specific
-and passed directly to `docker run` before the image name.
-
-### Execution flow
-
-1. Resolve the block definition from the template.
-2. Create a new block execution ID.
-3. Resolve each input slot to a concrete artifact instance.
-   The caller may specify explicit bindings for any input slot.
-   For unbound copy inputs, the most recent instance for that
-   slot is used (a provisional "latest wins" default). For git
-   inputs, re-resolve the current committed state and record
-   as a new git artifact instance.
-4. Allocate fresh output directories with new artifact IDs.
-5. Mount input instances and output directories into the
-   container.
-6. Run the container.
-7. On success, finalize output artifact instances, record the
-   execution, and persist the workspace.
-8. On failure, record the execution with failure status and
-   preserve state for inspection.
-
-### Agent block execution
-
-An agent block is a special execution variant where an AI agent
-runs inside a Docker container with the ability to trigger nested
-block executions. The agent reads source code, writes artifacts,
-and iteratively invokes other blocks (e.g., evaluation) via an
-MCP tool.
-
-The lifecycle:
-
-1. Create a fresh agent workspace directory. Seed it with the
-   latest artifacts from prior steps so the agent can continue
-   where the previous step left off.
-2. Start a block bridge service (HTTP, background thread).
-3. Run the optional ``pre_launch_hook`` callback. Projects use
-   this for game-specific init, artifact creation, or writing
-   files to the workspace before the container starts. The
-   bridge is already running, so the hook can create artifacts.
-4. Launch the agent container with the workspace, source mounts,
-   auth volume, and the bridge endpoint as an environment variable.
-   Stderr is drained in a background thread to prevent pipe
-   deadlocks.
-5. Stream JSON events from the agent's stdout and log them.
-6. On completion (or timeout), collect output artifacts from the
-   agent workspace by matching filenames to declared output names.
-7. Stop the bridge service.
-
-A total timeout (default 4 hours) kills the agent container if
-exceeded, ensuring hung agents do not block indefinitely.
-
-### Agent pause and resume
-
-Long-running agents can hit API rate limits or consume excessive
-budget in a single session. The agent runner
-(`batteries/claude/agent_runner.py`) supports pausing and resuming
-to handle both cases.
-
-**Pause triggers:**
-
-- **Max turns** (`MAX_TURNS` env var). The SDK stops the query
-  and emits a `ResultMessage` with `subtype == "error_max_turns"`.
-  The runner detects this and pauses. This is opt-in — omit
-  `MAX_TURNS` to let the agent run to natural completion.
-- **Rate limit rejection**. The SDK yields a `RateLimitEvent`
-  with `rate_limit_info.status == "rejected"`. The runner breaks
-  out of the query loop and pauses. Rate limit exceptions raised
-  outside the event stream are also caught.
-
-**Pause behavior:**
-
-On pause, the runner:
-1. Writes `.agent_state.json` to the workspace with the session
-   ID, status (`"paused"`), and reason (`"max_turns"` or
-   `"rate_limit"`).
-2. Emits an `agent_state` JSON event to stdout.
-3. Polls every 5 seconds for a `.agent_resume` file in the
-   workspace.
-
-**Resume:**
-
-The host (or user) writes a `.agent_resume` file to the shared
-workspace mount. The file content is used as the resume prompt
-(an empty file defaults to "Continue from where you left off.").
-The runner reads and deletes the file, then calls `query()` with
-`options.resume = session_id` to continue the conversation with
-full history.
-
-On startup, the runner also checks for:
-- `RESUME_SESSION` env var — resume a specific session immediately.
-- A saved `.agent_state.json` with `status == "paused"` — resume
-  the interrupted session automatically.
-
-**Assumptions:** The Docker container remains running between
-pause and resume. The Claude Agent SDK stores session history
-as local JSONL files at
-``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` inside
-the container. These files are lost when the container dies.
-The ``session_id`` alone is not enough to resume — the SDK
-needs the local session file.
-
-To support cross-container resume, mount a persistent volume
-at ``/home/claude/.claude/projects/`` (in addition to the
-existing auth volume at ``/home/claude/.claude/``), and ensure
-the working directory matches across containers. This is not
-yet implemented.
-
-Alternatively, avoid session resume entirely: capture results
-as artifacts and pass them into a fresh session's prompt. This
-is the approach the artifact-based architecture naturally
-supports.
-
-### Block bridge
-
-The block bridge is a generic HTTP service that lets containers
-trigger nested block executions within the same workspace. It is
-not specific to evaluation -- the invoked block and what it does
-are defined by the project's template, not by flywheel.
-
-The bridge supports two modes:
-
-**Invoke mode** (default): launches a Docker container.
-
-1. Validates the block name against the template and an optional
-   allowed-blocks list.
-2. Imports the provided artifact into the workspace via
-   ``register_artifact()``.
-3. Looks up the block definition from the template to determine
-   the image, docker args, input slots, and output slots.
-4. Runs the container with proper mounts.
-5. Records the output artifacts and block execution in the
-   workspace with full provenance.
-6. Returns the results (including any scores) to the caller.
-
-An invocation budget (``max_invocations``) limits how many
-blocks the agent can trigger per step.
-
-**Record mode**: creates artifacts without launching a container.
-Used for provenance tracking of actions that already happened
-(e.g., game steps executed via a REST API). The request includes
-structured output data as JSON; the bridge writes it to artifact
-directories and records a ``BlockExecution`` with input/output
-bindings. Record-mode blocks use the ``__record__`` sentinel as
-their image in the template. Input artifact IDs are validated
-for both existence and name match against the declared slot.
-
-### Project-provided MCP servers
-
-Projects can provide custom MCP servers by mounting a directory
-into the agent container at ``/workspace/.mcp_servers/``. The
-agent runner scans this directory on startup for files matching
-``*_mcp_server.py`` and registers each one by name (derived by
-stripping the ``_mcp_server.py`` suffix).
-
-An optional sidecar manifest (``*_mcp_server.json``) can list
-tool names to pre-register in ``allowed_tools``. If absent, tools
-are discovered via MCP handshake.
-
-All container environment variables are passed to mounted MCP
-server subprocesses. This is safe because the host controls the
-container's environment, and there are no secrets leaking from
-inside Docker.
+### Declarations and Instances
+
+An artifact declaration is template-level: a named artifact type and
+storage kind. An artifact instance is workspace-level: an immutable
+record with a unique id, timestamp, storage location, and provenance.
+
+The workspace stores instances. Templates declare what kinds of
+instances may exist.
+
+### Storage Kinds
+
+Flywheel currently has two canonical storage kinds:
+
+* `copy` - an immutable directory stored under the workspace.
+* `git` - a reference to a repository, commit SHA, and path.
+
+`copy` and `git` are the storage kinds for new block-execution work.
+Ordered histories are modeled with artifact sequences, not a third
+storage kind.
+
+### Directory-Shaped Artifacts
+
+Copy artifact instances are directories. Containers write output bytes
+under `/output/<slot>/`, and `flywheel import artifact` also requires a
+directory source. A single file must be wrapped in a directory by the
+caller.
+
+This keeps imports, block outputs, validators, and downstream mounts on
+one shape.
+
+### Validation
+
+Projects can register artifact validators in `flywheel.yaml`.
+Flywheel calls them from every artifact-finalization path. The
+validator receives a staged directory containing the exact candidate
+bytes that would become the artifact instance.
+
+Flywheel does not inspect artifact contents by default. Content policy
+belongs to the project validator.
+
+When a block emits multiple output slots and one slot fails validation,
+Flywheel commits slots that passed and rejects only failed slots. The
+execution is still recorded as failed with `failure_phase` describing
+the most downstream failure and per-slot rejection records explaining
+what happened.
+
+### Quarantine and Amendment
+
+Rejected block outputs are copied to
+`<workspace>/quarantine/<execution-id>/<slot>/` when preservation
+succeeds. The failed `BlockExecution` stores a `RejectedOutput` for
+each rejected slot.
+
+Corrected bytes are registered as new artifact instances through
+`flywheel fix execution` or `flywheel amend artifact`. They may carry a
+`SupersedesRef` pointing backward to an accepted artifact id or a
+rejected `(execution_id, slot)` pair. The predecessor is provenance,
+not a resolution rule.
+
+### Artifact Sequences
+
+Artifact sequences are append-only ordered ledger rows that reference
+normal immutable artifact instances. They are for whole-history
+consumption, such as alternating game states and actions, where a
+block needs the ordered sequence rather than the latest artifact by
+name.
+
+Sequences have workspace, run, or lane scope. Blocks append to a
+sequence by declaring `sequence:` on an output slot; blocks consume a
+whole sequence snapshot by declaring `sequence:` on an input slot. The
+consumed snapshot is recorded on
+`BlockExecution.input_sequence_bindings` so later appends do not
+rewrite execution provenance.
+
+The normative contract is in
+[specs/artifact-sequences.md](specs/artifact-sequences.md).
+
+## State
+
+Artifacts and state are both files, but they mean different things.
+
+Artifacts model edge relationships between block executions: one
+execution produces a named, immutable value that another execution may
+bind as input.
+
+State models node-local continuity for an execution lineage: bytes are
+restored because the next execution continues the same lineage, not
+because another block selected them as an input artifact.
+
+Managed state uses a write path separate from artifacts. It has:
+
+* state modes on block declarations and `BlockExecution`;
+* lineage keys supplied by the caller or pattern runner;
+* immutable `StateSnapshot` records;
+* compatibility checks before restore;
+* optional project-owned state validators;
+* recovery preservation for rejected or failed captures.
+
+The normative contract is in [specs/state.md](specs/state.md).
+
+## Block Execution
+
+The canonical implementation lives in
+[../flywheel/execution.py](../flywheel/execution.py).
+
+### Prepare
+
+Prepare mints an execution id, resolves input bindings, stages inputs,
+allocates proposal directories, creates one host tree mounted at
+`/flywheel`, restores managed state when declared, and prepares output
+proposal directories for the block's declared outputs.
+
+Canonical artifact directories are never mounted directly into a block.
+Inputs are copied into per-mount staging directories first.
+
+### Run
+
+The supported runtimes are one-shot containers and workspace-persistent
+containers. A runtime runner receives an `ExecutionPlan`, runs the
+already-prepared container body or request, and returns observation. It
+does not register artifacts, write state snapshots, quarantine bytes, or
+record executions.
+
+The default one-shot runner calls Docker and waits for the container to
+exit. The default persistent runner keeps a Docker container alive and
+dispatches execution requests through the exchange mount described in
+`docs/specs/persistent-runtime.md`. Tests can inject fake runners to
+prove that prepare and commit remain canonical.
+
+### Termination
+
+The runtime reports a normalized termination reason. Substrate-reserved
+reasons include `crash`, `timeout`, `interrupted`, and
+`protocol_violation`. Project-defined reasons are declared by the block
+and select which output slots are expected.
+
+`BlockExecution.status` is derived from termination reason by
+`flywheel.termination.derive_status`.
+
+### Commit
+
+Commit captures managed state for non-reserved termination reasons,
+collects only the output slots declared for the observed termination
+reason, validates candidates, registers accepted artifacts, quarantines
+rejected outputs, and records the `BlockExecution`.
+
+Reserved failure reasons record the execution without accepting
+artifacts or advancing state.
+
+Commit also ingests execution telemetry candidates from
+`/flywheel/telemetry`. Telemetry is a separate ledger lane from
+artifacts and state: valid candidates become `ExecutionTelemetry`
+records tied to the execution, and malformed candidates become durable
+telemetry rejection records. Telemetry ingest is non-fatal and never
+changes execution status. Flywheel validates and records telemetry
+candidates, and preserves rejected candidate bytes under
+`telemetry_rejections/` when possible, but battery wrappers own any
+stronger provenance boundary for the bytes they emit.
 
 ## Workspaces
 
-A workspace is a directory inside a project's foundry folder.
-It is created from a template and accumulates artifact instances
-and execution records over its lifetime.
+A workspace is a directory under a project's foundry. It contains
+`workspace.yaml`, artifact instances, state snapshots, run records,
+proposals, quarantine, and recovery directories.
 
-### Directory layout
+`workspace.yaml` is the durable ledger. It records workspace metadata,
+artifact declarations, artifact instances, state snapshots, block
+executions, execution telemetry and telemetry rejections, run records,
+and lifecycle events.
 
+Workspace mutations go through sanctioned methods such as
+`register_artifact`, `register_git_artifact`, `register_state_snapshot`,
+`record_execution`, `record_sequence_entry`, `record_execution_telemetry`,
+`record_rejected_telemetry`, `begin_run`, `record_run_step`, and
+`end_run`. Private mutators are not public write paths.
+
+`Workspace.save()` writes atomically via a temporary file and replace.
+
+## Templates and Foundry Layout
+
+A project declares its foundry directory in `flywheel.yaml`. Current
+template locations are:
+
+```text
+foundry/
+  templates/
+    workspaces/
+    blocks/
+    patterns/
+  workspaces/
 ```
-project_root/
-├── flywheel.yaml             ← project config (foundry_dir)
-├── crates/                   ← project source code
-└── foundry/                  ← flywheel's folder
-    ├── templates/            ← workspace templates
-    │   └── train_eval.yaml
-    └── workspaces/
-        └── my_workspace/
-            ├── workspace.yaml   ← metadata, artifacts, executions
-            └── artifacts/       ← copy artifact instance directories
-                ├── checkpoint@a3f7b2/
-                ├── checkpoint@d1e8c4/
-                └── score@b7a209/
-```
 
-### Templates
+Workspace templates declare artifact declarations and the block names
+available in the workspace. Block declarations live in
+`templates/blocks/` and define image, lifecycle, inputs, outputs,
+state mode, environment, and Docker arguments. Pattern declarations
+live in `templates/patterns/`.
 
-A template defines the capabilities of a workspace: what
-artifacts can exist, what blocks can run, and how containers are
-configured. Templates live in `foundry/templates/`.
+The long-term foundry layout is still being refined, but the conceptual
+split is stable: templates describe capabilities; workspaces contain
+results.
 
-A template declares:
-- **Artifact declarations**, which specify names and storage
-  kinds (copy or git), along with repo and path for git
-  artifacts.
-- **Block definitions**, which specify names, container images,
-  Docker configuration, and input/output artifact mappings
-  with container paths.
+## Runs and Patterns
 
-Block inputs and outputs must reference declared artifact names.
-This is validated at template parse time.
+Runs are stored as `RunRecord` objects on the workspace. A run groups
+related block executions without adding run-specific fields to
+`BlockExecution`.
 
-### Workspace creation
+The current pattern implementation executes a structured `do:` body.
+The supported body nodes are:
 
-`flywheel create workspace --name NAME --template TEMPLATE` runs
-from the project root. It reads `flywheel.yaml` to find the
-foundry directory, loads the template, resolves git artifacts
-(refusing if dirty) as baseline instances, and creates the
-workspace directory with a `workspace.yaml` metadata file.
+* `cohort` steps, whose members are canonical block executions;
+* `foreach`, which creates lane cohorts and runs each lane body to
+  completion before moving to the next lane;
+* `use`, which expands a local sub-pattern with an explicit parameter
+  map;
+* `run_until`, which repeats one block until declared termination
+  reasons stop, fail, or exhaust the loop budget.
 
-### Workspace persistence
+Cohorts support `min_successes: all` and `min_successes: 1`. Pattern
+lanes are run-scoped artifact resolution contexts. Pattern fixtures
+materialize ordinary copy artifacts per lane at run start. Pattern
+parameters are resolved once at run start, recorded on the `RunRecord`,
+and may be substituted into member environment values, member args,
+`run_until` settings, and invocation route args.
 
-The workspace.yaml file contains workspace metadata (name,
-template, creation time), all artifact instances keyed by ID,
-and all block execution records keyed by ID. Together these
-form the complete provenance record for the workspace.
+Pattern inputs can bind directly to an artifact id or to a prior
+member's output in the same run. Unbound copy inputs resolve to the
+latest artifact in the member's lane, not the latest workspace-global
+artifact by name. Invocation-child outputs are visible to later members
+in the same lane. The pattern runner records fixture, member, lane, and
+step results on the `RunRecord`; `BlockExecution` remains unaware of
+runs and lanes.
 
-## Future work
+Ad hoc `flywheel run block` may also pass `--param KEY=VALUE`; those
+values are used only for `${params.KEY}` placeholders in invocation
+route args. Pattern-only member env/arg substitution remains a pattern
+surface.
 
-### Default binding policy
+## Batteries
 
-When no explicit binding is provided for a copy input slot,
-the current implementation uses the most recent instance for
-that slot ("latest wins"). This is a provisional default that
-works for simple sequential workflows.
+Batteries are solve-once capabilities bundled with Flywheel for reuse.
+They are above the substrate.
 
-A more sophisticated policy might need per-subclass defaults
-(the best checkpoint for dueling vs defense), or selection
-based on an evaluation metric rather than recency. A formal
-`current_bindings` map on the workspace could support these
-patterns, but the right design is not yet clear.
+The bundled Claude battery currently includes:
 
-### Schema versioning
+* `batteries/claude/Dockerfile.claude`;
+* `batteries/claude/entrypoint.sh`;
+* `batteries/claude/agent_runner.py`;
+* `examples/hello-agent/`.
 
-The workspace.yaml format will evolve as new features are added.
-A `schema_version` field should be introduced to support loading
-older workspaces and migrating them forward.
+Projects invoke the battery as an ordinary block by declaring a block
+that uses a project image derived from the Claude battery. Prompt bytes
+belong to that derived image's agent workflow definition, not to the
+workspace artifact graph. Auth and other launch details live in the
+block declaration, and durable outputs remain ordinary block execution
+records, artifact instances, and state snapshots.
 
-### Interrupted execution handling
+If an agent block needs another block to run next, it announces a
+project termination reason whose block declaration routes to the child.
+Flywheel commits the agent block first, then invokes the child through
+the same canonical block execution path.
+Richer battery selection is deferred.
 
-Block executions can be interrupted (e.g., by Ctrl+C). The
-execution is recorded with "interrupted" status, and orphaned
-output directories are cleaned up. Partial outputs from
-interrupted executions are not preserved as artifact instances.
+## Future Work
 
-### Commit-pinned git mounts
+### Battery Boundaries
 
-Git artifact instances record a commit SHA, but the current
-mount implementation uses the live working tree. A future
-improvement could use ``git archive`` or ``git worktree`` to
-extract the exact committed state, making explicit bindings
-to historical git artifacts truly reproducible.
+Continue moving Claude-specific conventions into `batteries/claude/`
+and battery-provided templates. Batteries should be invoked through
+ordinary `flywheel run block` execution.
+
+Do not add agent-shaped fields to `BlockExecution` unless the field is
+meaningful for ordinary block executions.
+
+### Block Invocation
+
+Block invocation routes from a committed execution outcome to child
+block execution. Future work should add operator-facing inspection
+commands, decide whether pending tool calls from batteries need their
+own durable record, and rely on pattern execution for loops, limits,
+and conditional iteration.
+
+### Persistent Containers
+
+Persistent containers are a runtime variant that shares canonical
+prepare and commit. Flywheel owns the `/flywheel/exchange` request tree;
+the worker writes only proposals, telemetry candidates, and the
+termination sidecar for the current request. Persistent runtimes must
+not register artifacts, write state snapshots, or record executions
+directly.
+
+### Pattern Expressiveness
+
+Extend patterns with branching, richer `min_successes` policies,
+scheduler controls, and additional loop forms if real workflows need
+them. Preserve the distinction between semantic cohorts and scheduling
+concurrency.
+
+### Artifact Selection and Scope
+
+Ad hoc block execution still uses latest-by-name for unbound copy
+inputs. Pattern execution uses run-scoped lane resolution instead.
+Future selection may need explicit policies such as best-scoring
+artifact, per-subclass defaults, or promotion between contexts.
+
+### Artifact Indexing
+
+Artifact sequences now cover ordered histories. Future selection may
+still need unordered labels or tags for cases that are not naturally a
+sequence, but those should remain metadata over normal immutable
+artifact instances rather than a new storage kind.
+
+### Commit-Pinned Git Mounts
+
+Git artifact instances record a commit SHA, but runtime mounts still
+use the live working tree. Future work should mount the exact committed
+contents via `git archive`, `git worktree`, or equivalent.
+
+### Workspace Schema
+
+Introduce schema versioning and decide whether workspaces should store
+full declaration snapshots or no template schema at all. The current
+partial declaration snapshot is useful but not a complete long-term
+contract.

@@ -83,6 +83,51 @@ def build_docker_command(
     return cmd
 
 
+def start_container(
+    config: ContainerConfig,
+    args: list[str] | None = None,
+    name: str | None = None,
+    *,
+    capture_output: bool = False,
+) -> subprocess.Popen:
+    """Launch a Docker container non-blockingly.
+
+    Returns the live ``subprocess.Popen`` so callers can observe
+    and control the container lifecycle (poll for exit, wait with
+    timeout, signal by container name through ``docker kill``).
+    Does not block on ``wait()`` — that's the caller's
+    responsibility.
+
+    Args:
+        config: Container configuration specifying image, mounts,
+            env, etc.
+        args: Optional extra arguments for the container
+            entrypoint.
+        name: Optional container name.  Required if the caller
+            intends to signal the container via ``docker kill``
+            (which addresses containers by name).
+        capture_output: When ``True``, wire the child process's
+            stdout and stderr to pipes the caller can drain.
+            Default ``False`` lets the streams inherit the parent's
+            file descriptors (prints to the terminal).
+
+    Returns:
+        A running :class:`subprocess.Popen` for the container.
+    """
+    cmd = build_docker_command(config, args, name=name)
+    # Prevent MSYS/Git Bash from translating Unix-style paths
+    # (e.g., /output -> C:/Program Files/Git/output).
+    env = os.environ.copy()
+    env["MSYS_NO_PATHCONV"] = "1"
+    popen_kwargs: dict = {"env": env}
+    if capture_output:
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+        popen_kwargs["text"] = True
+        popen_kwargs["encoding"] = "utf-8"
+    return subprocess.Popen(cmd, **popen_kwargs)
+
+
 def run_container(
     config: ContainerConfig,
     args: list[str] | None = None,
@@ -105,15 +150,8 @@ def run_container(
         KeyboardInterrupt: Re-raised after terminating the container
             when the user presses Ctrl+C.
     """
-    cmd = build_docker_command(config, args, name=name)
-
-    # Prevent MSYS/Git Bash from translating Unix-style paths
-    # (e.g., /output -> C:/Program Files/Git/output) in Docker commands.
-    env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"
-
     start = time.monotonic()
-    process = subprocess.Popen(cmd, env=env)
+    process = start_container(config, args, name=name)
     try:
         process.wait()
     except KeyboardInterrupt:

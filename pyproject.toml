@@ -24,6 +24,9 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live_api: requires live Anthropic API access (network + auth); opt in with --run-live-api",
+]
 
 [tool.ruff]
 line-length = 100

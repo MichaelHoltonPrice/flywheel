@@ -2,29 +2,70 @@
 
 Orchestration framework for measurable AI improvement loops.
 
-Flywheel wires Docker containers together into pipelines where
-scores determine what happens next. It provides artifact tracking,
-visibility into hybrid human+agent workflows, and reusable
-capabilities (computer use agents, LLM agent wrappers) so projects
-can focus on their domain logic.
+Flywheel runs blocks, records their inputs and outputs, and keeps a
+durable workspace ledger for reproducible, pattern-driven workflows.
+Projects provide domain containers and validators; Flywheel provides
+the substrate for artifact tracking, managed state, patterns, and
+reusable batteries.
 
-See [docs/vision.md](docs/vision.md) for the design rationale
-(includes aspirational elements) and
-[docs/architecture.md](docs/architecture.md) for implementation
-decisions (future work is noted separately at the end).
+## Use Cases
+
+Flywheel is useful whenever a project needs repeatable block
+execution, artifact provenance, and durable records of how a workflow
+progressed. That includes RL training/evaluation loops, simulation
+workflows, benchmark runs, human-in-the-loop review, and AI agent
+orchestrators driving the CLI.
+
+Humans and AI agents use the same surface and read the same
+workspaces.
+
+## CLI Surface
+
+Core user-facing commands:
+
+* `flywheel create workspace` - materialize a fresh workspace from a
+  template. See [docs/cli/create-workspace.md](docs/cli/create-workspace.md).
+* `flywheel import artifact` - add files to the workspace as an
+  immutable artifact instance.
+* `flywheel run block` - execute one block ad hoc against a workspace.
+* `flywheel run pattern` - execute a declarative pattern against a
+  workspace.
+
+Per-command reference docs land in [docs/cli/](docs/cli/) as the
+underlying behavior is pinned. AI agents working with Flywheel should
+start at [AGENTS.md](AGENTS.md). Design rationale is in
+[docs/vision.md](docs/vision.md); implementation decisions are in
+[docs/architecture.md](docs/architecture.md).
+
+## Examples
+
+Versioned examples live under [examples/](examples/). Start with
+[examples/hello-agent](examples/hello-agent/), a smoke test for the
+Flywheel-provided Claude battery image and managed state
+restore/capture. The example invokes the battery as an ordinary block
+with `flywheel run block`.
+
+Reusable battery images live under [batteries/](batteries/). The
+Claude battery provides a managed-state agent container. The desktop
+battery provides an agent-agnostic virtual desktop service with
+screenshot/input APIs; projects derive from it and wire controller
+blocks to it through project Docker networking.
 
 ## Setup
 
 ```bash
 python -m venv .venv
 
-# Windows (Git Bash)
-source .venv/Scripts/activate
+# Windows cmd
+.venv\Scripts\activate.bat
+
+# PowerShell
+.\.venv\Scripts\Activate.ps1
 
 # macOS / Linux
 source .venv/bin/activate
 
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
 ## Verification

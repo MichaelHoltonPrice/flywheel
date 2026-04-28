@@ -1,16 +1,19 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from flywheel.artifact import ArtifactInstance
-from flywheel.cli import _parse_bindings, create_workspace, main
-from flywheel.template import Template
+from flywheel.artifact import BlockExecution, RejectedOutput
+from flywheel.cli import _parse_bindings, _parse_params, create_workspace, main
+from flywheel.container import ContainerResult
+from flywheel.state_validator import StateValidatorRegistry
 from flywheel.workspace import Workspace
+from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
 
 
@@ -43,8 +46,10 @@ def make_project(tmp_path: Path) -> Path:
     flywheel_yaml = project_root / "flywheel.yaml"
     flywheel_yaml.write_text("foundry_dir: foundry\n")
 
-    # Create template directory and file
-    templates_dir = project_root / "foundry" / "templates"
+    # Create workspace template directory and file
+    templates_dir = (
+        project_root / "foundry" / "templates" / "workspaces"
+    )
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "my_template.yaml"
@@ -60,14 +65,27 @@ artifacts:
     kind: copy
 
 blocks:
-  - name: train
-    image: cyberloop-train:latest
-    inputs: [checkpoint]
-    outputs: [checkpoint]
-  - name: eval
-    image: cyberloop-eval:latest
-    inputs: [checkpoint]
-    outputs: [score]
+  - train
+  - eval
+""")
+
+    blocks_dir = project_root / "foundry" / "templates" / "blocks"
+    blocks_dir.mkdir(parents=True)
+    (blocks_dir / "train.yaml").write_text("""\
+name: train
+image: cyberloop-train:latest
+inputs: [checkpoint]
+outputs:
+  normal:
+    - checkpoint
+""")
+    (blocks_dir / "eval.yaml").write_text("""\
+name: eval
+image: cyberloop-eval:latest
+inputs: [checkpoint]
+outputs:
+  normal:
+    - score
 """)
 
     # Commit the project config files so the tree is clean
@@ -93,7 +111,9 @@ def make_copy_only_project(tmp_path: Path) -> Path:
     flywheel_yaml = project_root / "flywheel.yaml"
     flywheel_yaml.write_text("foundry_dir: foundry\n")
 
-    templates_dir = project_root / "foundry" / "templates"
+    templates_dir = (
+        project_root / "foundry" / "templates" / "workspaces"
+    )
     templates_dir.mkdir(parents=True)
 
     template_yaml = templates_dir / "simple.yaml"
@@ -243,20 +263,39 @@ class TestParseBindings:
         assert result["checkpoint"] == "checkpoint@abc123"
 
 
+class TestParseParams:
+    def test_multiple_params(self):
+        result = _parse_params([
+            "model=claude-opus",
+            "eval_episodes=4000",
+        ])
+        assert result == {
+            "model": "claude-opus",
+            "eval_episodes": "4000",
+        }
+
+    def test_malformed_raises(self):
+        with pytest.raises(ValueError, match="Invalid --param format"):
+            _parse_params(["model"])
+
+
 class TestMainImportArtifact:
     def test_import_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         project_root = make_copy_only_project(tmp_path)
         monkeypatch.chdir(project_root)
 
         # Create workspace (copy-only template, no git needed)
-        template = Template.from_yaml(
-            project_root / "foundry" / "templates" / "simple.yaml")
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
-        # Write a file to import
-        src = tmp_path / "myfile.txt"
-        src.write_text("hello")
+        # Write a directory to import (artifacts are
+        # directory-shaped; single files are rejected).
+        src = tmp_path / "data_dir"
+        src.mkdir()
+        (src / "myfile.txt").write_text("hello")
 
         ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
         main(["import", "artifact",
@@ -278,13 +317,15 @@ class TestMainImportArtifact:
         project_root = make_copy_only_project(tmp_path)
         monkeypatch.chdir(project_root)
 
-        template = Template.from_yaml(
-            project_root / "foundry" / "templates" / "simple.yaml")
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
         foundry_dir = project_root / "foundry"
         Workspace.create("test_ws", template, foundry_dir)
 
-        src = tmp_path / "myfile.txt"
-        src.write_text("hello")
+        src = tmp_path / "data_dir"
+        src.mkdir()
+        (src / "myfile.txt").write_text("hello")
 
         ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
         main(["import", "artifact",
@@ -300,95 +341,448 @@ class TestMainImportArtifact:
         assert data_instances[0].source == "written by agent"
 
 
+class TestMainFixExecution:
+    """``flywheel fix execution`` registers a corrected artifact
+    for a quarantined output slot and records the rejection
+    lineage on the new instance.
+    """
+
+    @staticmethod
+    def _seed_workspace_with_rejection(
+        project_root: Path,
+    ) -> tuple[Path, str, str]:
+        """Create a workspace and seed a failed-execution record
+        whose ``rejected_outputs`` references the ``data`` slot.
+
+        Returns ``(workspace_path, execution_id, slot_name)``.
+        """
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        now = datetime.now(UTC)
+        ws._add_execution(BlockExecution(
+            id="exec_bad", block_name="produce_data",
+            started_at=now, finished_at=now,
+            status="failed", failure_phase="output_validate",
+            rejected_outputs={
+                "data": RejectedOutput(
+                    reason="schema mismatch",
+                    quarantine_path="quarantine/exec_bad/data",
+                ),
+            },
+        ))
+        ws.save()
+        return ws.path, "exec_bad", "data"
+
+    def test_registers_corrected_artifact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, exec_id, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        main([
+            "fix", "execution",
+            "--workspace", str(ws_path),
+            "--execution", exec_id,
+            "--slot", slot,
+            "--from", str(src),
+            "--reason", "patched schema",
+        ])
+
+        loaded = Workspace.load(ws_path)
+        instances = loaded.instances_for(slot)
+        assert len(instances) == 1
+        inst = instances[0]
+        assert inst.supersedes is not None
+        assert inst.supersedes.rejection is not None
+        assert inst.supersedes.rejection.execution_id == exec_id
+        assert inst.supersedes.rejection.slot == slot
+        assert inst.supersedes_reason == "patched schema"
+
+    def test_reason_is_optional(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, exec_id, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        main([
+            "fix", "execution",
+            "--workspace", str(ws_path),
+            "--execution", exec_id,
+            "--slot", slot,
+            "--from", str(src),
+        ])
+
+        loaded = Workspace.load(ws_path)
+        inst = loaded.instances_for(slot)[0]
+        assert inst.supersedes_reason is None
+
+    def test_unknown_execution_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, _, slot = (
+            self._seed_workspace_with_rejection(project_root)
+        )
+
+        src = tmp_path / "fixed"
+        src.mkdir()
+        (src / "data.txt").write_text("corrected")
+
+        with pytest.raises(ValueError, match="execution_id 'exec_ghost'"):
+            main([
+                "fix", "execution",
+                "--workspace", str(ws_path),
+                "--execution", "exec_ghost",
+                "--slot", slot,
+                "--from", str(src),
+            ])
+
+
+class TestMainAmendArtifact:
+    """``flywheel amend artifact`` registers a corrective successor
+    to an accepted predecessor and records the artifact-id
+    lineage on the new instance.
+    """
+
+    @staticmethod
+    def _seed_workspace_with_accepted(
+        project_root: Path, tmp_path: Path,
+    ) -> tuple[Path, str]:
+        """Create a workspace and register one accepted ``data``
+        instance.  Returns ``(workspace_path, predecessor_id)``.
+        """
+        template = from_yaml_with_inline_blocks(
+            project_root / "foundry" / "templates"
+            / "workspaces" / "simple.yaml")
+        foundry_dir = project_root / "foundry"
+        Workspace.create("test_ws", template, foundry_dir)
+
+        src = tmp_path / "v1"
+        src.mkdir()
+        (src / "data.txt").write_text("v1")
+        ws_path = str(project_root / "foundry" / "workspaces" / "test_ws")
+        main([
+            "import", "artifact",
+            "--workspace", ws_path,
+            "--name", "data",
+            "--from", str(src),
+        ])
+        loaded = Workspace.load(Path(ws_path))
+        predecessor_id = loaded.instances_for("data")[0].id
+        return Path(ws_path), predecessor_id
+
+    def test_registers_successor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, predecessor_id = (
+            self._seed_workspace_with_accepted(
+                project_root, tmp_path,
+            )
+        )
+
+        src = tmp_path / "v2"
+        src.mkdir()
+        (src / "data.txt").write_text("v2")
+
+        main([
+            "amend", "artifact",
+            "--workspace", str(ws_path),
+            "--artifact", predecessor_id,
+            "--from", str(src),
+            "--reason", "hand-edited",
+        ])
+
+        loaded = Workspace.load(ws_path)
+        instances = loaded.instances_for("data")
+        assert len(instances) == 2
+        successor = next(
+            i for i in instances if i.id != predecessor_id
+        )
+        assert successor.supersedes is not None
+        assert successor.supersedes.artifact_id == predecessor_id
+        assert successor.supersedes_reason == "hand-edited"
+
+    def test_unknown_artifact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_copy_only_project(tmp_path)
+        monkeypatch.chdir(project_root)
+        ws_path, _ = self._seed_workspace_with_accepted(
+            project_root, tmp_path,
+        )
+
+        src = tmp_path / "v2"
+        src.mkdir()
+        (src / "data.txt").write_text("v2")
+
+        with pytest.raises(ValueError, match="does not exist"):
+            main([
+                "amend", "artifact",
+                "--workspace", str(ws_path),
+                "--artifact", "data@deadbeef",
+                "--from", str(src),
+            ])
+
+
 class TestMainRunBlock:
     def test_argument_parsing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """Verify that main() parses run block args and calls the right path."""
+        """Verify that main() parses run block args and calls run_block."""
         project_root = make_project(tmp_path)
         monkeypatch.chdir(project_root)
 
-        # Create a workspace first
         main(["create", "workspace", "--name", "test_ws",
               "--template", "my_template"])
 
-        # run block should fail at container launch (Docker not available
-        # in tests), but it should get past argument parsing
-        with pytest.raises((RuntimeError, FileNotFoundError, OSError, ValueError)):
+        mock_result = MagicMock()
+        mock_result.container_result.exit_code = 0
+        mock_result.container_result.elapsed_s = 1.0
+
+        with patch("flywheel.cli.run_block", return_value=mock_result) as mock_rb:
             main([
                 "run", "block",
                 "--workspace",
                 str(project_root / "foundry" / "workspaces" / "test_ws"),
                 "--block", "train",
                 "--template", "my_template",
+                "--state-lineage", "train_dueling",
+                "--param", "eval_episodes=4000",
                 "--", "--subclass", "dueling",
             ])
+            mock_rb.assert_called_once()
+            call_args = mock_rb.call_args
+            assert call_args[0][1] == "train"
+            assert call_args.kwargs["state_lineage_key"] == "train_dueling"
+            assert call_args.kwargs["invocation_params"] == {
+                "eval_episodes": "4000",
+            }
+            assert isinstance(
+                call_args.kwargs["state_validator_registry"],
+                StateValidatorRegistry,
+            )
 
-
-def _make_materialize_project(tmp_path: Path) -> Path:
-    """Create a project with game_step and game_history artifacts."""
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-
-    flywheel_yaml = project_root / "flywheel.yaml"
-    flywheel_yaml.write_text("foundry_dir: foundry\n")
-
-    templates_dir = project_root / "foundry" / "templates"
-    templates_dir.mkdir(parents=True)
-
-    template_yaml = templates_dir / "step_test.yaml"
-    template_yaml.write_text("""\
-artifacts:
-  - name: game_step
-    kind: copy
-  - name: game_history
-    kind: copy
-
-blocks: []
+    def test_managed_state_missing_lineage_records_execution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        project_root = make_project(tmp_path)
+        train_yaml = (
+            project_root / "foundry" / "templates" / "blocks"
+            / "train.yaml"
+        )
+        train_yaml.write_text("""\
+name: train
+image: cyberloop-train:latest
+state: managed
+inputs: []
+outputs:
+  normal:
+    - checkpoint
 """)
-    return project_root
-
-
-class TestMainMaterialize:
-    def test_materialize_via_cli(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        project_root = _make_materialize_project(tmp_path)
+        subprocess.run(
+            ["git", "-C", str(project_root), "add", "."],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(project_root), "commit", "-m", "stateful train"],
+            check=True,
+            capture_output=True,
+        )
         monkeypatch.chdir(project_root)
+        main(["create", "workspace", "--name", "test_ws",
+              "--template", "my_template"])
+        workspace_path = (
+            project_root / "foundry" / "workspaces" / "test_ws"
+        )
 
-        main(["create", "workspace", "--name", "mat_ws",
-              "--template", "step_test"])
+        with (
+            patch(
+                "flywheel.execution.run_container",
+                side_effect=AssertionError("container should not run"),
+            ),
+            pytest.raises(ValueError, match="state lineage key"),
+        ):
+            main([
+                "run", "block",
+                "--workspace", str(workspace_path),
+                "--block", "train",
+                "--template", "my_template",
+            ])
 
-        ws_path = project_root / "foundry" / "workspaces" / "mat_ws"
-        ws = Workspace.load(ws_path)
+        ws = Workspace.load(workspace_path)
+        execution = next(iter(ws.executions.values()))
+        assert execution.block_name == "train"
+        assert execution.status == "failed"
+        assert execution.failure_phase == "stage_in"
+        assert execution.state_mode == "managed"
 
-        # Add a step artifact.
-        aid = ws.generate_artifact_id("game_step")
-        artifact_dir = ws.path / "artifacts" / aid
-        artifact_dir.mkdir(parents=True)
-        (artifact_dir / "game_step.json").write_text(
-            json.dumps({"step_index": 1, "action": "A"}))
-        ws.add_artifact(ArtifactInstance(
-            id=aid, name="game_step", kind="copy",
-            created_at=datetime.now(UTC), copy_path=aid,
-        ))
-        ws.save()
 
-        main(["materialize", "--workspace", str(ws_path),
-              "--from", "game_step", "--to", "game_history"])
-
-        reloaded = Workspace.load(ws_path)
-        history = reloaded.instances_for("game_history")
-        assert len(history) == 1
-
-    def test_materialize_no_instances_raises(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+class TestRemovedAgentSurfaces:
+    def test_run_agent_is_not_a_cli_surface(
+        self, capsys: pytest.CaptureFixture[str],
     ):
-        project_root = _make_materialize_project(tmp_path)
-        monkeypatch.chdir(project_root)
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "agent", "--help"])
+        assert exc_info.value.code != 0
+        assert "invalid choice" in capsys.readouterr().err
 
-        main(["create", "workspace", "--name", "empty_ws",
-              "--template", "step_test"])
+    def test_run_battery_is_not_a_cli_surface(
+        self, capsys: pytest.CaptureFixture[str],
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "battery", "claude", "--help"])
+        assert exc_info.value.code != 0
+        assert "invalid choice" in capsys.readouterr().err
 
-        ws_path = project_root / "foundry" / "workspaces" / "empty_ws"
-        with pytest.raises(ValueError, match="No instances"):
-            main(["materialize", "--workspace", str(ws_path),
-                  "--from", "game_step", "--to", "game_history"])
+
+# â”€â”€ flywheel run pattern â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+def _write_pattern(project_root: Path, name: str, body: str) -> Path:
+    patterns_dir = project_root / "foundry" / "templates" / "patterns"
+    patterns_dir.mkdir(parents=True, exist_ok=True)
+    path = patterns_dir / f"{name}.yaml"
+    path.write_text(body)
+    return path
+
+
+def test_run_pattern_uses_canonical_block_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    project_root = make_project(tmp_path)
+    (
+        project_root / "foundry" / "templates" / "blocks" / "train.yaml"
+    ).write_text("""\
+name: train
+image: cyberloop-train:latest
+inputs:
+  - name: checkpoint
+    optional: true
+outputs:
+  normal:
+    - checkpoint
+""")
+    subprocess.run(
+        ["git", "-C", str(project_root), "add", "."],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_root), "commit", "-m", "adjust train"],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.chdir(project_root)
+    main(["create", "workspace", "--name", "ws",
+          "--template", "my_template"])
+    _write_pattern(project_root, "train_eval", """\
+name: train_eval
+do:
+  - name: train
+    cohort:
+      min_successes: all
+      members:
+        - name: train_dueling
+          block: train
+  - name: eval
+    cohort:
+      min_successes: all
+      members:
+        - name: eval_dueling
+          block: eval
+          inputs:
+            checkpoint:
+              from_step: train
+              member: train_dueling
+              output: checkpoint
+""")
+
+    def fake_run_container(config, args=None):
+        del args
+        for host, container_path, mode in config.mounts:
+            if mode != "rw":
+                continue
+            path = Path(host)
+            if container_path == "/flywheel":
+                (path / "termination").write_text("normal")
+            elif container_path.endswith("checkpoint"):
+                (path / "checkpoint.pt").write_text("weights")
+            elif container_path.endswith("score"):
+                (path / "score.json").write_text('{"mean": 1.0}')
+        return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+    with patch(
+        "flywheel.execution.run_container",
+        side_effect=fake_run_container,
+    ):
+        main([
+            "run", "pattern", "train_eval",
+            "--workspace",
+            str(project_root / "foundry" / "workspaces" / "ws"),
+            "--template", "my_template",
+        ])
+
+    ws = Workspace.load(project_root / "foundry" / "workspaces" / "ws")
+    run = next(iter(ws.runs.values()))
+    assert run.status == "succeeded"
+    assert [step.name for step in run.steps] == ["train", "eval"]
+    assert {execution.block_name for execution in ws.executions.values()} == {
+        "train", "eval",
+    }
+
+
+def test_run_pattern_cli_passes_resume_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    project_root = make_project(tmp_path)
+    monkeypatch.chdir(project_root)
+    main(["create", "workspace", "--name", "ws",
+          "--template", "my_template"])
+    _write_pattern(project_root, "train_eval", """\
+name: train_eval
+do:
+  - name: train
+    cohort:
+      min_successes: all
+      members:
+        - name: train_dueling
+          block: train
+""")
+
+    with patch("flywheel.cli.run_pattern") as run_pattern:
+        run_pattern.return_value = SimpleNamespace(
+            run_id="run_existing",
+            status="succeeded",
+        )
+        main([
+            "run", "pattern", "train_eval",
+            "--workspace",
+            str(project_root / "foundry" / "workspaces" / "ws"),
+            "--template", "my_template",
+            "--resume", "run_existing",
+            "--param", "episode_limit=200",
+        ])
+
+    assert run_pattern.call_args.kwargs["resume_run_id"] == "run_existing"

@@ -36,7 +36,7 @@ class TestScanMountedServers:
         (tmp_path / "arc_mcp_server.py").write_text("# server")
         (tmp_path / "arc_mcp_server.json").write_text(json.dumps({
             "name": "arc",
-            "tools": ["mcp__arc__take_action", "mcp__arc__reset_level"],
+            "tools": ["mcp__arc__take_action", "mcp__arc__get_status"],
         }))
 
         with patch.dict(
@@ -47,7 +47,7 @@ class TestScanMountedServers:
 
         _, factory = servers["arc"]
         _, tools = factory()
-        assert tools == ["mcp__arc__take_action", "mcp__arc__reset_level"]
+        assert tools == ["mcp__arc__take_action", "mcp__arc__get_status"]
 
     def test_malformed_manifest_ignored(self, tmp_path: Path):
         (tmp_path / "game_mcp_server.py").write_text("# server")
@@ -133,6 +133,6 @@ class TestScanMountedServers:
             os.environ.pop("MCP_SERVER_MOUNT_DIR", None)
             servers = _scan_mounted_servers()
 
-        # Default is /workspace/.mcp_servers which won't exist on
+        # Default is /flywheel/mcp_servers which won't exist on
         # the host, so this should return empty — not crash.
         assert servers == {}
