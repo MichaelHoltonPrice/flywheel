@@ -1,0 +1,40 @@
+FROM python:3.12-slim
+
+# Install Node.js 22 for the Codex CLI.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl gnupg git iptables ripgrep \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+       > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex
+
+ENV PYTHONUNBUFFERED=1
+ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
+ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
+ENV CODEX_HOME=/home/codex/.codex
+
+# MCP support is project-provided; httpx is useful for small MCP proxy tools.
+RUN pip install mcp httpx
+
+COPY agent_runner.py /app/agent_runner.py
+COPY codex_handoff_hook.py /app/codex_handoff_hook.py
+COPY entrypoint.sh /app/entrypoint.sh
+
+RUN useradd -m codex \
+    && mkdir -p /home/codex/.codex /scratch /app/agent \
+                /flywheel/state /flywheel/mcp_servers /flywheel/telemetry \
+    && chown -R codex:codex /home/codex /scratch /app /flywheel \
+    && chmod +x /app/entrypoint.sh /app/agent_runner.py /app/codex_handoff_hook.py
+
+# Entrypoint runs as root to scrub auth/session state, configure optional
+# network isolation, and preserve managed state after the Codex process exits.
+WORKDIR /scratch
+
+ENTRYPOINT ["/app/entrypoint.sh"]

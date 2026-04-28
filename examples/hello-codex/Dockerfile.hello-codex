@@ -1,0 +1,3 @@
+FROM flywheel-codex:latest
+
+COPY prompt/prompt.md /app/agent/prompt.md

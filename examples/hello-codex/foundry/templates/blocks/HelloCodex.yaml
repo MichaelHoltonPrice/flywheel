@@ -1,0 +1,13 @@
+name: HelloCodex
+image: flywheel-hello-codex:latest
+docker_args:
+  - -v
+  - codex-auth:/home/codex/.codex:rw
+env:
+  MODEL: gpt-5.5
+  CODEX_AUTO_COMPACT_TOKEN_LIMIT: "200000"
+  CODEX_APPROVAL_POLICY: never
+  CODEX_SANDBOX: danger-full-access
+state: managed
+outputs:
+  normal: []
