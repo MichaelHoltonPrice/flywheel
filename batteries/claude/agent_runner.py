@@ -140,9 +140,9 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # ``/flywheel/state/session.jsonl`` (root-owned, mode 700) into
 # the SDK's location before this process starts, and copies the
 # updated working file back as root after this process exits.
-# We never read or write ``/flywheel/state/`` from here — it's
-# unreadable to the claude user by design.  See
-# ``cyber-root/substrate-contract.md`` for the runtime contract.
+# We never read or write ``/flywheel/state/`` from here: it is
+# unreadable to the claude user by design. The root entrypoint owns
+# the state handoff between Flywheel and the SDK session file.
 SDK_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 DEFAULT_PROMPT_FILE = Path("/app/agent/prompt.md")

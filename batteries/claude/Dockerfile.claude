@@ -21,10 +21,8 @@ ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
 ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
 ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
 
-# Install the Agents SDK, HTTP client, and image rendering deps.
-# NOTE: We intentionally do NOT install arc-agi here to prevent
-# information leakage — it includes the game engine, which would
-# let agents inspect game mechanics directly.
+# Install the Agents SDK, HTTP client, MCP support, and common
+# image-rendering dependencies used by agent-side tools.
 RUN pip install claude-agent-sdk httpx mcp Pillow numpy
 
 # Copy the agent runner.  Project-specific MCP servers are
@@ -40,17 +38,16 @@ RUN useradd -m claude \
     && chown -R claude:claude /home/claude /scratch /app /flywheel \
     && chmod +x /app/entrypoint.sh
 
-# Don't set USER here — entrypoint runs as root to configure
+# Don't set USER here: entrypoint runs as root to configure
 # iptables, then drops to claude via su.
 # ``/flywheel/`` is the single namespace for framework-owned
-# runtime data — state (``/flywheel/state/session.jsonl``),
+# runtime data: state (``/flywheel/state/session.jsonl``) and
 # project-mounted MCP server code (``/flywheel/mcp_servers/``).
-# Kept distinct
-# from the block body's ``/input`` / ``/output`` / ``/scratch``
-# mounts so it's easy to tell framework-owned files apart from
-# the agent's own working directory.  ``/scratch`` is the agent
-# working directory.  ``$FLYWHEEL_SCRATCHPAD_DIR`` is synced to
-# managed state by the entrypoint between block executions.
+# It is distinct from the block body's ``/input`` / ``/output`` /
+# ``/scratch`` mounts, so framework-owned files are easy to
+# distinguish from the agent's working directory. ``/scratch`` is
+# the agent working directory. ``$FLYWHEEL_SCRATCHPAD_DIR`` is
+# synced to managed state by the entrypoint between block executions.
 WORKDIR /scratch
 
 ENTRYPOINT ["/app/entrypoint.sh"]
