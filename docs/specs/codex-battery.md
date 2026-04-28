@@ -44,6 +44,7 @@ docker_args:
 env:
   MODEL: gpt-5.5
   CODEX_AUTO_COMPACT_TOKEN_LIMIT: "200000"
+  CODEX_SHELL_SNAPSHOT: "0"
   CODEX_APPROVAL_POLICY: never
   CODEX_SANDBOX: danger-full-access
   MCP_SERVER_MOUNT_DIR: /app/agent/mcp_servers
@@ -66,6 +67,13 @@ thread it from pattern params, rather than editing the auth volume's
 `config.toml` or using `CODEX_EXTRA_ARGS`. If both `CODEX_EXTRA_ARGS` and
 `CODEX_AUTO_COMPACT_TOKEN_LIMIT` set the same Codex config key, the named
 Flywheel setting is appended last and wins.
+
+`CODEX_SHELL_SNAPSHOT` defaults to `"0"`. The Codex CLI supports a shell
+snapshot feature for interactive shell continuity, but Flywheel agent blocks
+run in short-lived, non-interactive containers with explicit managed state.
+Disabling the feature avoids noisy non-fatal Codex CLI stderr when a generated
+snapshot script cannot be replayed by `/bin/sh`. Set it to `"1"` only when a
+project deliberately wants Codex shell snapshots inside the block container.
 
 ## Authentication
 
@@ -102,6 +110,15 @@ state:
 The agent can read the live session files while Codex is running because
 the CLI itself needs them. It cannot read the root-owned persisted
 managed-state copy from previous executions.
+
+When restored session files are present, the runner invokes
+`codex exec resume --last`. Fresh executions receive the image prompt
+from `FLYWHEEL_AGENT_PROMPT`; resumed executions receive
+`FLYWHEEL_RESUME_PROMPT` when Flywheel provides one, otherwise
+`Continue.`. Pattern execution uses `FLYWHEEL_RESUME_PROMPT` to point the
+agent at concrete result artifacts mounted after prior external work, so
+the resumed Codex turn gets the same continuation context as other agent
+batteries without requiring Flywheel core to understand Codex sessions.
 
 ## MCP Servers
 
@@ -141,10 +158,10 @@ Flywheel then commits the parent block and invokes any declared
 
 Codex's hook API does not currently provide the same durable session-JSONL
 splice point used by the Claude battery. On the next relaunch, the Codex
-agent resumes through `codex exec resume --last`; the project should make
-the result artifact available as a normal input and explain that path in
-the prompt. The battery records `result_path` and `result_label` in
-managed-state handoff metadata for project prompts and future tooling.
+agent resumes through `codex exec resume --last` with Flywheel's resume
+prompt describing newly mounted result artifacts. The battery also records
+`result_path` and `result_label` in managed-state handoff metadata for
+project prompts and future tooling.
 
 ## Telemetry
 

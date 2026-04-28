@@ -14,6 +14,14 @@ Environment variables:
     CODEX_AUTO_COMPACT_TOKEN_LIMIT
         Optional positive integer token threshold for Codex automatic
         conversation compaction.
+    CODEX_SHELL_SNAPSHOT
+        Optional boolean. Defaults to false because shell snapshots are not
+        useful in Flywheel's non-interactive containers and can produce noisy
+        Codex CLI validation errors.
+    FLYWHEEL_RESUME_PROMPT
+        Optional prompt used only when resuming an existing Codex session.
+        Pattern execution sets this to describe newly mounted result
+        artifacts from completed external work.
     FLYWHEEL_AGENT_PROMPT
         Image-local prompt file. Defaults to ``/app/agent/prompt.md``.
     MCP_SERVERS
@@ -333,10 +341,31 @@ def _build_command(prompt: str) -> list[str]:
             "-c",
             f"model_auto_compact_token_limit={compact_limit}",
         ])
+    shell_snapshot = _bool_env("CODEX_SHELL_SNAPSHOT", default=False)
+    command.extend([
+        "--enable" if shell_snapshot else "--disable",
+        "shell_snapshot",
+    ])
+    command_prompt = prompt
     if (CODEX_HOME / "sessions").exists():
         command.extend(["resume", "--last"])
-    command.append(prompt)
+        command_prompt = os.environ.get(
+            "FLYWHEEL_RESUME_PROMPT", "").strip() or "Continue."
+    command.append(command_prompt)
     return command
+
+
+def _bool_env(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean: one of 1/0, true/false, yes/no, on/off"
+    )
 
 
 def _positive_int_env(name: str) -> int | None:

@@ -11,6 +11,8 @@ It demonstrates:
 * Codex session and scratchpad persistence managed by the battery
 * an explicit 200K automatic compaction threshold via
   `CODEX_AUTO_COMPACT_TOKEN_LIMIT`
+* shell snapshots disabled by the battery default for quieter
+  non-interactive runs
 * normal termination through `/flywheel/termination`
 
 Run the commands from the Flywheel repository root. The example uses

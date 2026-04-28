@@ -85,6 +85,7 @@ def test_agent_runner_builds_codex_exec_command(monkeypatch, tmp_path):
     assert command[command.index("--model") + 1] == "gpt-5.5"
     assert "model_reasoning_effort=\"high\"" in command
     assert "model_auto_compact_token_limit=200000" in command
+    assert command[command.index("--disable") + 1] == "shell_snapshot"
     assert command[-1] == "do work"
 
 
@@ -114,6 +115,26 @@ def test_named_compact_limit_overrides_extra_args(monkeypatch, tmp_path):
     assert named_index > configured_index
 
 
+def test_agent_runner_can_enable_codex_shell_snapshot(monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_SHELL_SNAPSHOT", "true")
+    command = module._build_command("do work")
+    assert command[command.index("--enable") + 1] == "shell_snapshot"
+    assert "--disable" not in command
+
+
+def test_agent_runner_rejects_invalid_shell_snapshot_value(
+        monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_SHELL_SNAPSHOT", "maybe")
+    try:
+        module._build_command("do work")
+    except ValueError as exc:
+        assert "CODEX_SHELL_SNAPSHOT must be a boolean" in str(exc)
+    else:
+        raise AssertionError("expected invalid shell snapshot flag to fail")
+
+
 def test_agent_runner_classifies_known_rollout_warning(
         monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
@@ -130,7 +151,32 @@ def test_agent_runner_uses_resume_when_sessions_are_staged(
     module = _load_agent_runner(monkeypatch, tmp_path)
     (tmp_path / "codex-home" / "sessions").mkdir(parents=True)
     command = module._build_command("continue")
-    assert command[-3:] == ["resume", "--last", "continue"]
+    assert command[-3:] == ["resume", "--last", "Continue."]
+
+
+def test_agent_runner_uses_flywheel_resume_prompt_when_resuming(
+        monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    (tmp_path / "codex-home" / "sessions").mkdir(parents=True)
+    monkeypatch.setenv(
+        "FLYWHEEL_RESUME_PROMPT",
+        "The evaluation result is mounted at /input/score/scores.json.",
+    )
+    command = module._build_command("original task")
+    assert command[-3:] == [
+        "resume",
+        "--last",
+        "The evaluation result is mounted at /input/score/scores.json.",
+    ]
+
+
+def test_agent_runner_ignores_resume_prompt_for_fresh_session(
+        monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("FLYWHEEL_RESUME_PROMPT", "resume-only context")
+    command = module._build_command("original task")
+    assert "resume" not in command
+    assert command[-1] == "original task"
 
 
 def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
