@@ -57,6 +57,19 @@ from flywheel.validation import validate_name as _validate_name
 _PREDECESSOR_UNSPECIFIED = object()
 
 
+def _replace_with_windows_retry(tmp_path: Path, yaml_path: Path) -> None:
+    """Atomically replace workspace.yaml, retrying transient Windows locks."""
+    attempts = 6
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp_path, yaml_path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _supersedes_to_yaml(ref: SupersedesRef) -> dict:
     """Serialize a :class:`SupersedesRef` for ``workspace.yaml``.
 
@@ -2434,4 +2447,4 @@ class Workspace:
             tmp_path = yaml_path.with_suffix(".yaml.tmp")
             with open(tmp_path, "w") as f:
                 yaml.safe_dump(data, f, sort_keys=False)
-            os.replace(tmp_path, yaml_path)
+            _replace_with_windows_retry(tmp_path, yaml_path)

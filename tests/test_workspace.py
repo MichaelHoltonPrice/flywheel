@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import flywheel.workspace as workspace_module
 from flywheel.artifact import (
     ArtifactInstance,
     BlockExecution,
@@ -102,6 +103,27 @@ class TestWorkspaceCreate:
         assert ws.artifact_declarations == {
             "engine": "git", "checkpoint": "copy", "score": "copy",
         }
+
+    def test_save_retries_transient_replace_permission_error(
+            self, tmp_path: Path, monkeypatch):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        real_replace = workspace_module.os.replace
+        calls = 0
+
+        def flaky_replace(src, dst):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise PermissionError("target is temporarily locked")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(workspace_module.os, "replace", flaky_replace)
+        ws.save()
+
+        assert calls == 3
+        assert not (ws.path / "workspace.yaml.tmp").exists()
 
     def test_git_baseline_recorded(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
