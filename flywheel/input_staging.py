@@ -13,10 +13,9 @@ Two motivations:
    (or a buggy in-process block) cannot corrupt the canonical
    workspace store by writing through its mount, because the
    mount points at a copy and only at a copy.
-2. **Snapshot semantics.**  When a long-running incremental
-   artifact is mounted, the consumer sees the snapshot taken at
-   mount time.  Late appends by other executions don't surprise
-   the reader mid-run.
+2. **Snapshot semantics.** When an artifact is mounted, the consumer
+   sees the snapshot taken during prepare. Later artifact registrations
+   or sequence appends do not change what that execution reads.
 
 This module is the staging primitive both
 :mod:`flywheel.execution` (for container input mounts) and
@@ -82,9 +81,9 @@ def stage_artifact_instance(
     Args:
         workspace: The workspace whose canonical artifact store
             holds *instance*.
-        instance: The artifact instance to stage.  Must be of
-            kind ``"copy"`` or ``"incremental"``; ``"git"``
-            artifacts have no workspace-local directory and
+        instance: The artifact instance to stage. Must be of
+            kind ``"copy"``; ``"git"`` artifacts have no
+            workspace-local directory and
             should be handled by callers separately (today's
             mount path skips them silently, preserving the
             historical no-op behavior).
@@ -174,7 +173,7 @@ def stage_artifact_instances(
     Raises:
         StagingError: Propagated from
             :func:`stage_artifact_instance` for the first slot
-            whose copy/incremental staging actually failed.
+            whose copy-artifact staging actually failed.
             Already-staged tempdirs from prior slots in this
             batch are cleaned up before the exception propagates,
             so a partial failure leaves no orphaned dirs behind.

@@ -146,7 +146,7 @@ existing quarantined bytes remain exactly as they were.
 | `--workspace` path does not contain a `workspace.yaml`. | `FileNotFoundError`. | Confirm the path. |
 | `--execution` is not present in the workspace ledger. | `ValueError("supersedes.rejection.execution_id … does not exist …")`. | Confirm the execution id (look for `failed` records in `workspace.yaml`). |
 | `--slot` is not present in that execution's `rejected_outputs`. | `ValueError("execution … has no rejected output for slot …")`. | The error message lists the rejected slots that *are* available. Pick one of those, or use [`amend artifact`](amend-artifact.md) if you meant to supersede an accepted instance. |
-| `--slot` is not declared as `kind: copy` in the workspace's template. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git/incremental kinds are not amendable today. |
+| `--slot` is not declared as `kind: copy` in the workspace's template. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git artifacts are not amendable today. |
 | `--from` path does not exist. | `FileNotFoundError`. | Confirm the source path. |
 | `--from` is a single file. | `ValueError("Artifact source must be a directory …")`. | Wrap it in a directory and pass that. |
 | The validator rejects the corrected bytes. | `flywheel.artifact_validator.ArtifactValidationError`. | Read the validator message, fix the source, retry. |

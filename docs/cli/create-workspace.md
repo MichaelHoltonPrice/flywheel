@@ -43,9 +43,9 @@ state restore) assumes a workspace exists.
     baseline commit would not actually reflect what's on disk.
   * The `path:` referenced inside the repo exists at HEAD.
 
-`copy`-kind and `incremental`-kind artifact declarations require
-no pre-existing files; instances are produced later, by block
-executions or by `flywheel import artifact`.
+`copy`-kind artifact declarations require no pre-existing files;
+instances are produced later, by block executions or by
+`flywheel import artifact`.
 
 ## Invocation
 
@@ -73,19 +73,18 @@ flywheel create workspace --name 2026-04-22-baseline --template cyberloop
 
 A new directory at `<foundry_dir>/workspaces/<name>/` containing:
 
-* `artifacts/` — empty subdirectory that will hold `copy` and
-  `incremental` artifact instance dirs as they are produced.
+* `artifacts/` — empty subdirectory that will hold `copy`
+  artifact instance dirs as they are produced.
 * `workspace.yaml` — the durable workspace ledger. At creation
   time it contains:
   * `name`, `template_name`, `created_at`.
   * `artifact_declarations` — a map from declaration name to
-    storage kind (`copy`, `git`, `incremental`).
+    storage kind (`copy` or `git`).
   * `artifacts` — a map of artifact instances. At creation time
     this is empty *except* for one auto-registered `<name>@baseline`
     instance per `git` declaration, which records the resolved
     `repo` path and `commit` SHA at workspace-create time. `copy`
-    and `incremental` declarations produce no instances at
-    create time.
+    declarations produce no instances at create time.
   * `executions` — empty.
   * `state_snapshots` — empty.
   * `events` — empty.

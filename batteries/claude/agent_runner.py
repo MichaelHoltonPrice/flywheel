@@ -45,11 +45,10 @@ Environment variables:
                       ``continue: false`` so the SDK stops before
                       Claude reasons about the placeholder.  The next
                       launch resumes with a prompt describing the
-                      mounted result artifacts.
-                      Neither file is an artifact — they are
-                      framework-owned runtime data the agent
-                      launcher reads from the control tempdir
-                      after the container exits.
+                      mounted result artifacts. Pending handoff
+                      metadata is emitted as a runner event and
+                      consumed by the root entrypoint; it is not an
+                      artifact.
     HANDOFF_PLACEHOLDER_MARKER — Substring that the splice helper uses
                       to locate the placeholder tool_result on disk.
                       Defaults to ``Evaluation requested.``.
@@ -58,8 +57,8 @@ Environment variables:
                       value may set ``termination_reason``,
                       ``required_paths``, ``result_path``,
                       ``result_label``, and ``placeholder_marker``.
-                      When set, this replaces the legacy single-handoff
-                      env vars for the listed tools.
+                      When set, this replaces the simple HANDOFF_TOOLS
+                      env shape for the listed tools.
     FLYWHEEL_SCRATCHPAD_DIR
                     — Writable directory persisted by the entrypoint
                       across managed-state block executions. Defaults
@@ -170,7 +169,7 @@ def _legacy_handoff_config(
     result_label: str,
     placeholder_marker: str,
 ) -> dict[str, dict[str, Any]]:
-    """Build per-tool handoff config from the legacy env shape."""
+    """Build per-tool handoff config from HANDOFF_TOOLS-style env."""
     return {
         tool: {
             "termination_reason": termination_reason,
@@ -291,7 +290,7 @@ def _build_handoff_post_hook(
     Args:
         handoff_tools: Set of fully qualified MCP tool names or a
             mapping of tool names to per-tool handoff config.
-        required_paths: Legacy files or directories that must exist
+        required_paths: Files or directories that must exist
             before accepting the handoff.
 
     Returns:

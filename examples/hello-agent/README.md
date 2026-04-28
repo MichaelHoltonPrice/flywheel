@@ -8,7 +8,7 @@ block declaration uses the Claude battery image. It demonstrates:
 * the Flywheel-provided `batteries/claude` Docker image
 * prompt delivery through an example image derived from the Claude battery
 * managed state through `/flywheel/state`
-* agent control files under `/flywheel/control`
+* handoff/resume session state managed by the Claude battery
 * normal termination through `/flywheel/termination`
 
 Run the commands from the Flywheel repository root. The example uses

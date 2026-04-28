@@ -149,7 +149,7 @@ instance for the slot.
 | `flywheel.yaml` missing or malformed at the cwd. | `FileNotFoundError` / `ValueError`. | Run from the project root. |
 | `--workspace` path does not contain a `workspace.yaml`. | `FileNotFoundError`. | Confirm the path. |
 | `--artifact` is not present in the workspace ledger. | `ValueError("Artifact … does not exist in this workspace")`. | Confirm the predecessor id. List candidates with `yq '.artifacts | keys' <workspace>/workspace.yaml`. |
-| `--artifact`'s declaration name is not `kind: copy`. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git/incremental kinds are not amendable today. |
+| `--artifact`'s declaration name is not `kind: copy`. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git artifacts are not amendable today. |
 | `--from` path does not exist. | `FileNotFoundError`. | Confirm the source path. |
 | `--from` is a single file. | `ValueError("Artifact source must be a directory …")`. | Wrap it in a directory and pass that. |
 | The validator rejects the corrected bytes. | `flywheel.artifact_validator.ArtifactValidationError`. | Read the validator message, fix the source, retry. |

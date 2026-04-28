@@ -1,18 +1,17 @@
-"""Shared constants for the container runtime contract.
+"""Shared constants for Flywheel's container runtime contracts.
 
-The contract is specified in ``cyber-root/substrate-contract.md``
-(migrating to ``flywheel/docs/runtime-contract.md`` when the
-reshape lands).  This module is the single source of truth for
-the constants the contract names — paths, failure phases, stop
-timeouts.  Executors import them; block-side code inside a
-container should not depend on this module (it's flywheel-only).
+Normative behavior lives in ``docs/specs/``. This module is the
+single source of truth for the stable path, environment variable, and
+failure-phase strings those specs name. Executors import these
+constants; container-side project code should treat the string values
+as the public contract and should not import this module.
 """
 
 from __future__ import annotations
 
 from typing import Final
 
-# ── Filesystem conventions ──────────────────────────────────────
+# Filesystem conventions
 
 STATE_MOUNT_PATH: Final[str] = "/flywheel/state"
 """Container-side path where flywheel mounts state for blocks that
@@ -21,13 +20,6 @@ latest compatible state snapshot; captured after clean exit.  Lives
 under ``/flywheel/`` so every flywheel-owned mount is under a
 single namespace distinct from the block body's inputs/outputs."""
 
-FLYWHEEL_CONTROL_MOUNT: Final[str] = "/flywheel/control"
-"""Container-side path where agent-style blocks receive
-framework-owned control files (e.g. ``pending_tool_calls.json``,
-``agent_exit_state.json``, ``.agent_resume``).  Agent-specific —
-not written by the generic executor.  The agent launcher mounts
-a host tempdir here and reads any control files the block wrote
-after exit.  Not in the artifact graph."""
 
 FLYWHEEL_MCP_SERVERS_MOUNT: Final[str] = "/flywheel/mcp_servers"
 """Container-side path where projects mount MCP server code.

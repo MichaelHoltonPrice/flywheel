@@ -26,10 +26,9 @@ that did not come from a block execution:
 
 Do not use `import artifact` to:
 
-* register `git` or `incremental` artifacts. Only `copy`
-  declarations are importable; the others are populated by
-  workspace creation (`git` baselines) or by block execution
-  (`incremental` appends).
+* register `git` artifacts. Only `copy` declarations are importable;
+  git declarations are populated by workspace creation as pinned
+  baseline references.
 * "patch" an existing instance. Artifact instances are
   immutable; an import always creates a *new* instance with
   no recorded lineage to anything else. To register a
@@ -172,7 +171,7 @@ is consulted after every block execution.
 | `flywheel.yaml` missing or malformed at the cwd. | `FileNotFoundError` / `ValueError` from the project config loader. | Run from the project root. Confirm `flywheel.yaml` exists and declares `foundry_dir`. |
 | `--workspace` path does not contain a `workspace.yaml`. | `FileNotFoundError`. | Confirm the path. Create the workspace first if it doesn't exist. |
 | `--name` is not declared in the workspace's artifact declarations. | `ValueError("Artifact … not declared in this workspace")`. | Add the declaration to the template, or pick a declared name. Note: editing the template does not retroactively re-declare an existing workspace; create a new workspace from the updated template. |
-| `--name` is declared but not as `kind: copy`. | `ValueError("Only copy artifacts can be imported …")`. | Use the right kind for the source. Git artifacts are pulled from a clean working tree at workspace creation; incremental artifacts are appended by block executions. |
+| `--name` is declared but not as `kind: copy`. | `ValueError("Only copy artifacts can be imported …")`. | Use the right kind for the source. Git artifacts are pulled from a clean working tree at workspace creation. |
 | `--from` path does not exist. | `FileNotFoundError`. | Confirm the source path. Quote paths that contain spaces. |
 | `--from` path is a single file (or any non-directory). | `ValueError("Artifact source must be a directory …")`. | Wrap the file in a directory and pass that directory. |
 | `artifact_validators:` factory cannot be imported or returns the wrong type. | `ImportError` / `ValueError`. | Fix `flywheel.yaml`'s import path or the factory's return type. |

@@ -237,37 +237,36 @@ Runs are stored as `RunRecord` objects on the workspace. A run groups
 related block executions without adding run-specific fields to
 `BlockExecution`.
 
-The current pattern implementation is intentionally lean:
+The current pattern implementation executes a structured `do:` body.
+The supported body nodes are:
 
-* A pattern is an ordered list of steps.
-* Each step has one cohort.
-* Each cohort has members.
-* Each member is one canonical block execution.
-* Cohorts support `min_successes: all` and `min_successes: 1`.
-* A pattern may declare lanes, which are run-scoped artifact
-  resolution contexts.
-* Pattern fixtures materialize ordinary copy artifacts per lane at run
-  start.
-* Pattern parameters are resolved once at run start, recorded on the
-  `RunRecord`, and may be substituted into member environment values,
-  member args, and invocation route args.
-* Execution is sequential today, even when a cohort is semantically
-  parallel.
+* `cohort` steps, whose members are canonical block executions;
+* `foreach`, which creates lane cohorts and runs each lane body to
+  completion before moving to the next lane;
+* `use`, which expands a local sub-pattern with an explicit parameter
+  map;
+* `run_until`, which repeats one block until declared termination
+  reasons stop, fail, or exhaust the loop budget.
+
+Cohorts support `min_successes: all` and `min_successes: 1`. Pattern
+lanes are run-scoped artifact resolution contexts. Pattern fixtures
+materialize ordinary copy artifacts per lane at run start. Pattern
+parameters are resolved once at run start, recorded on the `RunRecord`,
+and may be substituted into member environment values, member args,
+`run_until` settings, and invocation route args.
 
 Pattern inputs can bind directly to an artifact id or to a prior
 member's output in the same run. Unbound copy inputs resolve to the
 latest artifact in the member's lane, not the latest workspace-global
-artifact by name. The pattern runner records fixture, member, lane, and
-step results on the `RunRecord`.
+artifact by name. Invocation-child outputs are visible to later members
+in the same lane. The pattern runner records fixture, member, lane, and
+step results on the `RunRecord`; `BlockExecution` remains unaware of
+runs and lanes.
 
 Ad hoc `flywheel run block` may also pass `--param KEY=VALUE`; those
 values are used only for `${params.KEY}` placeholders in invocation
 route args. Pattern-only member env/arg substitution remains a pattern
 surface.
-
-The resolver is separate from execution. It reads the current pattern
-and run prefix, chooses the next step, and does not mutate the
-workspace.
 
 ## Batteries
 
@@ -310,8 +309,8 @@ meaningful for ordinary block executions.
 Block invocation routes from a committed execution outcome to child
 block execution. Future work should add operator-facing inspection
 commands, decide whether pending tool calls from batteries need their
-own durable record, and rely on the pattern resolver for loops,
-limits, and conditional iteration.
+own durable record, and rely on pattern execution for loops, limits,
+and conditional iteration.
 
 ### Persistent Containers
 
@@ -324,9 +323,10 @@ directly.
 
 ### Pattern Expressiveness
 
-Extend patterns with loops, branching, nested patterns, richer
-`min_successes` policies, and scheduler controls. Preserve the
-distinction between semantic cohorts and scheduling concurrency.
+Extend patterns with branching, richer `min_successes` policies,
+scheduler controls, and additional loop forms if real workflows need
+them. Preserve the distinction between semantic cohorts and scheduling
+concurrency.
 
 ### Artifact Selection and Scope
 
@@ -335,11 +335,12 @@ inputs. Pattern execution uses run-scoped lane resolution instead.
 Future selection may need explicit policies such as best-scoring
 artifact, per-subclass defaults, or promotion between contexts.
 
-### Incremental Replacement
+### Artifact Indexing
 
-Replace incremental artifacts with tagged copy instances if that still
-fits real workflows. Tagged copy instances would make amendment,
-validation, quarantine, and concurrency uniform across artifact kinds.
+Artifact sequences now cover ordered histories. Future selection may
+still need unordered labels or tags for cases that are not naturally a
+sequence, but those should remain metadata over normal immutable
+artifact instances rather than a new storage kind.
 
 ### Commit-Pinned Git Mounts
 

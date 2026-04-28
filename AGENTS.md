@@ -62,9 +62,9 @@ one commit/finalization pass. The canonical path is in
 **Artifacts** have declarations and instances. Declarations live
 in templates. Instances live in workspaces and are immutable.
 Copy artifacts are directory-shaped. Git artifacts record a repo,
-commit, and path. Incremental artifacts still exist in code but
-are legacy-shaped and candidates for replacement by tagged copy
-instances.
+commit, and path. Ordered histories are represented by artifact
+sequences over immutable artifact instances, not by a separate
+storage kind.
 
 **State** is not an artifact. Artifacts model edges between block
 executions: one execution produces a named value that another may

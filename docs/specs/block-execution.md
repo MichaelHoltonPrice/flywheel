@@ -671,9 +671,13 @@ deliberately defers. They land in their own normative passes.
   [state.md](state.md). State is orthogonal to artifacts and belongs
   to execution lineages, not artifact bindings.
 * **Pattern control flow.** Invocation is specified in
-  [block-invocation.md](block-invocation.md), but loops, limits, and
-  conditional iteration belong to the pattern resolver.
-* **Tags** (replacing the older incremental-artifact concept).
+  [block-invocation.md](block-invocation.md). Loops, limits, failure
+  handling, and lane-scoped resolution belong to
+  [pattern-execution.md](pattern-execution.md).
+* **Artifact sequences and future tags.** Ordered histories are
+  specified in [artifact-sequences.md](artifact-sequences.md). If
+  unordered tags are needed later, they should be metadata over normal
+  immutable artifact instances.
 * **Patterns** and the pattern runner.
 * **Block groups** (parallel scheduling).
 * **Project hooks**, refactored to be runtime/executor-shaped rather

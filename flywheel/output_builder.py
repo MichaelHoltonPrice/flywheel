@@ -10,11 +10,10 @@ The separation matters: the container body is free to produce
 whatever human-readable intermediate content is natural for the
 agent inside it (e.g., two markdown files), while the builder
 collapses that content into the canonical artifact shape the
-consuming side expects (e.g., a one-line ``entries.jsonl`` for
-an ``incremental`` output slot).  Provenance fields that depend
-on workspace state — for instance, the current length of an
-incremental input — can be stamped here using host-side
-knowledge the container never had.
+consuming side expects (e.g., a normalized JSON manifest or a
+single summary file). Provenance fields that depend on workspace
+state can be stamped here using host-side knowledge the container
+never had.
 
 The builder mutates the per-execution output tempdir in place:
 it can write new files, rewrite existing ones, or leave the dir
@@ -23,10 +22,9 @@ same as any empty output dir).  Files the builder writes are
 picked up by the standard collection path as if the container
 had written them directly.
 
-The builder MUST NOT write outside the output tempdir.  The
-workspace is passed for read-only introspection (e.g., to
-compute an incremental input's entry count at build time).
-Mutating the workspace from inside a builder is unsupported and
+The builder MUST NOT write outside the output tempdir. The workspace
+is passed for read-only introspection. Mutating the workspace from
+inside a builder is unsupported and
 the workspace's durability guarantees do not cover it.
 """
 
@@ -57,11 +55,9 @@ class OutputBuilderContext:
             The builder may read from these directories and
             write new or replacement files within them.  Paths
             outside these dirs are not part of the contract.
-        workspace: The workspace the execution belongs to.
-            Passed for read-only introspection (e.g., computing
-            the length of an incremental input at build time).
-            Mutating the workspace from inside a builder is
-            unsupported.
+        workspace: The workspace the execution belongs to. Passed
+            for read-only introspection. Mutating the workspace from
+            inside a builder is unsupported.
     """
 
     block: str

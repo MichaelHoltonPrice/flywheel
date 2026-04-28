@@ -60,9 +60,9 @@ After the invoking execution commits successfully, Flywheel looks up routes for
 its committed `termination_reason`. Each child runs through canonical
 preparation, runtime, commit, validation, state capture, and ledger recording.
 
-For the first implementation, invoked children do not recursively dispatch
-their own `on_termination` routes. Iteration, retry limits, and conditional
-loops belong in the pattern resolver.
+Invoked children do not recursively dispatch their own `on_termination`
+routes. Iteration, retry limits, and conditional loops belong in pattern
+execution.
 
 All routes declared for a termination reason are attempted. A child failure is
 recorded on that route's `BlockInvocation` record and does not prevent sibling

@@ -1,4 +1,4 @@
-"""Tests for the shared runtime-contract constants.
+"""Tests for the shared runtime contract constants.
 
 These constants are the single source of truth for the paths and
 failure-phase identifiers named in the container runtime
@@ -17,13 +17,6 @@ class TestPathConstants:
         # Block authors look for this path; the executor mounts
         # there when a block declares ``state: managed``.
         assert runtime.STATE_MOUNT_PATH == "/flywheel/state"
-
-    def test_flywheel_control_mount(self):
-        # Agent-specific framework-owned control files; the agent
-        # launcher mounts a host tempdir here.
-        assert (
-            runtime.FLYWHEEL_CONTROL_MOUNT == "/flywheel/control"
-        )
 
     def test_flywheel_mcp_servers_mount(self):
         # Agent-specific MCP server code mount path.

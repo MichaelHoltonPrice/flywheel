@@ -28,7 +28,7 @@ from flywheel.workspace import Workspace
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
-    """Build a workspace with declared copy/incremental/git artifacts."""
+    """Build a workspace with declared copy and git artifacts."""
     ws_path = tmp_path / "ws"
     ws_path.mkdir()
     (ws_path / "artifacts").mkdir()
@@ -39,7 +39,6 @@ def workspace(tmp_path: Path) -> Workspace:
         created_at=datetime.now(UTC),
         artifact_declarations={
             "predictor": "copy",
-            "history": "incremental",
             "corpus": "git",
         },
         artifacts={},
@@ -119,22 +118,6 @@ class TestStageArtifactInstance:
         finally:
             cleanup_staged_inputs({"a": first, "b": second})
 
-    @pytest.mark.skip(reason="Incremental artifact kind has been excised")
-    def test_incremental_artifact_entries_file_is_copied(
-            self, workspace):
-        inst = workspace.register_incremental_artifact("history")
-        workspace.append_to_incremental(
-            inst.id, [{"step": 0}, {"step": 1}])
-        staged = stage_artifact_instance(workspace, inst)
-        try:
-            entries = staged / "entries.jsonl"
-            assert entries.is_file()
-            lines = entries.read_text().splitlines()
-            assert [json.loads(line) for line in lines] == [
-                {"step": 0}, {"step": 1}]
-        finally:
-            cleanup_staged_inputs({"slot": staged})
-
     def test_subdirectories_are_copied_recursively(
             self, workspace):
         aid = workspace.generate_artifact_id("predictor")
@@ -182,23 +165,6 @@ class TestStageArtifactInstance:
 
 class TestStageArtifactInstances:
     """Batch wrapper composes per-slot staging correctly."""
-
-    @pytest.mark.skip(reason="Incremental artifact kind has been excised")
-    def test_returns_one_path_per_slot(self, workspace):
-        a = _register_copy(workspace, "predictor", {"a.txt": "1"})
-        b = workspace.register_incremental_artifact("history")
-        workspace.append_to_incremental(b.id, [{"step": 0}])
-        staged = stage_artifact_instances(
-            workspace, {"predictor": a.id, "history": b.id})
-        try:
-            assert set(staged) == {"predictor", "history"}
-            assert (staged["predictor"] / "a.txt").read_text() == "1"
-            assert (
-                staged["history"] / "entries.jsonl"
-            ).read_text().strip() == json.dumps(
-                {"step": 0}, separators=(",", ":"))
-        finally:
-            cleanup_staged_inputs(staged)
 
     def test_unknown_artifact_id_is_skipped(self, workspace):
         staged = stage_artifact_instances(
