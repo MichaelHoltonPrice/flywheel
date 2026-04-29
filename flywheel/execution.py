@@ -48,7 +48,11 @@ from flywheel.artifact_validator import (
     ArtifactValidatorRegistry,
 )
 from flywheel.container import ContainerConfig, ContainerResult, run_container
-from flywheel.invocation import dispatch_invocations
+from flywheel.invocation import (
+    DEFAULT_MAX_INVOCATION_DEPTH,
+    InvocationChain,
+    dispatch_invocations,
+)
 from flywheel.persistent_runtime import (
     DockerHttpPersistentRuntimeRunner,
     PersistentRuntimeResult,
@@ -1540,6 +1544,8 @@ def run_block(
     env_overlay: dict[str, str] | None = None,
     invocation_params: dict[str, object] | None = None,
     run_context: RunContext | None = None,
+    invocation_chain: InvocationChain | None = None,
+    max_invocation_depth: int = DEFAULT_MAX_INVOCATION_DEPTH,
 ) -> BlockRunResult:
     """Execute a block within a workspace.
 
@@ -1572,8 +1578,8 @@ def run_block(
             if this execution was invoked by another block.
         dispatch_child_invocations: Whether to fire routes declared
             for this block's committed termination reason before
-            returning.  Invoked children disable this in v1 so
-            iteration remains a pattern-level concern.
+            returning. Recursive dispatch is guarded by
+            invocation_chain and max_invocation_depth.
         allow_workspace_latest: Whether unbound copy inputs may fall
             back to the workspace-global latest instance. Pattern
             execution disables this so lane-scoped resolution cannot
@@ -1584,6 +1590,10 @@ def run_block(
             substitute invocation route args for child executions.
         run_context: Optional pattern run/lane context used to
             resolve sequence scope policies.
+        invocation_chain: Runtime guard state for recursive route
+            dispatch. Callers normally leave this unset.
+        max_invocation_depth: Maximum committed parent executions
+            allowed in one recursive invocation chain.
 
     Returns:
         A BlockRunResult with the ledger execution and raw
@@ -1750,6 +1760,13 @@ def run_block(
         )
     execution = workspace.executions[plan.execution_id]
     if dispatch_child_invocations:
+        dispatch_chain = invocation_chain or InvocationChain.empty()
+        if execution.termination_reason is not None:
+            dispatch_chain = dispatch_chain.extend(
+                block_name=block_def.name,
+                termination_reason=execution.termination_reason,
+                execution_id=execution.id,
+            )
         dispatch_invocations(
             workspace=workspace,
             template=template,
@@ -1760,6 +1777,8 @@ def run_block(
             state_validator_registry=state_validator_registry,
             params=invocation_params or {},
             run_context=run_context,
+            invocation_chain=dispatch_chain,
+            max_invocation_depth=max_invocation_depth,
         )
     return BlockRunResult(
         execution_id=plan.execution_id,
