@@ -21,9 +21,20 @@ ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
 ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
 ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
 
-# Install the Agents SDK, HTTP client, MCP support, and common
-# image-rendering dependencies used by agent-side tools.
-RUN pip install claude-agent-sdk httpx mcp Pillow numpy
+# Install the Agents SDK, HTTP client, MCP support, and a compact
+# Python analysis stack used by agent-side tools for structured
+# inputs such as grids, JSON histories, images, and tables.  Keep this
+# aligned with the Codex battery so project prompts can make the same
+# local Python promises across Claude and Codex agent containers.
+RUN pip install \
+    claude-agent-sdk \
+    httpx \
+    mcp \
+    numpy \
+    pandas \
+    Pillow \
+    scipy \
+    scikit-image
 
 # Copy the agent runner.  Project-specific MCP servers are
 # mounted at runtime.
