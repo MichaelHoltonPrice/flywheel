@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,6 +22,7 @@ from flywheel.pattern_declaration import (
     PatternStep,
     PatternUse,
     PriorOutputBinding,
+    ResumePromptBuilder,
 )
 from flywheel.pattern_lanes import DEFAULT_LANE
 from flywheel.pattern_params import (
@@ -50,6 +53,16 @@ class PatternRunResult:
 
     run_id: str
     status: Literal["succeeded", "failed"]
+
+
+@dataclass(frozen=True)
+class ResumeTransitionContext:
+    """Context passed to project resume-prompt builders."""
+
+    previous_member: RunMemberRecord
+    termination_reason: str
+    reason_count: int | None = None
+    after_every: list[dict] | None = None
 
 
 def _reopen_pattern_run(
@@ -381,6 +394,7 @@ def _execute_run_until(
     iteration = 0
     step_name = _generated_step_name([*step_prefix, node.name])
     step: RunStepRecord | None = None
+    resume_transition: ResumeTransitionContext | None = None
     if resume:
         existing = _existing_run_step(workspace, run_id, step_name)
         if existing is not None:
@@ -397,6 +411,14 @@ def _execute_run_until(
             step = existing
             iteration = len(existing.members)
             reason_counts.update(existing.reason_counts)
+            resume_transition = _resume_transition_from_existing_step(
+                workspace,
+                run_id,
+                node,
+                step_prefix,
+                after_every,
+                existing,
+            )
             if existing.stop_kind == "stop_on":
                 return
             if existing.stop_kind == "budget_exhausted":
@@ -413,6 +435,18 @@ def _execute_run_until(
             args=list(node.args),
             env=dict(node.env),
         )
+        resume_prompt_override = _run_until_resume_prompt(
+            workspace,
+            node,
+            template,
+            project_root,
+            pattern_name=pattern.name,
+            run_id=run_id,
+            lane_name=lane_name,
+            iteration=iteration,
+            transition=resume_transition,
+            params=params,
+        )
         result = _execute_member(
             workspace,
             member,
@@ -424,6 +458,7 @@ def _execute_run_until(
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
             params=params,
+            resume_prompt_override=resume_prompt_override,
         )
         members = [*step.members, result] if step is not None else [result]
         step = RunStepRecord(
@@ -493,7 +528,7 @@ def _execute_run_until(
                 terminal_reason=None,
                 reason_counts=reason_counts,
             )
-            _execute_due_after_every(
+            after_context = _execute_due_after_every(
                 workspace,
                 after_every,
                 pattern_node=node,
@@ -509,6 +544,12 @@ def _execute_run_until(
                 reason=reason,
                 reason_count=reason_counts[reason],
                 resume=resume,
+            )
+            resume_transition = ResumeTransitionContext(
+                previous_member=result,
+                termination_reason=reason,
+                reason_count=reason_counts[reason],
+                after_every=after_context,
             )
             if reason_counts[reason] >= budgets[reason]:
                 _finish_run_until_step(
@@ -561,6 +602,249 @@ def _finish_run_until_step(
     return updated
 
 
+def _resume_transition_from_existing_step(
+    workspace: Workspace,
+    run_id: str,
+    node: PatternRunUntil,
+    step_prefix: list[str],
+    after_every: list[tuple[PatternAfterEvery, int]],
+    step: RunStepRecord,
+) -> ResumeTransitionContext | None:
+    if not step.members:
+        return None
+    previous_member = step.members[-1]
+    if previous_member.execution_id is None:
+        return None
+    execution = workspace.executions.get(previous_member.execution_id)
+    if execution is None or execution.termination_reason is None:
+        return None
+    reason = execution.termination_reason
+    reason_count = step.reason_counts.get(reason)
+    return ResumeTransitionContext(
+        previous_member=previous_member,
+        termination_reason=reason,
+        reason_count=reason_count,
+        after_every=_existing_after_every_context(
+            workspace,
+            run_id,
+            node,
+            step_prefix,
+            after_every,
+            reason=reason,
+            reason_count=reason_count,
+        ),
+    )
+
+
+def _existing_after_every_context(
+    workspace: Workspace,
+    run_id: str,
+    node: PatternRunUntil,
+    step_prefix: list[str],
+    after_every: list[tuple[PatternAfterEvery, int]],
+    *,
+    reason: str,
+    reason_count: int | None,
+) -> list[dict]:
+    if reason_count is None:
+        return []
+    run = workspace.runs[run_id]
+    contexts: list[dict] = []
+    for trigger, count in after_every:
+        if trigger.reason != reason:
+            continue
+        if reason_count % count != 0:
+            continue
+        occurrence = reason_count // count
+        prefix = _generated_step_name([
+            *step_prefix,
+            node.name,
+            f"after_{reason}_{count}_{occurrence}",
+        ])
+        steps = [
+            step for step in run.steps
+            if step.name == prefix or step.name.startswith(f"{prefix}__")
+        ]
+        if not steps:
+            continue
+        contexts.append({
+            "reason": reason,
+            "count": count,
+            "occurrence": occurrence,
+            "steps": [_run_step_context(step) for step in steps],
+        })
+    return contexts
+
+
+def _run_until_resume_prompt(
+    workspace: Workspace,
+    node: PatternRunUntil,
+    template: Template,
+    project_root: Path,
+    *,
+    pattern_name: str,
+    run_id: str,
+    lane_name: str,
+    iteration: int,
+    transition: ResumeTransitionContext | None,
+    params: dict[str, object],
+) -> str | None:
+    """Build a project-owned resume prompt for a repeated block."""
+    if iteration <= 1 or node.resume_prompt_builder is None:
+        return None
+    context = _resume_builder_context(
+        workspace,
+        node,
+        template,
+        pattern_name=pattern_name,
+        run_id=run_id,
+        lane_name=lane_name,
+        iteration=iteration,
+        transition=transition,
+    )
+    return _run_resume_prompt_builder(
+        node.resume_prompt_builder,
+        context,
+        project_root=project_root,
+        params=params,
+    )
+
+
+def _resume_builder_context(
+    workspace: Workspace,
+    node: PatternRunUntil,
+    template: Template,
+    *,
+    pattern_name: str,
+    run_id: str,
+    lane_name: str,
+    iteration: int,
+    transition: ResumeTransitionContext | None,
+) -> dict:
+    block = _block_definition(template, node.block)
+    current_inputs: dict[str, dict] = {}
+    for slot in block.inputs:
+        slot_info: dict[str, object] = {
+            "path": slot.container_path,
+            "optional": slot.optional,
+        }
+        if slot.sequence is not None:
+            slot_info["sequence"] = {
+                "name": slot.sequence.name,
+                "scope": slot.sequence.scope,
+            }
+        current_inputs[slot.name] = slot_info
+    payload: dict[str, object] = {
+        "pattern": pattern_name,
+        "run_id": run_id,
+        "lane": lane_name,
+        "run_until": node.name,
+        "block": node.block,
+        "iteration": iteration,
+        "current_inputs": current_inputs,
+    }
+    if transition is not None:
+        payload["transition"] = {
+            "termination_reason": transition.termination_reason,
+            "reason_count": transition.reason_count,
+            "previous_member": _run_member_context(
+                workspace, transition.previous_member),
+            "after_every": transition.after_every or [],
+        }
+    return payload
+
+
+def _run_resume_prompt_builder(
+    builder: ResumePromptBuilder,
+    context: dict,
+    *,
+    project_root: Path,
+    params: dict[str, object],
+) -> str | None:
+    command = [
+        substitute_params(part, params)
+        for part in builder.command
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=json.dumps(context, indent=2, sort_keys=True),
+            text=True,
+            capture_output=True,
+            cwd=project_root,
+            timeout=30,
+            check=False,
+        )
+    except OSError as exc:
+        raise PatternRunError(
+            "resume_prompt_builder could not be launched: "
+            f"{command!r}: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PatternRunError(
+            "resume_prompt_builder timed out after 30 seconds: "
+            f"{command!r}"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise PatternRunError(
+            "resume_prompt_builder failed with exit code "
+            f"{result.returncode}: {detail}"
+        )
+    prompt = result.stdout.strip()
+    return prompt or None
+
+
+def _run_step_context(step: RunStepRecord) -> dict:
+    return {
+        "name": step.name,
+        "kind": step.kind,
+        "status": step.status,
+        "members": [
+            _run_member_context(None, member)
+            for member in step.members
+        ],
+    }
+
+
+def _run_member_context(
+    workspace: Workspace | None,
+    member: RunMemberRecord,
+) -> dict:
+    payload = {
+        "name": member.name,
+        "block": member.block_name,
+        "status": member.status,
+        "lane": member.lane,
+        "execution_id": member.execution_id,
+        "output_bindings": dict(member.output_bindings),
+        "invocation_ids": list(member.invocation_ids),
+    }
+    if member.error is not None:
+        payload["error"] = member.error
+    if workspace is not None and member.invocation_ids:
+        invocations = []
+        for invocation_id in member.invocation_ids:
+            invocation = workspace.invocations.get(invocation_id)
+            if invocation is None:
+                continue
+            execution = workspace.executions.get(invocation.invoked_execution_id)
+            invocations.append({
+                "invocation_id": invocation_id,
+                "block": invocation.invoked_block_name,
+                "execution_id": invocation.invoked_execution_id,
+                "termination_reason": (
+                    execution.termination_reason if execution else None
+                ),
+                "status": execution.status if execution else None,
+                "output_bindings": (
+                    dict(execution.output_bindings) if execution else {}
+                ),
+            })
+        payload["invocations"] = invocations
+    return payload
+
+
 def _execute_due_after_every(
     workspace: Workspace,
     after_every: list[tuple[PatternAfterEvery, int]],
@@ -578,13 +862,17 @@ def _execute_due_after_every(
     reason: str,
     reason_count: int,
     resume: bool,
-) -> None:
+) -> list[dict]:
+    triggered: list[dict] = []
     for trigger, count in after_every:
         if trigger.reason != reason:
             continue
         if reason_count % count != 0:
             continue
         occurrence = reason_count // count
+        before_steps = {
+            step.name for step in workspace.runs[run_id].steps
+        }
         _execute_body(
             workspace,
             trigger.body,
@@ -603,6 +891,18 @@ def _execute_due_after_every(
             params=params,
             resume=resume,
         )
+        new_steps = [
+            step
+            for step in workspace.runs[run_id].steps
+            if step.name not in before_steps
+        ]
+        triggered.append({
+            "reason": trigger.reason,
+            "count": count,
+            "occurrence": occurrence,
+            "steps": [_run_step_context(step) for step in new_steps],
+        })
+    return triggered
 
 
 def _resolve_positive_int(
@@ -706,6 +1006,7 @@ def _execute_member(
     validator_registry: ArtifactValidatorRegistry | None,
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
+    resume_prompt_override: str | None = None,
 ) -> RunMemberRecord:
     try:
         input_bindings = _resolve_member_inputs(
@@ -720,7 +1021,7 @@ def _execute_member(
             key: substitute_params(value, params)
             for key, value in member.env.items()
         }
-        resume_prompt = _build_resume_prompt(
+        resume_prompt = resume_prompt_override or _build_resume_prompt(
             workspace,
             template,
             member.block,
@@ -906,6 +1207,18 @@ def _collect_body_param_references(
                 env=dict(node.env),
             )
             _check_member_param_references(member, check=check)
+            if node.resume_prompt_builder is not None:
+                for index, part in enumerate(
+                    node.resume_prompt_builder.command
+                ):
+                    check(
+                        part,
+                        (
+                            f"run_until {node.name!r} "
+                            "resume_prompt_builder.command"
+                            f"[{index}]"
+                        ),
+                    )
             for reason, budget in node.continue_on.items():
                 if isinstance(budget.max, str):
                     check(

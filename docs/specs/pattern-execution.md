@@ -368,6 +368,38 @@ structured body may omit `name`; if a nameless cohort has one member,
 Flywheel uses that member name for the generated step name, otherwise
 it uses a stable `cohort_N` name.
 
+`run_until.resume_prompt_builder` lets a project own the prompt used
+when the loop launches the same block again after the first iteration:
+
+```yaml
+run_until:
+  name: play
+  block: PlayAgent
+  resume_prompt_builder:
+    command:
+      - python
+      - workforce/resume_prompt.py
+      - play
+```
+
+The builder command runs from the project root. Pattern params may be
+referenced in command strings with `${params.name}`. Flywheel writes a
+JSON context document to the command's stdin and uses stdout, stripped
+of surrounding whitespace, as `FLYWHEEL_RESUME_PROMPT` for the next
+block execution. Empty stdout falls back to the default generic resume
+prompt. A nonzero exit, launch failure, or timeout fails the pattern.
+
+The context is intentionally structural rather than artifact-semantic.
+It includes the pattern name, run id, current lane, `run_until` name,
+block name, next iteration number, declared current input slots, and
+the previous edge transition when one is known. The transition includes
+the previous member, its termination reason, the counted reason value,
+and any `after_every` steps that just ran. When a pattern run is later
+continued with `flywheel run pattern ... --resume`, Flywheel
+reconstructs this transition from the existing run record so the same
+callback can still distinguish, for example, a plain action edge from
+an edge that just ran a periodic brainstorm body.
+
 ## Input Resolution
 
 Pattern members may bind an input slot from:
