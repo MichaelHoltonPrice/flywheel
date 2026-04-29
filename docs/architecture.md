@@ -273,19 +273,24 @@ surface.
 Batteries are solve-once capabilities bundled with Flywheel for reuse.
 They are above the substrate.
 
-The bundled Claude battery currently includes:
+The bundled agent batteries currently include:
 
 * `batteries/claude/Dockerfile.claude`;
 * `batteries/claude/entrypoint.sh`;
 * `batteries/claude/agent_runner.py`;
-* `examples/hello-agent/`.
+* `batteries/codex/Dockerfile.codex`;
+* `batteries/codex/entrypoint.sh`;
+* `batteries/codex/agent_runner.py`;
+* `examples/hello-agent/`;
+* `examples/hello-codex/`.
 
-Projects invoke the battery as an ordinary block by declaring a block
-that uses a project image derived from the Claude battery. Prompt bytes
+Projects invoke a battery as an ordinary block by declaring a block that
+uses a project image derived from the chosen battery image. Prompt bytes
 belong to that derived image's agent workflow definition, not to the
-workspace artifact graph. Auth and other launch details live in the
-block declaration, and durable outputs remain ordinary block execution
-records, artifact instances, and state snapshots.
+workspace artifact graph. Auth, model policy, compaction policy, and
+other launch details live in the block declaration, and durable outputs
+remain ordinary block execution records, artifact instances, and state
+snapshots.
 
 If an agent block needs another block to run next, it announces a
 project termination reason whose block declaration routes to the child.
@@ -297,9 +302,9 @@ Richer battery selection is deferred.
 
 ### Battery Boundaries
 
-Continue moving Claude-specific conventions into `batteries/claude/`
-and battery-provided templates. Batteries should be invoked through
-ordinary `flywheel run block` execution.
+Keep agent-specific conventions inside their battery directories and
+battery-provided templates. Batteries should be invoked through ordinary
+`flywheel run block` execution.
 
 Do not add agent-shaped fields to `BlockExecution` unless the field is
 meaningful for ordinary block executions.

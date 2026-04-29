@@ -89,17 +89,18 @@ currently sequential even when the cohort is semantically parallel.
 Batteries are reusable project-style capabilities bundled with
 Flywheel. They are not substrate abstractions.
 
-The current bundled battery is `batteries/claude/`: a Dockerfile,
-entrypoint, and Claude SDK runner that can be used as a block
-image. Projects invoke it as an ordinary block by declaring a block
-that uses the battery image, mounts the prompt as a normal input
-artifact, and sets any needed env or Docker arguments in the block
-declaration. Artifact finalization, state snapshots, validation,
-quarantine, and `BlockExecution` records are not battery-owned.
+The current bundled agent batteries are `batteries/claude/` and
+`batteries/codex/`: Dockerfiles, entrypoints, and agent runners that
+can be used as block images. Projects invoke them as ordinary blocks
+by declaring a block that uses a derived battery image, bakes or mounts
+the project prompt into the image's documented prompt path, and sets
+any needed env or Docker arguments in the block declaration. Artifact
+finalization, state snapshots, validation, quarantine, and
+`BlockExecution` records are not battery-owned.
 
 Important boundary:
 
-* Core block execution must not grow Claude-, MCP-, prompt-, or
+* Core block execution must not grow Claude-, Codex-, MCP-, prompt-, or
   handoff-shaped schema fields.
 * Batteries may provide images, entrypoints, runners, validators,
   examples, and CLI conveniences.
@@ -149,3 +150,5 @@ before considering work complete.
   contract.
 * [examples/hello-agent](examples/hello-agent/) - minimal bundled
   Claude battery example.
+* [examples/hello-codex](examples/hello-codex/) - minimal bundled
+  Codex battery example.

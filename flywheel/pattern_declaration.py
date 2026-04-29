@@ -110,6 +110,13 @@ class PatternAfterEvery:
 
 
 @dataclass(frozen=True)
+class ResumePromptBuilder:
+    """Project command that builds a resume prompt for a loop edge."""
+
+    command: list[str]
+
+
+@dataclass(frozen=True)
 class PatternRunUntil:
     """Repeatedly run one block until a termination reason stops it."""
 
@@ -122,6 +129,7 @@ class PatternRunUntil:
     stop_on: list[str] = field(default_factory=list)
     fail_on: list[str] = field(default_factory=list)
     after_every: list[PatternAfterEvery] = field(default_factory=list)
+    resume_prompt_builder: ResumePromptBuilder | None = None
 
 
 PatternNode = PatternStep | PatternForEach | PatternUse | PatternRunUntil
@@ -534,7 +542,7 @@ def _parse_run_until_node(
         )
     unknown = set(raw) - {
         "name", "block", "inputs", "args", "env", "continue_on", "stop_on",
-        "fail_on", "after_every",
+        "fail_on", "after_every", "resume_prompt_builder",
     }
     if unknown:
         raise ValueError(
@@ -592,7 +600,46 @@ def _parse_run_until_node(
             pattern_name=pattern_name,
             node_name=name,
         ),
+        resume_prompt_builder=_parse_resume_prompt_builder(
+            raw.get("resume_prompt_builder"),
+            pattern_name=pattern_name,
+            node_name=name,
+        ),
     )
+
+
+def _parse_resume_prompt_builder(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> ResumePromptBuilder | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'resume_prompt_builder' must be a mapping"
+        )
+    unknown = set(raw) - {"command"}
+    if unknown:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            f"resume_prompt_builder has unknown key(s) "
+            f"{sorted(unknown)!r}"
+        )
+    command = raw.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(item, str) and item for item in command)
+    ):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "resume_prompt_builder.command must be a non-empty list "
+            "of strings"
+        )
+    return ResumePromptBuilder(command=list(command))
 
 
 def _parse_after_every(

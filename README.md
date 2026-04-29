@@ -41,13 +41,14 @@ start at [AGENTS.md](AGENTS.md). Design rationale is in
 
 Versioned examples live under [examples/](examples/). Start with
 [examples/hello-agent](examples/hello-agent/), a smoke test for the
-Flywheel-provided Claude battery image and managed state
-restore/capture. The example invokes the battery as an ordinary block
-with `flywheel run block`.
+Flywheel-provided Claude battery image, or
+[examples/hello-codex](examples/hello-codex/), the parallel Codex CLI
+battery example. Both invoke a battery as an ordinary block with
+`flywheel run block`.
 
 Reusable battery images live under [batteries/](batteries/). The
-Claude battery provides a managed-state agent container. The desktop
-battery provides an agent-agnostic virtual desktop service with
+Claude and Codex batteries provide managed-state agent containers. The
+desktop battery provides an agent-agnostic virtual desktop service with
 screenshot/input APIs; projects derive from it and wire controller
 blocks to it through project Docker networking.
 

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+import sys
 from unittest.mock import patch
 
 from flywheel.artifact_validator import ArtifactValidatorRegistry
@@ -685,6 +686,43 @@ def test_unknown_invocation_route_param_reference_fails_before_run(
     assert Workspace.load(workspace.path).runs == {}
 
 
+def test_unknown_resume_prompt_builder_param_reference_fails_before_run(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "bad_resume_builder",
+        "params": {
+            "script": {"type": "string", "default": "resume.py"},
+        },
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "resume_prompt_builder": {
+                        "command": ["python", "${params.scirpt}"],
+                    },
+                    "continue_on": {"eval_requested": {"max": 3}},
+                    "stop_on": ["normal"],
+                },
+            }
+        ],
+    })
+
+    try:
+        run_pattern(workspace, pattern, template, project_root)
+    except ValueError as exc:
+        assert "unknown param" in str(exc)
+        assert "scirpt" in str(exc)
+        assert "resume_prompt_builder.command" in str(exc)
+    else:
+        raise AssertionError("expected resume builder param failure")
+
+    assert Workspace.load(workspace.path).runs == {}
+
+
 def test_unknown_pattern_param_override_is_rejected(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(
         tmp_path, PARAM_INVOCATION_TEMPLATE_YAML)
@@ -1299,6 +1337,16 @@ blocks:
 """
     project_root, template, workspace = _setup_workspace(
         tmp_path, template_yaml)
+    callback = project_root / "resume_prompt.py"
+    callback.write_text(
+        "import json, sys\n"
+        "ctx = json.load(sys.stdin)\n"
+        "if ctx.get('transition', {}).get('after_every'):\n"
+        "    print('after brainstorm')\n"
+        "else:\n"
+        "    print('after action')\n",
+        encoding="utf-8",
+    )
     pattern = parse_pattern_declaration({
         "name": "resume_loop",
         "params": {
@@ -1316,6 +1364,9 @@ blocks:
                 "run_until": {
                     "name": "improve",
                     "block": "ImproveBot",
+                    "resume_prompt_builder": {
+                        "command": [sys.executable, str(callback)],
+                    },
                     "continue_on": {"tick": {"max": "${params.max}"}},
                     "stop_on": ["normal"],
                     "after_every": [
@@ -1342,6 +1393,7 @@ blocks:
     })
     calls: list[str] = []
     improve_inputs: list[str] = []
+    resume_prompts: list[str | None] = []
 
     def fake_container(config, args=None):
         del args
@@ -1359,6 +1411,7 @@ blocks:
             return ContainerResult(exit_code=0, elapsed_s=0.1)
         if config.image == "improve:latest":
             calls.append("improve")
+            resume_prompts.append(config.env.get("FLYWHEEL_RESUME_PROMPT"))
             source = (mounts["/input/bot"] / "bot.txt").read_text()
             improve_inputs.append(source)
             next_text = f"{source}->{len(improve_inputs)}"
@@ -1409,6 +1462,13 @@ blocks:
         "BASE->1->2",
         "BASE->1->2->3",
     ]
+    assert resume_prompts[0] is not None
+    assert resume_prompts[0].startswith("Continue the original task.")
+    assert resume_prompts[1:] == [
+        "after action",
+        "after brainstorm",
+        "after action",
+    ]
     assert [step.name for step in run.steps] == [
         "boot",
         "improve",
@@ -1449,6 +1509,16 @@ def test_run_until_after_every_runs_after_invocation_before_next_iteration(
 ):
     project_root, template, workspace = _setup_workspace(
         tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    callback = project_root / "resume_prompt.py"
+    callback.write_text(
+        "import json, sys\n"
+        "ctx = json.load(sys.stdin)\n"
+        "if ctx.get('transition', {}).get('after_every'):\n"
+        "    print('after brainstorm')\n"
+        "else:\n"
+        "    print('after action')\n",
+        encoding="utf-8",
+    )
     fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
     fixture_bot.mkdir(parents=True)
     (fixture_bot / "bot.py").write_text("BASE")
@@ -1463,6 +1533,9 @@ def test_run_until_after_every_runs_after_invocation_before_next_iteration(
                 "run_until": {
                     "name": "improve",
                     "block": "ImproveBot",
+                    "resume_prompt_builder": {
+                        "command": [sys.executable, str(callback)],
+                    },
                     "continue_on": {"eval_requested": {"max": 3}},
                     "stop_on": ["normal"],
                     "after_every": [
@@ -1489,6 +1562,7 @@ def test_run_until_after_every_runs_after_invocation_before_next_iteration(
     })
     order: list[str] = []
     brainstorm_scores: list[str] = []
+    resume_prompts: list[str | None] = []
 
     def fake_container(config, args=None):
         del args
@@ -1498,6 +1572,7 @@ def test_run_until_after_every_runs_after_invocation_before_next_iteration(
         }
         if config.image == "improve:latest":
             order.append("improve")
+            resume_prompts.append(config.env.get("FLYWHEEL_RESUME_PROMPT"))
             source = (mounts["/input/bot"] / "bot.py").read_text()
             output = mounts["/output/bot"] / "bot.py"
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -1537,6 +1612,9 @@ def test_run_until_after_every_runs_after_invocation_before_next_iteration(
         "brainstorm",
         "improve", "eval",
     ]
+    assert resume_prompts[0] is not None
+    assert resume_prompts[0].startswith("Continue the original task.")
+    assert resume_prompts[1:] == ["after action", "after brainstorm"]
     assert brainstorm_scores == ["score:BASE->1->3"]
     assert [step.kind for step in run.steps] == ["run_until", "cohort"]
     assert run.steps[1].name == (
