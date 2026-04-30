@@ -246,6 +246,39 @@ on_termination:
         assert route.block == "eval"
         assert route.bind["bot"].parent_output == "bot"
 
+    def test_parses_required_expected_termination_reasons(
+        self, tmp_path: Path,
+    ):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            required: true
+            expected_termination_reasons:
+              - normal
+            bind:
+              bot: bot""")
+        template = _from_yaml_with_inline_blocks(path)
+        route = template.blocks[0].on_termination["eval_requested"][0]
+        assert route.required is True
+        assert route.expected_termination_reasons == ("normal",)
+
+    def test_rejects_unknown_expected_termination_reason(
+        self, tmp_path: Path,
+    ):
+        path = self._write(tmp_path, """\
+on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            expected_termination_reasons:
+              - missing
+            bind:
+              bot: bot""")
+        with pytest.raises(ValueError, match="expects child"):
+            _from_yaml_with_inline_blocks(path)
+
     def test_rejects_route_for_undeclared_reason(self, tmp_path: Path):
         path = self._write(tmp_path, """\
 on_termination:

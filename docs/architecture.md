@@ -312,10 +312,14 @@ meaningful for ordinary block executions.
 ### Block Invocation
 
 Block invocation routes from a committed execution outcome to child
-block execution. Future work should add operator-facing inspection
-commands, decide whether pending tool calls from batteries need their
-own durable record, and rely on pattern execution for loops, limits,
-and conditional iteration.
+block execution. Routes dispatch recursively by default, through the
+same canonical block execution path, with a runtime depth limit and
+cycle guard. A descendant failure is recorded on that descendant's
+execution and the invocation that launched it; ancestors are not
+rewritten after they have committed. Future work should add
+operator-facing inspection commands, decide whether pending tool calls
+from batteries need their own durable record, and rely on pattern
+execution for loops, limits, and conditional iteration.
 
 ### Persistent Containers
 

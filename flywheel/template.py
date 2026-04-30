@@ -94,6 +94,8 @@ class InvocationDeclaration:
     block: str
     bind: dict[str, InvocationBinding] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+    required: bool = False
+    expected_termination_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -409,6 +411,8 @@ _INVOCATION_ROUTE_KEYS: frozenset[str] = frozenset({
     "block",
     "bind",
     "args",
+    "required",
+    "expected_termination_reasons",
 })
 
 _INVOCATION_BINDING_KEYS: frozenset[str] = frozenset({
@@ -750,10 +754,34 @@ def _parse_invocation_route(
             f"invoke route to {child_block!r}: 'args' must be a "
             "list of strings"
         )
+    required = entry.get("required", False)
+    if not isinstance(required, bool):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: 'required' must be a "
+            "boolean"
+        )
+    raw_expected = entry.get("expected_termination_reasons", [])
+    if (
+        not isinstance(raw_expected, list)
+        or not all(isinstance(item, str) and item.strip()
+                   for item in raw_expected)
+    ):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: "
+            "'expected_termination_reasons' must be a list of "
+            "non-empty strings"
+        )
+    expected_termination_reasons = tuple(raw_expected)
+    for expected_reason in expected_termination_reasons:
+        _validate_name(expected_reason, "Termination reason")
     return InvocationDeclaration(
         block=child_block,
         bind=bind,
         args=list(args),
+        required=required,
+        expected_termination_reasons=expected_termination_reasons,
     )
 
 
@@ -1058,6 +1086,15 @@ def _validate_invocations(blocks: list[BlockDefinition], template_label: str) ->
                         f"{child.name!r}; invocation routes do not yet "
                         "declare child state lineage keys"
                     )
+                for expected_reason in invocation.expected_termination_reasons:
+                    if expected_reason not in child.outputs:
+                        raise ValueError(
+                            f"Block {block.name!r} "
+                            f"on_termination[{reason!r}] expects child "
+                            f"block {child.name!r} termination reason "
+                            f"{expected_reason!r}, but that reason is "
+                            "not declared under child outputs"
+                        )
                 child_inputs = {slot.name for slot in child.inputs}
                 for child_input, binding in invocation.bind.items():
                     if child_input not in child_inputs:

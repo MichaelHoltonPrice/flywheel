@@ -306,7 +306,13 @@ class BlockExecution:
 
 @dataclass(frozen=True)
 class BlockInvocation:
-    """A durable link from one execution to an invoked execution."""
+    """A durable link from one execution to an invoked execution.
+
+    Recursive invocation records are written after the invoked child
+    returns, so a deep child invocation may appear in insertion order
+    before the parent invocation that launched its parent. Use
+    ``invoking_execution_id`` to reconstruct the tree.
+    """
 
     id: str
     invoking_execution_id: str

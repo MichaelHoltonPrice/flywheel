@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
-from pathlib import Path
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 from flywheel.artifact_validator import ArtifactValidatorRegistry
@@ -71,6 +71,41 @@ blocks:
       normal:
         - name: score
           container_path: /output/score
+"""
+
+REQUIRED_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            required: true
+            expected_termination_reasons:
+              - normal
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+      rejected: []
 """
 
 LANE_TEMPLATE_YAML = """\
@@ -150,6 +185,127 @@ blocks:
     inputs:
       - name: score
         container_path: /input/score
+    outputs:
+      normal:
+        - name: bot
+          container_path: /output/bot
+"""
+
+NESTED_INVOCATION_OUTPUT_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: candidate_score
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: candidate_score
+          container_path: /output/candidate_score
+    on_termination:
+      normal:
+        invoke:
+          - block: validate_score
+            bind:
+              candidate_score: candidate_score
+  - name: validate_score
+    image: validate-score:latest
+    inputs:
+      - name: candidate_score
+        container_path: /input/candidate_score
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+  - name: consume_score
+    image: consume-score:latest
+    inputs:
+      - name: score
+        container_path: /input/score
+    outputs:
+      normal:
+        - name: bot
+          container_path: /output/bot
+"""
+
+FAILED_GRANDCHILD_OUTPUT_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: candidate_score
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: candidate_score
+          container_path: /output/candidate_score
+    on_termination:
+      normal:
+        invoke:
+          - block: validate_score
+            bind:
+              candidate_score: candidate_score
+  - name: validate_score
+    image: validate-score:latest
+    inputs:
+      - name: candidate_score
+        container_path: /input/candidate_score
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+  - name: consume_score
+    image: consume-score:latest
+    inputs:
+      - name: score
+        container_path: /input/score
+        optional: true
     outputs:
       normal:
         - name: bot
@@ -1090,6 +1246,187 @@ def test_invocation_child_output_feeds_next_step_in_lane(tmp_path: Path):
         child_execution.output_bindings["score"])
 
 
+def test_nested_invocation_output_feeds_next_step_in_lane(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, NESTED_INVOCATION_OUTPUT_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "nested_invocation_lane",
+        "lanes": ["A"],
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "name": "agent",
+                "cohort": {
+                    "foreach": "lanes",
+                    "block": "agent",
+                },
+            },
+            {
+                "name": "consume",
+                "cohort": {
+                    "foreach": "lanes",
+                    "block": "consume_score",
+                },
+            },
+        ],
+    })
+    consumed_scores: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "agent:latest":
+            assert (mounts["/input/bot"] / "bot.py").read_text() == "BASE"
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("AGENT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            assert (mounts["/input/bot"] / "bot.py").read_text() == "AGENT"
+            candidate = (
+                mounts["/output/candidate_score"]
+                / "candidate_score.json"
+            )
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("CANDIDATE")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "validate-score:latest":
+            assert (
+                mounts["/input/candidate_score"]
+                / "candidate_score.json"
+            ).read_text() == "CANDIDATE"
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("SCORE")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "consume-score:latest":
+            consumed_scores.append(
+                (mounts["/input/score"] / "score.json").read_text())
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("NEXT")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    agent_member = run.steps[0].members[0]
+    consume_member = run.steps[1].members[0]
+    direct_invocation = reloaded.invocations[agent_member.invocation_ids[0]]
+    eval_execution = reloaded.executions[direct_invocation.invoked_execution_id]
+    grandchild_invocation = next(
+        invocation for invocation in reloaded.invocations.values()
+        if invocation.invoking_execution_id == eval_execution.id
+    )
+    validate_execution = reloaded.executions[
+        grandchild_invocation.invoked_execution_id]
+    consume_execution = reloaded.executions[consume_member.execution_id]
+
+    assert consumed_scores == ["SCORE"]
+    assert consume_execution.input_bindings["score"] == (
+        validate_execution.output_bindings["score"])
+    assert len(agent_member.invocation_ids) == 1
+    assert grandchild_invocation.id not in agent_member.invocation_ids
+
+
+def test_failed_nested_invocation_output_is_not_lane_latest(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, FAILED_GRANDCHILD_OUTPUT_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "failed_nested_invocation_lane",
+        "lanes": ["A"],
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "name": "agent",
+                "cohort": {
+                    "foreach": "lanes",
+                    "block": "agent",
+                },
+            },
+            {
+                "name": "consume",
+                "cohort": {
+                    "foreach": "lanes",
+                    "block": "consume_score",
+                },
+            },
+        ],
+    })
+    saw_score_mount: list[bool] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "agent:latest":
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("AGENT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            candidate = (
+                mounts["/output/candidate_score"]
+                / "candidate_score.json"
+            )
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("CANDIDATE")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "validate-score:latest":
+            return ContainerResult(exit_code=1, elapsed_s=0.1)
+        if config.image == "consume-score:latest":
+            saw_score_mount.append("/input/score" in mounts)
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("NEXT")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    agent_member = run.steps[0].members[0]
+    consume_member = run.steps[1].members[0]
+    consume_execution = reloaded.executions[consume_member.execution_id]
+    failed_invocation = next(
+        invocation for invocation in reloaded.invocations.values()
+        if invocation.status == "failed"
+    )
+    failed_execution = reloaded.executions[
+        failed_invocation.invoked_execution_id]
+
+    assert saw_score_mount == [False]
+    assert "score" not in consume_execution.input_bindings
+    assert failed_invocation.invoked_block_name == "validate_score"
+    assert failed_execution.status == "failed"
+    assert len(agent_member.invocation_ids) == 1
+
+
 def test_run_until_executes_lane_major_and_stops_on_normal(
     tmp_path: Path,
 ):
@@ -1918,6 +2255,66 @@ def test_pattern_member_stays_parent_when_invoked_child_fails(
     assert invocation.invoked_execution_id in reloaded.executions
     assert reloaded.executions[invocation.invoked_execution_id].block_name == (
         "eval_bad")
+
+
+def test_required_invocation_unexpected_reason_fails_member(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, REQUIRED_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "do": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "agent"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "agent:latest":
+            bot_dir = mounts["/output/bot"]
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            (bot_dir / "bot.py").write_text("BOT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            (mounts["/flywheel"] / "termination").write_text("rejected")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError as exc:
+            assert "step 'improve' failed" in str(exc)
+        else:
+            raise AssertionError("expected pattern failure")
+
+    reloaded = Workspace.load(workspace.path)
+    run = next(iter(reloaded.runs.values()))
+    member = run.steps[0].members[0]
+    agent_execution = reloaded.executions[member.execution_id]
+    invocation = next(iter(reloaded.invocations.values()))
+    eval_execution = reloaded.executions[invocation.invoked_execution_id]
+
+    assert run.status == "failed"
+    assert member.status == "failed"
+    assert agent_execution.status == "succeeded"
+    assert eval_execution.termination_reason == "rejected"
+    assert invocation.status == "failed"
+    assert "expected one of ['normal']" in invocation.error
 
 
 def test_run_pattern_uses_artifact_validators(tmp_path: Path):

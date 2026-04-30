@@ -25,7 +25,14 @@ from flywheel.state_validator import (
     StateValidationError,
     StateValidatorRegistry,
 )
-from flywheel.template import InvocationBinding, Template
+from flywheel.template import (
+    ArtifactDeclaration,
+    BlockDefinition,
+    InvocationBinding,
+    InvocationDeclaration,
+    OutputSlot,
+    Template,
+)
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
 from tests.conftest import _init_git_repo
@@ -112,6 +119,54 @@ blocks:
       normal:
         - name: score
           container_path: /output/score
+"""
+
+NESTED_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+  - name: report
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+    on_termination:
+      normal:
+        invoke:
+          - block: audit
+            bind:
+              score: score
+  - name: audit
+    image: audit:latest
+    inputs:
+      - name: score
+        container_path: /input/score
+    outputs:
+      normal:
+        - name: report
+          container_path: /output/report
 """
 
 MULTI_INVOCATION_TEMPLATE_YAML = """\
@@ -1189,6 +1244,217 @@ class TestBlockInvocation:
         assert loaded_invocation.input_bindings == invocation.input_bindings
         loaded_child = reloaded.executions[invocation.invoked_execution_id]
         assert loaded_child.invoking_execution_id == result.execution_id
+
+    def test_invocation_child_routes_are_dispatched_recursively(
+        self, tmp_path: Path,
+    ):
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, NESTED_INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        def fake_run(config, args=None):
+            del args
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            if config.image == "agent:latest":
+                bot = mounts["/output/bot"] / "bot.py"
+                bot.parent.mkdir(parents=True, exist_ok=True)
+                bot.write_text("BOT", encoding="utf-8")
+                (mounts["/flywheel"] / "termination").write_text(
+                    "eval_requested")
+                return ContainerResult(exit_code=0, elapsed_s=0.1)
+            if config.image == "eval:latest":
+                assert (mounts["/input/bot"] / "bot.py").read_text(
+                    encoding="utf-8") == "BOT"
+                score = mounts["/output/score"] / "score.json"
+                score.parent.mkdir(parents=True, exist_ok=True)
+                score.write_text("SCORE", encoding="utf-8")
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=0.1)
+            if config.image == "audit:latest":
+                assert (mounts["/input/score"] / "score.json").read_text(
+                    encoding="utf-8") == "SCORE"
+                report = mounts["/output/report"] / "report.json"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("REPORT", encoding="utf-8")
+                (mounts["/flywheel"] / "termination").write_text("normal")
+                return ContainerResult(exit_code=0, elapsed_s=0.1)
+            raise AssertionError(config.image)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "agent", template, project_root)
+
+        executions_by_block = {
+            execution.block_name: execution
+            for execution in ws.executions.values()
+        }
+        parent = executions_by_block["agent"]
+        child = executions_by_block["eval"]
+        grandchild = executions_by_block["audit"]
+        assert parent.id == result.execution_id
+        assert child.invoking_execution_id == parent.id
+        assert grandchild.invoking_execution_id == child.id
+        assert child.input_bindings["bot"] == parent.output_bindings["bot"]
+        assert grandchild.input_bindings["score"] == (
+            child.output_bindings["score"])
+
+        invocations = list(ws.invocations.values())
+        assert len(invocations) == 2
+        assert {
+            (invocation.invoking_execution_id, invocation.invoked_block_name)
+            for invocation in invocations
+        } == {(parent.id, "eval"), (child.id, "audit")}
+        assert all(invocation.status == "succeeded"
+                   for invocation in invocations)
+
+    def test_invocation_depth_limit_records_failed_child_invocation(
+        self, tmp_path: Path,
+    ):
+        blocks = []
+        for index in range(9):
+            next_route = ""
+            if index < 8:
+                next_route = f"""
+    on_termination:
+      next:
+        invoke:
+          - block: step_{index + 1}
+"""
+            blocks.append(f"""
+  - name: step_{index}
+    image: step-{index}:latest
+    outputs:
+      next:
+        - name: artifact_{index}
+          container_path: /output/artifact_{index}
+      normal:
+        - name: artifact_{index}
+          container_path: /output/artifact_{index}
+{next_route.rstrip()}
+""")
+        artifacts = "".join(
+            f"  - name: artifact_{index}\n    kind: copy\n"
+            for index in range(9)
+        )
+        template_yaml = f"artifacts:\n{artifacts}\nblocks:\n{''.join(blocks)}"
+        project_root, foundry_dir, _template_path, template = (
+            _setup_state_project(tmp_path, template_yaml)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        seen_images: list[str] = []
+
+        def fake_run(config, args=None):
+            del args
+            seen_images.append(config.image)
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            image_index = int(
+                config.image.removeprefix("step-").removesuffix(":latest"))
+            output = (
+                mounts[f"/output/artifact_{image_index}"]
+                / f"artifact_{image_index}.txt"
+            )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(str(image_index), encoding="utf-8")
+            reason = "next" if image_index < 8 else "normal"
+            (mounts["/flywheel"] / "termination").write_text(reason)
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "step_0", template, project_root)
+
+        assert result.execution.status == "succeeded"
+        assert "step-8:latest" not in seen_images
+        assert len(ws.executions) == 8
+        failed_invocation = next(
+            invocation for invocation in ws.invocations.values()
+            if invocation.status == "failed"
+        )
+        assert failed_invocation.invoked_block_name == "step_8"
+        assert "invocation depth limit (8) exceeded" in (
+            failed_invocation.error or "")
+        deepest_execution = next(
+            execution for execution in ws.executions.values()
+            if execution.block_name == "step_7"
+        )
+        assert deepest_execution.status == "succeeded"
+
+    def test_runtime_cycle_guard_records_failed_invocation(
+        self, tmp_path: Path,
+    ):
+        template = Template(
+            name="test_template",
+            artifacts=[ArtifactDeclaration(name="payload", kind="copy")],
+            blocks=[
+                BlockDefinition(
+                    name="agent",
+                    image="agent:latest",
+                    outputs={
+                        "next": [
+                            OutputSlot(
+                                name="payload",
+                                container_path="/output/payload",
+                            )
+                        ]
+                    },
+                    on_termination={
+                        "next": [InvocationDeclaration(block="eval")]
+                    },
+                ),
+                BlockDefinition(
+                    name="eval",
+                    image="eval:latest",
+                    outputs={
+                        "next": [
+                            OutputSlot(
+                                name="payload",
+                                container_path="/output/payload",
+                            )
+                        ]
+                    },
+                    on_termination={
+                        "next": [InvocationDeclaration(block="agent")]
+                    },
+                ),
+            ],
+        )
+        project_root, foundry_dir, _template_path, _parsed_template = (
+            _setup_state_project(tmp_path, INVOCATION_TEMPLATE_YAML)
+        )
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        seen_images: list[str] = []
+
+        def fake_run(config, args=None):
+            del args
+            seen_images.append(config.image)
+            mounts = {
+                container: Path(host)
+                for host, container, _mode in config.mounts
+            }
+            payload = mounts["/output/payload"] / "payload.txt"
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            payload.write_text(config.image, encoding="utf-8")
+            (mounts["/flywheel"] / "termination").write_text("next")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+        with patch("flywheel.execution.run_container", side_effect=fake_run):
+            result = run_block(ws, "agent", template, project_root)
+
+        assert result.execution.status == "succeeded"
+        assert seen_images == ["agent:latest", "eval:latest"]
+        failed_invocation = next(
+            invocation for invocation in ws.invocations.values()
+            if invocation.status == "failed"
+        )
+        assert failed_invocation.invoked_block_name == "agent"
+        assert failed_invocation.invoked_execution_id is None
+        assert "recursive invocation cycle detected" in (
+            failed_invocation.error or "")
 
     def test_ad_hoc_invocation_route_substitutes_params(
         self, tmp_path: Path,

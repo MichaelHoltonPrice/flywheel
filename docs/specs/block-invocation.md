@@ -60,13 +60,19 @@ After the invoking execution commits successfully, Flywheel looks up routes for
 its committed `termination_reason`. Each child runs through canonical
 preparation, runtime, commit, validation, state capture, and ledger recording.
 
-Invoked children do not recursively dispatch their own `on_termination`
-routes. Iteration, retry limits, and conditional loops belong in pattern
-execution.
+Invoked children recursively dispatch their own `on_termination` routes by
+default. Dispatch remains synchronous, host-side, and post-commit: a child
+must finish and commit before its own routes are fired. Recursive dispatch is
+bounded by a runtime depth limit; the default permits eight committed
+executions in one invocation chain and rejects the ninth launch. Template load
+also rejects declared invocation cycles, and the runtime keeps a same-block
+cycle guard as a final failsafe.
 
 All routes declared for a termination reason are attempted. A child failure is
 recorded on that route's `BlockInvocation` record and does not prevent sibling
-routes from running.
+routes from running. A descendant failure is local to the descendant
+`BlockExecution` and the `BlockInvocation` that launched it; it does not
+retroactively rewrite parent execution status or ancestor invocation records.
 
 ## Ledger
 
@@ -78,6 +84,9 @@ status, and error text.
 The child `BlockExecution` stores `invoking_execution_id`. The invoking
 execution's own status is derived only from its termination reason and output
 commit result; child failure does not rewrite the invoking execution.
+Recursive invocation trees are reconstructed by following
+`invoking_execution_id` links and `BlockInvocation.invoked_execution_id`;
+pattern member records store only direct child invocation ids.
 
 For `flywheel run block`, the process exit status follows the invoking block's
 own execution result. Invocation failures are durable ledger records, not a

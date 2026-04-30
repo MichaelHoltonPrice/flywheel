@@ -26,6 +26,80 @@ from flywheel.template import (
 )
 from flywheel.workspace import Workspace
 
+DEFAULT_MAX_INVOCATION_DEPTH = 8
+"""Maximum committed executions allowed in one invocation chain.
+
+The top-level block counts as parent #1 once it commits and begins
+dispatching routes, so the default allows eight committed executions
+and rejects the ninth launch.
+"""
+
+
+@dataclass(frozen=True)
+class InvocationStep:
+    """One committed execution in an invocation dispatch chain."""
+
+    block_name: str
+    termination_reason: str
+    execution_id: str
+
+
+@dataclass(frozen=True)
+class InvocationChain:
+    """Runtime guard state for recursive termination-route dispatch."""
+
+    steps: tuple[InvocationStep, ...] = ()
+
+    @classmethod
+    def empty(cls) -> InvocationChain:
+        """Return an empty invocation chain."""
+        return cls()
+
+    @property
+    def depth(self) -> int:
+        """Number of committed executions in the chain."""
+        return len(self.steps)
+
+    def extend(
+        self,
+        *,
+        block_name: str,
+        termination_reason: str,
+        execution_id: str,
+    ) -> InvocationChain:
+        """Return a new chain with one committed execution appended."""
+        return InvocationChain((
+            *self.steps,
+            InvocationStep(
+                block_name=block_name,
+                termination_reason=termination_reason,
+                execution_id=execution_id,
+            ),
+        ))
+
+    def contains_block(self, block_name: str) -> bool:
+        """Return whether the chain already contains block_name.
+
+        This is a runtime failsafe on top of static template cycle
+        validation. It rejects same-block re-entry even through a
+        different termination reason; relax this to a narrower key if
+        intentional re-entry becomes a supported composition pattern.
+        """
+        return any(step.block_name == block_name for step in self.steps)
+
+    def describe(self, *, next_block: str | None = None) -> str:
+        """Return a human-readable chain path for diagnostics."""
+        parts = [
+            (
+                f"{step.block_name}({step.execution_id})"
+                f" --{step.termination_reason}-->"
+            )
+            for step in self.steps
+        ]
+        if next_block is not None:
+            parts.append(next_block)
+        return " ".join(parts) if parts else (next_block or "<empty>")
+
 
 @dataclass(frozen=True)
 class InvocationDispatchResult:
@@ -33,6 +107,19 @@ class InvocationDispatchResult:
 
     invocation: BlockInvocation
     exception: Exception | None = None
+
+
+class RequiredInvocationFailure(RuntimeError):
+    """A required invocation route did not satisfy its contract."""
+
+
+def _required_invocation_error(
+    *, parent_execution_id: str, message: str,
+) -> RequiredInvocationFailure:
+    """Return an exception annotated with the committed parent execution."""
+    error = RequiredInvocationFailure(message)
+    error.flywheel_execution_id = parent_execution_id  # type: ignore[attr-defined]
+    return error
 
 
 def _resolve_child_bindings(
@@ -83,6 +170,8 @@ def dispatch_invocations(
     state_validator_registry: StateValidatorRegistry | None = None,
     params: dict[str, Any] | None = None,
     run_context: RunContext | None = None,
+    invocation_chain: InvocationChain | None = None,
+    max_invocation_depth: int = DEFAULT_MAX_INVOCATION_DEPTH,
 ) -> list[InvocationDispatchResult]:
     """Run child blocks routed from a committed parent execution.
 
@@ -103,6 +192,7 @@ def dispatch_invocations(
     results: list[InvocationDispatchResult] = []
     params = dict(params or {})
     run_context = run_context or RunContext.empty()
+    invocation_chain = invocation_chain or InvocationChain.empty()
     for route in routes:
         invocation_id = workspace.generate_invocation_id()
         input_bindings: dict[str, str] = {}
@@ -111,6 +201,17 @@ def dispatch_invocations(
             route_args = [
                 substitute_params(arg, params) for arg in route.args
             ]
+            if invocation_chain.depth >= max_invocation_depth:
+                raise RuntimeError(
+                    "invocation depth limit "
+                    f"({max_invocation_depth}) exceeded for chain "
+                    f"{invocation_chain.describe(next_block=route.block)}"
+                )
+            if invocation_chain.contains_block(route.block):
+                raise RuntimeError(
+                    "recursive invocation cycle detected for chain "
+                    f"{invocation_chain.describe(next_block=route.block)}"
+                )
             input_bindings = _resolve_child_bindings(
                 parent=parent_execution,
                 route=route,
@@ -126,22 +227,50 @@ def dispatch_invocations(
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
                 invoking_execution_id=parent_execution.id,
-                dispatch_child_invocations=False,
+                dispatch_child_invocations=True,
                 run_context=run_context,
+                invocation_chain=invocation_chain,
+                max_invocation_depth=max_invocation_depth,
             )
+            route_error: str | None = None
+            if (
+                route.expected_termination_reasons
+                and child_result.execution.termination_reason
+                not in route.expected_termination_reasons
+            ):
+                route_error = (
+                    f"invoked block {route.block!r} terminated with "
+                    f"{child_result.execution.termination_reason!r}; "
+                    "expected one of "
+                    f"{list(route.expected_termination_reasons)!r}"
+                )
             invocation = BlockInvocation(
                 id=invocation_id,
                 invoking_execution_id=parent_execution.id,
                 termination_reason=parent_execution.termination_reason,
                 invoked_block_name=route.block,
                 invoked_at=datetime.now(UTC),
-                status="succeeded",
+                status="failed" if route_error else "succeeded",
                 invoked_execution_id=child_result.execution_id,
                 input_bindings=dict(child_result.execution.input_bindings),
                 args=list(route_args),
+                error=route_error,
             )
             workspace.record_invocation(invocation)
-            results.append(InvocationDispatchResult(invocation=invocation))
+            route_exception = None
+            if route_error is not None:
+                route_exception = _required_invocation_error(
+                    parent_execution_id=parent_execution.id,
+                    message=route_error,
+                )
+            results.append(InvocationDispatchResult(
+                invocation=invocation,
+                exception=route_exception,
+            ))
+            if route.required and route_exception is not None:
+                raise route_exception
+        except RequiredInvocationFailure:
+            raise
         except Exception as exc:
             child_id = getattr(exc, "flywheel_execution_id", None)
             if child_id is not None and child_id in workspace.executions:
@@ -164,4 +293,12 @@ def dispatch_invocations(
                 invocation=invocation,
                 exception=exc,
             ))
+            if route.required:
+                raise _required_invocation_error(
+                    parent_execution_id=parent_execution.id,
+                    message=(
+                        f"required invocation of {route.block!r} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
     return results

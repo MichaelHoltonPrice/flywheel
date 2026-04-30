@@ -1461,6 +1461,11 @@ def _resolve_latest_in_lane(
     lane_name: str,
     artifact_name: str,
 ) -> str | None:
+    """Resolve the latest lane-visible artifact, including descendants.
+
+    Lane visibility includes fixtures, successful prior members, and
+    all successful transitive invocation descendants of those members.
+    """
     run = workspace.runs.get(run_id)
     if run is None:
         raise PatternRunError(f"run {run_id!r} is not known")
@@ -1475,21 +1480,42 @@ def _resolve_latest_in_lane(
             artifact_id = member.output_bindings.get(artifact_name)
             if artifact_id is not None:
                 candidates.append(artifact_id)
-            for invocation_id in member.invocation_ids:
-                invocation = workspace.invocations.get(invocation_id)
-                if invocation is None or invocation.status != "succeeded":
-                    continue
-                child_id = invocation.invoked_execution_id
-                if child_id is None:
-                    continue
-                child = workspace.executions.get(child_id)
-                if child is None:
-                    continue
-                child_artifact_id = child.output_bindings.get(
-                    artifact_name)
-                if child_artifact_id is not None:
-                    candidates.append(child_artifact_id)
+            candidates.extend(_invocation_output_candidates(
+                workspace,
+                member.execution_id,
+                artifact_name,
+            ))
     return candidates[-1] if candidates else None
+
+
+def _invocation_output_candidates(
+    workspace: Workspace,
+    root_execution_id: str,
+    artifact_name: str,
+) -> list[str]:
+    """Return successful descendant outputs in depth-first route order."""
+    candidates: list[str] = []
+    for invocation_id in _invocation_ids_for_parent(
+        workspace, root_execution_id,
+    ):
+        invocation = workspace.invocations.get(invocation_id)
+        if invocation is None or invocation.status != "succeeded":
+            continue
+        child_id = invocation.invoked_execution_id
+        if child_id is None:
+            continue
+        child = workspace.executions.get(child_id)
+        if child is None or child.status != "succeeded":
+            continue
+        child_artifact_id = child.output_bindings.get(artifact_name)
+        if child_artifact_id is not None:
+            candidates.append(child_artifact_id)
+        candidates.extend(_invocation_output_candidates(
+            workspace,
+            child.id,
+            artifact_name,
+        ))
+    return candidates
 
 
 def _invocation_ids_for_parent(

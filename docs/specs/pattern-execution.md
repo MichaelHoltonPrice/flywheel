@@ -428,18 +428,18 @@ history is derived from:
 
 * pattern fixtures materialized for the lane;
 * prior successful members in the same lane;
-* invoked child executions recorded by prior successful members in the
-  same lane.
+* invoked child executions, including transitive invocation descendants,
+  recorded by prior successful members in the same lane.
 
 Pattern execution intentionally does not fall back to workspace-global
 latest-by-name for `copy` inputs. Global latest remains an ad hoc
 `flywheel run block` convenience, not a pattern default. Git inputs
 continue to use the canonical git resolution path.
 
-Lane visibility includes direct invocation children recorded by prior
-successful members. Invocation children do not dispatch further routes
-in v1, so there are no transitive invocation grandchildren for the
-lane resolver to consider.
+Lane visibility includes all successful transitive invocation descendants
+recorded by prior successful members. Failed invocations and failed child
+executions are ignored, so a validator or repair child only becomes
+lane-latest when its own execution commits successfully.
 
 Managed-state blocks in patterns use a lineage key derived from the
 run id, lane, and block name. The iteration member name is deliberately
