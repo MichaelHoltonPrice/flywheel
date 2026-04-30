@@ -109,6 +109,19 @@ class InvocationDispatchResult:
     exception: Exception | None = None
 
 
+class RequiredInvocationFailure(RuntimeError):
+    """A required invocation route did not satisfy its contract."""
+
+
+def _required_invocation_error(
+    *, parent_execution_id: str, message: str,
+) -> RequiredInvocationFailure:
+    """Return an exception annotated with the committed parent execution."""
+    error = RequiredInvocationFailure(message)
+    error.flywheel_execution_id = parent_execution_id  # type: ignore[attr-defined]
+    return error
+
+
 def _resolve_child_bindings(
     *,
     parent: BlockExecution,
@@ -219,19 +232,45 @@ def dispatch_invocations(
                 invocation_chain=invocation_chain,
                 max_invocation_depth=max_invocation_depth,
             )
+            route_error: str | None = None
+            if (
+                route.expected_termination_reasons
+                and child_result.execution.termination_reason
+                not in route.expected_termination_reasons
+            ):
+                route_error = (
+                    f"invoked block {route.block!r} terminated with "
+                    f"{child_result.execution.termination_reason!r}; "
+                    "expected one of "
+                    f"{list(route.expected_termination_reasons)!r}"
+                )
             invocation = BlockInvocation(
                 id=invocation_id,
                 invoking_execution_id=parent_execution.id,
                 termination_reason=parent_execution.termination_reason,
                 invoked_block_name=route.block,
                 invoked_at=datetime.now(UTC),
-                status="succeeded",
+                status="failed" if route_error else "succeeded",
                 invoked_execution_id=child_result.execution_id,
                 input_bindings=dict(child_result.execution.input_bindings),
                 args=list(route_args),
+                error=route_error,
             )
             workspace.record_invocation(invocation)
-            results.append(InvocationDispatchResult(invocation=invocation))
+            route_exception = None
+            if route_error is not None:
+                route_exception = _required_invocation_error(
+                    parent_execution_id=parent_execution.id,
+                    message=route_error,
+                )
+            results.append(InvocationDispatchResult(
+                invocation=invocation,
+                exception=route_exception,
+            ))
+            if route.required and route_exception is not None:
+                raise route_exception
+        except RequiredInvocationFailure:
+            raise
         except Exception as exc:
             child_id = getattr(exc, "flywheel_execution_id", None)
             if child_id is not None and child_id in workspace.executions:
@@ -254,4 +293,12 @@ def dispatch_invocations(
                 invocation=invocation,
                 exception=exc,
             ))
+            if route.required:
+                raise _required_invocation_error(
+                    parent_execution_id=parent_execution.id,
+                    message=(
+                        f"required invocation of {route.block!r} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
     return results

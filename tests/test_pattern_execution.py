@@ -73,6 +73,41 @@ blocks:
           container_path: /output/score
 """
 
+REQUIRED_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+
+blocks:
+  - name: agent
+    image: agent:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            required: true
+            expected_termination_reasons:
+              - normal
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+      rejected: []
+"""
+
 LANE_TEMPLATE_YAML = """\
 artifacts:
   - name: bot
@@ -2220,6 +2255,66 @@ def test_pattern_member_stays_parent_when_invoked_child_fails(
     assert invocation.invoked_execution_id in reloaded.executions
     assert reloaded.executions[invocation.invoked_execution_id].block_name == (
         "eval_bad")
+
+
+def test_required_invocation_unexpected_reason_fails_member(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, REQUIRED_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "do": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "members": [
+                        {"name": "agent", "block": "agent"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "agent:latest":
+            bot_dir = mounts["/output/bot"]
+            bot_dir.mkdir(parents=True, exist_ok=True)
+            (bot_dir / "bot.py").write_text("BOT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            (mounts["/flywheel"] / "termination").write_text("rejected")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except RuntimeError as exc:
+            assert "step 'improve' failed" in str(exc)
+        else:
+            raise AssertionError("expected pattern failure")
+
+    reloaded = Workspace.load(workspace.path)
+    run = next(iter(reloaded.runs.values()))
+    member = run.steps[0].members[0]
+    agent_execution = reloaded.executions[member.execution_id]
+    invocation = next(iter(reloaded.invocations.values()))
+    eval_execution = reloaded.executions[invocation.invoked_execution_id]
+
+    assert run.status == "failed"
+    assert member.status == "failed"
+    assert agent_execution.status == "succeeded"
+    assert eval_execution.termination_reason == "rejected"
+    assert invocation.status == "failed"
+    assert "expected one of ['normal']" in invocation.error
 
 
 def test_run_pattern_uses_artifact_validators(tmp_path: Path):
