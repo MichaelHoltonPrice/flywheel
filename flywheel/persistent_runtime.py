@@ -239,6 +239,11 @@ def _start_container(
     labels: dict[str, str],
     port: int,
 ) -> None:
+    if config.network is None:
+        raise PersistentRuntimeError(
+            "persistent containers require an explicit 'network' field; "
+            "declare one in the block YAML"
+        )
     cmd = [
         "docker",
         "run",
@@ -247,6 +252,7 @@ def _start_container(
         name,
         "-p",
         f"127.0.0.1:{port}:{port}",
+        f"--network={config.network}",
     ]
     for key, value in labels.items():
         cmd.extend(["--label", f"{key}={value}"])
@@ -400,6 +406,7 @@ class DockerHttpPersistentRuntimeRunner:
         env[runtime.CONTROL_PORT_ENV_VAR] = str(port)
         config = ContainerConfig(
             image=block_def.image,
+            network=block_def.network,
             docker_args=block_def.docker_args,
             env=env,
             mounts=[

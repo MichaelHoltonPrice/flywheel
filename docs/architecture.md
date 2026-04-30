@@ -158,6 +158,17 @@ dispatches execution requests through the exchange mount described in
 `docs/specs/persistent-runtime.md`. Tests can inject fake runners to
 prove that prepare and commit remain canonical.
 
+Flywheel runs containers with default-deny networking. A one-shot block
+gets Docker's `none` network unless its block YAML declares
+`network: <docker-network-name>` explicitly. Workspace-persistent
+container blocks must declare `network:` because Flywheel needs a
+host-to-container control channel. Network membership is only a
+substrate knob; project batteries that run agents or other untrusted
+code should still apply their own outbound policy inside the container.
+This is a containment improvement, not a complete sandbox: explicit
+`network: host`, broad Docker capabilities, privileged mounts, and
+trusted-image assumptions remain project policy.
+
 ### Termination
 
 The runtime reports a normalized termination reason. Substrate-reserved

@@ -60,6 +60,7 @@ def test_state_compatibility_hash_field_set_is_pinned():
     assert STATE_COMPATIBILITY_HASH_FIELDS == (
         "inputs",
         "outputs",
+        "network",
         "docker_args",
         "env",
         "runner",
@@ -124,6 +125,8 @@ def test_state_compatibility_hash_changes_for_operational_fields():
                 ]
             },
         ),
+        replace(original, network="bridge"),
+        replace(original, network="cyberloop-cua"),
         replace(original, docker_args=["--shm-size", "8g"]),
         replace(original, env={"MODE": "eval"}),
         replace(original, runner="lifecycle"),
@@ -134,6 +137,13 @@ def test_state_compatibility_hash_changes_for_operational_fields():
     ]
 
     assert all(_hash(variant) != _hash(original) for variant in variants)
+
+
+def test_state_compatibility_hash_changes_for_network_value():
+    bridge = _block(network="bridge")
+    project_network = _block(network="cyberloop-cua")
+
+    assert _hash(bridge) != _hash(project_network)
 
 
 def test_state_compatibility_hash_canonicalizes_slot_order():

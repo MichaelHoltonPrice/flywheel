@@ -129,8 +129,12 @@ The compatibility identity is:
 
 `block_template_hash` is the SHA-256 hash of the operational fields in
 the block declaration that affect state restore/capture expectations:
-inputs, outputs, `docker_args`, `env`, `runner`, `post_check`,
+inputs, outputs, `network`, `docker_args`, `env`, `runner`, `post_check`,
 `output_builder`, `lifecycle`, and `stop_timeout_s`.
+
+Adding or changing a block's `network:` value changes this hash. That
+means managed state created under a previous network declaration is not
+silently reused after the container's network environment changes.
 
 The top-level identity already carries block name, state mode, and
 image string, so those fields are not duplicated inside the hash.

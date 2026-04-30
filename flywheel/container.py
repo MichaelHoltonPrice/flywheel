@@ -19,14 +19,19 @@ class ContainerConfig:
 
     Attributes:
         image: Docker image name (with optional tag).
+        network: Docker network namespace/name for the container.
+            ``None`` means default-deny networking and emits
+            ``--network=none``.
         docker_args: Extra flags passed to ``docker run`` before the image
             name (e.g. ``["--gpus", "all", "--shm-size", "8g"]``).
-            Project-specific; flywheel does not interpret these.
+            Project-specific; flywheel does not interpret these. Docker
+            network selection belongs in ``network`` instead.
         env: Environment variables to set inside the container.
         mounts: List of (host_path, container_path, mode) tuples for -v mounts.
     """
 
     image: str
+    network: str | None = None
     docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     mounts: list[tuple[str, str, str]] = field(default_factory=list)
@@ -64,6 +69,9 @@ def build_docker_command(
 
     if name:
         cmd.extend(["--name", name])
+
+    network = config.network if config.network is not None else "none"
+    cmd.append(f"--network={network}")
 
     cmd.extend(config.docker_args)
 

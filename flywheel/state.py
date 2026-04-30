@@ -16,6 +16,7 @@ StateMode = Literal["none", "managed", "unmanaged"]
 STATE_COMPATIBILITY_HASH_FIELDS: tuple[str, ...] = (
     "inputs",
     "outputs",
+    "network",
     "docker_args",
     "env",
     "runner",
@@ -105,6 +106,7 @@ def state_compatibility_identity(
             ], key=lambda item: item["name"])
             for reason, slots in sorted(block_def.outputs.items())
         },
+        "network": block_def.network,
         "docker_args": list(block_def.docker_args),
         "env": dict(sorted(block_def.env.items())),
         "runner": block_def.runner,

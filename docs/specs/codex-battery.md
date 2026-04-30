@@ -38,10 +38,12 @@ A Codex block is a normal one-shot block. Typical fields:
 ```yaml
 name: SomeCodexAgent
 image: project-codex-agent:latest
+network: bridge
 docker_args:
   - -v
   - codex-auth:/home/codex/.codex:rw
 env:
+  NETWORK_ISOLATION: "1"
   MODEL: gpt-5.5
   CODEX_AUTO_COMPACT_TOKEN_LIMIT: "200000"
   CODEX_SHELL_SNAPSHOT: "0"
@@ -54,6 +56,21 @@ outputs:
     - name: result
       container_path: /output/result
 ```
+
+`network: bridge` lets the agent reach the model API. Projects that run
+agent-authored code should pair network opt-in with their own outbound
+policy inside the container, such as the battery's `NETWORK_ISOLATION`
+firewall mode when it fits the project.
+
+When `NETWORK_ISOLATION=1`, the Codex battery drops outbound traffic by
+default and allows DNS, loopback, established connections, optional
+`HOST_WHITELIST_PORTS`, and HTTPS to the comma-separated
+`CODEX_ALLOWED_HOSTS`. The default host list is
+`api.openai.com,auth.openai.com,chatgpt.com,ab.chatgpt.com,chat.openai.com`,
+which covers Codex CLI's API-key and ChatGPT sign-in paths as of the bundled
+CLI. Override `CODEX_ALLOWED_HOSTS` in project YAML only when a project has
+verified that a different Codex CLI version needs a different OpenAI endpoint
+set.
 
 `state: managed` is recommended when a pattern relaunches the same
 agent over multiple block executions. The battery persists Codex session

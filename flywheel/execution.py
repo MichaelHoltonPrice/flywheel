@@ -819,6 +819,7 @@ def _container_config_for_plan(plan: ExecutionPlan) -> ContainerConfig:
         env.update(plan.env_overlay)
     return ContainerConfig(
         image=plan.block_def.image,
+        network=plan.block_def.network,
         docker_args=plan.block_def.docker_args,
         env=env,
         mounts=plan.mounts,

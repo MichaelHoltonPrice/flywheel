@@ -755,6 +755,137 @@ blocks:
         )
 
 
+class TestNetworkField:
+    def test_network_parses(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    network: cyberloop-cua
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "network.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].network == "cyberloop-cua"
+
+    def test_network_defaults_to_none(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "network.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        assert template.blocks[0].network is None
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_network_must_be_non_empty(self, tmp_path: Path, value: str):
+        yaml_content = f"""\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    network: {value!r}
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "network.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="network.*non-empty"):
+            _from_yaml_with_inline_blocks(path)
+
+    @pytest.mark.parametrize("flag", [
+        "--network",
+        "--network=bridge",
+        "--net",
+        "--net=bridge",
+    ])
+    def test_network_flags_rejected_in_docker_args(
+        self, tmp_path: Path, flag: str,
+    ):
+        yaml_content = f"""\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    docker_args:
+      - {flag}
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "bad_network_arg.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="use.*network"):
+            _from_yaml_with_inline_blocks(path)
+
+    def test_network_alias_is_not_network_opt_in(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    docker_args:
+      - --network-alias=proc
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "network_alias.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        block = template.blocks[0]
+        assert block.network is None
+        assert block.docker_args == ["--network-alias=proc"]
+
+    def test_network_rejected_on_lifecycle_runner(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    runner: lifecycle
+    runner_justification: "test fixture"
+    network: bridge
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "bad_network.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(
+            ValueError, match="only valid for runner 'container'",
+        ):
+            _from_yaml_with_inline_blocks(path)
+
+
 class TestNameValidationAccepted:
     def test_valid_names_with_hyphens_and_underscores(self, tmp_path: Path):
         yaml_content = """\
@@ -831,6 +962,7 @@ blocks:
   - name: proc
     image: proc:latest
     lifecycle: workspace_persistent
+    network: bridge
     inputs: []
     outputs:
       normal:
@@ -840,6 +972,26 @@ blocks:
         path.write_text(yaml_content)
         template = _from_yaml_with_inline_blocks(path)
         assert template.blocks[0].lifecycle == "workspace_persistent"
+        assert template.blocks[0].network == "bridge"
+
+    def test_workspace_persistent_requires_network(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: data
+    kind: copy
+blocks:
+  - name: proc
+    image: proc:latest
+    lifecycle: workspace_persistent
+    inputs: []
+    outputs:
+      normal:
+        - data
+"""
+        path = tmp_path / "persistent.yaml"
+        path.write_text(yaml_content)
+        with pytest.raises(ValueError, match="requires.*network"):
+            _from_yaml_with_inline_blocks(path)
 
     def test_unknown_lifecycle_raises(self, tmp_path: Path):
         yaml_content = """\
@@ -1044,6 +1196,7 @@ blocks:
   - name: proc
     image: proc:latest
     lifecycle: workspace_persistent
+    network: bridge
     state: managed
     inputs: []
     outputs:
@@ -1068,6 +1221,7 @@ blocks:
   - name: proc
     image: proc:latest
     lifecycle: workspace_persistent
+    network: bridge
     state: unmanaged
     inputs: []
     outputs:

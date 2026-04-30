@@ -1,5 +1,6 @@
 name: HelloAgent
 image: flywheel-hello-agent:latest
+network: bridge
 docker_args:
   - -v
   - claude-auth:/home/claude/.claude:rw

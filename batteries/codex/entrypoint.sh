@@ -3,15 +3,31 @@
 set -e
 
 if [ "${NETWORK_ISOLATION}" = "1" ]; then
-    API_IPS=$(getent ahosts api.openai.com | awk '{print $1}' | sort -u)
+    CODEX_ALLOWED_HOSTS="${CODEX_ALLOWED_HOSTS:-api.openai.com,auth.openai.com,chatgpt.com,ab.chatgpt.com,chat.openai.com}"
     HOST_IP=$(getent ahosts host.docker.internal 2>/dev/null | awk '{print $1}' | head -1)
     iptables -P OUTPUT DROP
     iptables -A OUTPUT -o lo -j ACCEPT
     iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
     iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
     iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-    for ip in $API_IPS; do
-        iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT
+    IFS=',' read -ra _codex_hosts <<< "$CODEX_ALLOWED_HOSTS"
+    for _host in "${_codex_hosts[@]}"; do
+        _host=$(echo "$_host" | tr -d '[:space:]')
+        if [ -z "$_host" ]; then
+            continue
+        fi
+        if ! [[ "$_host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "[entrypoint] CODEX_ALLOWED_HOSTS contains invalid host: $_host" >&2
+            exit 1
+        fi
+        _ips=$(getent ahosts "$_host" | awk '{print $1}' | sort -u)
+        if [ -z "$_ips" ]; then
+            echo "[entrypoint] CODEX_ALLOWED_HOSTS host did not resolve: $_host" >&2
+            exit 1
+        fi
+        for ip in $_ips; do
+            iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT
+        done
     done
     if [ -n "$HOST_IP" ] && [ -n "${HOST_WHITELIST_PORTS}" ]; then
         IFS=',' read -ra _ports <<< "$HOST_WHITELIST_PORTS"

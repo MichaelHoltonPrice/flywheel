@@ -1,5 +1,6 @@
 name: HelloCodex
 image: flywheel-hello-codex:latest
+network: bridge
 docker_args:
   - -v
   - codex-auth:/home/codex/.codex:rw

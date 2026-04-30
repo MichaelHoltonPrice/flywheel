@@ -108,6 +108,11 @@ class BlockDefinition:
             forbidden for ``runner == "lifecycle"``.
         inputs: Declared input artifact slots.
         outputs: Declared output artifact slots.
+        network: Explicit Docker network namespace/name.  ``None``
+            means one-shot container executions use Docker's
+            ``none`` network.  Workspace-persistent container
+            blocks must declare a network because Flywheel reaches
+            their HTTP control endpoint through Docker networking.
         docker_args: Extra docker run args for container blocks.
         env: Extra env vars for container blocks.
         runner: How the block is physically performed.  One of:
@@ -192,6 +197,7 @@ class BlockDefinition:
     Single-reason blocks should use ``normal:`` explicitly. See
     :func:`_parse_output_groups`.
     """
+    network: str | None = None
     docker_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     runner: Literal["container", "lifecycle"] = "container"
@@ -841,6 +847,7 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
     "runner_justification",
     "inputs",
     "outputs",
+    "network",
     "docker_args",
     "env",
     "post_check",
@@ -852,6 +859,49 @@ _BLOCK_YAML_KEYS: frozenset[str] = frozenset({
 })
 
 _BLOCK_LIFECYCLES: tuple[str, ...] = ("one_shot", "workspace_persistent")
+
+
+def _parse_network(value: object, *, block_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"Block {block_name!r}: 'network' must be a non-empty string"
+        )
+    return value.strip()
+
+
+def _uses_docker_network_flag(arg: str) -> bool:
+    return (
+        arg in ("--network", "--net")
+        or arg.startswith(("--network=", "--net="))
+    )
+
+
+def _validate_docker_args(
+    docker_args: object, *, block_name: str,
+) -> list[str]:
+    if docker_args is None:
+        return []
+    if not isinstance(docker_args, list):
+        raise ValueError(
+            f"Block {block_name!r}: 'docker_args' must be a list of strings"
+        )
+    normalized: list[str] = []
+    for arg in docker_args:
+        if not isinstance(arg, str):
+            raise ValueError(
+                f"Block {block_name!r}: 'docker_args' must be a list "
+                f"of strings"
+            )
+        if _uses_docker_network_flag(arg):
+            raise ValueError(
+                f"Block {block_name!r}: Docker network flag {arg!r} "
+                f"is not allowed in 'docker_args'; use the top-level "
+                f"'network' field instead"
+            )
+        normalized.append(arg)
+    return normalized
 
 
 def parse_block_definition(
@@ -964,12 +1014,26 @@ def parse_block_definition(
             f"Block {name!r}: 'lifecycle' is only valid for "
             f"runner 'container' (got {runner!r})"
         )
+    if "network" in entry and runner != "container":
+        raise ValueError(
+            f"Block {name!r}: 'network' is only valid for "
+            f"runner 'container' (got {runner!r})"
+        )
     lifecycle = entry.get("lifecycle", "one_shot")
     if lifecycle not in _BLOCK_LIFECYCLES:
         raise ValueError(
             f"Block {name!r}: unknown lifecycle {lifecycle!r}; "
             f"expected one of {', '.join(_BLOCK_LIFECYCLES)}"
         )
+
+    network = _parse_network(entry.get("network"), block_name=name)
+    if lifecycle == "workspace_persistent" and network is None:
+        raise ValueError(
+            f"Block {name!r}: lifecycle 'workspace_persistent' requires "
+            f"a top-level 'network' field"
+        )
+    docker_args = _validate_docker_args(
+        entry.get("docker_args", []), block_name=name)
 
     state = normalize_state_mode(entry.get("state", "none"), block_name=name)
     if state != "none" and runner != "container":
@@ -1012,7 +1076,8 @@ def parse_block_definition(
         inputs=_parse_input_slots(entry.get("inputs", [])),
         outputs=_parse_output_groups(
             entry.get("outputs"), block_name=name),
-        docker_args=entry.get("docker_args", []),
+        network=network,
+        docker_args=docker_args,
         env=entry.get("env", {}),
         runner=runner,
         runner_justification=runner_justification,

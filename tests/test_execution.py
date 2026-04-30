@@ -15,11 +15,13 @@ from flywheel.artifact_validator import (
     ArtifactValidationError,
     ArtifactValidatorRegistry,
 )
-from flywheel.container import ContainerResult
+from flywheel.container import ContainerConfig, ContainerResult
 from flywheel.execution import RuntimeResult, run_block
 from flywheel.persistent_runtime import (
     DockerHttpPersistentRuntimeRunner,
+    PersistentRuntimeError,
     PersistentRuntimeResult,
+    _start_container,
 )
 from flywheel.state_validator import (
     StateValidationError,
@@ -260,6 +262,7 @@ blocks:
   - name: worker
     image: persistent:latest
     lifecycle: workspace_persistent
+    network: bridge
     state: unmanaged
     inputs:
       - name: seed
@@ -382,6 +385,46 @@ class TestBlockLookup:
 
 
 class TestPersistentRuntimeExecution:
+    def test_start_container_uses_explicit_network(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(cmd, *, check, env):
+            del check, env
+            commands.append(list(cmd))
+
+        monkeypatch.setattr(
+            "flywheel.persistent_runtime.subprocess.run",
+            fake_run,
+        )
+        _start_container(
+            name="fw-test",
+            config=ContainerConfig(
+                image="persistent:latest",
+                network="cyberloop-cua",
+                env={"STATIC": "base"},
+                mounts=[(str(tmp_path), "/exchange", "rw")],
+            ),
+            labels={"flywheel.block_name": "worker"},
+            port=45678,
+        )
+
+        cmd = commands[0]
+        assert "--network=cyberloop-cua" in cmd
+        assert "-p" in cmd
+        assert "127.0.0.1:45678:45678" in cmd
+        assert "--network=none" not in cmd
+
+    def test_start_container_requires_explicit_network(self):
+        with pytest.raises(PersistentRuntimeError, match="network.*field"):
+            _start_container(
+                name="fw-test",
+                config=ContainerConfig(image="persistent:latest"),
+                labels={},
+                port=45678,
+            )
+
     def test_persistent_block_uses_exchange_root_and_commit_path(
         self, tmp_path: Path,
     ):
@@ -570,6 +613,7 @@ class TestPersistentRuntimeExecution:
         def fake_start_container(*, name, config, labels, port):
             starts.append({
                 "name": name,
+                "network": config.network,
                 "env": dict(config.env),
                 "labels": dict(labels),
                 "port": port,
@@ -609,6 +653,7 @@ class TestPersistentRuntimeExecution:
             "STATIC": "base",
             runtime.CONTROL_PORT_ENV_VAR: "45678",
         }
+        assert starts[0]["network"] == "bridge"
         assert payloads[0]["env"] == {
             "STATIC": "base",
             "MODEL": "sonnet",

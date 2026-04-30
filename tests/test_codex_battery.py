@@ -69,6 +69,32 @@ def test_codex_entrypoint_preserves_state_and_writes_termination():
     assert "echo \"$REASON\" > /flywheel/termination" in text
 
 
+def test_codex_network_isolation_allows_codex_auth_hosts():
+    text = (CODEX_DIR / "entrypoint.sh").read_text(encoding="utf-8")
+    assert (
+        "CODEX_ALLOWED_HOSTS:-api.openai.com,auth.openai.com,chatgpt.com,"
+        "ab.chatgpt.com,chat.openai.com"
+    ) in text
+    assert "CODEX_ALLOWED_HOSTS contains invalid host" in text
+    assert "CODEX_ALLOWED_HOSTS host did not resolve" in text
+    assert 'iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT' in text
+
+
+def test_codex_docs_explain_network_isolation_host_allowlist():
+    spec = (ROOT / "docs" / "specs" / "codex-battery.md").read_text(
+        encoding="utf-8")
+    assert "NETWORK_ISOLATION=1" in spec
+    assert "CODEX_ALLOWED_HOSTS" in spec
+    for host in (
+        "api.openai.com",
+        "auth.openai.com",
+        "chatgpt.com",
+        "ab.chatgpt.com",
+        "chat.openai.com",
+    ):
+        assert host in spec
+
+
 def test_agent_runner_default_event_log_is_not_entrypoint_capture_log():
     text = (CODEX_DIR / "agent_runner.py").read_text(encoding="utf-8")
     assert 'RUNNER_LOG=/tmp/flywheel-codex-runner.jsonl' not in text

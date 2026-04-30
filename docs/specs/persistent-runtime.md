@@ -78,6 +78,13 @@ configuration. Per-execution environment overlays are sent in the
 request envelope as `env`; they are not sticky process environment for
 later requests.
 
+Workspace-persistent container blocks must declare a top-level
+`network:` field. The built-in Docker runner publishes the control port
+on host loopback and starts the container on that declared Docker
+network. Docker network flags such as `--network` or `--net` do not
+belong in `docker_args`; use `network:` for network membership and keep
+`docker_args` for orthogonal Docker flags.
+
 ## Built-In HTTP Protocol
 
 Flywheel starts the persistent Docker container detached and sets

@@ -161,6 +161,7 @@ def _template_yaml(*, agent_image: str, eval_image: str) -> str:
             {
                 "name": "ImproveBot",
                 "image": agent_image,
+                "network": "bridge",
                 "docker_args": ["-v", "claude-auth:/home/claude/.claude:rw"],
                 "env": env,
                 "state": "managed",
