@@ -38,6 +38,7 @@ A Codex block is a normal one-shot block. Typical fields:
 ```yaml
 name: SomeCodexAgent
 image: project-codex-agent:latest
+network: bridge
 docker_args:
   - -v
   - codex-auth:/home/codex/.codex:rw
@@ -54,6 +55,11 @@ outputs:
     - name: result
       container_path: /output/result
 ```
+
+`network: bridge` lets the agent reach the model API. Projects that run
+agent-authored code should pair network opt-in with their own outbound
+policy inside the container, such as the battery's `NETWORK_ISOLATION`
+firewall mode when it fits the project.
 
 `state: managed` is recommended when a pattern relaunches the same
 agent over multiple block executions. The battery persists Codex session

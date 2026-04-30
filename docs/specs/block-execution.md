@@ -443,6 +443,11 @@ both depend on it.
 
 ### One-Shot Container Runner
 
+One-shot containers use default-deny Docker networking. If a block does
+not declare `network:`, Flywheel starts it with `--network=none`. Blocks
+that need a model API, a project Docker network, or another explicit
+network namespace must declare `network: <value>` in block YAML.
+
 * **Channel**: a sidecar file at `/flywheel/termination` inside the
   container. The path is part of the runtime contract.
 * **Format**: a single line of UTF-8 text, optionally trailed by a

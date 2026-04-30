@@ -22,6 +22,7 @@ def test_hello_agent_example_templates_parse():
     assert [block.name for block in template.blocks] == ["HelloAgent"]
     block = template.blocks[0]
     assert block.image == "flywheel-hello-agent:latest"
+    assert block.network == "bridge"
     assert block.state == "managed"
     assert block.inputs == []
     assert "claude-auth:/home/claude/.claude:rw" in block.docker_args
@@ -44,6 +45,7 @@ def test_hello_codex_example_templates_parse():
     assert [block.name for block in template.blocks] == ["HelloCodex"]
     block = template.blocks[0]
     assert block.image == "flywheel-hello-codex:latest"
+    assert block.network == "bridge"
     assert block.state == "managed"
     assert block.inputs == []
     assert "codex-auth:/home/codex/.codex:rw" in block.docker_args

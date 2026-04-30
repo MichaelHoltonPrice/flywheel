@@ -12,7 +12,31 @@ class TestBuildDockerCommand:
     def test_minimal_command(self):
         config = ContainerConfig(image="myimage:latest")
         cmd = build_docker_command(config)
-        assert cmd == ["docker", "run", "--rm", "-t", "myimage:latest"]
+        assert cmd == [
+            "docker", "run", "--rm", "-t", "--network=none",
+            "myimage:latest",
+        ]
+
+    def test_default_denies_networking(self):
+        config = ContainerConfig(image="myimage:latest")
+        cmd = build_docker_command(config)
+        assert "--network=none" in cmd
+
+    def test_explicit_network_replaces_default(self):
+        config = ContainerConfig(image="myimage:latest", network="bridge")
+        cmd = build_docker_command(config)
+        assert "--network=bridge" in cmd
+        assert "--network=none" not in cmd
+
+    @pytest.mark.parametrize("network", [
+        "cyberloop-cua",
+        "host",
+        "container:abc123",
+    ])
+    def test_explicit_network_values_pass_through(self, network: str):
+        config = ContainerConfig(image="myimage:latest", network=network)
+        cmd = build_docker_command(config)
+        assert f"--network={network}" in cmd
 
     def test_docker_args_passed_through(self):
         config = ContainerConfig(
@@ -95,6 +119,7 @@ class TestBuildDockerCommand:
         )
         cmd = build_docker_command(config, args=["--fast"])
         assert cmd[0:4] == ["docker", "run", "--rm", "-t"]
+        assert cmd[4] == "--network=none"
         assert "--gpus" in cmd
         assert "--shm-size" in cmd
         assert "-e" in cmd
@@ -137,7 +162,10 @@ class TestRunContainer:
         run_container(config)
 
         mock_popen.assert_called_once_with(
-            ["docker", "run", "--rm", "-t", "test:latest"], env=ANY
+            [
+                "docker", "run", "--rm", "-t", "--network=none",
+                "test:latest",
+            ], env=ANY
         )
         mock_process.wait.assert_called_once()
 
@@ -174,7 +202,10 @@ class TestRunContainer:
         config = ContainerConfig(image="test:latest")
         run_container(config, args=["--epochs", "5"])
 
-        expected = ["docker", "run", "--rm", "-t", "test:latest", "--epochs", "5"]
+        expected = [
+            "docker", "run", "--rm", "-t", "--network=none",
+            "test:latest", "--epochs", "5",
+        ]
         mock_popen.assert_called_once_with(expected, env=ANY)
 
     @patch("flywheel.container.subprocess.Popen")
@@ -247,5 +278,6 @@ class TestContainerConfig:
     def test_defaults(self):
         config = ContainerConfig(image="img:latest")
         assert config.docker_args == []
+        assert config.network is None
         assert config.env == {}
         assert config.mounts == []

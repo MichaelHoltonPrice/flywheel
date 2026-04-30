@@ -12,6 +12,7 @@ AGENT_TEMPLATE_YAML = """\
 blocks:
   - name: agent
     image: agent:latest
+    network: bridge
     env:
       BASE_ENV: base
       MAX_TURNS: "3"
@@ -44,6 +45,7 @@ def test_claude_battery_uses_canonical_managed_state_path(
         seen["image"] = config.image
         seen["args"] = args
         seen["env"] = dict(config.env)
+        seen["network"] = config.network
         seen["mounts"] = dict(mounts)
         seen["docker_args"] = list(config.docker_args)
 
@@ -89,6 +91,7 @@ def test_claude_battery_uses_canonical_managed_state_path(
     ).read_text() == "hello state"
 
     assert seen["image"] == "agent:latest"
+    assert seen["network"] == "bridge"
     assert seen["args"] is None
     env = seen["env"]
     assert env["BASE_ENV"] == "base"

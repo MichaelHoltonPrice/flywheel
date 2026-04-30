@@ -96,9 +96,9 @@ name: MyDesktop
 runner: container
 lifecycle: workspace_persistent
 image: my-desktop:latest
+network: my-cua-network
 docker_args:
   - --restart=unless-stopped
-  - --network=my-cua-network
   - --network-alias=my-desktop
 outputs:
   normal: []
@@ -108,14 +108,15 @@ outputs:
 name: MyController
 runner: container
 image: my-controller:latest
-docker_args:
-  - --network=my-cua-network
+network: my-cua-network
 env:
   DESKTOP_URL: http://my-desktop:8080
 ```
 
 The Docker network is project setup, not substrate state. Create it with
 `docker network create <name>` before running the pattern.
+`--network-alias` is DNS metadata for that selected network, so it stays
+in `docker_args`; network membership itself belongs in `network:`.
 
 Long-lived desktop blocks should usually pass `--restart=unless-stopped`.
 That lets Docker restart the service container if the daemon restarts or the

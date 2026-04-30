@@ -675,7 +675,8 @@ def test_persistent_sequence_input_uses_request_input_root(
 ) -> None:
     text = SEQUENCE_TEMPLATE_YAML.replace(
         "  - name: history\n    image: history:latest",
-        "  - name: history\n    image: history:latest\n    lifecycle: workspace_persistent",
+        "  - name: history\n    image: history:latest\n"
+        "    lifecycle: workspace_persistent\n    network: bridge",
     )
     template = _template(tmp_path, text)
     ws = _workspace(tmp_path, template)
