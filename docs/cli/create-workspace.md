@@ -75,20 +75,20 @@ A new directory at `<foundry_dir>/workspaces/<name>/` containing:
 
 * `artifacts/` — empty subdirectory that will hold `copy`
   artifact instance dirs as they are produced.
-* `workspace.yaml` — the durable workspace ledger. At creation
-  time it contains:
+* `ledgers/` — append-only JSONL ledgers for artifact instances,
+  executions, invocations, sequence entries, telemetry, events, and
+  state snapshots.
+* `runs/` — one YAML file per pattern run.
+* `workspace.yaml` — root workspace metadata. At creation time it
+  contains:
+  * `storage_version`.
   * `name`, `template_name`, `created_at`.
   * `artifact_declarations` — a map from declaration name to
     storage kind (`copy` or `git`).
-  * `artifacts` — a map of artifact instances. At creation time
-    this is empty *except* for one auto-registered `<name>@baseline`
-    instance per `git` declaration, which records the resolved
-    `repo` path and `commit` SHA at workspace-create time. `copy`
-    declarations produce no instances at create time.
-  * `executions` — empty.
-  * `state_snapshots` — empty.
-  * `events` — empty.
-  * `runs` — empty.
+* `ledgers/artifacts.jsonl` records one auto-registered
+  `<name>@baseline` instance per `git` declaration, with the resolved
+  `repo` path and `commit` SHA at workspace-create time. `copy`
+  declarations produce no instances at create time.
 
 The workspace is fully usable as soon as this command returns
 exit code zero.
@@ -119,14 +119,16 @@ Exit code zero plus the workspace directory existing at
 ```bash
 ls <foundry_dir>/workspaces/<name>/
 cat <foundry_dir>/workspaces/<name>/workspace.yaml
+cat <foundry_dir>/workspaces/<name>/ledgers/artifacts.jsonl
 ```
 
 `workspace.yaml` should list the expected `artifact_declarations`
-(matching the template) and a `<name>@baseline` artifact for each
-`git` declaration with the recorded `commit`.
+(matching the template). A `<name>@baseline` artifact for each `git`
+declaration should appear in `ledgers/artifacts.jsonl` with the
+recorded `commit`.
 
-There is no `flywheel status` command yet; reading the YAML
-directly is the canonical way to inspect a workspace. The format
+There is no `flywheel status` command yet; reading the YAML and ledger
+files directly is the canonical way to inspect a workspace. The format
 is stable enough to grep.
 
 ## Typical next steps

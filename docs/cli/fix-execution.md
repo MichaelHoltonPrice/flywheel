@@ -144,7 +144,7 @@ existing quarantined bytes remain exactly as they were.
 | --- | --- | --- |
 | `flywheel.yaml` missing or malformed at the cwd. | `FileNotFoundError` / `ValueError`. | Run from the project root. |
 | `--workspace` path does not contain a `workspace.yaml`. | `FileNotFoundError`. | Confirm the path. |
-| `--execution` is not present in the workspace ledger. | `ValueError("supersedes.rejection.execution_id … does not exist …")`. | Confirm the execution id (look for `failed` records in `workspace.yaml`). |
+| `--execution` is not present in the workspace ledger. | `ValueError("supersedes.rejection.execution_id … does not exist …")`. | Confirm the execution id (look for `failed` records in `ledgers/executions.jsonl`). |
 | `--slot` is not present in that execution's `rejected_outputs`. | `ValueError("execution … has no rejected output for slot …")`. | The error message lists the rejected slots that *are* available. Pick one of those, or use [`amend artifact`](amend-artifact.md) if you meant to supersede an accepted instance. |
 | `--slot` is not declared as `kind: copy` in the workspace's template. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git artifacts are not amendable today. |
 | `--from` path does not exist. | `FileNotFoundError`. | Confirm the source path. |
@@ -164,12 +164,11 @@ To inspect:
 
 ```bash
 ls <workspace>/artifacts/<slot>@<id>/
-yq '.artifacts."<slot>@<id>".supersedes' \
-  <workspace>/workspace.yaml
+grep '"id": "<slot>@<id>"' <workspace>/ledgers/artifacts.jsonl
 ```
 
 The `supersedes.rejected.execution` and `supersedes.rejected.slot`
-fields in `workspace.yaml` are the canonical lineage record.
+fields in `ledgers/artifacts.jsonl` are the canonical lineage record.
 
 ## Typical next steps
 

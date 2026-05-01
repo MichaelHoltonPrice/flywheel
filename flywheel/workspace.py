@@ -8,6 +8,7 @@ provenance graph.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -55,6 +56,7 @@ from flywheel.termination import derive_status
 from flywheel.validation import validate_name as _validate_name
 
 _PREDECESSOR_UNSPECIFIED = object()
+_WORKSPACE_STORAGE_VERSION = 2
 
 
 def _replace_with_windows_retry(tmp_path: Path, yaml_path: Path) -> None:
@@ -537,6 +539,524 @@ def _state_snapshots_from_yaml(entry: object) -> dict[str, StateSnapshot]:
     return snapshots
 
 
+def _artifact_to_yaml(inst: ArtifactInstance) -> dict:
+    """Serialize one artifact instance for the workspace ledger."""
+    entry: dict = {
+        "id": inst.id,
+        "name": inst.name,
+        "kind": inst.kind,
+        "created_at": inst.created_at.isoformat(),
+    }
+    if inst.produced_by is not None:
+        entry["produced_by"] = inst.produced_by
+    if inst.fixture_id is not None:
+        entry["fixture_id"] = inst.fixture_id
+    if inst.source is not None:
+        entry["source"] = inst.source
+    if inst.kind == "copy" and inst.copy_path is not None:
+        entry["copy_path"] = inst.copy_path
+    if inst.kind == "git":
+        entry["repo"] = inst.repo
+        entry["commit"] = inst.commit
+        entry["git_path"] = inst.git_path
+    if inst.supersedes is not None:
+        entry["supersedes"] = _supersedes_to_yaml(inst.supersedes)
+    if inst.supersedes_reason is not None:
+        entry["supersedes_reason"] = inst.supersedes_reason
+    return entry
+
+
+def _artifact_from_yaml(entry: dict) -> ArtifactInstance:
+    """Deserialize one artifact instance from the workspace ledger."""
+    return ArtifactInstance(
+        id=entry["id"],
+        name=entry["name"],
+        kind=entry["kind"],
+        created_at=datetime.fromisoformat(entry["created_at"]),
+        produced_by=entry.get("produced_by"),
+        fixture_id=entry.get("fixture_id"),
+        source=entry.get("source"),
+        copy_path=entry.get("copy_path"),
+        repo=entry.get("repo"),
+        commit=entry.get("commit"),
+        git_path=entry.get("git_path"),
+        supersedes=_supersedes_from_yaml(entry.get("supersedes")),
+        supersedes_reason=entry.get("supersedes_reason"),
+    )
+
+
+def _execution_to_yaml(ex: BlockExecution) -> dict:
+    """Serialize one block execution for the workspace ledger."""
+    entry = {
+        "id": ex.id,
+        "block_name": ex.block_name,
+        "started_at": ex.started_at.isoformat(),
+        "status": ex.status,
+        "input_bindings": ex.input_bindings,
+        "output_bindings": ex.output_bindings,
+        "runner": ex.runner,
+    }
+    if ex.input_sequence_bindings:
+        entry["input_sequence_bindings"] = {
+            name: _sequence_binding_to_yaml(binding)
+            for name, binding in ex.input_sequence_bindings.items()
+        }
+    if ex.finished_at is not None:
+        entry["finished_at"] = ex.finished_at.isoformat()
+    if ex.exit_code is not None:
+        entry["exit_code"] = ex.exit_code
+    if ex.elapsed_s is not None:
+        entry["elapsed_s"] = ex.elapsed_s
+    if ex.image is not None:
+        entry["image"] = ex.image
+    if ex.error is not None:
+        entry["error"] = ex.error
+    if ex.failure_phase is not None:
+        entry["failure_phase"] = ex.failure_phase
+    if ex.rejected_outputs:
+        entry["rejected_outputs"] = _rejected_outputs_to_yaml(
+            ex.rejected_outputs)
+    if ex.termination_reason is not None:
+        entry["termination_reason"] = ex.termination_reason
+    if ex.state_mode != "none":
+        entry["state_mode"] = ex.state_mode
+    if ex.state_snapshot_id is not None:
+        entry["state_snapshot_id"] = ex.state_snapshot_id
+    if ex.invoking_execution_id is not None:
+        entry["invoking_execution_id"] = ex.invoking_execution_id
+    return entry
+
+
+def _execution_from_yaml(entry: dict) -> BlockExecution:
+    """Deserialize one block execution from the workspace ledger."""
+    finished = entry.get("finished_at")
+    return BlockExecution(
+        id=entry["id"],
+        block_name=entry["block_name"],
+        started_at=datetime.fromisoformat(entry["started_at"]),
+        finished_at=(
+            datetime.fromisoformat(finished) if finished else None
+        ),
+        status=entry.get("status", "failed"),
+        input_bindings=entry.get("input_bindings", {}),
+        input_sequence_bindings={
+            name: _sequence_binding_from_yaml(raw)
+            for name, raw in entry.get(
+                "input_sequence_bindings", {}
+            ).items()
+        },
+        output_bindings=entry.get("output_bindings", {}),
+        exit_code=entry.get("exit_code"),
+        elapsed_s=entry.get("elapsed_s"),
+        image=entry.get("image"),
+        runner=entry["runner"],
+        error=entry.get("error"),
+        failure_phase=entry.get("failure_phase"),
+        rejected_outputs=_rejected_outputs_from_yaml(
+            entry.get("rejected_outputs")),
+        termination_reason=entry.get("termination_reason"),
+        state_mode=entry.get("state_mode", "none"),
+        state_snapshot_id=entry.get("state_snapshot_id"),
+        invoking_execution_id=entry.get("invoking_execution_id"),
+    )
+
+
+def _invocation_to_yaml(inv: BlockInvocation) -> dict:
+    """Serialize one block invocation for the workspace ledger."""
+    entry = {
+        "id": inv.id,
+        "invoking_execution_id": inv.invoking_execution_id,
+        "termination_reason": inv.termination_reason,
+        "invoked_block_name": inv.invoked_block_name,
+        "invoked_at": inv.invoked_at.isoformat(),
+        "status": inv.status,
+        "input_bindings": inv.input_bindings,
+        "args": inv.args,
+    }
+    if inv.invoked_execution_id is not None:
+        entry["invoked_execution_id"] = inv.invoked_execution_id
+    if inv.error is not None:
+        entry["error"] = inv.error
+    return entry
+
+
+def _invocation_from_yaml(entry: dict) -> BlockInvocation:
+    """Deserialize one block invocation from the workspace ledger."""
+    return BlockInvocation(
+        id=entry["id"],
+        invoking_execution_id=entry["invoking_execution_id"],
+        termination_reason=entry["termination_reason"],
+        invoked_block_name=entry["invoked_block_name"],
+        invoked_at=datetime.fromisoformat(entry["invoked_at"]),
+        status=entry["status"],
+        invoked_execution_id=entry.get("invoked_execution_id"),
+        input_bindings=entry.get("input_bindings", {}),
+        args=entry.get("args", []),
+        error=entry.get("error"),
+    )
+
+
+def _telemetry_to_yaml(tel: ExecutionTelemetry) -> dict:
+    """Serialize one telemetry record for the workspace ledger."""
+    entry = {
+        "id": tel.id,
+        "execution_id": tel.execution_id,
+        "kind": tel.kind,
+        "recorded_at": tel.recorded_at.isoformat(),
+        "data": dict(tel.data),
+    }
+    if tel.source is not None:
+        entry["source"] = tel.source
+    return entry
+
+
+def _telemetry_from_yaml(entry: dict) -> ExecutionTelemetry:
+    """Deserialize one telemetry record from the workspace ledger."""
+    return ExecutionTelemetry(
+        id=entry["id"],
+        execution_id=entry["execution_id"],
+        kind=entry["kind"],
+        recorded_at=datetime.fromisoformat(entry["recorded_at"]),
+        data=dict(entry.get("data", {})),
+        source=entry.get("source"),
+    )
+
+
+def _telemetry_rejection_to_yaml(rejection: RejectedTelemetry) -> dict:
+    """Serialize one rejected telemetry record for the workspace ledger."""
+    entry = {
+        "id": rejection.id,
+        "execution_id": rejection.execution_id,
+        "recorded_at": rejection.recorded_at.isoformat(),
+        "path": rejection.path,
+        "reason": rejection.reason,
+    }
+    if rejection.preserved_path is not None:
+        entry["preserved_path"] = rejection.preserved_path
+    return entry
+
+
+def _telemetry_rejection_from_yaml(entry: dict) -> RejectedTelemetry:
+    """Deserialize one rejected telemetry record from the workspace ledger."""
+    return RejectedTelemetry(
+        id=entry["id"],
+        execution_id=entry["execution_id"],
+        recorded_at=datetime.fromisoformat(entry["recorded_at"]),
+        path=entry["path"],
+        reason=entry["reason"],
+        preserved_path=entry.get("preserved_path"),
+    )
+
+
+def _event_to_yaml(ev: LifecycleEvent) -> dict:
+    """Serialize one lifecycle event for the workspace ledger."""
+    entry = {
+        "id": ev.id,
+        "kind": ev.kind,
+        "timestamp": ev.timestamp.isoformat(),
+    }
+    if ev.execution_id is not None:
+        entry["execution_id"] = ev.execution_id
+    if ev.detail:
+        entry["detail"] = ev.detail
+    return entry
+
+
+def _event_from_yaml(entry: dict) -> LifecycleEvent:
+    """Deserialize one lifecycle event from the workspace ledger."""
+    return LifecycleEvent(
+        id=entry["id"],
+        kind=entry["kind"],
+        timestamp=datetime.fromisoformat(entry["timestamp"]),
+        execution_id=entry.get("execution_id"),
+        detail=entry.get("detail", {}),
+    )
+
+
+def _state_snapshot_row_to_yaml(snapshot: StateSnapshot) -> dict:
+    """Serialize one managed state snapshot for the workspace ledger."""
+    entry = _state_snapshot_to_yaml(snapshot)
+    entry["id"] = snapshot.id
+    return entry
+
+
+def _state_snapshot_from_row(entry: dict) -> StateSnapshot:
+    """Deserialize one managed state snapshot from the workspace ledger."""
+    return StateSnapshot(
+        id=entry["id"],
+        lineage_key=entry["lineage_key"],
+        created_at=datetime.fromisoformat(entry["created_at"]),
+        produced_by=entry["produced_by"],
+        predecessor_snapshot_id=entry.get("predecessor_snapshot_id"),
+        compatibility=dict(entry.get("compatibility", {})),
+        state_path=entry["state_path"],
+    )
+
+
+def _run_to_yaml(run: RunRecord) -> dict:
+    """Serialize one pattern run record."""
+    entry = {
+        "id": run.id,
+        "kind": run.kind,
+        "started_at": run.started_at.isoformat(),
+        "status": run.status,
+    }
+    if run.finished_at is not None:
+        entry["finished_at"] = run.finished_at.isoformat()
+    if run.config_snapshot is not None:
+        entry["config_snapshot"] = run.config_snapshot
+    if run.params:
+        entry["params"] = dict(run.params)
+    if run.lanes != [DEFAULT_LANE]:
+        entry["lanes"] = list(run.lanes)
+    if run.fixtures:
+        entry["fixtures"] = _run_fixtures_to_yaml(run.fixtures)
+    if run.steps:
+        entry["steps"] = [_run_step_to_yaml(step) for step in run.steps]
+    if run.error is not None:
+        entry["error"] = run.error
+    return entry
+
+
+def _run_from_yaml(entry: dict) -> RunRecord:
+    """Deserialize one pattern run record."""
+    finished = entry.get("finished_at")
+    return RunRecord(
+        id=entry["id"],
+        kind=entry["kind"],
+        started_at=datetime.fromisoformat(entry["started_at"]),
+        finished_at=(
+            datetime.fromisoformat(finished) if finished else None),
+        status=entry.get("status", "running"),
+        config_snapshot=entry.get("config_snapshot"),
+        params=dict(entry.get("params", {})),
+        lanes=list(entry.get("lanes", [DEFAULT_LANE])),
+        fixtures=_run_fixtures_from_yaml(entry.get("fixtures")),
+        steps=_run_steps_from_yaml(entry.get("steps")),
+        error=entry.get("error"),
+    )
+
+
+def _json_default(value: object) -> object:
+    """Reject non-JSON values with a useful error."""
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+class SplitWorkspaceStore:
+    """Durable split-file storage for a workspace."""
+
+    _LEDGER_FILES = {
+        "artifact": "artifacts.jsonl",
+        "execution": "executions.jsonl",
+        "invocation": "invocations.jsonl",
+        "sequence_entry": "sequence_entries.jsonl",
+        "telemetry": "telemetry.jsonl",
+        "telemetry_rejection": "telemetry_rejections.jsonl",
+        "event": "events.jsonl",
+        "state_snapshot": "state_snapshots.jsonl",
+    }
+
+    def __init__(self, path: Path) -> None:
+        """Bind the store to a workspace directory."""
+        self.path = path
+        self.ledgers_dir = path / "ledgers"
+        self.runs_dir = path / "runs"
+
+    def initialize(self) -> None:
+        """Create storage directories."""
+        self.ledgers_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_root(
+        self,
+        *,
+        name: str,
+        template_name: str,
+        created_at: datetime,
+        artifact_declarations: dict[str, str],
+    ) -> None:
+        """Write root workspace metadata only."""
+        data = {
+            "storage_version": _WORKSPACE_STORAGE_VERSION,
+            "name": name,
+            "template_name": template_name,
+            "created_at": created_at.isoformat(),
+            "artifact_declarations": artifact_declarations,
+        }
+        yaml_path = self.path / "workspace.yaml"
+        tmp_path = yaml_path.with_suffix(".yaml.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_with_windows_retry(tmp_path, yaml_path)
+
+    def append(self, kind: str, row: dict) -> None:
+        """Append one committed ledger row."""
+        self._append_rows(kind, [row], batch_id=None)
+
+    def append_batch(self, records: list[tuple[str, dict]]) -> str | None:
+        """Append a committed batch of immutable ledger rows."""
+        if not records:
+            return None
+        batch_id = f"batch_{uuid.uuid4().hex[:8]}"
+        by_kind: dict[str, list[dict]] = {}
+        for kind, row in records:
+            by_kind.setdefault(kind, []).append(row)
+        for kind, rows in by_kind.items():
+            self._append_rows(kind, rows, batch_id=batch_id)
+        marker = {
+            "batch_id": batch_id,
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "counts": {kind: len(rows) for kind, rows in by_kind.items()},
+        }
+        self._append_jsonl(self.ledgers_dir / "batches.jsonl", marker)
+        return batch_id
+
+    def write_run(self, run: RunRecord) -> None:
+        """Atomically write one mutable run record."""
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        path = self.runs_dir / f"{run.id}.yaml"
+        tmp_path = path.with_suffix(".yaml.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(_run_to_yaml(run), f, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_with_windows_retry(tmp_path, path)
+
+    def rewrite_all(self, workspace: Workspace) -> None:
+        """Compact all ledgers from the in-memory workspace."""
+        self.initialize()
+        self.write_root(
+            name=workspace.name,
+            template_name=workspace.template_name,
+            created_at=workspace.created_at,
+            artifact_declarations=workspace.artifact_declarations,
+        )
+        for filename in [*self._LEDGER_FILES.values(), "batches.jsonl"]:
+            path = self.ledgers_dir / filename
+            if path.exists():
+                path.unlink()
+        for run_path in self.runs_dir.glob("*.yaml"):
+            run_path.unlink()
+        rows: list[tuple[str, dict]] = []
+        rows.extend(
+            ("artifact", _artifact_to_yaml(record))
+            for record in workspace.artifacts.values()
+        )
+        rows.extend(
+            ("execution", _execution_to_yaml(record))
+            for record in workspace.executions.values()
+        )
+        rows.extend(
+            ("invocation", _invocation_to_yaml(record))
+            for record in workspace.invocations.values()
+        )
+        rows.extend(
+            ("sequence_entry", _sequence_entry_to_yaml(record))
+            for record in workspace.sequence_entries
+        )
+        rows.extend(
+            ("telemetry", _telemetry_to_yaml(record))
+            for record in workspace.telemetry.values()
+        )
+        rows.extend(
+            ("telemetry_rejection", _telemetry_rejection_to_yaml(record))
+            for record in workspace.telemetry_rejections.values()
+        )
+        rows.extend(
+            ("event", _event_to_yaml(record))
+            for record in workspace.events.values()
+        )
+        rows.extend(
+            ("state_snapshot", _state_snapshot_row_to_yaml(record))
+            for record in workspace.state_snapshots.values()
+        )
+        self.append_batch(rows)
+        for run in workspace.runs.values():
+            self.write_run(run)
+
+    def _append_rows(
+        self, kind: str, rows: list[dict], *, batch_id: str | None,
+    ) -> None:
+        """Append rows to one ledger."""
+        filename = self._LEDGER_FILES[kind]
+        payloads = []
+        for row in rows:
+            payload = dict(row)
+            if batch_id is not None:
+                payload["batch_id"] = batch_id
+            payloads.append(payload)
+        self._append_jsonl(self.ledgers_dir / filename, *payloads)
+
+    def _append_jsonl(self, path: Path, *rows: dict) -> None:
+        """Append JSON rows and fsync the containing file."""
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            for row in rows:
+                f.write(json.dumps(row, default=_json_default, sort_keys=True))
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def committed_batches(self) -> set[str]:
+        """Return batch IDs with a durable commit marker."""
+        batches: set[str] = set()
+        for row in self._read_jsonl(self.ledgers_dir / "batches.jsonl"):
+            batch_id = row.get("batch_id")
+            if isinstance(batch_id, str):
+                batches.add(batch_id)
+        return batches
+
+    def read_ledger(self, kind: str) -> list[dict]:
+        """Read committed rows from one immutable ledger."""
+        committed = self.committed_batches()
+        path = self.ledgers_dir / self._LEDGER_FILES[kind]
+        rows: list[dict] = []
+        for row in self._read_jsonl(path):
+            batch_id = row.get("batch_id")
+            if batch_id is not None and batch_id not in committed:
+                continue
+            row.pop("batch_id", None)
+            rows.append(row)
+        return rows
+
+    def read_runs(self) -> dict[str, RunRecord]:
+        """Read all mutable run records."""
+        runs: dict[str, RunRecord] = {}
+        if not self.runs_dir.exists():
+            return runs
+        for path in sorted(self.runs_dir.glob("*.yaml")):
+            with open(path, encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            run = _run_from_yaml(raw)
+            runs[run.id] = run
+        return runs
+
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        """Read JSONL rows, tolerating a torn final row."""
+        if not path.exists():
+            return []
+        rows: list[dict] = []
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                if index == len(lines) - 1:
+                    break
+                raise
+            if not isinstance(row, dict):
+                raise ValueError(f"ledger row in {path} must be a mapping")
+            rows.append(row)
+        return rows
+
+
 @dataclass
 class Workspace:
     """A workspace instance created from a template.
@@ -563,6 +1083,52 @@ class Workspace:
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False,
     )
+    _active_batch: WorkspaceBatch | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _store: SplitWorkspaceStore | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _deferred_records: list[tuple[str, dict]] = field(
+        default_factory=list, init=False, repr=False, compare=False,
+    )
+
+    @property
+    def store(self) -> SplitWorkspaceStore:
+        """Return the split workspace store for this workspace."""
+        if self._store is None:
+            self._store = SplitWorkspaceStore(self.path)
+            self._store.initialize()
+        return self._store
+
+    def batch(self) -> WorkspaceBatch:
+        """Return an explicit workspace persistence batch."""
+        return WorkspaceBatch(self)
+
+    def _persist_ledger(self, kind: str, row: dict, *, persist: bool) -> None:
+        """Persist or batch one immutable ledger row."""
+        if self._active_batch is not None:
+            self._active_batch.append(kind, row)
+            return
+        if persist:
+            self.store.append(kind, row)
+        else:
+            self._deferred_records.append((kind, row))
+
+    def _persist_run(self, run: RunRecord) -> None:
+        """Persist or batch one mutable run record."""
+        if self._active_batch is not None:
+            self._active_batch.write_run(run)
+            return
+        self.store.write_run(run)
+
+    def flush_deferred(self) -> None:
+        """Persist records queued by ``persist=False`` calls."""
+        if not self._deferred_records:
+            return
+        records = list(self._deferred_records)
+        self.store.append_batch(records)
+        self._deferred_records.clear()
 
     @staticmethod
     def _short_uuid() -> str:
@@ -847,8 +1413,8 @@ class Workspace:
         if execution.termination_reason is not None:
             execution = self._validate_and_normalize_execution(execution)
         self._add_execution(execution)
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "execution", _execution_to_yaml(execution), persist=persist)
         return execution
 
     def record_invocation(
@@ -866,7 +1432,8 @@ class Workspace:
                     f"Unknown invocation status {invocation.status!r}"
                 )
             self.invocations[invocation.id] = invocation
-        self.save()
+        self._persist_ledger(
+            "invocation", _invocation_to_yaml(invocation), persist=True)
         return invocation
 
     def validate_sequence_entry(
@@ -961,8 +1528,8 @@ class Workspace:
                 recorded_at=datetime.now(UTC),
             )
             self.sequence_entries.append(entry)
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "sequence_entry", _sequence_entry_to_yaml(entry), persist=persist)
         return entry
 
     def resolve_sequence_snapshot(
@@ -1006,8 +1573,8 @@ class Workspace:
             if not isinstance(telemetry.data, dict):
                 raise ValueError("Telemetry data must be a mapping")
             self.telemetry[telemetry.id] = telemetry
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "telemetry", _telemetry_to_yaml(telemetry), persist=persist)
         return telemetry
 
     def record_rejected_telemetry(
@@ -1029,8 +1596,11 @@ class Workspace:
                     f"unknown execution {rejection.execution_id!r}"
                 )
             self.telemetry_rejections[rejection.id] = rejection
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "telemetry_rejection",
+            _telemetry_rejection_to_yaml(rejection),
+            persist=persist,
+        )
         return rejection
 
     @staticmethod
@@ -1128,6 +1698,7 @@ class Workspace:
                     f"Event {event.id!r} already exists in workspace"
                 )
             self.events[event.id] = event
+        self._persist_ledger("event", _event_to_yaml(event), persist=True)
 
     def begin_run(
         self,
@@ -1175,7 +1746,7 @@ class Workspace:
                 ),
             )
             self.runs[candidate] = record
-        self.save()
+        self._persist_run(record)
         return record
 
     def reopen_run(
@@ -1209,7 +1780,7 @@ class Workspace:
                 error=None,
             )
             self.runs[run_id] = updated
-        self.save()
+        self._persist_run(updated)
         return updated
 
     def record_run_fixture(
@@ -1269,7 +1840,7 @@ class Workspace:
                 fixtures=[*current.fixtures, fixture],
             )
             self.runs[run_id] = updated
-        self.save()
+        self._persist_run(updated)
         return updated
 
     def record_run_step(
@@ -1300,7 +1871,7 @@ class Workspace:
                 steps=[*current.steps, step],
             )
             self.runs[run_id] = updated
-        self.save()
+        self._persist_run(updated)
         return updated
 
     def replace_run_step(
@@ -1335,7 +1906,7 @@ class Workspace:
                 )
             updated = replace(current, steps=steps)
             self.runs[run_id] = updated
-        self.save()
+        self._persist_run(updated)
         return updated
 
     def end_run(
@@ -1393,7 +1964,7 @@ class Workspace:
                 error=error,
             )
             self.runs[run_id] = updated
-        self.save()
+        self._persist_run(updated)
         return updated
 
     def events_for(self, kind: str) -> list[LifecycleEvent]:
@@ -1553,8 +2124,11 @@ class Workspace:
         except Exception:
             shutil.rmtree(target_dir, ignore_errors=True)
             raise
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "state_snapshot",
+            _state_snapshot_row_to_yaml(snapshot),
+            persist=persist,
+        )
         return snapshot
 
     def preserve_state_recovery(
@@ -1793,8 +2367,8 @@ class Workspace:
             supersedes_reason=supersedes_reason,
         )
         self._add_artifact(instance)
-        if persist:
-            self.save()
+        self._persist_ledger(
+            "artifact", _artifact_to_yaml(instance), persist=persist)
         return instance
 
     def register_git_artifact(
@@ -1894,7 +2468,8 @@ class Workspace:
             git_path=declaration.path,
         )
         self._add_artifact(instance)
-        self.save()
+        self._persist_ledger(
+            "artifact", _artifact_to_yaml(instance), persist=True)
         return instance
 
     def _check_supersedes(
@@ -2086,7 +2661,7 @@ class Workspace:
 
     @classmethod
     def load(cls, path: Path) -> Workspace:
-        """Load an existing workspace from its workspace.yaml.
+        """Load an existing split-storage workspace.
 
         Args:
             path: Path to the workspace directory.
@@ -2098,134 +2673,50 @@ class Workspace:
             ValueError: If the YAML contains invalid data.
         """
         yaml_path = path / "workspace.yaml"
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f)
+        with open(yaml_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if data.get("storage_version") != _WORKSPACE_STORAGE_VERSION:
+            raise ValueError(
+                f"Unsupported workspace storage_version "
+                f"{data.get('storage_version')!r}; expected "
+                f"{_WORKSPACE_STORAGE_VERSION}"
+            )
+        store = SplitWorkspaceStore(path)
 
         declarations = data.get("artifact_declarations", {})
-
-        artifacts: dict[str, ArtifactInstance] = {}
-        for aid, entry in data.get("artifacts", {}).items():
-            artifacts[aid] = ArtifactInstance(
-                id=aid,
-                name=entry["name"],
-                kind=entry["kind"],
-                created_at=datetime.fromisoformat(entry["created_at"]),
-                produced_by=entry.get("produced_by"),
-                fixture_id=entry.get("fixture_id"),
-                source=entry.get("source"),
-                copy_path=entry.get("copy_path"),
-                repo=entry.get("repo"),
-                commit=entry.get("commit"),
-                git_path=entry.get("git_path"),
-                supersedes=_supersedes_from_yaml(entry.get("supersedes")),
-                supersedes_reason=entry.get("supersedes_reason"),
-            )
-
-        executions: dict[str, BlockExecution] = {}
-        for eid, entry in data.get("executions", {}).items():
-            finished = entry.get("finished_at")
-            executions[eid] = BlockExecution(
-                id=eid,
-                block_name=entry["block_name"],
-                started_at=datetime.fromisoformat(entry["started_at"]),
-                finished_at=(
-                    datetime.fromisoformat(finished) if finished else None
-                ),
-                status=entry.get("status", "failed"),
-                input_bindings=entry.get("input_bindings", {}),
-                input_sequence_bindings={
-                    name: _sequence_binding_from_yaml(raw)
-                    for name, raw in entry.get(
-                        "input_sequence_bindings", {}
-                    ).items()
-                },
-                output_bindings=entry.get("output_bindings", {}),
-                exit_code=entry.get("exit_code"),
-                elapsed_s=entry.get("elapsed_s"),
-                image=entry.get("image"),
-                runner=entry["runner"],
-                error=entry.get("error"),
-                failure_phase=entry.get("failure_phase"),
-                rejected_outputs=_rejected_outputs_from_yaml(
-                    entry.get("rejected_outputs")),
-                termination_reason=entry.get("termination_reason"),
-                state_mode=entry.get("state_mode", "none"),
-                state_snapshot_id=entry.get("state_snapshot_id"),
-                invoking_execution_id=entry.get("invoking_execution_id"),
-            )
-
-        invocations: dict[str, BlockInvocation] = {}
-        for iid, entry in data.get("invocations", {}).items():
-            invocations[iid] = BlockInvocation(
-                id=iid,
-                invoking_execution_id=entry["invoking_execution_id"],
-                termination_reason=entry["termination_reason"],
-                invoked_block_name=entry["invoked_block_name"],
-                invoked_at=datetime.fromisoformat(entry["invoked_at"]),
-                status=entry["status"],
-                invoked_execution_id=entry.get("invoked_execution_id"),
-                input_bindings=entry.get("input_bindings", {}),
-                args=entry.get("args", []),
-                error=entry.get("error"),
-            )
-
-        telemetry: dict[str, ExecutionTelemetry] = {}
-        for tid, entry in data.get("telemetry", {}).items():
-            telemetry[tid] = ExecutionTelemetry(
-                id=tid,
-                execution_id=entry["execution_id"],
-                kind=entry["kind"],
-                recorded_at=datetime.fromisoformat(entry["recorded_at"]),
-                data=dict(entry.get("data", {})),
-                source=entry.get("source"),
-            )
-
-        telemetry_rejections: dict[str, RejectedTelemetry] = {}
-        for rid, entry in data.get("telemetry_rejections", {}).items():
-            telemetry_rejections[rid] = RejectedTelemetry(
-                id=rid,
-                execution_id=entry["execution_id"],
-                recorded_at=datetime.fromisoformat(entry["recorded_at"]),
-                path=entry["path"],
-                reason=entry["reason"],
-                preserved_path=entry.get("preserved_path"),
-            )
-
-        events: dict[str, LifecycleEvent] = {}
-        for evid, entry in data.get("events", {}).items():
-            events[evid] = LifecycleEvent(
-                id=evid,
-                kind=entry["kind"],
-                timestamp=datetime.fromisoformat(entry["timestamp"]),
-                execution_id=entry.get("execution_id"),
-                detail=entry.get("detail", {}),
-            )
-
-        runs: dict[str, RunRecord] = {}
-        for rid, entry in data.get("runs", {}).items():
-            finished = entry.get("finished_at")
-            runs[rid] = RunRecord(
-                id=rid,
-                kind=entry["kind"],
-                started_at=datetime.fromisoformat(
-                    entry["started_at"]),
-                finished_at=(
-                    datetime.fromisoformat(finished)
-                    if finished else None),
-                status=entry.get("status", "running"),
-                config_snapshot=entry.get("config_snapshot"),
-                params=dict(entry.get("params", {})),
-                lanes=list(entry.get("lanes", [DEFAULT_LANE])),
-                fixtures=_run_fixtures_from_yaml(
-                    entry.get("fixtures")),
-                steps=_run_steps_from_yaml(entry.get("steps")),
-                error=entry.get("error"),
-            )
-
+        artifacts = {
+            entry["id"]: _artifact_from_yaml(entry)
+            for entry in store.read_ledger("artifact")
+        }
+        executions = {
+            entry["id"]: _execution_from_yaml(entry)
+            for entry in store.read_ledger("execution")
+        }
+        invocations = {
+            entry["id"]: _invocation_from_yaml(entry)
+            for entry in store.read_ledger("invocation")
+        }
+        telemetry = {
+            entry["id"]: _telemetry_from_yaml(entry)
+            for entry in store.read_ledger("telemetry")
+        }
+        telemetry_rejections = {
+            entry["id"]: _telemetry_rejection_from_yaml(entry)
+            for entry in store.read_ledger("telemetry_rejection")
+        }
+        events = {
+            entry["id"]: _event_from_yaml(entry)
+            for entry in store.read_ledger("event")
+        }
+        runs = store.read_runs()
         sequence_entries = [
             _sequence_entry_from_yaml(entry)
-            for entry in data.get("sequence_entries", [])
+            for entry in store.read_ledger("sequence_entry")
         ]
+        state_snapshots = {
+            entry["id"]: _state_snapshot_from_row(entry)
+            for entry in store.read_ledger("state_snapshot")
+        }
         _validate_loaded_sequence_entries(
             sequence_entries,
             artifacts=artifacts,
@@ -2237,7 +2728,7 @@ class Workspace:
             runs=runs,
         )
 
-        return cls(
+        workspace = cls(
             name=data["name"],
             path=path,
             template_name=data["template_name"],
@@ -2251,200 +2742,87 @@ class Workspace:
             telemetry_rejections=telemetry_rejections,
             events=events,
             runs=runs,
-            state_snapshots=_state_snapshots_from_yaml(
-                data.get("state_snapshots")),
+            state_snapshots=state_snapshots,
         )
+        workspace._store = store
+        return workspace
 
     def save(self) -> None:
-        """Write workspace.yaml to the workspace directory.
+        """Compact split workspace storage from memory.
 
-        Thread-safe: acquires the workspace lock.  Uses atomic
-        write (write to temp file, then rename) to prevent torn
-        YAML from concurrent saves or crashes.
+        Hot-path record methods write targeted ledger rows directly.
+        This full save is retained as an escape hatch for tests and
+        rare internal callers that deliberately mutate the in-memory
+        workspace before flushing.
         """
         with self._lock:
-            serialized_artifacts = {}
-            for aid, inst in self.artifacts.items():
-                entry: dict = {
-                    "name": inst.name,
-                    "kind": inst.kind,
-                    "created_at": inst.created_at.isoformat(),
-                }
-                if inst.produced_by is not None:
-                    entry["produced_by"] = inst.produced_by
-                if inst.fixture_id is not None:
-                    entry["fixture_id"] = inst.fixture_id
-                if inst.source is not None:
-                    entry["source"] = inst.source
-                if inst.kind == "copy" and inst.copy_path is not None:
-                    entry["copy_path"] = inst.copy_path
-                if inst.kind == "git":
-                    entry["repo"] = inst.repo
-                    entry["commit"] = inst.commit
-                    entry["git_path"] = inst.git_path
-                if inst.supersedes is not None:
-                    entry["supersedes"] = _supersedes_to_yaml(inst.supersedes)
-                if inst.supersedes_reason is not None:
-                    entry["supersedes_reason"] = inst.supersedes_reason
-                serialized_artifacts[aid] = entry
+            self.store.rewrite_all(self)
+            self._deferred_records.clear()
 
-            serialized_executions = {}
-            for eid, ex in self.executions.items():
-                entry = {
-                    "block_name": ex.block_name,
-                    "started_at": ex.started_at.isoformat(),
-                    "status": ex.status,
-                    "input_bindings": ex.input_bindings,
-                    "output_bindings": ex.output_bindings,
-                }
-                if ex.input_sequence_bindings:
-                    entry["input_sequence_bindings"] = {
-                        name: _sequence_binding_to_yaml(binding)
-                        for name, binding in (
-                            ex.input_sequence_bindings.items()
-                        )
-                    }
-                if ex.finished_at is not None:
-                    entry["finished_at"] = ex.finished_at.isoformat()
-                if ex.exit_code is not None:
-                    entry["exit_code"] = ex.exit_code
-                if ex.elapsed_s is not None:
-                    entry["elapsed_s"] = ex.elapsed_s
-                if ex.image is not None:
-                    entry["image"] = ex.image
-                entry["runner"] = ex.runner
-                if ex.error is not None:
-                    entry["error"] = ex.error
-                if ex.failure_phase is not None:
-                    entry["failure_phase"] = ex.failure_phase
-                if ex.rejected_outputs:
-                    entry["rejected_outputs"] = (
-                        _rejected_outputs_to_yaml(
-                            ex.rejected_outputs))
-                if ex.termination_reason is not None:
-                    entry["termination_reason"] = ex.termination_reason
-                if ex.state_mode != "none":
-                    entry["state_mode"] = ex.state_mode
-                if ex.state_snapshot_id is not None:
-                    entry["state_snapshot_id"] = ex.state_snapshot_id
-                if ex.invoking_execution_id is not None:
-                    entry["invoking_execution_id"] = ex.invoking_execution_id
-                serialized_executions[eid] = entry
 
-            serialized_invocations = {}
-            for iid, inv in self.invocations.items():
-                entry = {
-                    "invoking_execution_id": inv.invoking_execution_id,
-                    "termination_reason": inv.termination_reason,
-                    "invoked_block_name": inv.invoked_block_name,
-                    "invoked_at": inv.invoked_at.isoformat(),
-                    "status": inv.status,
-                    "input_bindings": inv.input_bindings,
-                    "args": inv.args,
-                }
-                if inv.invoked_execution_id is not None:
-                    entry["invoked_execution_id"] = inv.invoked_execution_id
-                if inv.error is not None:
-                    entry["error"] = inv.error
-                serialized_invocations[iid] = entry
+class WorkspaceBatch:
+    """Explicit persistence batch for workspace ledger writes."""
 
-            serialized_telemetry = {}
-            for tid, tel in self.telemetry.items():
-                entry = {
-                    "execution_id": tel.execution_id,
-                    "kind": tel.kind,
-                    "recorded_at": tel.recorded_at.isoformat(),
-                    "data": dict(tel.data),
-                }
-                if tel.source is not None:
-                    entry["source"] = tel.source
-                serialized_telemetry[tid] = entry
+    def __init__(self, workspace: Workspace) -> None:
+        """Create a batch bound to one workspace."""
+        self.workspace = workspace
+        self.records: list[tuple[str, dict]] = []
+        self.runs: dict[str, RunRecord] = {}
+        self._snapshot: dict[str, object] | None = None
 
-            serialized_telemetry_rejections = {}
-            for rid, rejection in self.telemetry_rejections.items():
-                serialized_telemetry_rejections[rid] = {
-                    "execution_id": rejection.execution_id,
-                    "recorded_at": rejection.recorded_at.isoformat(),
-                    "path": rejection.path,
-                    "reason": rejection.reason,
-                }
-                if rejection.preserved_path is not None:
-                    serialized_telemetry_rejections[rid][
-                        "preserved_path"
-                    ] = rejection.preserved_path
+    def __enter__(self) -> WorkspaceBatch:
+        """Start buffering workspace persistence."""
+        if self.workspace._active_batch is not None:
+            raise RuntimeError("nested workspace batches are not supported")
+        self._snapshot = {
+            "artifacts": dict(self.workspace.artifacts),
+            "executions": dict(self.workspace.executions),
+            "invocations": dict(self.workspace.invocations),
+            "sequence_entries": list(self.workspace.sequence_entries),
+            "telemetry": dict(self.workspace.telemetry),
+            "telemetry_rejections": dict(self.workspace.telemetry_rejections),
+            "events": dict(self.workspace.events),
+            "runs": dict(self.workspace.runs),
+            "state_snapshots": dict(self.workspace.state_snapshots),
+        }
+        self.workspace._active_batch = self
+        return self
 
-            serialized_events = {}
-            for evid, ev in self.events.items():
-                entry = {
-                    "kind": ev.kind,
-                    "timestamp": ev.timestamp.isoformat(),
-                }
-                if ev.execution_id is not None:
-                    entry["execution_id"] = ev.execution_id
-                if ev.detail:
-                    entry["detail"] = ev.detail
-                serialized_events[evid] = entry
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Flush on success; roll back memory on failure."""
+        try:
+            if exc_type is not None:
+                self._restore()
+                return False
+            try:
+                self.workspace.store.append_batch(self.records)
+                for run in self.runs.values():
+                    self.workspace.store.write_run(run)
+            except Exception:
+                self._restore()
+                raise
+            return False
+        finally:
+            self.workspace._active_batch = None
 
-            serialized_runs = {}
-            for rid, run in self.runs.items():
-                entry = {
-                    "kind": run.kind,
-                    "started_at": run.started_at.isoformat(),
-                    "status": run.status,
-                }
-                if run.finished_at is not None:
-                    entry["finished_at"] = (
-                        run.finished_at.isoformat())
-                if run.config_snapshot is not None:
-                    entry["config_snapshot"] = run.config_snapshot
-                if run.params:
-                    entry["params"] = dict(run.params)
-                if run.lanes != [DEFAULT_LANE]:
-                    entry["lanes"] = list(run.lanes)
-                if run.fixtures:
-                    entry["fixtures"] = _run_fixtures_to_yaml(
-                        run.fixtures)
-                if run.steps:
-                    entry["steps"] = [
-                        _run_step_to_yaml(step) for step in run.steps
-                    ]
-                if run.error is not None:
-                    entry["error"] = run.error
-                serialized_runs[rid] = entry
+    def append(self, kind: str, row: dict) -> None:
+        """Queue one immutable ledger row."""
+        self.records.append((kind, row))
 
-            data: dict = {
-                "name": self.name,
-                "template_name": self.template_name,
-                "created_at": self.created_at.isoformat(),
-                "artifact_declarations": self.artifact_declarations,
-                "artifacts": serialized_artifacts,
-                "executions": serialized_executions,
-            }
-            if serialized_invocations:
-                data["invocations"] = serialized_invocations
-            if self.sequence_entries:
-                data["sequence_entries"] = [
-                    _sequence_entry_to_yaml(entry)
-                    for entry in self.sequence_entries
-                ]
-            if serialized_telemetry:
-                data["telemetry"] = serialized_telemetry
-            if serialized_telemetry_rejections:
-                data["telemetry_rejections"] = (
-                    serialized_telemetry_rejections
-                )
-            if serialized_events:
-                data["events"] = serialized_events
-            if serialized_runs:
-                data["runs"] = serialized_runs
-            if self.state_snapshots:
-                data["state_snapshots"] = {
-                    sid: _state_snapshot_to_yaml(snapshot)
-                    for sid, snapshot in self.state_snapshots.items()
-                }
+    def write_run(self, run: RunRecord) -> None:
+        """Queue one mutable run rewrite."""
+        self.runs[run.id] = run
 
-            yaml_path = self.path / "workspace.yaml"
-            tmp_path = yaml_path.with_suffix(".yaml.tmp")
-            with open(tmp_path, "w") as f:
-                yaml.safe_dump(data, f, sort_keys=False)
-            _replace_with_windows_retry(tmp_path, yaml_path)
+    def _restore(self) -> None:
+        """Restore the in-memory workspace to the batch entry state."""
+        if self._snapshot is None:
+            return
+        self.workspace.artifacts = self._snapshot["artifacts"]  # type: ignore[assignment]
+        self.workspace.executions = self._snapshot["executions"]  # type: ignore[assignment]
+        self.workspace.invocations = self._snapshot["invocations"]  # type: ignore[assignment]
+        self.workspace.sequence_entries = self._snapshot["sequence_entries"]  # type: ignore[assignment]
+        self.workspace.telemetry = self._snapshot["telemetry"]  # type: ignore[assignment]
+        self.workspace.telemetry_rejections = self._snapshot["telemetry_rejections"]  # type: ignore[assignment]
+        self.workspace.events = self._snapshot["events"]  # type: ignore[assignment]
+        self.workspace.runs = self._snapshot["runs"]  # type: ignore[assignment]
+        self.workspace.state_snapshots = self._snapshot["state_snapshots"]  # type: ignore[assignment]

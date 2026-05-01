@@ -76,10 +76,10 @@ retroactively rewrite parent execution status or ancestor invocation records.
 
 ## Ledger
 
-Each fired route creates a `BlockInvocation` record in `workspace.yaml`. The
-record stores the invoking execution id, termination reason, invoked block name,
-invoked execution id when one exists, concrete input bindings, arguments,
-status, and error text.
+Each fired route creates a `BlockInvocation` row in the workspace invocation
+ledger. The record stores the invoking execution id, termination reason,
+invoked block name, invoked execution id when one exists, concrete input
+bindings, arguments, status, and error text.
 
 The child `BlockExecution` stores `invoking_execution_id`. The invoking
 execution's own status is derived only from its termination reason and output

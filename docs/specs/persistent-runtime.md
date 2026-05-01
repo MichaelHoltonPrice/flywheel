@@ -164,7 +164,8 @@ container with an unverifiable identity.
 
 Runtime dispatch failures after prepare are durable failed block
 executions with `failure_phase: invoke`. This preserves the invariant
-that every minted execution id is represented in `workspace.yaml`.
+that every minted execution id is represented in the workspace execution
+ledger.
 
 Examples:
 

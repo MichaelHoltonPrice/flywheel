@@ -1158,7 +1158,7 @@ def _ingest_execution_telemetry(
             )
     if changed:
         with suppress(Exception):
-            workspace.save()
+            workspace.flush_deferred()
 
 
 def _record_flywheel_phase_telemetry(
@@ -1502,7 +1502,9 @@ def commit_block_execution(
             state_snapshot_id=state_snapshot_id,
             invoking_execution_id=invoking_execution_id,
             runner=plan.runner,
+            persist=False,
         )
+        workspace.flush_deferred()
         _ingest_execution_telemetry(workspace, plan)
         _cleanup_execution_proposals(workspace, plan)
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
@@ -1541,7 +1543,7 @@ def commit_block_execution(
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
         runner=plan.runner,
-        persist=not sequence_appends,
+        persist=False,
     )
     for slot, artifact_id, scope in sequence_appends:
         assert slot.sequence is not None
@@ -1553,8 +1555,7 @@ def commit_block_execution(
             producer_context=run_context,
             persist=False,
         )
-    if sequence_appends:
-        workspace.save()
+    workspace.flush_deferred()
     _ingest_execution_telemetry(workspace, plan)
     _cleanup_execution_proposals(workspace, plan)
 

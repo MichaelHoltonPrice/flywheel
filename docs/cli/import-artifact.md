@@ -189,7 +189,7 @@ Exit code zero plus the printed `Imported '<name>' as
 
 ```bash
 ls <workspace>/artifacts/<name>@<id>/
-yq '.artifacts."<name>@<id>"' <workspace>/workspace.yaml
+grep '"id": "<name>@<id>"' <workspace>/ledgers/artifacts.jsonl
 ```
 
 The recorded instance's `source` and `created_at` fields are
