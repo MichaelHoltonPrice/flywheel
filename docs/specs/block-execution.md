@@ -228,6 +228,16 @@ candidate path, reason, timestamp, and a best-effort
 warnings in the ledger; they do not fail the execution.
 
 The substrate provides the mount and validates the envelope. A battery
+or project may add its own telemetry candidates in that directory.
+Flywheel also records a substrate-owned `flywheel_execution_phases`
+telemetry item for successful executions. Its `data.phase_timings_s`
+contains host-side prepare, runtime, commit, and total observed
+durations; when the Docker one-shot runner is used,
+`data.container_phase_timings_s` includes low-level process-launch and
+container-wait durations. These timings are diagnostic only and do not
+affect execution status.
+
+A battery
 that wants stronger provenance for its own telemetry must also control
 who can write the candidate file. The Claude battery, for example,
 keeps `/flywheel/telemetry` root-owned and derives usage telemetry

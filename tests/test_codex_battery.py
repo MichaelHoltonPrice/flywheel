@@ -9,7 +9,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CODEX_DIR = ROOT / "batteries" / "codex"
 
@@ -340,3 +339,7 @@ print(json.dumps({
     assert usage["data"]["input_tokens"] == 3
     assert usage["data"]["cached_input_tokens"] == 1
     assert usage["data"]["output_tokens"] == 2
+    phases = usage["data"]["phase_timings_s"]
+    assert "process_popen_s" in phases
+    assert "time_to_first_event_s" in phases
+    assert "process_total_s" in phases

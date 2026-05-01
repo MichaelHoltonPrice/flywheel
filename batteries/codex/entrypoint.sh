@@ -2,6 +2,21 @@
 # Entrypoint for the flywheel-codex container.
 set -e
 
+PHASE_LOG=/tmp/flywheel-codex-phases.tsv
+: > "$PHASE_LOG"
+phase() {
+    python3 - "$PHASE_LOG" "$1" <<'PY'
+import sys
+import time
+
+path, name = sys.argv[1], sys.argv[2]
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(f"{name}\t{time.monotonic():.9f}\n")
+PY
+}
+
+phase entrypoint_start
+
 if [ "${NETWORK_ISOLATION}" = "1" ]; then
     CODEX_ALLOWED_HOSTS="${CODEX_ALLOWED_HOSTS:-api.openai.com,auth.openai.com,chatgpt.com,ab.chatgpt.com,chat.openai.com}"
     HOST_IP=$(getent ahosts host.docker.internal 2>/dev/null | awk '{print $1}' | head -1)
@@ -46,6 +61,7 @@ if [ "${NETWORK_ISOLATION}" = "1" ]; then
     iptables -A OUTPUT -j DROP
     echo "[entrypoint] network isolation active"
 fi
+phase network_setup_done
 
 export CODEX_HOME="${CODEX_HOME:-/home/codex/.codex}"
 export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch/.flywheel_scratchpad}"
@@ -85,6 +101,7 @@ if [ -d "$PERSISTED_SESSIONS" ]; then
     echo "[entrypoint] staged Codex sessions"
 fi
 chown -R codex:codex "$CODEX_HOME"
+phase codex_home_stage_done
 
 rm -rf "$SCRATCHPAD_RUNTIME_DIR"
 mkdir -p "$SCRATCHPAD_RUNTIME_DIR"
@@ -96,6 +113,7 @@ else
 fi
 chown -R codex:codex "$SCRATCHPAD_RUNTIME_DIR"
 chmod 700 "$SCRATCHPAD_RUNTIME_DIR" 2>/dev/null || true
+phase scratchpad_stage_done
 
 mkdir -p /flywheel/state /flywheel/mcp_servers /flywheel/telemetry
 chown -R root:root /flywheel/state /flywheel/telemetry
@@ -110,8 +128,10 @@ set +e
 chown root:root "$RUNNER_LOG"
 chmod 600 "$RUNNER_LOG"
 set -o pipefail
+phase agent_process_start
 su -s /bin/bash codex -c "FLYWHEEL_TELEMETRY_DIR='$RUNTIME_TELEMETRY_DIR' python3 /app/agent_runner.py" | tee "$RUNNER_LOG"
 RC=${PIPESTATUS[0]}
+phase agent_process_done
 set +o pipefail
 set -e
 
@@ -120,18 +140,21 @@ if [ -d "$RUNTIME_TELEMETRY_DIR" ]; then
     chown -R root:root /flywheel/telemetry
     chmod -R go-rwx /flywheel/telemetry
 fi
+phase agent_telemetry_copy_done
 
 rm -rf "$SCRATCHPAD_STATE_DIR"
 mkdir -p "$SCRATCHPAD_STATE_DIR"
 if [ -d "$SCRATCHPAD_RUNTIME_DIR" ]; then
     cp -a "$SCRATCHPAD_RUNTIME_DIR"/. "$SCRATCHPAD_STATE_DIR"/
 fi
+phase scratchpad_checkpoint_done
 
 rm -rf "$PERSISTED_SESSIONS"
 if [ -d "$CODEX_HOME/sessions" ]; then
     mkdir -p "$PERSISTED_SESSIONS"
     cp -a "$CODEX_HOME/sessions"/. "$PERSISTED_SESSIONS"/
 fi
+phase sessions_checkpoint_done
 
 python3 - <<'PY'
 import json
@@ -172,9 +195,11 @@ else:
         encoding="utf-8",
     )
 PY
+phase session_metadata_done
 
 chown -R root:root /flywheel/state /flywheel/telemetry
 chmod -R go-rwx /flywheel/state /flywheel/telemetry 2>/dev/null || true
+phase permissions_done
 
 if [ "$RC" -eq 0 ]; then
     REASON=$(python3 - <<'PY'
@@ -198,5 +223,41 @@ PY
 )
     echo "$REASON" > /flywheel/termination
 fi
+phase termination_done
+
+python3 - "$PHASE_LOG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+marks = []
+try:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, raw = line.split("\t", 1)
+        marks.append((name, float(raw)))
+except Exception:
+    marks = []
+
+durations = {}
+for (name, at), (next_name, next_at) in zip(marks, marks[1:]):
+    durations[f"{name}_to_{next_name}_s"] = round(next_at - at, 6)
+if marks:
+    durations["entrypoint_total_s"] = round(marks[-1][1] - marks[0][1], 6)
+
+telemetry = {
+    "kind": "codex_entrypoint_phases",
+    "source": "flywheel-codex",
+    "data": {
+        "schema_version": 1,
+        "marks": [name for name, _ in marks],
+        "phase_timings_s": durations,
+    },
+}
+Path("/flywheel/telemetry/codex_entrypoint_phases.json").write_text(
+    json.dumps(telemetry, indent=2, sort_keys=True),
+    encoding="utf-8",
+)
+PY
 
 exit "$RC"
