@@ -59,7 +59,6 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -381,7 +380,11 @@ def _positive_int_env(name: str) -> int | None:
     return parsed
 
 
-def _record_usage(events: list[dict[str, Any]]) -> None:
+def _record_usage(
+    events: list[dict[str, Any]],
+    *,
+    phase_timings: dict[str, float] | None = None,
+) -> None:
     telemetry_path = FLYWHEEL_TELEMETRY_DIR / "codex_usage.json"
     telemetry_path.parent.mkdir(parents=True, exist_ok=True)
     usage_events = [
@@ -420,6 +423,10 @@ def _record_usage(events: list[dict[str, Any]]) -> None:
             "cached_input_tokens": cached_input_tokens,
             "output_tokens": output_tokens,
             "last_message": latest_message,
+            "phase_timings_s": {
+                key: round(value, 6)
+                for key, value in (phase_timings or {}).items()
+            },
         },
     }, indent=2), encoding="utf-8")
 
@@ -435,10 +442,13 @@ def _is_benign_stderr(stderr: str) -> bool:
 
 
 def _run_codex(prompt: str) -> int:
+    command_build_start = time.monotonic()
     command = _build_command(prompt)
+    command_build_done = time.monotonic()
     _emit({"type": "codex_command", "argv": command[:-1] + ["<prompt>"]})
     EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     events: list[dict[str, Any]] = []
+    process_start = time.monotonic()
     proc = subprocess.Popen(
         command,
         cwd=str(WORKSPACE),
@@ -448,9 +458,13 @@ def _run_codex(prompt: str) -> int:
         encoding="utf-8",
         errors="replace",
     )
+    process_started = time.monotonic()
     assert proc.stdout is not None
+    first_event_at: float | None = None
     with EVENT_LOG.open("w", encoding="utf-8") as log:
         for line in proc.stdout:
+            if first_event_at is None:
+                first_event_at = time.monotonic()
             log.write(line)
             log.flush()
             stripped = line.strip()
@@ -463,8 +477,10 @@ def _run_codex(prompt: str) -> int:
                 continue
             events.append(event)
             _emit({"type": "codex_event", "event": event})
+    stdout_done = time.monotonic()
     stderr = proc.stderr.read() if proc.stderr is not None else ""
     rc = proc.wait()
+    process_done = time.monotonic()
     if stderr:
         FLYWHEEL_TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
         (FLYWHEEL_TELEMETRY_DIR / "codex_stderr.txt").write_text(
@@ -476,7 +492,18 @@ def _run_codex(prompt: str) -> int:
             })
         else:
             _emit({"type": "codex_stderr", "preview": stderr[:4000]})
-    _record_usage(events)
+    phase_timings = {
+        "command_build_s": command_build_done - command_build_start,
+        "process_popen_s": process_started - process_start,
+        "stdout_stream_s": stdout_done - process_started,
+        "process_wait_after_stdout_s": process_done - stdout_done,
+        "process_total_s": process_done - process_start,
+    }
+    if first_event_at is not None:
+        phase_timings["time_to_first_event_s"] = (
+            first_event_at - process_start
+        )
+    _record_usage(events, phase_timings=phase_timings)
     session_ids = [
         event.get("thread_id") for event in events
         if isinstance(event.get("thread_id"), str)
@@ -507,6 +534,7 @@ def _run_codex(prompt: str) -> int:
 
 
 def main() -> int:
+    """Run the Codex agent process and translate failures to events."""
     try:
         prompt = _load_prompt()
         handoff_configs = _handoff_configs()

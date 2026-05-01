@@ -44,10 +44,13 @@ class ContainerResult:
     Attributes:
         exit_code: Process exit code (0 means success).
         elapsed_s: Wall-clock time in seconds.
+        phase_timings: Optional low-level runner timings. Keys are
+            stable snake_case phase names; values are durations in seconds.
     """
 
     exit_code: int
     elapsed_s: float
+    phase_timings: dict[str, float] = field(default_factory=dict)
 
 
 def build_docker_command(
@@ -159,7 +162,9 @@ def run_container(
             when the user presses Ctrl+C.
     """
     start = time.monotonic()
+    popen_start = time.monotonic()
     process = start_container(config, args, name=name)
+    popen_done = time.monotonic()
     try:
         process.wait()
     except KeyboardInterrupt:
@@ -170,6 +175,14 @@ def run_container(
             process.kill()
             process.wait()
         raise
-    elapsed = time.monotonic() - start
+    wait_done = time.monotonic()
+    elapsed = wait_done - start
 
-    return ContainerResult(exit_code=process.returncode, elapsed_s=elapsed)
+    return ContainerResult(
+        exit_code=process.returncode,
+        elapsed_s=elapsed,
+        phase_timings={
+            "docker_popen_s": popen_done - popen_start,
+            "docker_wait_s": wait_done - popen_done,
+        },
+    )

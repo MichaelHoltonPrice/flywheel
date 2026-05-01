@@ -499,9 +499,11 @@ class TestPersistentRuntimeExecution:
         assert (
             ws.path / "artifacts" / instance.copy_path / "result.txt"
         ).read_text() == "result bytes"
-        assert {
-            item.kind: item.data for item in ws.telemetry.values()
-        } == {"usage": {"requests": 1}}
+        telemetry_by_kind = {
+            item.kind: item.data for item in ws.telemetry.values()}
+        assert telemetry_by_kind["usage"] == {"requests": 1}
+        assert telemetry_by_kind["flywheel_execution_phases"]["runner"] == (
+            "container_persistent")
         assert result.execution_id not in [
             p.name for p in (
                 ws.path / "runtimes" / "worker" / "exchange" / "requests"
@@ -899,14 +901,21 @@ class TestExecutionTelemetry:
             result = run_block(ws, "train", template, project_root)
 
         reloaded = Workspace.load(ws.path)
-        telemetry = sorted(
-            reloaded.telemetry.values(), key=lambda item: item.kind)
-        assert [item.kind for item in telemetry] == ["timing", "usage"]
+        telemetry_by_kind = {
+            item.kind: item for item in reloaded.telemetry.values()}
+        assert set(telemetry_by_kind) == {
+            "flywheel_execution_phases", "timing", "usage"}
+        telemetry = list(telemetry_by_kind.values())
         assert {item.execution_id for item in telemetry} == {
             result.execution_id}
-        assert telemetry[0].data == {"elapsed_ms": 50}
-        assert telemetry[1].source == "test"
-        assert telemetry[1].data == {"tokens": 12}
+        assert telemetry_by_kind["timing"].data == {"elapsed_ms": 50}
+        assert telemetry_by_kind["usage"].source == "test"
+        assert telemetry_by_kind["usage"].data == {"tokens": 12}
+        phase_data = telemetry_by_kind["flywheel_execution_phases"].data
+        assert phase_data["block_name"] == "train"
+        assert phase_data["runner"] == "container_one_shot"
+        assert set(phase_data["phase_timings_s"]) == {
+            "prepare_s", "runtime_s", "commit_s", "total_observed_s"}
         assert reloaded.telemetry_rejections == {}
         preserved = (
             reloaded.path / "telemetry" / result.execution_id
@@ -952,9 +961,10 @@ class TestExecutionTelemetry:
         reloaded = Workspace.load(ws.path)
         assert reloaded.executions[result.execution_id].status == "succeeded"
         telemetry = list(reloaded.telemetry.values())
-        assert len(telemetry) == 1
-        assert telemetry[0].kind == "usage"
-        assert telemetry[0].data == {"payload": "x" * 300000}
+        telemetry_by_kind = {item.kind: item for item in telemetry}
+        assert set(telemetry_by_kind) == {
+            "flywheel_execution_phases", "usage"}
+        assert telemetry_by_kind["usage"].data == {"payload": "x" * 300000}
         rejections = sorted(
             reloaded.telemetry_rejections.values(),
             key=lambda item: item.path,

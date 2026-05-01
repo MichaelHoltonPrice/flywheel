@@ -82,6 +82,21 @@ def _setup_project(tmp_path: Path) -> tuple[Path, Path, Template]:
     return project_root, foundry_dir, template
 
 
+def _ledger_rows(ws: Workspace, ledger_name: str) -> list[dict]:
+    path = ws.path / "ledgers" / f"{ledger_name}.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _ledger_by_id(ws: Workspace, ledger_name: str) -> dict[str, dict]:
+    return {row["id"]: row for row in _ledger_rows(ws, ledger_name)}
+
+
 class TestWorkspaceCreate:
     def test_creates_directory(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -90,6 +105,27 @@ class TestWorkspaceCreate:
         assert (ws.path / "artifacts").exists()
         assert (ws.path / "states").exists()
         assert (ws.path / "workspace.yaml").exists()
+        assert (ws.path / "ledgers").exists()
+        assert (ws.path / "runs").exists()
+
+    def test_workspace_root_is_metadata_only(self, tmp_path: Path):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+
+        root = yaml.safe_load((ws.path / "workspace.yaml").read_text())
+
+        assert root["storage_version"] == 2
+        assert set(root) == {
+            "storage_version",
+            "name",
+            "template_name",
+            "created_at",
+            "artifact_declarations",
+        }
+        assert "artifacts" not in root
+        assert "executions" not in root
+        assert "sequence_entries" not in root
+        assert "engine@baseline" in _ledger_by_id(ws, "artifacts")
 
     def test_name_and_template(self, tmp_path: Path):
         _, foundry_dir, template = _setup_project(tmp_path)
@@ -1014,9 +1050,7 @@ class TestBlockExecutionFailurePhase:
         ws._add_execution(ex)
         ws.save()
 
-        with open(ws.path / "workspace.yaml") as f:
-            raw = yaml.safe_load(f)
-        exec_data = raw["executions"]["exec1"]
+        exec_data = _ledger_by_id(ws, "executions")["exec1"]
         assert "failure_phase" not in exec_data
 
 
@@ -1134,12 +1168,10 @@ class TestRoundTripSupersedesAndQuarantine:
         ))
         ws.save()
 
-        with open(ws.path / "workspace.yaml") as f:
-            raw = yaml.safe_load(f)
-        artifact_yaml = raw["artifacts"]["checkpoint@plain"]
+        artifact_yaml = _ledger_by_id(ws, "artifacts")["checkpoint@plain"]
         assert "supersedes" not in artifact_yaml
         assert "supersedes_reason" not in artifact_yaml
-        exec_yaml = raw["executions"]["exec_plain"]
+        exec_yaml = _ledger_by_id(ws, "executions")["exec_plain"]
         assert "rejected_outputs" not in exec_yaml
 
     def test_load_old_format_has_safe_defaults(
@@ -1183,11 +1215,10 @@ class TestRoundTripSupersedesAndQuarantine:
         ))
         ws.save()
 
-        with open(ws.path / "workspace.yaml") as f:
-            raw = yaml.safe_load(f)
-        assert raw["artifacts"]["a@id"]["supersedes"] == {
+        artifacts = _ledger_by_id(ws, "artifacts")
+        assert artifacts["a@id"]["supersedes"] == {
             "artifact": "a@parent"}
-        assert raw["artifacts"]["a@rej"]["supersedes"] == {
+        assert artifacts["a@rej"]["supersedes"] == {
             "rejected": {"execution": "exec_z",
                          "slot": "checkpoint"}}
 

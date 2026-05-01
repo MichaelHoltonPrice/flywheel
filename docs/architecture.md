@@ -205,10 +205,18 @@ A workspace is a directory under a project's foundry. It contains
 `workspace.yaml`, artifact instances, state snapshots, run records,
 proposals, quarantine, and recovery directories.
 
-`workspace.yaml` is the durable ledger. It records workspace metadata,
-artifact declarations, artifact instances, state snapshots, block
-executions, execution telemetry and telemetry rejections, run records,
-and lifecycle events.
+`workspace.yaml` records only workspace identity, storage version,
+creation metadata, and artifact declarations. Durable execution state is
+split across append ledgers under `ledgers/` and one mutable YAML file
+per pattern run under `runs/`.
+
+Append ledgers record artifact instances, state snapshots, block
+executions, block invocations, artifact sequence entries, execution
+telemetry, telemetry rejections, and lifecycle events. Commit-critical
+groups of ledger rows are written with a batch marker so a load only
+accepts rows whose batch marker is durable. This keeps block commit
+semantics coherent without rewriting the entire workspace after every
+execution.
 
 Workspace mutations go through sanctioned methods such as
 `register_artifact`, `register_git_artifact`, `register_state_snapshot`,
@@ -216,7 +224,10 @@ Workspace mutations go through sanctioned methods such as
 `record_rejected_telemetry`, `begin_run`, `record_run_step`, and
 `end_run`. Private mutators are not public write paths.
 
-`Workspace.save()` writes atomically via a temporary file and replace.
+Hot record methods append targeted ledger rows or rewrite one run file.
+`Workspace.save()` remains as a compaction escape hatch for tests and
+rare internal callers that deliberately mutate the in-memory workspace
+before flushing.
 
 ## Templates and Foundry Layout
 

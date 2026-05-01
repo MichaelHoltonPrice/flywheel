@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from flywheel.artifact import BlockExecution
 from flywheel.container import ContainerResult
@@ -18,7 +17,6 @@ from flywheel.state import state_compatibility_identity
 from flywheel.template import Template
 from flywheel.workspace import Workspace
 from tests._inline_blocks import from_yaml_with_inline_blocks
-
 
 SEQUENCE_TEMPLATE_YAML = """\
 artifacts:
@@ -70,7 +68,7 @@ def _workspace(tmp_path: Path, template: Template) -> Workspace:
     (ws_path / "artifacts").mkdir(parents=True)
     (ws_path / "proposals").mkdir()
     (ws_path / "states").mkdir()
-    return Workspace(
+    workspace = Workspace(
         name="ws",
         path=ws_path,
         template_name=template.name,
@@ -78,6 +76,8 @@ def _workspace(tmp_path: Path, template: Template) -> Workspace:
         artifact_declarations={a.name: a.kind for a in template.artifacts},
         artifacts={},
     )
+    workspace.save()
+    return workspace
 
 
 def _template(tmp_path: Path, text: str = SEQUENCE_TEMPLATE_YAML) -> Template:
@@ -507,10 +507,16 @@ def test_sequence_entries_round_trip_and_gaps_are_rejected(
     assert len(loaded.sequence_entries) == 1
     assert loaded.sequence_entries[0].artifact_id == artifact.id
 
-    yaml_path = ws.path / "workspace.yaml"
-    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    data["sequence_entries"][0]["index"] = 1
-    yaml_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    ledger_path = ws.path / "ledgers" / "sequence_entries.jsonl"
+    rows = [
+        json.loads(line)
+        for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[0]["index"] = 1
+    ledger_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="invalid indices"):
         Workspace.load(ws.path)
@@ -540,12 +546,19 @@ def test_sequence_input_binding_load_rejects_unknown_artifact(
         run_context=RunContext(run.id, "lane_a"),
     )
 
-    yaml_path = ws.path / "workspace.yaml"
-    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    data["executions"][consumer.execution_id]["input_sequence_bindings"][
-        "arc_history"
-    ]["entries"][0]["artifact_id"] = "game_state@missing"
-    yaml_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    ledger_path = ws.path / "ledgers" / "executions.jsonl"
+    rows = [
+        json.loads(line)
+        for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in rows:
+        if row["id"] == consumer.execution_id:
+            row["input_sequence_bindings"]["arc_history"]["entries"][0][
+                "artifact_id"] = "game_state@missing"
+    ledger_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="references unknown artifact"):
         Workspace.load(ws.path)

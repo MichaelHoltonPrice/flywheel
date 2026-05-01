@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1157,7 +1158,44 @@ def _ingest_execution_telemetry(
             )
     if changed:
         with suppress(Exception):
-            workspace.save()
+            workspace.flush_deferred()
+
+
+def _record_flywheel_phase_telemetry(
+    workspace: Workspace,
+    plan: ExecutionPlan,
+    *,
+    phase_timings: dict[str, float],
+    container_result: ContainerResult | None,
+) -> None:
+    """Record host-side execution phase timings for one block."""
+    data: dict[str, Any] = {
+        "schema_version": 1,
+        "block_name": plan.block_name,
+        "runner": plan.runner,
+        "phase_timings_s": {
+            key: round(value, 6)
+            for key, value in phase_timings.items()
+        },
+    }
+    if container_result is not None:
+        data["container_elapsed_s"] = round(container_result.elapsed_s, 6)
+        if container_result.phase_timings:
+            data["container_phase_timings_s"] = {
+                key: round(value, 6)
+                for key, value in container_result.phase_timings.items()
+            }
+    with suppress(Exception):
+        workspace.record_execution_telemetry(
+            ExecutionTelemetry(
+                id=workspace.generate_telemetry_id(),
+                execution_id=plan.execution_id,
+                kind="flywheel_execution_phases",
+                recorded_at=datetime.now(UTC),
+                data=data,
+                source="flywheel",
+            )
+        )
 
 
 def _archive_persistent_exchange_envelopes(
@@ -1464,7 +1502,9 @@ def commit_block_execution(
             state_snapshot_id=state_snapshot_id,
             invoking_execution_id=invoking_execution_id,
             runner=plan.runner,
+            persist=False,
         )
+        workspace.flush_deferred()
         _ingest_execution_telemetry(workspace, plan)
         _cleanup_execution_proposals(workspace, plan)
         if execution_phase == runtime.FAILURE_OUTPUT_VALIDATE:
@@ -1503,7 +1543,7 @@ def commit_block_execution(
         state_snapshot_id=state_snapshot_id,
         invoking_execution_id=invoking_execution_id,
         runner=plan.runner,
-        persist=not sequence_appends,
+        persist=False,
     )
     for slot, artifact_id, scope in sequence_appends:
         assert slot.sequence is not None
@@ -1515,8 +1555,7 @@ def commit_block_execution(
             producer_context=run_context,
             persist=False,
         )
-    if sequence_appends:
-        workspace.save()
+    workspace.flush_deferred()
     _ingest_execution_telemetry(workspace, plan)
     _cleanup_execution_proposals(workspace, plan)
 
@@ -1651,6 +1690,7 @@ def run_block(
     # ── identity ─────────────────────────────────────────────────
     # Minted before prepare so any prepare-time failure has an
     # execution_id to record itself against.
+    execution_timer_start = time.monotonic()
     execution_id = workspace.generate_execution_id()
     started_at = datetime.now(UTC)
     runner = (
@@ -1665,6 +1705,7 @@ def run_block(
     )
 
     # ── prepare ──────────────────────────────────────────────────
+    prepare_start = time.monotonic()
     try:
         plan = prepare_block_execution(
             workspace, block_def, template, project_root,
@@ -1677,6 +1718,7 @@ def run_block(
             runner=runner,
             run_context=run_context,
         )
+        prepare_done = time.monotonic()
     except Exception as exc:
         commit_failure(
             workspace,
@@ -1695,6 +1737,7 @@ def run_block(
         raise
 
     # -- run -----------------------------------------------------
+    runtime_start = time.monotonic()
     try:
         if runner == "container_persistent":
             runtime_result = run_persistent_container(
@@ -1707,6 +1750,7 @@ def run_block(
             runtime_result = run_one_shot_container(
                 plan, args, container_runner=container_runner,
             )
+        runtime_done = time.monotonic()
     except KeyboardInterrupt as exc:
         error = str(exc) or "operator interrupt"
         commit_failure(
@@ -1743,6 +1787,7 @@ def run_block(
         raise
 
     # ── commit ───────────────────────────────────────────────────
+    commit_start = time.monotonic()
     result = commit_block_execution(
         workspace, plan, runtime_result, template,
         validator_registry=validator_registry,
@@ -1750,6 +1795,7 @@ def run_block(
         invoking_execution_id=invoking_execution_id,
         run_context=run_context,
     )
+    commit_done = time.monotonic()
     container_result = result or runtime_result.container_result
     if container_result is None:
         raise _with_execution_id(
@@ -1759,6 +1805,17 @@ def run_block(
             ),
             plan.execution_id,
         )
+    _record_flywheel_phase_telemetry(
+        workspace,
+        plan,
+        phase_timings={
+            "prepare_s": prepare_done - prepare_start,
+            "runtime_s": runtime_done - runtime_start,
+            "commit_s": commit_done - commit_start,
+            "total_observed_s": commit_done - execution_timer_start,
+        },
+        container_result=container_result,
+    )
     execution = workspace.executions[plan.execution_id]
     if dispatch_child_invocations:
         dispatch_chain = invocation_chain or InvocationChain.empty()

@@ -148,7 +148,7 @@ instance for the slot.
 | --- | --- | --- |
 | `flywheel.yaml` missing or malformed at the cwd. | `FileNotFoundError` / `ValueError`. | Run from the project root. |
 | `--workspace` path does not contain a `workspace.yaml`. | `FileNotFoundError`. | Confirm the path. |
-| `--artifact` is not present in the workspace ledger. | `ValueError("Artifact … does not exist in this workspace")`. | Confirm the predecessor id. List candidates with `yq '.artifacts | keys' <workspace>/workspace.yaml`. |
+| `--artifact` is not present in the workspace ledger. | `ValueError("Artifact … does not exist in this workspace")`. | Confirm the predecessor id. List candidates with `grep '"id":' <workspace>/ledgers/artifacts.jsonl`. |
 | `--artifact`'s declaration name is not `kind: copy`. | `ValueError("Only copy artifacts can be imported …")`. | Same constraint as `import artifact`. Git artifacts are not amendable today. |
 | `--from` path does not exist. | `FileNotFoundError`. | Confirm the source path. |
 | `--from` is a single file. | `ValueError("Artifact source must be a directory …")`. | Wrap it in a directory and pass that. |
@@ -166,19 +166,17 @@ Exit code zero plus the printed
 
 ```bash
 ls <workspace>/artifacts/<name>@<id>/
-yq '.artifacts."<name>@<id>".supersedes' \
-  <workspace>/workspace.yaml
+grep '"id": "<name>@<id>"' <workspace>/ledgers/artifacts.jsonl
 ```
 
-The `supersedes.artifact` field in `workspace.yaml` is the
+The `supersedes.artifact` field in `ledgers/artifacts.jsonl` is the
 canonical lineage record.
 
 ## Typical next steps
 
 * Confirm the new instance is what consumers will pick:
-  `yq '.artifacts | to_entries | map(select(.value.name ==
-  "<name>")) | sort_by(.value.created_at)'
-  <workspace>/workspace.yaml`. The last entry is what the
+  inspect entries whose `"name"` is `"<name>"` in
+  `<workspace>/ledgers/artifacts.jsonl`. The last entry is what the
   default input-resolution policy will bind.
 * Run a downstream block; no new flags are needed — the
   default policy will pick the successor.

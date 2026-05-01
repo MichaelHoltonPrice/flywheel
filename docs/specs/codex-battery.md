@@ -195,10 +195,20 @@ The runner writes a strict telemetry envelope to
     "event_count": 12,
     "input_tokens": 100,
     "cached_input_tokens": 50,
-    "output_tokens": 20
+    "output_tokens": 20,
+    "phase_timings_s": {
+      "process_total_s": 30.0,
+      "time_to_first_event_s": 2.0
+    }
   }
 }
 ```
+
+The root entrypoint also writes
+`/flywheel/telemetry/codex_entrypoint_phases.json`, which records setup,
+agent-process, checkpoint, and termination-write durations. Together
+with Flywheel's `flywheel_execution_phases` telemetry, these records
+separate Docker/process overhead from Codex CLI/model runtime.
 
 Flywheel core ingests this through the generic telemetry lane. Telemetry
 never decides execution status.

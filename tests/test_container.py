@@ -144,6 +144,7 @@ class TestContainerResult:
         result = ContainerResult(exit_code=0, elapsed_s=12.5)
         assert result.exit_code == 0
         assert result.elapsed_s == 12.5
+        assert result.phase_timings == {}
 
     def test_frozen(self):
         result = ContainerResult(exit_code=0, elapsed_s=1.0)
@@ -186,12 +187,16 @@ class TestRunContainer:
         mock_process = MagicMock()
         mock_process.returncode = 0
         mock_popen.return_value = mock_process
-        mock_time.side_effect = [100.0, 105.5]
+        mock_time.side_effect = [100.0, 100.1, 100.4, 105.5]
 
         config = ContainerConfig(image="test:latest")
         result = run_container(config)
 
         assert result.elapsed_s == pytest.approx(5.5)
+        assert result.phase_timings == {
+            "docker_popen_s": pytest.approx(0.3),
+            "docker_wait_s": pytest.approx(5.1),
+        }
 
     @patch("flywheel.container.subprocess.Popen")
     def test_passes_args_to_command(self, mock_popen):
