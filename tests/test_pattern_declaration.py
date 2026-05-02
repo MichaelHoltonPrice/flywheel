@@ -165,6 +165,7 @@ def test_structured_do_foreach_use_and_run_until_parse():
                                 },
                             },
                             "stop_on": ["normal"],
+                            "stop_on_invoked": ["terminal"],
                             "fail_on": ["aborted"],
                         },
                     }
@@ -178,6 +179,7 @@ def test_structured_do_foreach_use_and_run_until_parse():
     subpattern = pattern.patterns["improve_lane"]
     assert subpattern.params["max_evals"].type == "int"
     run_until = subpattern.body[0]
+    assert run_until.stop_on_invoked == ["terminal"]
     assert run_until.fail_on == ["aborted"]
 
 

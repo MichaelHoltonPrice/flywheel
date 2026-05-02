@@ -356,6 +356,9 @@ blocks:
       normal:
         - name: score
           container_path: /output/score
+      terminal:
+        - name: score
+          container_path: /output/score
   - name: Brainstorm
     image: brainstorm:latest
     inputs:
@@ -1561,6 +1564,75 @@ def test_run_until_executes_lane_major_and_stops_on_normal(
         lane_0_snapshots[0].id)
     assert lane_0_snapshots[2].predecessor_snapshot_id == (
         lane_0_snapshots[1].id)
+
+
+def test_run_until_can_stop_on_invoked_child_reason(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, RUN_UNTIL_TEMPLATE_YAML)
+    fixture_bot = project_root / "foundry" / "templates" / "assets" / "bot"
+    fixture_bot.mkdir(parents=True)
+    (fixture_bot / "bot.py").write_text("BASE")
+    pattern = parse_pattern_declaration({
+        "name": "invoked_stop",
+        "fixtures": {"bot": "foundry/templates/assets/bot"},
+        "do": [
+            {
+                "run_until": {
+                    "name": "improve",
+                    "block": "ImproveBot",
+                    "continue_on": {"eval_requested": {"max": 5}},
+                    "stop_on": ["normal"],
+                    "stop_on_invoked": ["terminal"],
+                },
+            }
+        ],
+    })
+    seen: list[str] = []
+
+    def fake_container(config, args=None):
+        del args
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            source = (mounts["/input/bot"] / "bot.py").read_text()
+            seen.append("improve")
+            output = mounts["/output/bot"] / "bot.py"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(f"{source}->done")
+            state_file = mounts["/flywheel"] / "state" / "session.txt"
+            state_file.write_text(f"{source}->done")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            seen.append("eval")
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("terminal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    step = run.steps[0]
+    assert seen == ["improve", "eval"]
+    assert step.kind == "run_until"
+    assert len(step.members) == 1
+    assert step.status == "succeeded"
+    assert step.terminal_reason == "terminal"
+    assert step.stop_kind == "stop_on_invoked"
+    assert step.reason_counts == {"eval_requested": 1}
+    invocation = reloaded.invocations[step.members[0].invocation_ids[0]]
+    child = reloaded.executions[invocation.invoked_execution_id]
+    assert child.termination_reason == "terminal"
 
 
 def test_run_until_budget_stops_after_max_continue_reason(

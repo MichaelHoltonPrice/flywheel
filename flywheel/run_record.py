@@ -45,7 +45,8 @@ class RunStepRecord:
     kind: Literal["cohort", "run_until"] = "cohort"
     terminal_reason: str | None = None
     stop_kind: Literal[
-        "stop_on", "budget_exhausted", "failed", "unexpected_reason",
+        "stop_on", "stop_on_invoked", "budget_exhausted", "failed",
+        "unexpected_reason",
     ] | None = None
     reason_counts: dict[str, int] = field(default_factory=dict)
 
