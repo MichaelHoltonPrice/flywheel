@@ -84,6 +84,23 @@ BENIGN_STDERR_PATTERNS = [
         r"failed to record rollout items: thread .* not found$"
     ),
 ]
+WEB_SEARCH_DISABLE_FEATURES = (
+    "web_search",
+    "web_search_cached",
+    "web_search_request",
+    "search_tool",
+    "browser_use",
+    "in_app_browser",
+)
+FORBIDDEN_EXTRA_ARG_FRAGMENTS = (
+    "--search",
+    "web_search",
+    "web_search_cached",
+    "web_search_request",
+    "search_tool",
+    "browser_use",
+    "in_app_browser",
+)
 
 
 def _emit(data: dict[str, Any]) -> None:
@@ -248,9 +265,14 @@ def _write_codex_config(handoff_configs: dict[str, dict[str, Any]]) -> None:
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
     lines = [
         'cli_auth_credentials_store = "file"',
+        'web_search = "disabled"',
         "",
         "[features]",
         "codex_hooks = true" if handoff_configs else "codex_hooks = false",
+        *[
+            f"{feature} = false"
+            for feature in WEB_SEARCH_DISABLE_FEATURES
+        ],
         "",
     ]
 
@@ -333,7 +355,10 @@ def _build_command(prompt: str) -> list[str]:
         command.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
     extra = os.environ.get("CODEX_EXTRA_ARGS", "").strip()
     if extra:
-        command.extend(shlex.split(extra))
+        extra_args = shlex.split(extra)
+        _validate_extra_args(extra_args)
+        command.extend(extra_args)
+    _append_web_search_disable_args(command)
     compact_limit = _positive_int_env("CODEX_AUTO_COMPACT_TOKEN_LIMIT")
     if compact_limit is not None:
         command.extend([
@@ -352,6 +377,22 @@ def _build_command(prompt: str) -> list[str]:
             "FLYWHEEL_RESUME_PROMPT", "").strip() or "Continue."
     command.append(command_prompt)
     return command
+
+
+def _validate_extra_args(args: list[str]) -> None:
+    for arg in args:
+        normalized = arg.strip().lower()
+        if any(fragment in normalized for fragment in FORBIDDEN_EXTRA_ARG_FRAGMENTS):
+            raise ValueError(
+                "CODEX_EXTRA_ARGS must not configure web search, browser, "
+                f"or search features: {arg}"
+            )
+
+
+def _append_web_search_disable_args(command: list[str]) -> None:
+    command.extend(["-c", 'web_search="disabled"'])
+    for feature in WEB_SEARCH_DISABLE_FEATURES:
+        command.extend(["--disable", feature])
 
 
 def _bool_env(name: str, *, default: bool) -> bool:
@@ -441,6 +482,14 @@ def _is_benign_stderr(stderr: str) -> bool:
     )
 
 
+def _event_uses_web_search(event: dict[str, Any]) -> bool:
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") == "web_search":
+        return True
+    payload = event.get("payload")
+    return isinstance(payload, dict) and payload.get("type") == "web_search_call"
+
+
 def _run_codex(prompt: str) -> int:
     command_build_start = time.monotonic()
     command = _build_command(prompt)
@@ -477,6 +526,18 @@ def _run_codex(prompt: str) -> int:
                 continue
             events.append(event)
             _emit({"type": "codex_event", "event": event})
+            if _event_uses_web_search(event):
+                # Research runs should preserve the trajectory for analysis even
+                # when a forbidden hosted-search event is observed.
+                _emit({
+                    "type": "warning",
+                    "message": (
+                        "Codex emitted a web-search event despite "
+                        "web_search=disabled."
+                    ),
+                    "warning_type": "WebSearchObserved",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                })
     stdout_done = time.monotonic()
     stderr = proc.stderr.read() if proc.stderr is not None else ""
     rc = proc.wait()
@@ -511,7 +572,7 @@ def _run_codex(prompt: str) -> int:
     if session_ids:
         _emit({
             "type": "agent_state",
-            "status": "complete" if rc == 0 else "failed",
+            "status": "failed" if rc != 0 else "complete",
             "session_id": session_ids[-1],
             "timestamp": time.time(),
         })

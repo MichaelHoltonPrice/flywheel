@@ -519,6 +519,19 @@ def _execute_run_until(
             )
         if reason in budgets:
             reason_counts[reason] += 1
+            invoked_stop_reason = _invoked_stop_reason(
+                workspace, result, node.stop_on_invoked)
+            if invoked_stop_reason is not None:
+                _finish_run_until_step(
+                    workspace,
+                    run_id,
+                    step,
+                    status="succeeded",
+                    stop_kind="stop_on_invoked",
+                    terminal_reason=invoked_stop_reason,
+                    reason_counts=reason_counts,
+                )
+                return
             step = _finish_run_until_step(
                 workspace,
                 run_id,
@@ -1527,6 +1540,51 @@ def _invocation_ids_for_parent(
         for invocation in workspace.invocations.values()
         if invocation.invoking_execution_id == execution_id
     ]
+
+
+def _invoked_stop_reason(
+    workspace: Workspace,
+    member: RunMemberRecord,
+    stop_on_invoked: list[str],
+) -> str | None:
+    stop_reasons = set(stop_on_invoked)
+    if not stop_reasons:
+        return None
+    for invocation_id in member.invocation_ids:
+        reason = _invoked_stop_reason_from_invocation(
+            workspace, invocation_id, stop_reasons, seen=set())
+        if reason is not None:
+            return reason
+    return None
+
+
+def _invoked_stop_reason_from_invocation(
+    workspace: Workspace,
+    invocation_id: str,
+    stop_reasons: set[str],
+    *,
+    seen: set[str],
+) -> str | None:
+    if invocation_id in seen:
+        return None
+    seen.add(invocation_id)
+    invocation = workspace.invocations.get(invocation_id)
+    if invocation is None or invocation.status != "succeeded":
+        return None
+    child_id = invocation.invoked_execution_id
+    if child_id is None:
+        return None
+    child = workspace.executions.get(child_id)
+    if child is None or child.status != "succeeded":
+        return None
+    if child.termination_reason in stop_reasons:
+        return child.termination_reason
+    for child_invocation_id in _invocation_ids_for_parent(workspace, child.id):
+        reason = _invoked_stop_reason_from_invocation(
+            workspace, child_invocation_id, stop_reasons, seen=seen)
+        if reason is not None:
+            return reason
+    return None
 
 
 def _validate_pattern_fixtures(

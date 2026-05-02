@@ -84,6 +84,8 @@ def test_codex_docs_explain_network_isolation_host_allowlist():
         encoding="utf-8")
     assert "NETWORK_ISOLATION=1" in spec
     assert "CODEX_ALLOWED_HOSTS" in spec
+    assert 'web_search = "disabled"' in spec
+    assert "CODEX_EXTRA_ARGS` must not contain `--search`" in spec
     for host in (
         "api.openai.com",
         "auth.openai.com",
@@ -115,7 +117,18 @@ def test_agent_runner_builds_codex_exec_command(monkeypatch, tmp_path):
     assert command[command.index("--model") + 1] == "gpt-5.5"
     assert "model_reasoning_effort=\"high\"" in command
     assert "model_auto_compact_token_limit=200000" in command
-    assert command[command.index("--disable") + 1] == "shell_snapshot"
+    assert "-c" in command
+    assert "web_search=\"disabled\"" in command
+    for feature in (
+        "web_search",
+        "web_search_cached",
+        "web_search_request",
+        "search_tool",
+        "browser_use",
+        "in_app_browser",
+        "shell_snapshot",
+    ):
+        assert feature in command
     assert command[-1] == "do work"
 
 
@@ -145,12 +158,38 @@ def test_named_compact_limit_overrides_extra_args(monkeypatch, tmp_path):
     assert named_index > configured_index
 
 
+def test_codex_web_search_overrides_follow_extra_args(monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_EXTRA_ARGS", "-c model_verbosity=\"low\"")
+    command = module._build_command("do work")
+    extra_index = command.index("model_verbosity=low")
+    web_search_index = command.index("web_search=\"disabled\"")
+    assert web_search_index > extra_index
+
+
+def test_agent_runner_rejects_search_related_extra_args(monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    for extra in (
+        "--search",
+        "-c web_search=\"live\"",
+        "-c features.web_search_request=true",
+        "--enable browser_use",
+    ):
+        monkeypatch.setenv("CODEX_EXTRA_ARGS", extra)
+        try:
+            module._build_command("do work")
+        except ValueError as exc:
+            assert "CODEX_EXTRA_ARGS must not configure web search" in str(exc)
+        else:
+            raise AssertionError(f"expected {extra!r} to fail")
+
+
 def test_agent_runner_can_enable_codex_shell_snapshot(monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("CODEX_SHELL_SNAPSHOT", "true")
     command = module._build_command("do work")
     assert command[command.index("--enable") + 1] == "shell_snapshot"
-    assert "--disable" not in command
+    assert "web_search" in command
 
 
 def test_agent_runner_rejects_invalid_shell_snapshot_value(
@@ -228,6 +267,13 @@ def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
     module._write_codex_config(configs)
     text = (tmp_path / "codex-home" / "config.toml").read_text(
         encoding="utf-8")
+    assert 'web_search = "disabled"' in text
+    assert "web_search = false" in text
+    assert "web_search_cached = false" in text
+    assert "web_search_request = false" in text
+    assert "search_tool = false" in text
+    assert "browser_use = false" in text
+    assert "in_app_browser = false" in text
     assert "[mcp_servers.demo]" in text
     assert "demo_mcp_server.py" in text
     assert "codex_hooks = true" in text
@@ -343,3 +389,63 @@ print(json.dumps({
     assert "process_popen_s" in phases
     assert "time_to_first_event_s" in phases
     assert "process_total_s" in phases
+
+
+def test_agent_runner_audits_codex_web_search_event(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Write a short message.")
+    workspace = tmp_path / "scratch"
+    workspace.mkdir()
+    telemetry = tmp_path / "telemetry"
+    codex_home = tmp_path / "codex-home"
+    fake_py = tmp_path / "fake_codex_web.py"
+    fake_py.write_text(
+        """
+from __future__ import annotations
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+out = None
+for i, arg in enumerate(args):
+    if arg == "--output-last-message":
+        out = Path(args[i + 1])
+if out is not None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("fake final", encoding="utf-8")
+print(json.dumps({"type": "thread.started", "thread_id": "thread_fake"}))
+print(json.dumps({
+    "type": "item.completed",
+    "item": {
+        "type": "web_search",
+        "query": "arc agi 3",
+        "action": {"type": "search", "query": "arc agi 3"},
+    },
+}))
+print(json.dumps({"type": "thread.completed", "thread_id": "thread_fake"}))
+""",
+        encoding="utf-8",
+    )
+    fake_cmd = tmp_path / "fake_codex.cmd"
+    fake_cmd.write_text(f'@echo off\r\n"{sys.executable}" "{fake_py}" %*\r\n')
+    env = os.environ.copy()
+    env.update({
+        "FLYWHEEL_CODEX_FAKE": str(fake_cmd),
+        "FLYWHEEL_AGENT_PROMPT": str(prompt),
+        "AGENT_WORKSPACE": str(workspace),
+        "CODEX_HOME": str(codex_home),
+        "FLYWHEEL_TELEMETRY_DIR": str(telemetry),
+        "FLYWHEEL_CODEX_EVENT_LOG": str(tmp_path / "events.jsonl"),
+        "FLYWHEEL_CODEX_LAST_MESSAGE": str(tmp_path / "last.txt"),
+    })
+    proc = subprocess.run(
+        [sys.executable, str(CODEX_DIR / "agent_runner.py")],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "WebSearchObserved" in proc.stdout
+    assert '"status": "complete"' in proc.stdout
