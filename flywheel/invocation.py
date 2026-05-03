@@ -228,6 +228,7 @@ def dispatch_invocations(
                 state_validator_registry=state_validator_registry,
                 invoking_execution_id=parent_execution.id,
                 dispatch_child_invocations=True,
+                invocation_params=params,
                 run_context=run_context,
                 invocation_chain=invocation_chain,
                 max_invocation_depth=max_invocation_depth,
