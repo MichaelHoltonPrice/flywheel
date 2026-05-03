@@ -63,8 +63,8 @@ preparation, runtime, commit, validation, state capture, and ledger recording.
 Invoked children recursively dispatch their own `on_termination` routes by
 default. Dispatch remains synchronous, host-side, and post-commit: a child
 must finish and commit before its own routes are fired. Recursive dispatch is
-bounded by a runtime depth limit; the default permits eight committed
-executions in one invocation chain and rejects the ninth launch. Template load
+bounded by a runtime depth limit; the default permits sixteen committed
+executions in one invocation chain and rejects the seventeenth launch. Template load
 also rejects declared invocation cycles, and the runtime keeps a same-block
 cycle guard as a final failsafe.
 

@@ -26,7 +26,7 @@ from flywheel.template import (
 )
 from flywheel.workspace import Workspace
 
-DEFAULT_MAX_INVOCATION_DEPTH = 12
+DEFAULT_MAX_INVOCATION_DEPTH = 16
 """Maximum committed executions allowed in one invocation chain.
 
 The top-level block counts as parent #1 once it commits and begins

@@ -1369,9 +1369,9 @@ class TestBlockInvocation:
         self, tmp_path: Path,
     ):
         blocks = []
-        for index in range(13):
+        for index in range(17):
             next_route = ""
-            if index < 12:
+            if index < 16:
                 next_route = f"""
     on_termination:
       next:
@@ -1392,7 +1392,7 @@ class TestBlockInvocation:
 """)
         artifacts = "".join(
             f"  - name: artifact_{index}\n    kind: copy\n"
-            for index in range(13)
+            for index in range(17)
         )
         template_yaml = f"artifacts:\n{artifacts}\nblocks:\n{''.join(blocks)}"
         project_root, foundry_dir, _template_path, template = (
@@ -1416,7 +1416,7 @@ class TestBlockInvocation:
             )
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(str(image_index), encoding="utf-8")
-            reason = "next" if image_index < 12 else "normal"
+            reason = "next" if image_index < 16 else "normal"
             (mounts["/flywheel"] / "termination").write_text(reason)
             return ContainerResult(exit_code=0, elapsed_s=0.1)
 
@@ -1424,18 +1424,18 @@ class TestBlockInvocation:
             result = run_block(ws, "step_0", template, project_root)
 
         assert result.execution.status == "succeeded"
-        assert "step-12:latest" not in seen_images
-        assert len(ws.executions) == 12
+        assert "step-16:latest" not in seen_images
+        assert len(ws.executions) == 16
         failed_invocation = next(
             invocation for invocation in ws.invocations.values()
             if invocation.status == "failed"
         )
-        assert failed_invocation.invoked_block_name == "step_12"
-        assert "invocation depth limit (12) exceeded" in (
+        assert failed_invocation.invoked_block_name == "step_16"
+        assert "invocation depth limit (16) exceeded" in (
             failed_invocation.error or "")
         deepest_execution = next(
             execution for execution in ws.executions.values()
-            if execution.block_name == "step_11"
+            if execution.block_name == "step_15"
         )
         assert deepest_execution.status == "succeeded"
 
