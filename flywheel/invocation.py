@@ -26,12 +26,12 @@ from flywheel.template import (
 )
 from flywheel.workspace import Workspace
 
-DEFAULT_MAX_INVOCATION_DEPTH = 8
+DEFAULT_MAX_INVOCATION_DEPTH = 12
 """Maximum committed executions allowed in one invocation chain.
 
 The top-level block counts as parent #1 once it commits and begins
-dispatching routes, so the default allows eight committed executions
-and rejects the ninth launch.
+dispatching routes, so the default allows twelve committed executions
+and rejects the thirteenth launch.
 """
 
 
@@ -228,6 +228,7 @@ def dispatch_invocations(
                 state_validator_registry=state_validator_registry,
                 invoking_execution_id=parent_execution.id,
                 dispatch_child_invocations=True,
+                invocation_params=params,
                 run_context=run_context,
                 invocation_chain=invocation_chain,
                 max_invocation_depth=max_invocation_depth,

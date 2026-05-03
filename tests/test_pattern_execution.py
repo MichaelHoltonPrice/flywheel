@@ -405,6 +405,57 @@ blocks:
           container_path: /output/score
 """
 
+NESTED_PARAM_INVOCATION_TEMPLATE_YAML = """\
+artifacts:
+  - name: bot
+    kind: copy
+  - name: score
+    kind: copy
+  - name: verdict
+    kind: copy
+
+blocks:
+  - name: improve
+    image: improve:latest
+    outputs:
+      eval_requested:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      eval_requested:
+        invoke:
+          - block: eval
+            bind:
+              bot: bot
+  - name: eval
+    image: eval:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      normal:
+        - name: score
+          container_path: /output/score
+    on_termination:
+      normal:
+        invoke:
+          - block: validate
+            bind:
+              score: score
+            args:
+              - --episodes
+              - ${params.eval_episodes}
+  - name: validate
+    image: validate:latest
+    inputs:
+      - name: score
+        container_path: /input/score
+    outputs:
+      normal:
+        - name: verdict
+          container_path: /output/verdict
+"""
+
 
 def _setup_workspace(
     tmp_path: Path,
@@ -586,6 +637,78 @@ def test_pattern_params_persist_and_substitute_into_env_args_and_invocations(
     assert [item[0] for item in seen] == ["improve:latest", "eval:latest"]
     invocation = next(iter(reloaded.invocations.values()))
     assert invocation.args == ["--episodes", "123"]
+
+
+def test_pattern_params_substitute_into_nested_invocation_args(
+    tmp_path: Path,
+):
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, NESTED_PARAM_INVOCATION_TEMPLATE_YAML)
+    pattern = parse_pattern_declaration({
+        "name": "improve",
+        "params": {
+            "eval_episodes": {
+                "type": "int",
+                "default": 4000,
+            },
+        },
+        "do": [
+            {
+                "name": "improve",
+                "cohort": {
+                    "min_successes": "all",
+                    "members": [
+                        {"name": "agent", "block": "improve"},
+                    ],
+                },
+            }
+        ],
+    })
+
+    def fake_container(config, args=None):
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        if config.image == "improve:latest":
+            bot = mounts["/output/bot"] / "bot.py"
+            bot.parent.mkdir(parents=True, exist_ok=True)
+            bot.write_text("BOT")
+            (mounts["/flywheel"] / "termination").write_text(
+                "eval_requested")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "eval:latest":
+            score = mounts["/output/score"] / "score.json"
+            score.parent.mkdir(parents=True, exist_ok=True)
+            score.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        if config.image == "validate:latest":
+            assert args == ["--episodes", "123"]
+            verdict = mounts["/output/verdict"] / "verdict.json"
+            verdict.parent.mkdir(parents=True, exist_ok=True)
+            verdict.write_text("{}")
+            (mounts["/flywheel"] / "termination").write_text("normal")
+            return ContainerResult(exit_code=0, elapsed_s=0.1)
+        raise AssertionError(config.image)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(
+            workspace,
+            pattern,
+            template,
+            project_root,
+            param_overrides={"eval_episodes": "123"},
+        )
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    assert run.status == "succeeded"
+    validate_invocation = next(
+        invocation for invocation in reloaded.invocations.values()
+        if invocation.invoked_block_name == "validate"
+    )
+    assert validate_invocation.args == ["--episodes", "123"]
 
 
 def test_pattern_param_resolution_coerces_defaults_and_overrides():
