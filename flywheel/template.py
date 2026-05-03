@@ -94,8 +94,10 @@ class InvocationDeclaration:
     block: str
     bind: dict[str, InvocationBinding] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
     required: bool = False
     expected_termination_reasons: tuple[str, ...] = ()
+    max_invocations_per_chain: int | None = None
 
 
 @dataclass(frozen=True)
@@ -417,8 +419,10 @@ _INVOCATION_ROUTE_KEYS: frozenset[str] = frozenset({
     "block",
     "bind",
     "args",
+    "env",
     "required",
     "expected_termination_reasons",
+    "max_invocations_per_chain",
 })
 
 _INVOCATION_BINDING_KEYS: frozenset[str] = frozenset({
@@ -760,6 +764,17 @@ def _parse_invocation_route(
             f"invoke route to {child_block!r}: 'args' must be a "
             "list of strings"
         )
+    raw_env = entry.get("env", {})
+    if not isinstance(raw_env, dict) or not all(
+        isinstance(key, str) and key
+        and isinstance(value, str)
+        for key, value in raw_env.items()
+    ):
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: 'env' must be a "
+            "mapping of non-empty string keys to string values"
+        )
     required = entry.get("required", False)
     if not isinstance(required, bool):
         raise ValueError(
@@ -782,12 +797,29 @@ def _parse_invocation_route(
     expected_termination_reasons = tuple(raw_expected)
     for expected_reason in expected_termination_reasons:
         _validate_name(expected_reason, "Termination reason")
+    raw_max_invocations = entry.get("max_invocations_per_chain")
+    if raw_max_invocations is None:
+        max_invocations_per_chain = None
+    elif (
+        isinstance(raw_max_invocations, int)
+        and not isinstance(raw_max_invocations, bool)
+        and raw_max_invocations > 0
+    ):
+        max_invocations_per_chain = raw_max_invocations
+    else:
+        raise ValueError(
+            f"Block {block_name!r} on_termination[{reason!r}] "
+            f"invoke route to {child_block!r}: "
+            "'max_invocations_per_chain' must be a positive integer"
+        )
     return InvocationDeclaration(
         block=child_block,
         bind=bind,
         args=list(args),
+        env=dict(raw_env),
         required=required,
         expected_termination_reasons=expected_termination_reasons,
+        max_invocations_per_chain=max_invocations_per_chain,
     )
 
 
@@ -1144,13 +1176,6 @@ def _validate_invocations(blocks: list[BlockDefinition], template_label: str) ->
                         f"references unknown block {invocation.block!r} "
                         f"in template {template_label!r}"
                     )
-                if child.state == "managed":
-                    raise ValueError(
-                        f"Block {block.name!r} on_termination[{reason!r}] "
-                        f"references managed-state child block "
-                        f"{child.name!r}; invocation routes do not yet "
-                        "declare child state lineage keys"
-                    )
                 for expected_reason in invocation.expected_termination_reasons:
                     if expected_reason not in child.outputs:
                         raise ValueError(
@@ -1203,6 +1228,7 @@ def _validate_invocation_route_cycles(
             invocation.block
             for invocations in block.on_termination.values()
             for invocation in invocations
+            if invocation.max_invocations_per_chain is None
         }
         for block in blocks
     }

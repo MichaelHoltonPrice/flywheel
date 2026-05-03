@@ -1171,6 +1171,14 @@ def _validate_pattern_param_references(
                                 f"on_termination[{reason!r}] arg"
                             ),
                         )
+                    for key, value in route.env.items():
+                        check(
+                            value,
+                            (
+                                f"block {block.name!r} "
+                                f"on_termination[{reason!r}] env[{key!r}]"
+                            ),
+                        )
 
     def visit(current: PatternDeclaration) -> None:
         validate_one(current)
