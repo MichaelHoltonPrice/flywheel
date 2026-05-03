@@ -30,11 +30,14 @@ on_termination:
         bind:
           bot: bot
         args: ["--episodes", "${params.eval_episodes}"]
+        env:
+          FLYWHEEL_RESUME_PROMPT: "Continue from the evaluation result."
 ```
 
 `on_termination.<reason>` must name a termination reason declared under
 `outputs`. Each `invoke` entry names a child block, optional child arguments,
-and optional `bind` entries. A binding maps a child input slot to either:
+optional child environment values, and optional `bind` entries. A binding maps
+a child input slot to either:
 
 - a parent output slot committed for that termination reason, using the short
   form `child_input: parent_output` or the long form
@@ -51,8 +54,16 @@ the resolved run values. Ad hoc `flywheel run block` can provide route-arg
 values with repeated `--param KEY=VALUE` flags; ad hoc params do not affect
 block environment or direct block argv.
 
-Invoked child blocks may not declare `state: managed` in the first
-implementation because routes do not yet declare child state lineage keys.
+Invocation route `env` values may also contain `${params.name}` placeholders.
+The values are layered over the child block's static environment for only that
+invoked execution. This is the intended way for a validation route to relaunch
+the same managed agent with a retry-specific `FLYWHEEL_RESUME_PROMPT`.
+
+Invoked child blocks may declare `state: managed`. In pattern runs, Flywheel
+uses the same run/lane/block lineage key shape as top-level pattern members,
+so repeated invocations of the same child block in the same lane restore the
+child's previous managed state. In ad hoc block runs, Flywheel derives a
+lineage key from the invoking execution, termination reason, and child block.
 
 ## Execution
 
@@ -67,6 +78,12 @@ bounded by a runtime depth limit; the default permits sixteen committed
 executions in one invocation chain and rejects the seventeenth launch. Template load
 also rejects declared invocation cycles, and the runtime keeps a same-block
 cycle guard as a final failsafe.
+
+Routes that intentionally re-enter a block already present in the current
+invocation chain must declare `max_invocations_per_chain`. The value is the
+maximum committed executions of the child block allowed in that chain. Such
+routes are treated as explicitly bounded cycle edges during template
+validation and at runtime.
 
 All routes declared for a termination reason are attempted. A child failure is
 recorded on that route's `BlockInvocation` record and does not prevent sibling

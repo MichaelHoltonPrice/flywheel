@@ -18,6 +18,7 @@ from flywheel.artifact import BlockExecution, BlockInvocation
 from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.pattern_params import substitute_params
 from flywheel.sequence import RunContext
+from flywheel.state import pattern_state_lineage_key
 from flywheel.state_validator import StateValidatorRegistry
 from flywheel.template import (
     BlockDefinition,
@@ -81,11 +82,16 @@ class InvocationChain:
         """Return whether the chain already contains block_name.
 
         This is a runtime failsafe on top of static template cycle
-        validation. It rejects same-block re-entry even through a
-        different termination reason; relax this to a narrower key if
-        intentional re-entry becomes a supported composition pattern.
+        validation. A route can opt into bounded re-entry with
+        ``max_invocations_per_chain``.
         """
         return any(step.block_name == block_name for step in self.steps)
+
+    def count_block(self, block_name: str) -> int:
+        """Return how many committed steps used block_name."""
+        return sum(
+            1 for step in self.steps if step.block_name == block_name
+        )
 
     def describe(self, *, next_block: str | None = None) -> str:
         """Return a human-readable chain path for diagnostics."""
@@ -159,6 +165,29 @@ def _resolve_child_bindings(
     return bindings
 
 
+def _child_state_lineage_key(
+    *,
+    parent_execution: BlockExecution,
+    route: InvocationDeclaration,
+    child: BlockDefinition,
+    run_context: RunContext,
+) -> str | None:
+    """Return a managed-state lineage key for an invoked child block."""
+    if child.state != "managed":
+        return None
+    if run_context.run_id is not None and run_context.lane is not None:
+        return pattern_state_lineage_key(
+            run_context.run_id,
+            run_context.lane,
+            route.block,
+        )
+    return (
+        f"invocation/{parent_execution.id}/"
+        f"termination/{parent_execution.termination_reason}/"
+        f"block/{route.block}"
+    )
+
+
 def dispatch_invocations(
     *,
     workspace: Workspace,
@@ -197,17 +226,36 @@ def dispatch_invocations(
         invocation_id = workspace.generate_invocation_id()
         input_bindings: dict[str, str] = {}
         route_args = list(route.args)
+        route_env = dict(route.env)
         try:
             route_args = [
                 substitute_params(arg, params) for arg in route.args
             ]
+            route_env = {
+                key: substitute_params(value, params)
+                for key, value in route.env.items()
+            }
             if invocation_chain.depth >= max_invocation_depth:
                 raise RuntimeError(
                     "invocation depth limit "
                     f"({max_invocation_depth}) exceeded for chain "
                     f"{invocation_chain.describe(next_block=route.block)}"
                 )
-            if invocation_chain.contains_block(route.block):
+            prior_invocations = invocation_chain.count_block(route.block)
+            if (
+                route.max_invocations_per_chain is not None
+                and prior_invocations >= route.max_invocations_per_chain
+            ):
+                raise RuntimeError(
+                    f"invocation route to block {route.block!r} exceeded "
+                    "max_invocations_per_chain="
+                    f"{route.max_invocations_per_chain} for chain "
+                    f"{invocation_chain.describe(next_block=route.block)}"
+                )
+            if (
+                route.max_invocations_per_chain is None
+                and invocation_chain.contains_block(route.block)
+            ):
                 raise RuntimeError(
                     "recursive invocation cycle detected for chain "
                     f"{invocation_chain.describe(next_block=route.block)}"
@@ -216,6 +264,9 @@ def dispatch_invocations(
                 parent=parent_execution,
                 route=route,
                 workspace=workspace,
+            )
+            child_block = next(
+                block for block in template.blocks if block.name == route.block
             )
             child_result = run_block(
                 workspace,
@@ -226,8 +277,15 @@ def dispatch_invocations(
                 args=route_args,
                 validator_registry=validator_registry,
                 state_validator_registry=state_validator_registry,
+                state_lineage_key=_child_state_lineage_key(
+                    parent_execution=parent_execution,
+                    route=route,
+                    child=child_block,
+                    run_context=run_context,
+                ),
                 invoking_execution_id=parent_execution.id,
                 dispatch_child_invocations=True,
+                env_overlay=route_env,
                 invocation_params=params,
                 run_context=run_context,
                 invocation_chain=invocation_chain,

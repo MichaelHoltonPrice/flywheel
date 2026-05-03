@@ -257,12 +257,17 @@ on_termination:
             required: true
             expected_termination_reasons:
               - normal
+            max_invocations_per_chain: 3
+            env:
+              FLYWHEEL_RESUME_PROMPT: Try again.
             bind:
               bot: bot""")
         template = _from_yaml_with_inline_blocks(path)
         route = template.blocks[0].on_termination["eval_requested"][0]
         assert route.required is True
         assert route.expected_termination_reasons == ("normal",)
+        assert route.max_invocations_per_chain == 3
+        assert route.env == {"FLYWHEEL_RESUME_PROMPT": "Try again."}
 
     def test_rejects_unknown_expected_termination_reason(
         self, tmp_path: Path,
@@ -359,7 +364,7 @@ on_termination:
         with pytest.raises(ValueError, match="unknown key"):
             _from_yaml_with_inline_blocks(path)
 
-    def test_rejects_managed_state_child(self, tmp_path: Path):
+    def test_allows_managed_state_child(self, tmp_path: Path):
         yaml_content = """\
 artifacts:
   - name: bot
@@ -388,8 +393,10 @@ blocks:
 """
         path = tmp_path / "managed_child.yaml"
         path.write_text(yaml_content)
-        with pytest.raises(ValueError, match="managed-state child"):
-            _from_yaml_with_inline_blocks(path)
+        template = _from_yaml_with_inline_blocks(path)
+        stateful = next(block for block in template.blocks
+                        if block.name == "stateful")
+        assert stateful.state == "managed"
 
     def test_rejects_invocation_route_cycle(self, tmp_path: Path):
         yaml_content = """\
@@ -432,6 +439,51 @@ blocks:
         path.write_text(yaml_content)
         with pytest.raises(ValueError, match="route cycle"):
             _from_yaml_with_inline_blocks(path)
+
+    def test_allows_bounded_invocation_route_cycle(self, tmp_path: Path):
+        yaml_content = """\
+artifacts:
+  - name: bot
+    kind: copy
+blocks:
+  - name: first
+    image: first:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      next:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      next:
+        invoke:
+          - block: second
+            max_invocations_per_chain: 3
+            bind:
+              bot: bot
+  - name: second
+    image: second:latest
+    inputs:
+      - name: bot
+        container_path: /input/bot
+    outputs:
+      next:
+        - name: bot
+          container_path: /output/bot
+    on_termination:
+      next:
+        invoke:
+          - block: first
+            max_invocations_per_chain: 3
+            bind:
+              bot: bot
+"""
+        path = tmp_path / "bounded_cycle.yaml"
+        path.write_text(yaml_content)
+        template = _from_yaml_with_inline_blocks(path)
+        route = template.blocks[0].on_termination["next"][0]
+        assert route.max_invocations_per_chain == 3
 
 
 class TestDataclassProperties:
