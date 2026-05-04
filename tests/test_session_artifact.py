@@ -97,16 +97,12 @@ class TestSdkSessionPath:
 
 
 class TestStopFile:
-    def test_stop_file_matches_substrate_sentinel(self):
-        """STOP_FILE is the contract's ``/scratch/.stop`` sentinel.
-
-        The agent runner watches the same path the substrate
-        writes for cooperative cancellation, so
-        :meth:`ContainerExecutionHandle.stop` and a handoff-loop
-        stop both terminate the agent through one channel.
-        """
-        assert _runner.STOP_FILE.name == ".stop"
-        assert str(_runner.STOP_FILE).endswith(".stop")
+    def test_stop_file_lives_outside_persisted_scratch(self):
+        assert _runner.STOP_FILE.name == "agent_stop"
+        assert str(_runner.STOP_FILE).endswith("agent_stop")
+        assert "/scratch" not in str(_runner.STOP_FILE)
+        assert _runner.RESUME_FILE.name == "agent_resume"
+        assert "/scratch" not in str(_runner.RESUME_FILE)
 
 
 class TestSessionPersistenceIsExternal:

@@ -41,7 +41,7 @@ def test_claude_battery_image_owns_runtime_env_defaults():
     assert "ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000" in text
     assert "ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md" in text
     assert "COPY handoff_session.py /app/handoff_session.py" in text
-    assert "/flywheel/control" not in text
+    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch" in text
 
 
 def test_hello_agent_image_bakes_prompt_into_battery_convention():
@@ -58,8 +58,10 @@ def test_claude_battery_entrypoint_creates_framework_subdirs():
     entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
     text = entrypoint.read_text(encoding="utf-8")
 
+    assert 'mkdir -p /flywheel/state "$CONTROL_DIR"' in text
     assert "mkdir -p /flywheel/mcp_servers /flywheel/telemetry" in text
-    assert "/flywheel/control" not in text
+    assert "CONTROL_DIR=/flywheel/control" in text
+    assert 'AGENT_CONTROL_DIR=\'$CONTROL_DIR\'' in text
     assert "termination_request" not in text
     assert "chown root:root /flywheel/telemetry" in text
     assert "chmod 700 /flywheel/telemetry" in text
@@ -71,12 +73,14 @@ def test_claude_battery_entrypoint_persists_agent_scratchpad():
     dockerfile_text = dockerfile.read_text(encoding="utf-8")
     entrypoint_text = entrypoint.read_text(encoding="utf-8")
 
-    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad" in (
+    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch" in (
         dockerfile_text)
     assert "SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad" in entrypoint_text
     assert "export FLYWHEEL_SCRATCHPAD_DIR=" in entrypoint_text
     assert "refusing unsafe FLYWHEEL_SCRATCHPAD_DIR" in entrypoint_text
     assert "FLYWHEEL_SCRATCHPAD_DIR must be under /scratch" in entrypoint_text
+    assert 'find "$SCRATCHPAD_RUNTIME_DIR" -mindepth 1 -maxdepth 1' in (
+        entrypoint_text)
     assert 'cp -a "$SCRATCHPAD_STATE_DIR"/. "$SCRATCHPAD_RUNTIME_DIR"/' in (
         entrypoint_text)
     assert 'cp -a "$SCRATCHPAD_RUNTIME_DIR"/. "$SCRATCHPAD_STATE_DIR"/' in (
@@ -105,6 +109,8 @@ def test_claude_battery_separates_resume_state_from_session_telemetry():
     text = entrypoint.read_text(encoding="utf-8")
 
     assert 'PERSISTED_SESSION=/flywheel/state/session.jsonl' in text
+    assert 'CONTROL_DIR=/flywheel/control' in text
+    assert 'rm -f "$CONTROL_DIR/agent_stop" "$CONTROL_DIR/agent_resume"' in text
     assert 'state_meta_path = Path("/flywheel/state/session_meta.json")' in text
     assert 'snapshot_dir = Path("/flywheel/telemetry/session")' in text
     assert (

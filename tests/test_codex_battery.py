@@ -37,7 +37,7 @@ def test_codex_dockerfile_installs_cli_and_uses_battery_contract():
     assert "scipy" in text
     assert "scikit-image" in text
     assert "ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md" in text
-    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad" in text
+    assert "ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch" in text
     assert "COPY agent_runner.py /app/agent_runner.py" in text
     assert "COPY codex_handoff_hook.py /app/codex_handoff_hook.py" in text
     assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in text
@@ -60,6 +60,7 @@ def test_codex_entrypoint_preserves_state_and_writes_termination():
     text = (CODEX_DIR / "entrypoint.sh").read_text(encoding="utf-8")
     assert "PERSISTED_SESSIONS=/flywheel/state/codex_sessions" in text
     assert "SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad" in text
+    assert 'find "$SCRATCHPAD_RUNTIME_DIR" -mindepth 1 -maxdepth 1' in text
     assert "RUNTIME_TELEMETRY_DIR=/tmp/flywheel-codex-telemetry" in text
     assert "chmod 700 /flywheel/state /flywheel/telemetry" in text
     assert "FLYWHEEL_TELEMETRY_DIR='$RUNTIME_TELEMETRY_DIR'" in text

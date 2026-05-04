@@ -133,16 +133,16 @@ SDK_SESSION_DIR="$PROJECTS_DIR/$SCRATCH_ENC"
 PERSISTED_SESSION=/flywheel/state/session.jsonl
 PERSISTED_HANDOFF=/flywheel/state/handoff_pending.json
 SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad
-export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch/.flywheel_scratchpad}"
+CONTROL_DIR=/flywheel/control
+export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch}"
 SCRATCHPAD_RUNTIME_DIR="$FLYWHEEL_SCRATCHPAD_DIR"
 if [ -z "$SCRATCHPAD_RUNTIME_DIR" ] \
-    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/" ] \
-    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/scratch" ]; then
+    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/" ]; then
     echo "[entrypoint] refusing unsafe FLYWHEEL_SCRATCHPAD_DIR: $SCRATCHPAD_RUNTIME_DIR" >&2
     exit 1
 fi
 case "$SCRATCHPAD_RUNTIME_DIR" in
-    /scratch/*) ;;
+    /scratch|/scratch/*) ;;
     *)
         echo "[entrypoint] FLYWHEEL_SCRATCHPAD_DIR must be under /scratch: $SCRATCHPAD_RUNTIME_DIR" >&2
         exit 1
@@ -182,8 +182,8 @@ except Exception:
     fi
 fi
 
-rm -rf "$SCRATCHPAD_RUNTIME_DIR"
 mkdir -p "$SCRATCHPAD_RUNTIME_DIR"
+find "$SCRATCHPAD_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 if [ -d "$SCRATCHPAD_STATE_DIR" ]; then
     cp -a "$SCRATCHPAD_STATE_DIR"/. "$SCRATCHPAD_RUNTIME_DIR"/
     echo "[entrypoint] staged scratchpad from managed state"
@@ -202,9 +202,12 @@ chown -R claude:claude "$PROJECTS_DIR"
 # create the directory if it is missing.  Without a host mount the
 # directory lives only in the container's overlay filesystem and is
 # discarded on exit, which is exactly what ``state: none`` means.
-mkdir -p /flywheel/state
+mkdir -p /flywheel/state "$CONTROL_DIR"
 chmod 700 /flywheel/state
 chown -R root:root /flywheel/state
+rm -f "$CONTROL_DIR/agent_stop" "$CONTROL_DIR/agent_resume"
+chown -R claude:claude "$CONTROL_DIR"
+chmod 700 "$CONTROL_DIR"
 
 mkdir -p /flywheel/mcp_servers /flywheel/telemetry
 chown root:root /flywheel/telemetry
@@ -225,7 +228,7 @@ RUNNER_LOG=/tmp/flywheel-claude-runner.jsonl
 chown root:root "$RUNNER_LOG"
 chmod 600 "$RUNNER_LOG"
 set -o pipefail
-su -s /bin/bash claude -c "python3 /app/agent_runner.py" | tee "$RUNNER_LOG"
+su -s /bin/bash claude -c "AGENT_CONTROL_DIR='$CONTROL_DIR' python3 /app/agent_runner.py" | tee "$RUNNER_LOG"
 RC=${PIPESTATUS[0]}
 set +o pipefail
 

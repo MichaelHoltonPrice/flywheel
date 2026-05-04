@@ -18,12 +18,12 @@ Pause/resume
 ------------
 
 - **Rate limit**: Detected from RateLimitEvent; auto-retries with
-  exponential backoff (60s, 120s, 300s, 300s, 300s).  Falls back
-  to ``/scratch/.agent_resume`` after exhausting retries.
+  exponential backoff (60s, 120s, 300s, 300s, 300s). Falls back
+  to ``$AGENT_CONTROL_DIR/agent_resume`` after exhausting retries.
 - **Auth error**: Detected from error messages; pauses and waits
-  for ``/scratch/.agent_resume``.
+  for ``$AGENT_CONTROL_DIR/agent_resume``.
 - **External resume**: Write a prompt (or empty) to
-  ``/scratch/.agent_resume`` to continue after a pause.
+  ``$AGENT_CONTROL_DIR/agent_resume`` to continue after a pause.
 
 Environment variables:
     MODEL           — Model to use (e.g., claude-sonnet-4-6)
@@ -62,8 +62,7 @@ Environment variables:
     FLYWHEEL_SCRATCHPAD_DIR
                     — Writable directory persisted by the entrypoint
                       across managed-state block executions. Defaults
-                      to ``/scratch/.flywheel_scratchpad`` in the
-                      Claude battery image.
+                      to ``/scratch`` in the Claude battery image.
 
     Session resume:
         ``entrypoint.sh`` runs as root and stages the persisted
@@ -116,15 +115,13 @@ from claude_agent_sdk.types import (
 # ------------------------------------------------------------------
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/scratch"))
-STOP_FILE = WORKSPACE / ".stop"
-# Pause/resume is intentionally separate from Flywheel's root-owned
-# control directory.  The agent can see this scratchpad file, but it
-# cannot see framework telemetry or control captures.
-RESUME_FILE = WORKSPACE / ".agent_resume"
+CONTROL_DIR = Path(os.environ.get("AGENT_CONTROL_DIR", "/flywheel/control"))
+STOP_FILE = CONTROL_DIR / "agent_stop"
+RESUME_FILE = CONTROL_DIR / "agent_resume"
 POLL_INTERVAL = 5  # seconds between resume-file checks
 
 # Rate limit auto-retry: sleep with exponential backoff before
-# retrying.  Falls back to .agent_resume after max retries.
+# retrying. Falls back to the control-dir resume file after max retries.
 RATE_LIMIT_BACKOFFS = [60, 120, 300, 300, 300]  # seconds per attempt
 
 # Proactive compaction: compact when input tokens exceed this fraction
@@ -841,8 +838,8 @@ async def main() -> None:
                         # Emit the message.
                         _emit_message(message)
 
-                        # Graceful stop: the host wrote .agent_stop
-                        # to the workspace.  The current tool response
+                        # Graceful stop: the host wrote agent_stop
+                        # to the control directory. The current tool response
                         # is already in the session — exit cleanly so
                         # the finally block exports it.
                         if STOP_FILE.exists():

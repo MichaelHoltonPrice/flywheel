@@ -17,7 +17,7 @@ RUN npm install -g @openai/codex
 
 ENV PYTHONUNBUFFERED=1
 ENV FLYWHEEL_AGENT_PROMPT=/app/agent/prompt.md
-ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch/.flywheel_scratchpad
+ENV FLYWHEEL_SCRATCHPAD_DIR=/scratch
 ENV CODEX_HOME=/home/codex/.codex
 
 # MCP support is project-provided. Include a compact Python analysis stack so
