@@ -490,12 +490,12 @@ You are running a Flywheel integration test. Follow these rules exactly.
 
 Your full task:
 1. Before requesting evaluation, write
-   `/scratch/.flywheel_scratchpad/notes.txt` with exactly:
+   `/scratch/notes.txt` with exactly:
    `SCRATCHPAD_SENTINEL_71429`.
 2. Call the `mcp__test__request_eval` tool exactly once.
 3. When the evaluation result is available at `/input/score/scores.json`,
    read `/input/score/scores.json`.
-4. Read `/scratch/.flywheel_scratchpad/notes.txt`.
+4. Read `/scratch/notes.txt`.
 5. Write `/output/bot/bot.txt` with exactly this prefix:
    `FINAL score=<score from scores.json> scratchpad=<notes.txt content>`.
 

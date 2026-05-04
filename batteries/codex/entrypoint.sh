@@ -64,7 +64,7 @@ fi
 phase network_setup_done
 
 export CODEX_HOME="${CODEX_HOME:-/home/codex/.codex}"
-export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch/.flywheel_scratchpad}"
+export FLYWHEEL_SCRATCHPAD_DIR="${FLYWHEEL_SCRATCHPAD_DIR:-/scratch}"
 SCRATCHPAD_RUNTIME_DIR="$FLYWHEEL_SCRATCHPAD_DIR"
 SCRATCHPAD_STATE_DIR=/flywheel/state/scratchpad
 PERSISTED_SESSIONS=/flywheel/state/codex_sessions
@@ -74,13 +74,12 @@ RUNNER_LOG=/tmp/flywheel-codex-runner.jsonl
 RUNTIME_TELEMETRY_DIR=/tmp/flywheel-codex-telemetry
 
 if [ -z "$SCRATCHPAD_RUNTIME_DIR" ] \
-    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/" ] \
-    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/scratch" ]; then
+    || [ "$SCRATCHPAD_RUNTIME_DIR" = "/" ]; then
     echo "[entrypoint] refusing unsafe FLYWHEEL_SCRATCHPAD_DIR: $SCRATCHPAD_RUNTIME_DIR" >&2
     exit 1
 fi
 case "$SCRATCHPAD_RUNTIME_DIR" in
-    /scratch/*) ;;
+    /scratch|/scratch/*) ;;
     *)
         echo "[entrypoint] FLYWHEEL_SCRATCHPAD_DIR must be under /scratch: $SCRATCHPAD_RUNTIME_DIR" >&2
         exit 1
@@ -103,8 +102,8 @@ fi
 chown -R codex:codex "$CODEX_HOME"
 phase codex_home_stage_done
 
-rm -rf "$SCRATCHPAD_RUNTIME_DIR"
 mkdir -p "$SCRATCHPAD_RUNTIME_DIR"
+find "$SCRATCHPAD_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 if [ -d "$SCRATCHPAD_STATE_DIR" ]; then
     cp -a "$SCRATCHPAD_STATE_DIR"/. "$SCRATCHPAD_RUNTIME_DIR"/
     echo "[entrypoint] staged scratchpad from managed state"

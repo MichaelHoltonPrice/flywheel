@@ -84,6 +84,9 @@ config overrides.
 `state: managed` is recommended when a pattern relaunches the same
 agent over multiple block executions. The battery persists Codex session
 files and the configured scratchpad through Flywheel managed state.
+By default the scratchpad is `/scratch`, which is also the agent's
+working directory. Files the agent writes under `/scratch` are restored
+on the next managed execution in the same lineage.
 
 `CODEX_AUTO_COMPACT_TOKEN_LIMIT` is the preferred way to set Codex CLI's
 automatic history-compaction threshold. The runner validates the value as
@@ -131,7 +134,8 @@ state:
 
 * `codex_sessions/` - Codex CLI session files needed for `codex exec resume`;
 * `session_id` - latest observed Codex thread id;
-* `scratchpad/` - contents of `FLYWHEEL_SCRATCHPAD_DIR`.
+* `scratchpad/` - contents of `FLYWHEEL_SCRATCHPAD_DIR`, defaulting to
+  `/scratch`.
 
 The agent can read the live session files while Codex is running because
 the CLI itself needs them. It cannot read the root-owned persisted
