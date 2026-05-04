@@ -72,6 +72,26 @@ def _replace_with_windows_retry(tmp_path: Path, yaml_path: Path) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+def _rename_with_windows_retry(src: Path, dst: Path) -> None:
+    """Rename ``src`` → ``dst``, retrying transient Windows locks.
+
+    Windows: AV scanners and the Docker filesystem can transiently
+    hold a handle on the just-written staging dir, causing rename
+    to fail with WinError 5 ("Access is denied"). Retry with brief
+    backoff; the contention typically clears within a few hundred
+    ms.
+    """
+    attempts = 6
+    for attempt in range(attempts):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1 * (2 ** attempt))
+
+
 def _supersedes_to_yaml(ref: SupersedesRef) -> dict:
     """Serialize a :class:`SupersedesRef` for ``workspace.yaml``.
 
@@ -2077,19 +2097,7 @@ class Workspace:
                 source_path, staging_dir, dirs_exist_ok=True,
             )
             target_dir = states_dir / snapshot_id
-            # Windows: AV scanners and Docker filesystem can transiently
-            # hold a handle on the just-written staging dir, causing
-            # rename to fail with WinError 5 ("Access is denied"). Retry
-            # with brief backoff; the contention typically clears within
-            # a few hundred ms.
-            for attempt in range(6):
-                try:
-                    staging_dir.rename(target_dir)
-                    break
-                except PermissionError:
-                    if attempt == 5:
-                        raise
-                    time.sleep(0.1 * (2 ** attempt))
+            _rename_with_windows_retry(staging_dir, target_dir)
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
@@ -2341,7 +2349,7 @@ class Workspace:
 
             artifact_id = self.generate_artifact_id(name)
             target_dir = artifacts_dir / artifact_id
-            staging_dir.rename(target_dir)
+            _rename_with_windows_retry(staging_dir, target_dir)
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
