@@ -110,6 +110,14 @@ class PatternAfterEvery:
 
 
 @dataclass(frozen=True)
+class PatternStateEpoch:
+    """Managed-state lineage epoching for one run_until loop."""
+
+    on: str
+    every: int | str
+
+
+@dataclass(frozen=True)
 class ResumePromptBuilder:
     """Project command that builds a resume prompt for a loop edge."""
 
@@ -130,6 +138,7 @@ class PatternRunUntil:
     stop_on_invoked: list[str] = field(default_factory=list)
     fail_on: list[str] = field(default_factory=list)
     after_every: list[PatternAfterEvery] = field(default_factory=list)
+    state_epoch: PatternStateEpoch | None = None
     resume_prompt_builder: ResumePromptBuilder | None = None
 
 
@@ -543,7 +552,8 @@ def _parse_run_until_node(
         )
     unknown = set(raw) - {
         "name", "block", "inputs", "args", "env", "continue_on", "stop_on",
-        "stop_on_invoked", "fail_on", "after_every", "resume_prompt_builder",
+        "stop_on_invoked", "fail_on", "after_every", "state_epoch",
+        "resume_prompt_builder",
     }
     if unknown:
         raise ValueError(
@@ -608,12 +618,72 @@ def _parse_run_until_node(
             pattern_name=pattern_name,
             node_name=name,
         ),
+        state_epoch=_parse_state_epoch(
+            raw.get("state_epoch"),
+            pattern_name=pattern_name,
+            node_name=name,
+        ),
         resume_prompt_builder=_parse_resume_prompt_builder(
             raw.get("resume_prompt_builder"),
             pattern_name=pattern_name,
             node_name=name,
         ),
     )
+
+
+def _parse_state_epoch(
+    raw: object,
+    *,
+    pattern_name: str,
+    node_name: str,
+) -> PatternStateEpoch | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "'state_epoch' must be a mapping"
+        )
+    raw = _normalize_state_epoch_keys(raw)
+    unknown = set(raw) - {"on", "every"}
+    if unknown:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            f"state_epoch has unknown key(s) {sorted(unknown)!r}"
+        )
+    reason = raw.get("on")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "state_epoch.on must be a non-empty string"
+        )
+    every = raw.get("every")
+    if isinstance(every, int) and not isinstance(every, bool):
+        if every < 1:
+            raise ValueError(
+                f"Pattern {pattern_name!r}: run_until {node_name!r} "
+                "state_epoch.every must be positive"
+            )
+        every_value: int | str = every
+    elif isinstance(every, str) and every:
+        every_value = every
+    else:
+        raise ValueError(
+            f"Pattern {pattern_name!r}: run_until {node_name!r} "
+            "state_epoch.every must be an int or string"
+        )
+    return PatternStateEpoch(on=reason, every=every_value)
+
+
+def _normalize_state_epoch_keys(raw: dict[object, object]) -> dict[object, object]:
+    normalized = dict(raw)
+    for key in list(normalized):
+        if key is True:
+            if "on" in normalized:
+                raise ValueError(
+                    "state_epoch cannot specify both 'on' and true")
+            normalized["on"] = normalized.pop(key)
+    return normalized
 
 
 def _parse_resume_prompt_builder(

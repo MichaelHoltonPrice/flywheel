@@ -8,6 +8,7 @@ from flywheel.artifact_validator import ArtifactValidatorRegistry
 from flywheel.container import ContainerResult
 from flywheel.pattern_declaration import parse_pattern_declaration
 from flywheel.pattern_execution import (
+    PatternRunError,
     resolve_pattern_params,
     run_pattern,
 )
@@ -2653,6 +2654,137 @@ def test_run_pattern_derives_managed_state_lineage(
     assert (
         reloaded.state_snapshot_path(snapshot.id) / "marker.txt"
     ).read_text() == "state"
+
+
+def test_run_until_state_epoch_rotates_managed_state_lineage(
+    tmp_path: Path,
+):
+    template_yaml = """\
+artifacts: []
+
+blocks:
+  - name: PlayAgent
+    image: play:latest
+    state: managed
+    outputs:
+      action_requested: []
+      terminal: []
+"""
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, template_yaml)
+    pattern = parse_pattern_declaration({
+        "name": "epoch_play",
+        "params": {"epoch_size": {"type": "int", "default": 2}},
+        "do": [
+            {
+                "run_until": {
+                    "name": "play",
+                    "block": "PlayAgent",
+                    "continue_on": {
+                        "action_requested": {"max": 5},
+                    },
+                    "stop_on": ["terminal"],
+                    "state_epoch": {
+                        "on": "action_requested",
+                        "every": "${params.epoch_size}",
+                    },
+                },
+            }
+        ],
+    })
+    calls = 0
+
+    def fake_container(config, args=None):
+        nonlocal calls
+        del args
+        calls += 1
+        mounts = {
+            container_path: Path(host)
+            for host, container_path, _mode in config.mounts
+        }
+        flywheel_dir = mounts["/flywheel"]
+        (flywheel_dir / "termination").write_text("action_requested")
+        state_file = flywheel_dir / "state" / "counter.txt"
+        prior = state_file.read_text() if state_file.exists() else ""
+        state_file.write_text(f"{prior}{calls}")
+        return ContainerResult(exit_code=0, elapsed_s=0.1)
+
+    with patch("flywheel.execution.run_container", side_effect=fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    reloaded = Workspace.load(workspace.path)
+    run = reloaded.runs[result.run_id]
+    step = run.steps[0]
+    assert step.stop_kind == "budget_exhausted"
+    assert step.reason_counts == {"action_requested": 5}
+    assert len(step.members) == 5
+
+    base = pattern_state_lineage_key(result.run_id, DEFAULT_LANE, "PlayAgent")
+    lineage_keys = []
+    state_contents = []
+    for member in step.members:
+        assert member.execution_id is not None
+        execution = reloaded.executions[member.execution_id]
+        assert execution.state_snapshot_id is not None
+        snapshot = reloaded.state_snapshots[execution.state_snapshot_id]
+        lineage_keys.append(snapshot.lineage_key)
+        state_contents.append(
+            (reloaded.state_snapshot_path(snapshot.id) / "counter.txt")
+            .read_text()
+        )
+
+    assert lineage_keys == [
+        f"{base}/epoch/1",
+        f"{base}/epoch/1",
+        f"{base}/epoch/2",
+        f"{base}/epoch/2",
+        f"{base}/epoch/3",
+    ]
+    assert state_contents == ["1", "12", "3", "34", "5"]
+
+
+def test_run_until_state_epoch_requires_continue_reason(tmp_path: Path):
+    template_yaml = """\
+artifacts: []
+
+blocks:
+  - name: PlayAgent
+    image: play:latest
+    state: managed
+    outputs:
+      action_requested: []
+      normal: []
+"""
+    project_root, template, workspace = _setup_workspace(
+        tmp_path, template_yaml)
+    pattern = parse_pattern_declaration({
+        "name": "bad_epoch",
+        "do": [
+            {
+                "run_until": {
+                    "name": "play",
+                    "block": "PlayAgent",
+                    "continue_on": {
+                        "action_requested": {"max": 5},
+                    },
+                    "stop_on": ["normal"],
+                    "state_epoch": {
+                        "on": "normal",
+                        "every": 2,
+                    },
+                },
+            }
+        ],
+    })
+
+    with patch("flywheel.execution.run_container") as run_container:
+        try:
+            run_pattern(workspace, pattern, template, project_root)
+        except PatternRunError as exc:
+            assert "state_epoch references reason 'normal'" in str(exc)
+        else:
+            raise AssertionError("expected state_epoch validation failure")
+    assert run_container.call_count == 0
 
 
 def test_pattern_state_lineage_key_is_injective_for_underscores():

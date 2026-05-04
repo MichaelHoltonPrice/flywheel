@@ -391,6 +391,14 @@ def _execute_run_until(
         )
         for trigger in node.after_every
     ]
+    state_epoch_every = (
+        _resolve_positive_int(
+            node.state_epoch.every,
+            params,
+            context=f"run_until {node.name!r} state_epoch.every",
+        )
+        if node.state_epoch is not None else None
+    )
     iteration = 0
     step_name = _generated_step_name([*step_prefix, node.name])
     step: RunStepRecord | None = None
@@ -459,6 +467,13 @@ def _execute_run_until(
             state_validator_registry=state_validator_registry,
             params=params,
             resume_prompt_override=resume_prompt_override,
+            state_lineage_key=_run_until_state_lineage_key(
+                run_id,
+                lane_name,
+                node,
+                reason_counts,
+                state_epoch_every,
+            ),
         )
         members = [*step.members, result] if step is not None else [result]
         step = RunStepRecord(
@@ -613,6 +628,22 @@ def _finish_run_until_step(
     )
     workspace.replace_run_step(run_id, updated)
     return updated
+
+
+def _run_until_state_lineage_key(
+    run_id: str,
+    lane_name: str,
+    node: PatternRunUntil,
+    reason_counts: dict[str, int],
+    state_epoch_every: int | None,
+) -> str:
+    base = pattern_state_lineage_key(run_id, lane_name, node.block)
+    if node.state_epoch is None:
+        return base
+    assert state_epoch_every is not None
+    completed = reason_counts.get(node.state_epoch.on, 0)
+    epoch = completed // state_epoch_every + 1
+    return f"{base}/epoch/{epoch}"
 
 
 def _resume_transition_from_existing_step(
@@ -1020,6 +1051,7 @@ def _execute_member(
     state_validator_registry: StateValidatorRegistry | None,
     params: dict[str, object],
     resume_prompt_override: str | None = None,
+    state_lineage_key: str | None = None,
 ) -> RunMemberRecord:
     try:
         input_bindings = _resolve_member_inputs(
@@ -1051,8 +1083,10 @@ def _execute_member(
             args=args,
             validator_registry=validator_registry,
             state_validator_registry=state_validator_registry,
-            state_lineage_key=pattern_state_lineage_key(
-                run_id, lane_name, member.block),
+            state_lineage_key=(
+                state_lineage_key
+                or pattern_state_lineage_key(run_id, lane_name, member.block)
+            ),
             allow_workspace_latest=False,
             env_overlay=env_overlay,
             invocation_params=params,
@@ -1249,6 +1283,14 @@ def _collect_body_param_references(
                             f"continue_on[{reason!r}].max"
                         ),
                     )
+            if (
+                node.state_epoch is not None
+                and isinstance(node.state_epoch.every, str)
+            ):
+                check(
+                    node.state_epoch.every,
+                    f"run_until {node.name!r} state_epoch.every",
+                )
             for trigger in node.after_every:
                 if isinstance(trigger.count, str):
                     check(
@@ -1351,6 +1393,15 @@ def _validate_body_run_until_reasons(
                     f"run_until {node.name!r} after_every references "
                     f"reason(s) {sorted(missing_after)!r} not listed "
                     "under continue_on"
+                )
+            if (
+                node.state_epoch is not None
+                and node.state_epoch.on not in node.continue_on
+            ):
+                raise PatternRunError(
+                    f"run_until {node.name!r} state_epoch references "
+                    f"reason {node.state_epoch.on!r} not listed under "
+                    "continue_on"
                 )
             for trigger in node.after_every:
                 _validate_body_run_until_reasons(trigger.body, template)

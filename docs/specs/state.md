@@ -256,6 +256,13 @@ run id. As a result, resumed pattern executions continue the same
 state lineages without introducing a separate parent/child lineage
 mapping.
 
+Structured `run_until` loops may declare `state_epoch` to periodically
+rotate the managed-state lineage for one repeated block. The epoch is
+based on the counted continuation reason declared by the loop, so
+resumed pattern runs continue from the same epoch calculation. Only the
+state lineage changes; the loop remains one run step and artifact
+resolution still sees the full lane history.
+
 Future pattern syntax may allow explicit lineage sharing across
 different logical runs. Such sharing must be recorded on `RunRecord`
 or equivalent run metadata; it must not be inferred from block name
