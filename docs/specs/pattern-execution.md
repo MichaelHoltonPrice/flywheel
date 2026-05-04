@@ -368,6 +368,32 @@ structured body may omit `name`; if a nameless cohort has one member,
 Flywheel uses that member name for the generated step name, otherwise
 it uses a stable `cohort_N` name.
 
+`run_until.state_epoch` lets a loop periodically start a fresh managed
+state lineage for the same block without changing artifact history or
+the loop body:
+
+```yaml
+run_until:
+  name: play
+  block: PlayAgent
+  continue_on:
+    action_requested:
+      max: 600
+  stop_on:
+    - terminal
+  state_epoch:
+    on: action_requested
+    every: 40
+```
+
+The `on` reason must be listed under `continue_on`, and `every` is a
+positive integer or parameter placeholder resolving to one. Flywheel
+computes the epoch from the already-completed count for that reason:
+with `every: 40`, the first 40 counted exits use epoch 1, the next 40
+use epoch 2, and so on. Only managed state changes. Inputs, outputs,
+sequence visibility, resume prompts, `after_every` triggers, and
+continuation budgets still use the single enclosing `run_until` step.
+
 `run_until.resume_prompt_builder` lets a project own the prompt used
 when the loop launches the same block again after the first iteration:
 
@@ -445,6 +471,9 @@ Managed-state blocks in patterns use a lineage key derived from the
 run id, lane, and block name. The iteration member name is deliberately
 excluded so repeated `run_until` iterations of the same managed block
 restore and extend one lane-local state chain.
+When a `run_until` node declares `state_epoch`, Flywheel appends an
+epoch suffix to that lineage key so later iterations can intentionally
+start from fresh managed state while staying in the same pattern loop.
 
 ## Run Records
 

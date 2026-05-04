@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from flywheel.pattern_declaration import (
+    PatternDeclaration,
     PriorOutputBinding,
     parse_pattern_declaration,
 )
@@ -181,6 +182,60 @@ def test_structured_do_foreach_use_and_run_until_parse():
     run_until = subpattern.body[0]
     assert run_until.stop_on_invoked == ["terminal"]
     assert run_until.fail_on == ["aborted"]
+
+
+def test_run_until_state_epoch_parse():
+    pattern = parse_pattern_declaration({
+        "name": "epoch_play",
+        "params": {"epoch_size": {"type": "int", "default": 40}},
+        "do": [
+            {
+                "run_until": {
+                    "name": "play",
+                    "block": "PlayAgent",
+                    "continue_on": {
+                        "action_requested": {"max": 600},
+                    },
+                    "stop_on": ["terminal"],
+                    "state_epoch": {
+                        "on": "action_requested",
+                        "every": "${params.epoch_size}",
+                    },
+                }
+            }
+        ],
+    })
+
+    run_until = pattern.body[0]
+    assert run_until.state_epoch is not None
+    assert run_until.state_epoch.on == "action_requested"
+    assert run_until.state_epoch.every == "${params.epoch_size}"
+
+
+def test_run_until_state_epoch_yaml_on_key_parse(tmp_path):
+    path = tmp_path / "pattern.yaml"
+    path.write_text("""\
+name: epoch_play
+do:
+  - run_until:
+      name: play
+      block: PlayAgent
+      continue_on:
+        action_requested:
+          max: 600
+      stop_on:
+        - terminal
+      state_epoch:
+        on: action_requested
+        every: 40
+""")
+
+    pattern = PatternDeclaration.from_yaml(path)
+
+    run_until = pattern.body[0]
+    assert run_until.state_epoch is not None
+    assert run_until.state_epoch.on == "action_requested"
+    assert run_until.state_epoch.every == 40
 
 
 def test_member_lane_must_be_declared():
