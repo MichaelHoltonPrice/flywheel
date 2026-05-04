@@ -995,6 +995,119 @@ class TestRegisterArtifactSupersedes:
         assert leftover == []
 
 
+class TestStagingRenameRetry:
+    """Windows AV/handle races on staging-dir rename.
+
+    On Windows, a freshly written staging directory can be briefly
+    held open by AV scanners or the Docker filesystem, so the
+    rename to its final name fails with WinError 5. The workspace
+    routes both artifact and state-snapshot renames through
+    ``_rename_with_windows_retry`` to ride out the race.
+    """
+
+    @staticmethod
+    def _flaky_rename(real_rename, fail_count: int, calls: list[int]):
+        def wrapper(self, target):
+            calls.append(1)
+            if len(calls) <= fail_count:
+                raise PermissionError(
+                    "[WinError 5] Access is denied (simulated)"
+                )
+            return real_rename(self, target)
+        return wrapper
+
+    def test_register_artifact_retries_then_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src_dir = tmp_path / "bot_dir"
+        src_dir.mkdir()
+        (src_dir / "bot.py").write_text("def player_fn(): pass")
+
+        calls: list[int] = []
+        real_rename = Path.rename
+        monkeypatch.setattr(
+            Path, "rename",
+            self._flaky_rename(real_rename, fail_count=2, calls=calls),
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            workspace_module.time, "sleep", sleeps.append,
+        )
+
+        inst = ws.register_artifact("checkpoint", src_dir)
+
+        assert len(calls) == 3
+        assert sleeps == [0.1, 0.2]
+        target = ws.path / "artifacts" / inst.id
+        assert (target / "bot.py").exists()
+
+    def test_register_artifact_exhausts_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        src_dir = tmp_path / "bot_dir"
+        src_dir.mkdir()
+        (src_dir / "bot.py").write_text("def player_fn(): pass")
+
+        calls: list[int] = []
+        real_rename = Path.rename
+        monkeypatch.setattr(
+            Path, "rename",
+            self._flaky_rename(real_rename, fail_count=99, calls=calls),
+        )
+        monkeypatch.setattr(
+            workspace_module.time, "sleep", lambda _s: None,
+        )
+
+        with pytest.raises(PermissionError, match="WinError 5"):
+            ws.register_artifact("checkpoint", src_dir)
+
+        assert len(calls) == 6
+        artifacts_dir = ws.path / "artifacts"
+        leftover = [
+            d for d in artifacts_dir.iterdir()
+            if d.name.startswith("_staging-checkpoint-")
+            or d.name.startswith("checkpoint@")
+        ]
+        assert leftover == []
+
+    def test_register_state_snapshot_retries_then_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _, foundry_dir, template = _setup_project(tmp_path)
+        ws = Workspace.create("test_ws", template, foundry_dir)
+        source = tmp_path / "state"
+        source.mkdir()
+        (source / "counter.txt").write_text("1")
+
+        calls: list[int] = []
+        real_rename = Path.rename
+        monkeypatch.setattr(
+            Path, "rename",
+            self._flaky_rename(real_rename, fail_count=2, calls=calls),
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            workspace_module.time, "sleep", sleeps.append,
+        )
+
+        snapshot = ws.register_state_snapshot(
+            lineage_key="lineage_a",
+            source_path=source,
+            produced_by="exec_abc",
+            compatibility={"block_template_hash": "hash-a"},
+        )
+
+        assert len(calls) == 3
+        assert sleeps == [0.1, 0.2]
+        assert (
+            ws.state_snapshot_path(snapshot.id) / "counter.txt"
+        ).read_text() == "1"
+
+
 class TestNameValidation:
     def test_empty_name_raises(self):
         with pytest.raises(ValueError, match="must not be empty"):
