@@ -2831,6 +2831,82 @@ def test_min_successes_one_runs_all_members_and_succeeds(tmp_path: Path):
     ]
 
 
+def test_min_successes_zero_tolerates_single_member_failure(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(tmp_path)
+    pattern = parse_pattern_declaration({
+        "name": "best_effort",
+        "do": [
+            {
+                "name": "side_work",
+                "cohort": {
+                    "min_successes": 0,
+                    "members": [
+                        {
+                            "name": "flaky",
+                            "block": "train",
+                            "args": ["--fail"],
+                        },
+                    ],
+                },
+            },
+            {
+                "name": "next_step",
+                "cohort": {
+                    "members": [
+                        {"name": "good", "block": "train"},
+                    ],
+                },
+            },
+        ],
+    })
+
+    with patch("flywheel.execution.run_container", side_effect=_fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    run = Workspace.load(workspace.path).runs[result.run_id]
+    assert run.status == "succeeded"
+    assert run.steps[0].status == "succeeded"
+    assert run.steps[0].members[0].status == "failed"
+    assert run.steps[1].status == "succeeded"
+
+
+def test_min_successes_zero_runs_all_members(tmp_path: Path):
+    project_root, template, workspace = _setup_workspace(tmp_path)
+    pattern = parse_pattern_declaration({
+        "name": "best_effort_all_fail",
+        "do": [
+            {
+                "name": "side_work",
+                "cohort": {
+                    "min_successes": 0,
+                    "members": [
+                        {
+                            "name": "flaky_a",
+                            "block": "train",
+                            "args": ["--fail"],
+                        },
+                        {
+                            "name": "flaky_b",
+                            "block": "train",
+                            "args": ["--fail"],
+                        },
+                    ],
+                },
+            },
+        ],
+    })
+
+    with patch("flywheel.execution.run_container", side_effect=_fake_container):
+        result = run_pattern(workspace, pattern, template, project_root)
+
+    run = Workspace.load(workspace.path).runs[result.run_id]
+    assert run.status == "succeeded"
+    assert [member.status for member in run.steps[0].members] == [
+        "failed",
+        "failed",
+    ]
+
+
 def test_min_successes_all_stops_after_first_failure(tmp_path: Path):
     project_root, template, workspace = _setup_workspace(tmp_path)
     pattern = parse_pattern_declaration({

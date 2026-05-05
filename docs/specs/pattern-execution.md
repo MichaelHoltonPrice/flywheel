@@ -261,6 +261,11 @@ Supported success rules:
   members after the first failure.
 * `min_successes: 1`: the cohort succeeds if at least one member
   succeeds. All declared members are launched.
+* `min_successes: 0`: the cohort succeeds regardless of member
+  outcomes. All declared members are launched and recorded; failed
+  members appear in the run record as failed but do not propagate
+  failure to the parent step or run. Use this for best-effort side
+  work that should not gate the surrounding loop.
 
 Unsupported success-rule keys or values are parse errors.
 

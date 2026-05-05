@@ -1059,11 +1059,11 @@ def _parse_min_successes(
     *,
     step_name: str,
 ) -> MinSuccesses:
-    if value == "all" or value == 1:
+    if value == "all" or value == 0 or value == 1:
         return value
     raise ValueError(
         f"Pattern step {step_name!r}: min_successes must be "
-        "'all' or 1"
+        "'all', 0, or 1"
     )
 
 

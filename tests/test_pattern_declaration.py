@@ -78,6 +78,15 @@ def test_unknown_success_rule_fails_at_parse_time():
         raise AssertionError("expected parse failure")
 
 
+def test_min_successes_zero_parses():
+    data = _pattern()
+    data["do"][0]["cohort"]["min_successes"] = 0
+
+    pattern = parse_pattern_declaration(data)
+
+    assert pattern.body[0].cohort.min_successes == 0
+
+
 def test_lanes_fixtures_and_foreach_parse():
     pattern = parse_pattern_declaration({
         "name": "improve",
