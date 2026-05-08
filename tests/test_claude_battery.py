@@ -104,6 +104,33 @@ def test_claude_battery_writes_usage_telemetry():
     assert '"source": "flywheel-claude"' in entrypoint_text
 
 
+def test_claude_battery_delivers_prompt_as_system_prompt():
+    """The image-local prompt becomes the session ``system_prompt`` rather
+    than a regular user message.
+
+    Regular user messages live in conversation history and are
+    summarized away by ``/compact`` once long-running sessions hit
+    ``COMPACT_TOKEN_LIMIT``. System prompts are reapplied on every API
+    request and survive compaction. For game-playing agents with long
+    sessions and tool-use guidance baked into the prompt, the latter is
+    what we want.
+    """
+    runner = ROOT / "batteries" / "claude" / "agent_runner.py"
+    text = runner.read_text(encoding="utf-8")
+
+    assert "system_prompt=prompt," in text, (
+        "ClaudeAgentOptions must receive the prompt as system_prompt "
+        "so it sits outside conversation history and survives /compact."
+    )
+    assert 'await client.query(prompt)' not in text, (
+        "The prompt must no longer be passed as the first user message."
+    )
+    assert 'await client.query("Begin.")' in text, (
+        "First-turn kickoff should be a minimal trigger now that the "
+        "task lives in the system prompt."
+    )
+
+
 def test_claude_battery_separates_resume_state_from_session_telemetry():
     entrypoint = ROOT / "batteries" / "claude" / "entrypoint.sh"
     text = entrypoint.read_text(encoding="utf-8")
