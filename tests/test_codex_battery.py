@@ -19,6 +19,13 @@ def _load_agent_runner(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("FLYWHEEL_CODEX_EVENT_LOG", str(tmp_path / "events.jsonl"))
     monkeypatch.setenv(
         "FLYWHEEL_CODEX_LAST_MESSAGE", str(tmp_path / "last.txt"))
+    # ``_resolve_prompt_path`` validates the prompt file exists and is
+    # non-empty before the runner writes its config. Tests don't bring
+    # an image-baked /app/agent/prompt.md, so we synthesize one and
+    # point ``FLYWHEEL_AGENT_PROMPT`` at it.
+    fake_prompt = tmp_path / "prompt.md"
+    fake_prompt.write_text("game prompt", encoding="utf-8")
+    monkeypatch.setenv("FLYWHEEL_AGENT_PROMPT", str(fake_prompt))
     spec = importlib.util.spec_from_file_location(
         "codex_agent_runner", CODEX_DIR / "agent_runner.py")
     assert spec is not None and spec.loader is not None
@@ -108,7 +115,7 @@ def test_agent_runner_builds_codex_exec_command(monkeypatch, tmp_path):
     monkeypatch.setenv("MODEL", "gpt-5.5")
     monkeypatch.setenv("REASONING_EFFORT", "high")
     monkeypatch.setenv("CODEX_AUTO_COMPACT_TOKEN_LIMIT", "200000")
-    command = module._build_command("do work")
+    command = module._build_command()
     assert command[:2] == ["codex", "exec"]
     assert "--json" in command
     assert "--output-last-message" in command
@@ -130,7 +137,10 @@ def test_agent_runner_builds_codex_exec_command(monkeypatch, tmp_path):
         "shell_snapshot",
     ):
         assert feature in command
-    assert command[-1] == "do work"
+    # The prompt no longer rides the command line; it lives in
+    # ``model_instructions_file`` in config.toml. The trailing argv is
+    # the first-turn kickoff.
+    assert command[-1] == "Begin."
 
 
 def test_agent_runner_rejects_invalid_auto_compact_limit(
@@ -138,7 +148,7 @@ def test_agent_runner_rejects_invalid_auto_compact_limit(
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("CODEX_AUTO_COMPACT_TOKEN_LIMIT", "0")
     try:
-        module._build_command("do work")
+        module._build_command()
     except ValueError as exc:
         assert (
             "CODEX_AUTO_COMPACT_TOKEN_LIMIT must be a positive integer"
@@ -153,7 +163,7 @@ def test_named_compact_limit_overrides_extra_args(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "CODEX_EXTRA_ARGS", "-c model_auto_compact_token_limit=900000")
     monkeypatch.setenv("CODEX_AUTO_COMPACT_TOKEN_LIMIT", "200000")
-    command = module._build_command("do work")
+    command = module._build_command()
     configured_index = command.index("model_auto_compact_token_limit=900000")
     named_index = command.index("model_auto_compact_token_limit=200000")
     assert named_index > configured_index
@@ -162,7 +172,7 @@ def test_named_compact_limit_overrides_extra_args(monkeypatch, tmp_path):
 def test_codex_web_search_overrides_follow_extra_args(monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("CODEX_EXTRA_ARGS", "-c model_verbosity=\"low\"")
-    command = module._build_command("do work")
+    command = module._build_command()
     extra_index = command.index("model_verbosity=low")
     web_search_index = command.index("web_search=\"disabled\"")
     assert web_search_index > extra_index
@@ -178,7 +188,7 @@ def test_agent_runner_rejects_search_related_extra_args(monkeypatch, tmp_path):
     ):
         monkeypatch.setenv("CODEX_EXTRA_ARGS", extra)
         try:
-            module._build_command("do work")
+            module._build_command()
         except ValueError as exc:
             assert "CODEX_EXTRA_ARGS must not configure web search" in str(exc)
         else:
@@ -188,7 +198,7 @@ def test_agent_runner_rejects_search_related_extra_args(monkeypatch, tmp_path):
 def test_agent_runner_can_enable_codex_shell_snapshot(monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("CODEX_SHELL_SNAPSHOT", "true")
-    command = module._build_command("do work")
+    command = module._build_command()
     assert command[command.index("--enable") + 1] == "shell_snapshot"
     assert "web_search" in command
 
@@ -198,7 +208,7 @@ def test_agent_runner_rejects_invalid_shell_snapshot_value(
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("CODEX_SHELL_SNAPSHOT", "maybe")
     try:
-        module._build_command("do work")
+        module._build_command()
     except ValueError as exc:
         assert "CODEX_SHELL_SNAPSHOT must be a boolean" in str(exc)
     else:
@@ -220,7 +230,7 @@ def test_agent_runner_uses_resume_when_sessions_are_staged(
         monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
     (tmp_path / "codex-home" / "sessions").mkdir(parents=True)
-    command = module._build_command("continue")
+    command = module._build_command()
     assert command[-3:] == ["resume", "--last", "Continue."]
 
 
@@ -232,7 +242,7 @@ def test_agent_runner_uses_flywheel_resume_prompt_when_resuming(
         "FLYWHEEL_RESUME_PROMPT",
         "The evaluation result is mounted at /input/score/scores.json.",
     )
-    command = module._build_command("original task")
+    command = module._build_command()
     assert command[-3:] == [
         "resume",
         "--last",
@@ -244,9 +254,9 @@ def test_agent_runner_ignores_resume_prompt_for_fresh_session(
         monkeypatch, tmp_path):
     module = _load_agent_runner(monkeypatch, tmp_path)
     monkeypatch.setenv("FLYWHEEL_RESUME_PROMPT", "resume-only context")
-    command = module._build_command("original task")
+    command = module._build_command()
     assert "resume" not in command
-    assert command[-1] == "original task"
+    assert command[-1] == "Begin."
 
 
 def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
@@ -265,7 +275,8 @@ def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
             "required_paths": ["/output/result"],
         },
     }
-    module._write_codex_config(configs)
+    prompt_path = tmp_path / "prompt.md"
+    module._write_codex_config(configs, prompt_path)
     text = (tmp_path / "codex-home" / "config.toml").read_text(
         encoding="utf-8")
     assert 'web_search = "disabled"' in text
@@ -280,6 +291,49 @@ def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
     assert "codex_hooks = true" in text
     assert "[[hooks.PostToolUse]]" in text
     assert "mcp__demo__finish" in text
+    # The prompt path must be wired into Codex via
+    # ``model_instructions_file`` so the prompt becomes session
+    # base_instructions rather than a user message subject to
+    # ``model_auto_compact_token_limit`` summarization.
+    assert (
+        f'model_instructions_file = {json.dumps(str(prompt_path))}'
+        in text
+    )
+
+
+def test_resolve_prompt_path_honors_flywheel_agent_prompt_env(
+        monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    custom = tmp_path / "custom-prompt.md"
+    custom.write_text("custom game prompt", encoding="utf-8")
+    monkeypatch.setenv("FLYWHEEL_AGENT_PROMPT", str(custom))
+
+    assert module._resolve_prompt_path() == custom
+
+
+def test_resolve_prompt_path_rejects_missing_file(monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "FLYWHEEL_AGENT_PROMPT", str(tmp_path / "does-not-exist.md"))
+    try:
+        module._resolve_prompt_path()
+    except RuntimeError as exc:
+        assert "Prompt file not found" in str(exc)
+    else:
+        raise AssertionError("expected missing prompt to fail")
+
+
+def test_resolve_prompt_path_rejects_empty_file(monkeypatch, tmp_path):
+    module = _load_agent_runner(monkeypatch, tmp_path)
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+    monkeypatch.setenv("FLYWHEEL_AGENT_PROMPT", str(empty))
+    try:
+        module._resolve_prompt_path()
+    except RuntimeError as exc:
+        assert "is empty" in str(exc)
+    else:
+        raise AssertionError("expected empty prompt to fail")
 
 
 def test_codex_handoff_hook_records_pending_metadata(tmp_path):

@@ -107,7 +107,16 @@ def _emit(data: dict[str, Any]) -> None:
     print(json.dumps(data, default=str), flush=True)
 
 
-def _load_prompt() -> str:
+def _resolve_prompt_path() -> Path:
+    """Resolve the image-local prompt path and validate its contents.
+
+    The path is wired into Codex via ``model_instructions_file`` in the
+    auto-written ``config.toml``. Codex re-reads the file at session
+    start and uses it as the developer-role base instructions, so the
+    prompt is reapplied on every API call rather than living in the
+    user-message history that ``model_auto_compact_token_limit``
+    summarizes away.
+    """
     prompt_file = Path(os.environ.get(
         "FLYWHEEL_AGENT_PROMPT", str(DEFAULT_PROMPT_FILE)))
     if not prompt_file.is_file():
@@ -116,10 +125,9 @@ def _load_prompt() -> str:
             "image from the Codex battery and copy the project prompt into "
             "that path, or set FLYWHEEL_AGENT_PROMPT."
         )
-    prompt = prompt_file.read_text(encoding="utf-8")
-    if not prompt.strip():
+    if not prompt_file.read_text(encoding="utf-8").strip():
         raise RuntimeError(f"Prompt file {prompt_file} is empty")
-    return prompt
+    return prompt_file
 
 
 def _scan_mounted_servers() -> dict[str, dict[str, Any]]:
@@ -261,11 +269,21 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def _write_codex_config(handoff_configs: dict[str, dict[str, Any]]) -> None:
+def _write_codex_config(
+    handoff_configs: dict[str, dict[str, Any]],
+    prompt_path: Path,
+) -> None:
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    # ``model_instructions_file`` overrides Codex's built-in coding-agent
+    # base instructions with the contents of our prompt.md. Codex loads
+    # the file at session start and stores it as the session's
+    # base_instructions, which it sends as developer-role content on
+    # every API request — outside the conversation history that
+    # ``model_auto_compact_token_limit`` summarizes.
     lines = [
         'cli_auth_credentials_store = "file"',
         'web_search = "disabled"',
+        f"model_instructions_file = {_toml_string(str(prompt_path))}",
         "",
         "[features]",
         "codex_hooks = true" if handoff_configs else "codex_hooks = false",
@@ -332,7 +350,7 @@ def _write_codex_config(handoff_configs: dict[str, dict[str, Any]]) -> None:
     })
 
 
-def _build_command(prompt: str) -> list[str]:
+def _build_command() -> list[str]:
     executable = os.environ.get("FLYWHEEL_CODEX_FAKE", "codex")
     command = [executable, "exec"]
     command.extend(["--json"])
@@ -370,7 +388,11 @@ def _build_command(prompt: str) -> list[str]:
         "--enable" if shell_snapshot else "--disable",
         "shell_snapshot",
     ])
-    command_prompt = prompt
+    # First-turn kickoff. The full task lives in the developer-role
+    # base instructions written to ``config.toml`` via
+    # ``model_instructions_file``; this trailing positional is just the
+    # nudge that prompts the agent to start.
+    command_prompt = "Begin."
     if (CODEX_HOME / "sessions").exists():
         command.extend(["resume", "--last"])
         command_prompt = os.environ.get(
@@ -490,9 +512,9 @@ def _event_uses_web_search(event: dict[str, Any]) -> bool:
     return isinstance(payload, dict) and payload.get("type") == "web_search_call"
 
 
-def _run_codex(prompt: str) -> int:
+def _run_codex() -> int:
     command_build_start = time.monotonic()
-    command = _build_command(prompt)
+    command = _build_command()
     command_build_done = time.monotonic()
     _emit({"type": "codex_command", "argv": command[:-1] + ["<prompt>"]})
     EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -597,13 +619,13 @@ def _run_codex(prompt: str) -> int:
 def main() -> int:
     """Run the Codex agent process and translate failures to events."""
     try:
-        prompt = _load_prompt()
+        prompt_path = _resolve_prompt_path()
         handoff_configs = _handoff_configs()
         os.environ["HANDOFF_TOOL_CONFIG_NORMALIZED"] = json.dumps(
             handoff_configs, sort_keys=True)
         os.environ["FLYWHEEL_HANDOFF_PENDING"] = str(HANDOFF_PENDING_PATH)
-        _write_codex_config(handoff_configs)
-        return _run_codex(prompt)
+        _write_codex_config(handoff_configs, prompt_path)
+        return _run_codex()
     except Exception as exc:  # noqa: BLE001
         _emit({
             "type": "error",

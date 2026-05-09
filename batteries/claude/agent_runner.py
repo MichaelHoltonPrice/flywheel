@@ -709,10 +709,15 @@ async def main() -> None:
         })
 
     # --- Build options ---
+    # The image-local prompt becomes the session's system prompt rather
+    # than a regular user message. This is the only way to keep the
+    # instructions out of conversation history (and therefore out of
+    # /compact's reach) once the agent runs long enough to compact.
     options = ClaudeAgentOptions(
         cwd="/scratch",
         allowed_tools=allowed_tools,
         permission_mode="bypassPermissions",
+        system_prompt=prompt,
     )
     if tools_whitelist is not None:
         options.tools = tools_whitelist
@@ -771,7 +776,10 @@ async def main() -> None:
                     "FLYWHEEL_RESUME_PROMPT", "").strip()
                 await client.query(resume_prompt or "Continue.")
             else:
-                await client.query(prompt)
+                # First-turn kickoff. The full task lives in the system
+                # prompt set on ``options`` above; this is just the
+                # nudge that prompts the agent to start.
+                await client.query("Begin.")
 
             # Process responses.  receive_response() yields messages
             # until a ResultMessage, then stops.  After compaction or
