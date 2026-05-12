@@ -36,7 +36,7 @@ def _load_agent_runner(monkeypatch, tmp_path: Path):
 
 def test_codex_dockerfile_installs_cli_and_uses_battery_contract():
     text = (CODEX_DIR / "Dockerfile.codex").read_text(encoding="utf-8")
-    assert "npm install -g @openai/codex" in text
+    assert "npm install -g @openai/codex@0.128.0" in text
     assert "ripgrep" in text
     assert "numpy" in text
     assert "pandas" in text
