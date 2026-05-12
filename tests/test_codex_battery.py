@@ -288,7 +288,7 @@ def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
     assert "in_app_browser = false" in text
     assert "[mcp_servers.demo]" in text
     assert "demo_mcp_server.py" in text
-    assert "codex_hooks = true" in text
+    assert "hooks = true" in text
     assert "[[hooks.PostToolUse]]" in text
     assert "mcp__demo__finish" in text
     # The prompt path must be wired into Codex via

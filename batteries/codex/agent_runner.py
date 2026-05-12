@@ -286,7 +286,7 @@ def _write_codex_config(
         f"model_instructions_file = {_toml_string(str(prompt_path))}",
         "",
         "[features]",
-        "codex_hooks = true" if handoff_configs else "codex_hooks = false",
+        "hooks = true" if handoff_configs else "hooks = false",
         *[
             f"{feature} = false"
             for feature in WEB_SEARCH_DISABLE_FEATURES
