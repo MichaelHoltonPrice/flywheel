@@ -84,13 +84,24 @@ BENIGN_STDERR_PATTERNS = [
         r"failed to record rollout items: thread .* not found$"
     ),
 ]
-WEB_SEARCH_DISABLE_FEATURES = (
+HOSTED_TOOL_DISABLE_FEATURES = (
     "web_search",
     "web_search_cached",
     "web_search_request",
     "search_tool",
     "browser_use",
     "in_app_browser",
+    "apps",
+    "plugins",
+    "tool_search",
+    "tool_suggest",
+    "skill_mcp_dependency_install",
+    "image_generation",
+    "computer_use",
+    "workspace_dependencies",
+    "remote_plugin",
+    "plugin_hooks",
+    "enable_mcp_apps",
 )
 FORBIDDEN_EXTRA_ARG_FRAGMENTS = (
     "--search",
@@ -100,6 +111,17 @@ FORBIDDEN_EXTRA_ARG_FRAGMENTS = (
     "search_tool",
     "browser_use",
     "in_app_browser",
+    "apps",
+    "plugins",
+    "tool_search",
+    "tool_suggest",
+    "skill_mcp_dependency_install",
+    "image_generation",
+    "computer_use",
+    "workspace_dependencies",
+    "remote_plugin",
+    "plugin_hooks",
+    "enable_mcp_apps",
 )
 
 
@@ -289,7 +311,7 @@ def _write_codex_config(
         "hooks = true" if handoff_configs else "hooks = false",
         *[
             f"{feature} = false"
-            for feature in WEB_SEARCH_DISABLE_FEATURES
+            for feature in HOSTED_TOOL_DISABLE_FEATURES
         ],
         "",
     ]
@@ -376,7 +398,7 @@ def _build_command() -> list[str]:
         extra_args = shlex.split(extra)
         _validate_extra_args(extra_args)
         command.extend(extra_args)
-    _append_web_search_disable_args(command)
+    _append_hosted_tool_disable_args(command)
     compact_limit = _positive_int_env("CODEX_AUTO_COMPACT_TOKEN_LIMIT")
     if compact_limit is not None:
         command.extend([
@@ -406,14 +428,14 @@ def _validate_extra_args(args: list[str]) -> None:
         normalized = arg.strip().lower()
         if any(fragment in normalized for fragment in FORBIDDEN_EXTRA_ARG_FRAGMENTS):
             raise ValueError(
-                "CODEX_EXTRA_ARGS must not configure web search, browser, "
-                f"or search features: {arg}"
+                "CODEX_EXTRA_ARGS must not configure hosted search, browser, "
+                f"connector, plugin, or tool-discovery features: {arg}"
             )
 
 
-def _append_web_search_disable_args(command: list[str]) -> None:
+def _append_hosted_tool_disable_args(command: list[str]) -> None:
     command.extend(["-c", 'web_search="disabled"'])
-    for feature in WEB_SEARCH_DISABLE_FEATURES:
+    for feature in HOSTED_TOOL_DISABLE_FEATURES:
         command.extend(["--disable", feature])
 
 
@@ -504,12 +526,17 @@ def _is_benign_stderr(stderr: str) -> bool:
     )
 
 
-def _event_uses_web_search(event: dict[str, Any]) -> bool:
+def _event_uses_forbidden_hosted_tool(event: dict[str, Any]) -> bool:
     item = event.get("item")
     if isinstance(item, dict) and item.get("type") == "web_search":
         return True
     payload = event.get("payload")
-    return isinstance(payload, dict) and payload.get("type") == "web_search_call"
+    if isinstance(payload, dict) and payload.get("type") == "web_search_call":
+        return True
+    # Codex Apps/connectors can surface as MCP-flavored tool calls rather than
+    # as legacy web_search events. Treat any event mentioning the Codex Apps
+    # namespace as forbidden in this battery.
+    return "codex_apps" in json.dumps(event, default=str)
 
 
 def _run_codex() -> int:
@@ -548,16 +575,16 @@ def _run_codex() -> int:
                 continue
             events.append(event)
             _emit({"type": "codex_event", "event": event})
-            if _event_uses_web_search(event):
+            if _event_uses_forbidden_hosted_tool(event):
                 # Research runs should preserve the trajectory for analysis even
-                # when a forbidden hosted-search event is observed.
+                # when a forbidden hosted/discoverable tool event is observed.
                 _emit({
                     "type": "warning",
                     "message": (
-                        "Codex emitted a web-search event despite "
-                        "web_search=disabled."
+                        "Codex emitted a hosted or discoverable tool event "
+                        "despite the battery's feature disables."
                     ),
-                    "warning_type": "WebSearchObserved",
+                    "warning_type": "ForbiddenHostedToolObserved",
                     "timestamp": datetime.now(UTC).isoformat(),
                 })
     stdout_done = time.monotonic()

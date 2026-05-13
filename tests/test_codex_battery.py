@@ -94,6 +94,8 @@ def test_codex_docs_explain_network_isolation_host_allowlist():
     assert "CODEX_ALLOWED_HOSTS" in spec
     assert 'web_search = "disabled"' in spec
     assert "CODEX_EXTRA_ARGS` must not contain `--search`" in spec
+    assert "Apps/connectors" in spec
+    assert "tool discovery" in spec
     for host in (
         "api.openai.com",
         "auth.openai.com",
@@ -134,6 +136,17 @@ def test_agent_runner_builds_codex_exec_command(monkeypatch, tmp_path):
         "search_tool",
         "browser_use",
         "in_app_browser",
+        "apps",
+        "plugins",
+        "tool_search",
+        "tool_suggest",
+        "skill_mcp_dependency_install",
+        "image_generation",
+        "computer_use",
+        "workspace_dependencies",
+        "remote_plugin",
+        "plugin_hooks",
+        "enable_mcp_apps",
         "shell_snapshot",
     ):
         assert feature in command
@@ -185,12 +198,16 @@ def test_agent_runner_rejects_search_related_extra_args(monkeypatch, tmp_path):
         "-c web_search=\"live\"",
         "-c features.web_search_request=true",
         "--enable browser_use",
+        "--enable apps",
+        "-c features.plugins=true",
+        "--enable tool_search",
+        "--enable tool_suggest",
     ):
         monkeypatch.setenv("CODEX_EXTRA_ARGS", extra)
         try:
             module._build_command()
         except ValueError as exc:
-            assert "CODEX_EXTRA_ARGS must not configure web search" in str(exc)
+            assert "CODEX_EXTRA_ARGS must not configure hosted search" in str(exc)
         else:
             raise AssertionError(f"expected {extra!r} to fail")
 
@@ -286,6 +303,17 @@ def test_agent_runner_writes_config_for_mounted_mcp_and_handoff(
     assert "search_tool = false" in text
     assert "browser_use = false" in text
     assert "in_app_browser = false" in text
+    assert "apps = false" in text
+    assert "plugins = false" in text
+    assert "tool_search = false" in text
+    assert "tool_suggest = false" in text
+    assert "skill_mcp_dependency_install = false" in text
+    assert "image_generation = false" in text
+    assert "computer_use = false" in text
+    assert "workspace_dependencies = false" in text
+    assert "remote_plugin = false" in text
+    assert "plugin_hooks = false" in text
+    assert "enable_mcp_apps = false" in text
     assert "[mcp_servers.demo]" in text
     assert "demo_mcp_server.py" in text
     assert "hooks = true" in text
@@ -446,7 +474,7 @@ print(json.dumps({
     assert "process_total_s" in phases
 
 
-def test_agent_runner_audits_codex_web_search_event(tmp_path):
+def test_agent_runner_audits_forbidden_hosted_tool_events(tmp_path):
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Write a short message.")
     workspace = tmp_path / "scratch"
@@ -478,6 +506,15 @@ print(json.dumps({
         "action": {"type": "search", "query": "arc agi 3"},
     },
 }))
+print(json.dumps({
+    "type": "item.started",
+    "item": {
+        "type": "mcp_tool_call",
+        "server": "codex_apps__github",
+        "tool": "_search",
+        "arguments": {"query": "vc33"},
+    },
+}))
 print(json.dumps({"type": "thread.completed", "thread_id": "thread_fake"}))
 """,
         encoding="utf-8",
@@ -502,5 +539,5 @@ print(json.dumps({"type": "thread.completed", "thread_id": "thread_fake"}))
         check=False,
     )
     assert proc.returncode == 0
-    assert "WebSearchObserved" in proc.stdout
+    assert "ForbiddenHostedToolObserved" in proc.stdout
     assert '"status": "complete"' in proc.stdout
