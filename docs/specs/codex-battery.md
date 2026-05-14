@@ -72,14 +72,16 @@ CLI. Override `CODEX_ALLOWED_HOSTS` in project YAML only when a project has
 verified that a different Codex CLI version needs a different OpenAI endpoint
 set.
 
-The battery also disables Codex's hosted web-search path. The runner writes
-`web_search = "disabled"` into `$CODEX_HOME/config.toml`, disables the legacy
-search/browser feature flags, appends the same overrides after
+The battery also disables Codex's hosted and discoverable tool surfaces. The
+runner writes `web_search = "disabled"` into `$CODEX_HOME/config.toml`,
+disables the legacy search/browser feature flags, disables Codex
+Apps/connectors, plugins, tool discovery, image generation, computer-use, and
+workspace dependency helper features, appends the same overrides after
 `CODEX_EXTRA_ARGS` on every `codex exec` command, and emits an audit warning if
 Codex ever emits a web-search event. The runner intentionally does not stop the
 trajectory on that warning, so research runs can preserve the full record for
-analysis. `CODEX_EXTRA_ARGS` must not contain `--search` or search/browser
-config overrides.
+analysis. `CODEX_EXTRA_ARGS` must not contain `--search` or hosted search,
+browser, connector, plugin, or tool-discovery config overrides.
 
 `state: managed` is recommended when a pattern relaunches the same
 agent over multiple block executions. The battery persists Codex session
